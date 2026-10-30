@@ -937,14 +937,14 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 id = "tsql.select.assign-into"
 kind = "converter"
 proof = "lemma:Sqldiff.Mirror/C3b queries/rule 4"
-note = "`SELECT @x = COUNT(*) FROM t [WHERE c]` into an int variable only (`SELECT COUNT(*) INTO x`); every other SELECT ... INTO engine (ASM-SELECT-ASSIGN-CARDINALITY)"
+note = "`SELECT @x = COUNT(*) FROM ... [WHERE c]` over a table or (C3d) a block of tables, into an int variable only (`SELECT COUNT(*) INTO x`); every other SELECT ... INTO engine (ASM-SELECT-ASSIGN-CARDINALITY)"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
 id = "tsql.select.assign-loop"
 kind = "converter"
 proof = "lemma:Sqldiff.Mirror/C3b queries/rule 1"
-note = "one plain table, a WHERE that fixes every primary-key column, int or fitting string targets, procedures only; other queries engine"
+note = "one plain table or (C3d) a block of them (inner and cross joins, comma lists, aliases, qualified names) whose every table the key closure determines, int or fitting string targets, procedures only; other queries engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
@@ -1063,7 +1063,7 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 id = "tsql.stmt.set-variable"
 kind = "converter"
 proof = "lemma:Sqldiff.Mirror/Statements"
-note = "`SET @x = e` with `e` in the slice (`x := e`), and `SET @x = (SELECT e FROM t WHERE c)` (C3b rule 2); compound operators (`+=`) engine"
+note = "`SET @x = e` with `e` in the slice (`x := e`), and `SET @x = (SELECT e FROM ...)` over a table or (C3d) a block of tables, more than one row the cardinality error (C3b rule 2); compound operators (`+=`) engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]

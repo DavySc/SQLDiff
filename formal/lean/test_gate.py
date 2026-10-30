@@ -12,7 +12,8 @@ block, `EXISTS`, scalar subqueries, `COUNT(*)`), with `statements` `c3b`;
 C3c string columns and constant defaults in the CATALOG; (0.13.0) the
 `why` reason codes; (0.14.0) C2c typed values (integer widths, bit against
 boolean, date and datetime2 with DATEADD/DATEDIFF, typed columns in the
-CATALOG); the `why` reason codes on an unconfirmed answer whose routine is outside the
+CATALOG); (0.16.0) C3d query blocks (joins, aliases, qualified names, the
+key closure, a scalar subquery over a join); the `why` reason codes on an unconfirmed answer whose routine is outside the
 spec (Sqldiff/Mirror/Diagnose.lean), and their absence on every other
 answer, confirmed or not.
 Anything else is unconfirmed, including malformed requests.
@@ -915,11 +916,106 @@ cases += [
     ("125", req3(125, a=q_t(string("abc")), b=q_p(string("abc")), dep=Q_DEP,
                  cat=q_cat("TEXT"), cert=Q_CERT), "unconfirmed"),
 ]
+# C3d: query blocks. T-SQL dbo.Ord (Id int PRIMARY KEY, Qty int NULL, CustId
+# int NULL) and dbo.Cust (Id int PRIMARY KEY, Score int NULL) are the target
+# tables ord and cust; joins, aliases and qualified names in the C3b shapes.
+J_DEP = f"0;{hx('dbo.Ord')}:{hx('ord')},{hx('dbo.Cust')}:{hx('cust')}"
+J_CAT = (f"{hx('ord')}={hx('id')}.ink.{hx('Id')}/{hx('qty')}.i.{hx('Qty')}/{hx('custid')}.i.{hx('CustId')},"
+         f"{hx('cust')}={hx('id')}.ink.{hx('Id')}/{hx('score')}.i.{hx('Score')}")
+
+
+def tbl(name, alias=None):
+    return C("Table", L(*map(S, name)), NONE if alias is None else S(alias), L())
+
+
+def join(kind, left, right, on=NONE):
+    return C("Join", S(kind), left, right, on)
+
+
+def sel_f(items, froms, where=NONE, into=()):
+    return C("Select", L(), "f", L(), "f", NONE, L(*items), L(*into), "f",
+             L(*froms), where, L(), NONE, L(), NONE, NONE, L(), NONE)
+
+
+def qn(a, c):
+    return C("Name", L(S(a), S(c)))
+
+
+def oc_t(on):
+    return [join("INNER", tbl(["dbo", "Ord"], "o"), tbl(["dbo", "Cust"], "c"), on)]
+
+
+def oc_p(on):
+    return [join("INNER", tbl(["ord"], "o"), tbl(["cust"], "c"), on)]
+
+
+def j_t(body, name=("dbo", "look")):
+    return proc(list(name), [param("@id", "In"), param("@q", "InOut")], [], body)
+
+
+def j_p(body, name=("look",)):
+    return proc(list(name), [param("p_id", "In"), param("p_q", "InOut")], [], body)
+
+
+def req3j(i, a, b):
+    return req3(i, a=a, b=b, dep=J_DEP, cat=J_CAT, cert=Q_CERT_J)
+
+
+Q_CERT_J = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@id", "p_id"), ("@q", "p_q"), ("%status", "%status")])
+ON_KEY_T = bin_("=", qn("c", "Id"), qn("o", "CustId"))
+ON_KEY_P = bin_("=", qn("c", "id"), qn("o", "custid"))
+J_SEL_T = C("NStmt", C("SSelect", sel_f([item(qn("c", "Score"), assign_=S("@q"))], oc_t(ON_KEY_T),
+                                        bin_("=", qn("o", "Id"), tv("@id")))))
+J_FOR_P = C("NBlock", C("Block", L(C("Declare", S("sqldiff_r"), C("Ty", S("RECORD"), L()), NONE)),
+                        L(C("ForQuery", S("sqldiff_r"),
+                            sel_f([item(qn("c", "score"), alias=S("sqldiff_c1"))], oc_p(ON_KEY_P),
+                                  bin_("=", qn("o", "id"), pv("p_id"))),
+                            L(field("p_q", "sqldiff_c1"))))))
+
+
+def j_scalar_t(where):
+    return assign(tv("@q"), C("Subquery", sel_f([item(qn("c", "Score"))], oc_t(ON_KEY_T), where)))
+
+
+def j_scalar_p(where):
+    return assign(pv("p_q"), C("Subquery", sel_f([item(qn("c", "score"))], oc_p(ON_KEY_P), where)))
+
+
+cases += [
+    # SELECT @q = c.Score over a join by key against the FOR block.
+    ("126", req3j(126, j_t([J_SEL_T]), j_p([J_FOR_P])), "confirmed"),
+    # Joined on a column that is no key: the block may keep several rows.
+    ("127", req3j(127, j_t([C("NStmt", C("SSelect", sel_f([item(qn("c", "Score"), assign_=S("@q"))],
+                                                          oc_t(bin_("=", qn("c", "Score"), qn("o", "Qty"))),
+                                                          bin_("=", qn("o", "Id"), tv("@id")))))]),
+                  j_p([J_FOR_P])), "unconfirmed"),
+    # A scalar subquery over a join that may keep two rows: in, as the
+    # cardinality error; without XACT_ABORT ON only on the C1 theorem.
+    ("128", req3j(128, j_t([j_scalar_t(bin_(">", qn("o", "Qty"), tv("@id")))]),
+                  j_p([j_scalar_p(bin_(">", qn("o", "qty"), pv("p_id")))])), "confirmed"),
+    ("129", req3j(129, j_t([ABORT, j_scalar_t(bin_(">", qn("o", "Qty"), tv("@id")))]),
+                  j_p([j_scalar_p(bin_(">", qn("o", "qty"), pv("p_id")))])), "confirmed"),
+    # An unqualified name that is a column of both tables (209, 42702).
+    ("130", req3j(130, j_t([C("NStmt", C("SSelect", sel_f([item(qn("c", "Score"), assign_=S("@q"))],
+                                                          oc_t(ON_KEY_T), bin_("=", col("Id"), tv("@id")))))]),
+                  j_p([J_FOR_P])), "unconfirmed"),
+    # The PL/pgSQL qualifier is the routine's name (eval/queries Q12).
+    ("131", req3j(131, j_t([J_SEL_T]), j_p([J_FOR_P], name=("o",))), "unconfirmed"),
+    # A LEFT JOIN.
+    ("132", req3j(132, j_t([C("NStmt", C("SSelect", sel_f([item(qn("c", "Score"), assign_=S("@q"))],
+                                                          [join("LEFT", tbl(["dbo", "Ord"], "o"),
+                                                                tbl(["dbo", "Cust"], "c"), ON_KEY_T)],
+                                                          bin_("=", qn("o", "Id"), tv("@id")))))]),
+                  j_p([J_FOR_P])), "unconfirmed"),
+]
 THEOREMS = {
     "114": "Sqldiff.Mirror.check_sound_c2a",
     "116": "Sqldiff.Mirror.check_sound_c2a",
     "123": "Sqldiff.Mirror.check_sound",
     "118": "Sqldiff.Mirror.check_sound_c2a",
+    "126": "Sqldiff.Mirror.check_sound_c2a",
+    "128": "Sqldiff.Mirror.check_sound",
+    "129": "Sqldiff.Mirror.check_sound_c2a",
     "104": "Sqldiff.Mirror.check_sound_c2a",
     "91": "Sqldiff.Mirror.check_sound_c2a",
     "83": "Sqldiff.Mirror.check_sound_c2a",
@@ -1011,6 +1107,16 @@ EXTRA = {
     "123": {"scalars": "uninterpreted", "statements": "c1"},
     "124": {"why": ["node:call:type"]},
     "125": {"why": ["node:call:type"]},
+    # C3d: query blocks.
+    "126": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"],
+            "statements": "c3b"},
+    "127": {"why": ["stmt:select:many-rows"]},
+    "128": {"scalars": "uninterpreted", "statements": "c3b"},
+    "129": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"],
+            "statements": "c3b"},
+    "130": {"why": ["name:ambiguous"]},
+    "131": {"why": ["stmt:select:from:qualifier"]},
+    "132": {"why": ["stmt:select:from:join:left"]},
     "106": {"why": ["store:declare:smallint"]},
     "107": {"why": ["store:assign:bit", "expr:bit-literal"]},
     "108": {"why": ["store:assign:date", "expr:date-literal"]},

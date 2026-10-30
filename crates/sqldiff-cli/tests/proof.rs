@@ -582,6 +582,102 @@ fn the_real_checker_confirms_reads_of_a_plain_table() {
     assert_eq!(r["answer"], "unconfirmed", "{r}");
 }
 
+/// C3d end to end: a procedure that reads two plain tables through a join
+/// by key (`SELECT @x = o.Qty, @s = c.Score FROM dbo.Ord AS o JOIN dbo.Cust
+/// c ON c.Id = o.CustId WHERE o.Id = @id`, which becomes the PL/pgSQL `FOR`
+/// block over the same join), takes a scalar subquery over an inner join,
+/// counts the rows of a comma list and tests `EXISTS` over a cross join is
+/// confirmed by `check_sound_c2a`; both tables are sent. The near miss,
+/// a join on a column that is no key, may keep several rows, of which T-SQL
+/// assigns an unspecified one: refused with `stmt:select:many-rows`.
+#[test]
+fn the_real_checker_confirms_a_join_read_by_key() {
+    let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
+        return;
+    };
+    let _turn = turn();
+    let d = scratch("c3d-real");
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write(
+        &src,
+        "tables.sql",
+        "CREATE TABLE dbo.Ord (Id int NOT NULL, Qty int NULL, CustId int NULL, CONSTRAINT PK_Ord PRIMARY KEY (Id));\nGO\n\
+         CREATE TABLE dbo.Cust (Id int NOT NULL, Score int NULL, CONSTRAINT PK_Cust PRIMARY KEY (Id));\nGO\n",
+    );
+    let look = |on: &str| {
+        format!(
+            "CREATE PROCEDURE dbo.look @id int, @q int OUTPUT, @s int OUTPUT, @n int OUTPUT\nAS\nBEGIN\n  SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  SELECT @q = o.Qty, @s = c.Score FROM dbo.Ord AS o JOIN dbo.Cust c ON {on} WHERE o.Id = @id;\n  SET @s = (SELECT c.Score FROM dbo.Ord o INNER JOIN dbo.Cust AS c ON o.CustId = c.Id WHERE o.Qty > @id);\n  SELECT @n = COUNT(*) FROM dbo.Ord, dbo.Cust WHERE Ord.CustId = Cust.Id;\n  IF EXISTS (SELECT 1 FROM dbo.Ord o CROSS JOIN dbo.Cust c WHERE o.Qty = c.Score)\n    SET @n = 0;\nEND\n"
+        )
+    };
+    write(&src, "look.sql", &look("c.Id = o.CustId"));
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+            .args([
+                "convert",
+                &src.display().to_string(),
+                "--to",
+                "postgres",
+                "--out",
+            ])
+            .arg(d.join("out"))
+            .args(["--overwrite", "--isolated", "--proof", "report"])
+            .env("SQLDIFF_CHECK", &real)
+            .output()
+            .unwrap();
+        let c: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(d.join("out/certificates.json")).unwrap(),
+        )
+        .unwrap();
+        c["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|f| f["routines"].as_array().unwrap().clone())
+            .find(|r| r["routine"] == "dbo.look")
+            .unwrap()
+    };
+    let r = run();
+    // The converter keeps the FROM as written: aliases, qualifiers, joins.
+    let out = std::fs::read_to_string(d.join("out/look.sql")).unwrap();
+    for shape in [
+        "FOR sqldiff_r IN SELECT o.Qty AS sqldiff_c1, c.Score AS sqldiff_c2 FROM Ord AS o JOIN Cust c ON c.Id = o.CustId WHERE o.Id = p_id LOOP",
+        "p_s := (SELECT c.Score FROM Ord o INNER JOIN Cust AS c ON o.CustId = c.Id WHERE o.Qty > p_id);",
+        "SELECT COUNT(*) INTO p_n FROM Ord, Cust WHERE Ord.CustId = Cust.Id;",
+        "IF EXISTS (SELECT 1 FROM Ord o CROSS JOIN Cust c WHERE o.Qty = c.Score) THEN",
+    ] {
+        assert!(out.contains(shape), "{shape}:\n{out}");
+    }
+    assert_eq!(r["answer"], "confirmed", "{r}");
+    assert_eq!(r["theorems"][0], "Sqldiff.Mirror.check_sound_c2a", "{r}");
+    assert_eq!(r["statements"], "c3b", "{r}");
+    let asm: Vec<&str> = r["assumptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    for a in [
+        "ASM-TSQL-ARITH-ERRORS",
+        "ASM-TSQL-ANSI-NULLS",
+        "ASM-TABLES-AS-DECLARED",
+    ] {
+        assert!(asm.contains(&a), "{a}: {r}");
+    }
+    assert!(!asm.contains(&"ASM-OBSERVER-ROWCOUNT"), "{r}");
+    // A join on a column that is no key: `Cust` is not determined.
+    write(&src, "look.sql", &look("c.Score = o.Qty"));
+    let r = run();
+    assert_eq!(r["answer"], "unconfirmed", "{r}");
+    let why: Vec<&str> = r["why"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    assert_eq!(why, ["stmt:select:many-rows"], "{r}");
+}
+
 /// C3c end to end: a procedure over a table with a `varchar` and an
 /// `nvarchar` column, two constant defaults and a non-unique index inserts
 /// (the left-out columns get their defaults), updates the string columns
