@@ -8,9 +8,10 @@ use sqldiff_convert::tree;
 use sqldiff_convert::Status;
 use sqldiff_core::Dialect;
 use sqldiff_gui::convert_review::{
-    stored_key, Action, RecordRequest, Review, Setup, Target, UnitView, GATE_BLOCKERS_SHOWN,
+    stored_key, Action, Near, RecordRequest, Review, Setup, Target, UnitView, GATE_BLOCKERS_SHOWN,
     GATE_STALE,
 };
+use sqldiff_gui::review_list::{Group, Query};
 
 const ASSUMING: &str = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  UPDATE dbo.t SET a = 1;\nEND\n";
 const ASSUMING_2: &str = "CREATE PROCEDURE dbo.p2 AS\nBEGIN\n  UPDATE dbo.t SET a = 2;\nEND\n";
@@ -92,8 +93,7 @@ impl Drop for Fixture {
 
 /// Units of `path` in the review state's queue, by id.
 fn unit_items(r: &Review, path: &str, all: bool) -> Vec<String> {
-    r.state(all)
-        .items
+    r.items(all)
         .iter()
         .filter(|i| i.item.path == path)
         .filter_map(|i| i.item.unit.clone())
@@ -336,9 +336,8 @@ fn a_comment_discharges_nothing_and_a_rejection_keeps_the_unit_open() {
         "2026-10-26T12:01:00Z",
     )
     .unwrap();
-    let st = r.state(false);
-    let item = st
-        .items
+    let items = r.items(false);
+    let item = items
         .iter()
         .find(|i| i.item.unit.as_deref() == Some(p.unit.as_str()))
         .unwrap();
@@ -373,15 +372,15 @@ fn after_a_source_changes_the_tree_is_converted_again_and_decisions_are_outdated
     );
     // Kept conversion = a fresh one.
     assert_eq!(r.report_json(), f.open().report_json());
-    assert!(r.state(false).items.iter().all(|i| !i.item.outdated));
+    assert!(r.items(false).iter().all(|i| !i.item.outdated));
 
     // The unit's own text is the same; the file around it is not.
     std::fs::write(f.dir.join("src/a.sql"), format!("{body}-- changed\n")).unwrap();
     r.refresh().unwrap();
     assert!(r.converted_last());
     let st = r.state(false);
-    let item = st
-        .items
+    let items = r.items(false);
+    let item = items
         .iter()
         .find(|i| i.item.unit.as_deref() == Some(u.unit.as_str()))
         .expect("the unit is open again");
@@ -610,10 +609,10 @@ fn listed_units_carry_their_hashes_and_what_no_decision_discharges() {
         ],
     );
     let mut r = f.open();
-    let st = r.state(false);
+    let items = r.items(false);
     // The page groups and bulk-accepts from the list alone: each unit item
     // carries the hashes /api/unit would give, and what blocks it.
-    for i in st.items.iter().filter(|i| i.item.unit.is_some()) {
+    for i in items.iter().filter(|i| i.item.unit.is_some()) {
         let u = r.unit(&i.item.path, i.item.unit.as_ref().unwrap()).unwrap();
         assert_eq!(
             i.hashes,
@@ -627,8 +626,7 @@ fn listed_units_carry_their_hashes_and_what_no_decision_discharges() {
             assert!(i.blocking.is_empty(), "{}: {:?}", i.item.path, i.blocking);
         }
     }
-    let refused = st
-        .items
+    let refused = items
         .iter()
         .find(|i| i.item.path == "r.sql" && i.item.unit.is_some())
         .expect("the refused unit is listed");
@@ -642,8 +640,7 @@ fn listed_units_carry_their_hashes_and_what_no_decision_discharges() {
         .find(|x| b.assumptions.contains(x))
         .expect("a shared assumption")
         .clone();
-    let targets: Vec<Target> = st
-        .items
+    let targets: Vec<Target> = items
         .iter()
         .filter(|i| i.item.path != "r.sql" && i.open_assumptions.contains(&rule))
         .map(|i| {
@@ -663,40 +660,45 @@ fn listed_units_carry_their_hashes_and_what_no_decision_discharges() {
         n
     );
     assert!(!r
-        .state(false)
-        .items
+        .items(false)
         .iter()
         .any(|i| i.item.path != "r.sql" && i.open_assumptions.contains(&rule)));
 }
 
 #[test]
 fn the_page_gets_the_gates_first_blockers_and_how_many_there_are() {
-    let f = Fixture::new("gate-shown", &[("a.sql", ASSUMING), ("t.sql", PLAIN)]);
+    // A blocker or more per file: more than the review keeps.
+    let names: Vec<String> = (0..GATE_BLOCKERS_SHOWN + 5)
+        .map(|i| format!("p{i}.sql"))
+        .collect();
+    let files: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), ASSUMING)).collect();
+    let f = Fixture::new("gate-shown", &files);
     let r = f.open();
-    let mut st = r.state(false);
-    let g = st.gate.as_mut().expect("judged");
-    let first = g.blockers[0].clone();
-    g.blockers = vec![first; GATE_BLOCKERS_SHOWN + 5];
-    let full = serde_json::to_value(&*g).unwrap();
-    let v = serde_json::to_value(&st).unwrap();
-    let shown = v["gate"]["blockers"].as_array().unwrap();
-    assert_eq!(shown.len(), GATE_BLOCKERS_SHOWN);
-    assert_eq!(v["gate"]["blockers_total"], GATE_BLOCKERS_SHOWN + 5);
-    // Everything else as the gate has it.
-    let mut expect = full;
-    expect["blockers"] = serde_json::Value::Array(shown.clone());
-    expect["blockers_total"] = (GATE_BLOCKERS_SHOWN + 5).into();
-    assert_eq!(v["gate"], expect);
-    // `/api/gate` gives the state's gate, error and time.
+    // The gate as `sqldiff review-status` judges it, every blocker listed.
+    let a = f.args();
+    let (inputs, unreadable) = tree::read(&a).unwrap();
+    let mut t = tree::convert(&a, &inputs, unreadable, Some(&f.out())).unwrap();
+    tree::review(&mut t, &inputs, &Ledger::default(), "(none)");
+    let full = sqldiff_convert::gate::check(&t, &a, &f.out(), None).unwrap();
+    assert!(
+        full.blockers.len() > GATE_BLOCKERS_SHOWN,
+        "{}",
+        full.blockers.len()
+    );
+    let g = r.gate().unwrap();
+    assert_eq!(g.blockers.len(), GATE_BLOCKERS_SHOWN);
+    assert_eq!(g.blockers_total, full.blockers.len());
+    // The first blockers, and everything else as the gate has it.
+    let mut expect = serde_json::to_value(&full).unwrap();
+    expect["blockers"] = serde_json::to_value(&full.blockers[..GATE_BLOCKERS_SHOWN]).unwrap();
+    expect["blockers_total"] = full.blockers.len().into();
     let st = serde_json::to_value(r.state(false)).unwrap();
+    assert_eq!(st["gate"], expect);
+    // `/api/gate` gives the state's gate, error and time.
     let gate = serde_json::to_value(r.gate_state()).unwrap();
     for k in ["gate", "gate_error", "gate_judged"] {
         assert_eq!(gate[k], st[k], "{k}");
     }
-    assert_eq!(
-        st["gate"]["blockers_total"],
-        st["gate"]["blockers"].as_array().unwrap().len()
-    );
 }
 
 #[test]
@@ -789,4 +791,55 @@ fn a_stored_conversion_opens_the_review_a_fresh_one_would() {
     )
     .unwrap();
     assert_ne!(stored_key(&f.setup(), b"extra").unwrap().0, key);
+}
+
+#[test]
+fn the_list_pages_through_the_queue_as_the_queue_has_it() {
+    let f = Fixture::new(
+        "list-pages",
+        &[
+            ("a.sql", ASSUMING),
+            ("b.sql", ASSUMING_2),
+            ("c.sql", DECIDING),
+            ("d.sql", REFUSED),
+            ("t.sql", PLAIN),
+        ],
+    );
+    let r = f.open();
+    let items = r.items(false);
+    assert!(items.len() > 2, "{}", items.len());
+    // By tier, every tier: the rows, a page of one at a time, are the queue.
+    let q = Query {
+        tiers: vec![1, 2, 3, 4, 5],
+        group: Group::Tier,
+        filter: String::new(),
+    };
+    let l = r.list(&q, 0, 1000);
+    assert_eq!((l.total, l.shown), (items.len(), items.len()));
+    let mut paged = Vec::new();
+    for g in &l.groups {
+        let mut from = 0;
+        while let Some(page) = r.rows(&q, &g.key, from, 1).filter(|p| from < p.n) {
+            paged.extend(page.rows);
+            from += 1;
+        }
+    }
+    let k = |v: &[sqldiff_gui::convert_review::ListedItem]| -> Vec<String> {
+        v.iter().map(|i| i.item.key.clone()).collect()
+    };
+    assert_eq!(k(&paged), k(&items));
+    // Rows carry the hashes the unit view gives.
+    for i in paged.iter().filter(|i| i.item.unit.is_some()) {
+        let u = r.unit(&i.item.path, i.item.unit.as_ref().unwrap()).unwrap();
+        assert_eq!(i.hashes, Some((u.input_hash, u.output_hash)));
+    }
+    // The walk starts with the first, and a page of groups is a page.
+    let first = r.near(&q, Near::Index(0)).unwrap();
+    assert_eq!(first.key, items[0].item.key);
+    assert_eq!(r.list(&q, 1, 1).groups.len(), 1.min(l.groups_total - 1));
+    assert!(r.rows(&q, "no such group", 0, 10).is_none());
+    // The state counts, the list lists.
+    let st = r.state(false);
+    assert_eq!(st.open, items.len());
+    assert_eq!(st.reviewed_total, st.reviewed.len());
 }

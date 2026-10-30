@@ -318,6 +318,8 @@ The page's actions append records to `OUT/review-decisions.jsonl` and change not
 
 After every action the sources are read again, the ledger applied again and the queue rebuilt; the tree is converted again when a source changed, and otherwise the previous conversion is kept, since the same files with the same options convert the same way (`tests/convert_review.rs` checks that the kept report equals a fresh one). A reviewed unit leaves the queue and is listed, folded, as *accepted in review*, with its status unchanged; it is never shown as converted. A plainly converted unit reads *nothing found, not proven* and is listed only with "Nothing found too" (tier 6). Items whose decisions were made on other file contents are marked *outdated*; banners list ledger lines that were not applied, decisions about units that no longer exist, and files in OUT that differ from what this conversion writes (converted with other options, or edited by hand).
 
+The queue comes to the page a page at a time, whatever the size of the tree: the server takes the lens, the filter and the grouping over the whole queue and sends the group headings and the rows of the open groups, 200 at a time (*Show more*); J and K, `[` and `]`, and the item that takes a decided item's place are found there too (`crates/sqldiff-gui/src/review_list.rs`, `tests/review_list.rs`). The review keeps the first 100 blockers of the done gate and their number, and of the engine's reports only the findings the unit view shows.
+
 ## The page
 
 - **Location pane** (the strip at the right edge): every unit that is not plain "converted", at its position in the output; click to jump. The box shows the visible part.

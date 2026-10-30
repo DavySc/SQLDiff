@@ -196,10 +196,25 @@ fn list_split_near_misses_stay_apart() {
     }
 }
 
-/// A position that grows by one each level has no bound from the anchor:
-/// T-SQL's bigint cast to int is not taken as PostgreSQL's integer.
+/// The recursive member casts a bigint position to int: equal while the
+/// position keeps its anchor's bound (a CHARINDEX, at most the string's
+/// length), not once it grows by one each level, where the induction
+/// drops the bound.
 #[test]
 fn growing_recursion_has_no_bound() {
+    let pair = |step: &str| {
+        (
+            format!("WITH N (p, e) AS (SELECT 1, CHARINDEX(N',', @List) UNION ALL SELECT CAST(e AS int) + 1, {step} FROM N WHERE p < @n)
+  INSERT INTO dbo.S (Pos) SELECT p FROM N OPTION (MAXRECURSION 0);"),
+            format!("WITH RECURSIVE N (p, e) AS (SELECT 1, strpos(p_list, ',') UNION ALL SELECT CAST(e AS integer) + 1, {step} FROM N WHERE p < p_n)
+  INSERT INTO S (Pos) SELECT p FROM N;"),
+        )
+    };
+    let (a, b) = pair("e");
+    assert_equal(&a, &b, &["ASM-VALUE-SIZE-1GB", "ASM-CTE-MAXRECURSION"]);
+    let (a, b) = pair("e + 1");
+    assert_apart(&a, &b);
+    // A cast outside the CTE has no recursive bound either.
     assert_apart(
         "WITH N (x) AS (SELECT CAST(1 AS bigint) UNION ALL SELECT x + 1 FROM N WHERE x < @n)
   INSERT INTO dbo.S (Pos) SELECT CAST(x AS int) FROM N OPTION (MAXRECURSION 0);",

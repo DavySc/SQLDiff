@@ -259,8 +259,13 @@ const LENSES = [
 ];
 const KIND_LABEL = { missing_object: "missing object", unplaced: "outside any unit", template: "template instances", not_exercised: "template no instance uses", not_in_manifest: "not in the manifest", unreadable: "unreadable file" };
 const time = (t) => (t || "").replace("T", " ").replace(/:\d\d(\.\d+)?Z$/, " UTC");
+// The queue comes a page at a time: `list` holds the lens's groups as the
+// server grouped them, `rows` the rows loaded of each open group, `items`
+// every row loaded (and the picked ones), by key; `selIndex` is where the
+// selection is in the walk order.
 const S = { st: INITIAL.state, sel: null, view: null, unit: 0, picked: new Set(), files: new Map(), action: null, rule: "", gateOpen: false,
-  lens: null, group: "cause", filter: "", openGroups: new Set(), full: new Set(), recorded: 0, confirm: 0 };
+  lens: null, group: "cause", filter: "", openGroups: new Set(), recorded: 0, confirm: 0,
+  list: null, rows: new Map(), items: new Map(), selIndex: 0, reviewed: INITIAL.state.reviewed };
 try {
   $("author").value = localStorage.getItem(AUTHOR_KEY) || "";
   const v = JSON.parse(localStorage.getItem(VIEW_KEY) || "{}");
@@ -312,8 +317,8 @@ function renderHeader() {
   const gate = g
     ? `<button class="chip gate${g.complete ? " ok" : ""}" id="gatechip" aria-expanded="${S.gateOpen}" title="${g.complete ? "Done" : `Not done: ${g.blockers_total} blocker(s)`}, as the done gate (sqldiff review-status) judges it. Click for why.">${g.complete ? `<span class="dot" style="background:var(--s-converted)"></span>Done` : `<span class="dot" style="background:var(--s-unproven)"></span>Not done · <b>${g.blockers_total}</b>`}</button>`
     : `<span class="chip" title="${esc(st.gate_error || "")}">Done gate not judged</span>`;
-  const nOpen = st.items.filter((i) => i.tier <= 5).length;
-  $("chips").innerHTML = `<span class="chip" title="Items in tiers 1 to 5, in every lens"><b>${nOpen}</b> open</span>${S.recorded ? `<span class="chip" title="Decisions recorded from this page since it was opened"><b>${S.recorded}</b> recorded now</span>` : ""}<span class="chip" title="Units people accepted in review (accepted, which is not the same as converted)"><span class="dot" style="background:var(--focus)"></span><b>${st.reviewed.length}</b> of ${st.units} accepted in review</span>${gate}`;
+  const nOpen = st.open;
+  $("chips").innerHTML = `<span class="chip" title="Items in tiers 1 to 5, in every lens"><b>${nOpen}</b> open</span>${S.recorded ? `<span class="chip" title="Decisions recorded from this page since it was opened"><b>${S.recorded}</b> recorded now</span>` : ""}<span class="chip" title="Units people accepted in review (accepted, which is not the same as converted)"><span class="dot" style="background:var(--focus)"></span><b>${st.reviewed_total}</b> of ${st.units} accepted in review</span>${gate}`;
   if ($("gatechip")) $("gatechip").onclick = () => { S.gateOpen = !S.gateOpen; renderHeader(); };
   const b = [];
   if (g && S.gateOpen) {
@@ -363,36 +368,47 @@ function causes(it) {
   return it.open.length ? [...new Set(it.open)] : [statusLabel(it.status)];
 }
 
-function shown() {
-  const L = lens(), f = S.filter.trim().toLowerCase();
-  return S.st.items.filter((it) => L.tiers.includes(it.tier)
-    && (!f || [it.path, it.reason, ...causes(it)].some((x) => String(x).toLowerCase().includes(f))));
+// What the list shows: the lens, grouped and filtered as the page says.
+const lq = () => `tiers=${lens().tiers.join(",")}&group=${S.group}&q=${encodeURIComponent(S.filter)}${allQ()}`;
+// Where an item is in the list: `from` it alone, `step` items on from it,
+// the first of the group `jump` groups on from its, or the one at `index`.
+const near = (q) => api(`/api/near?${lq()}&${q}`);
+const isOpen = (g) => S.list.groups_total === 1 || S.openGroups.has(gid(g.key));
+
+// The lens's groups (as many as were shown), and the rows of the open ones
+// (as many as were loaded).
+async function loadList() {
+  const had = new Map([...S.rows].map(([k, v]) => [k, v.rows.length]));
+  const count = Math.max(GROUPS, S.list ? S.list.groups.length : 0);
+  S.list = await api(`/api/list?${lq()}&count=${count}`);
+  S.rows = new Map();
+  S.items = new Map([...S.picked].filter((k) => S.items.has(k)).map((k) => [k, S.items.get(k)]));
+  await Promise.all(S.list.groups.filter(isOpen).map((g) => loadRows(g.key, 0, Math.max(ROWS, had.get(gid(g.key)) || 0))));
 }
 
-// Groups of the items shown, biggest first (by tier: worst first).
-function groups(items) {
-  const m = new Map(), add = (k, it) => { if (!m.has(k)) m.set(k, []); m.get(k).push(it); };
-  for (const it of items) {
-    if (S.group === "tier") add(it.tier, it);
-    else if (S.group === "file") add(it.path, it);
-    else if (it.tier <= 2) add(causes(it)[0], it);
-    else causes(it).forEach((c) => add(c, it));
+async function loadRows(key, from, count = ROWS) {
+  const r = await api(`/api/rows?${lq()}&key=${encodeURIComponent(key)}&from=${from}&count=${count}`);
+  const k = gid(key), before = from ? (S.rows.get(k) || { rows: [] }).rows : [];
+  S.rows.set(k, { n: r.n, rows: before.concat(r.rows) });
+  for (const it of r.rows) S.items.set(it.key, it);
+}
+
+// Groups up to index `g` loaded, that one open, and its rows loaded up to
+// `offset`: where an item from `near` is listed.
+async function reveal(p) {
+  if (p.group >= S.list.groups.length) {
+    const more = await api(`/api/list?${lq()}&from=${S.list.groups.length}&count=${p.group + 1 - S.list.groups.length + GROUPS}`);
+    S.list.groups = S.list.groups.concat(more.groups);
   }
-  const g = [...m].map(([key, items]) => ({ key: String(key), items }));
-  if (S.group === "tier") g.sort((a, b) => a.key - b.key);
-  else g.sort((a, b) => b.items.length - a.items.length || a.key.localeCompare(b.key));
-  return g;
-}
-
-// Keys in the order J/K walks them: group by group, each item once.
-function order() {
-  const seen = new Set(), keys = [];
-  for (const g of groups(shown())) for (const it of g.items) if (!seen.has(it.key)) { seen.add(it.key); keys.push(it.key); }
-  return keys;
+  const g = S.list.groups[p.group];
+  if (!g) return;
+  S.openGroups.add(gid(g.key));
+  const loaded = (S.rows.get(gid(g.key)) || { rows: [] }).rows.length;
+  if (p.offset >= loaded) await loadRows(g.key, loaded, p.offset + 1 - loaded + ROWS);
 }
 
 const gid = (key) => `${S.group}:${key}`;
-const ROWS = 200;
+const ROWS = 200, GROUPS = 200;
 function groupTitle(g) {
   if (S.group === "tier") return `Tier ${g.key} · ${S.st.tier_labels[g.key]}`;
   return g.key;
@@ -402,8 +418,6 @@ function pathHtml(path, at = "") {
   const cut = path.search(/[^\\/]*$/);
   return `${esc(path.slice(cut))}${esc(at)} <span class="dir">${esc(path.slice(0, cut))}</span>`;
 }
-// Units in a group whose open assumption is the group's cause.
-const acceptable = (g) => S.group === "cause" ? g.items.filter((i) => i.open_assumptions.includes(g.key)) : [];
 
 function renderLenses() {
   $("lenses").innerHTML = LENSES.map((l, k) => {
@@ -413,40 +427,44 @@ function renderLenses() {
 }
 
 function renderQueue() {
-  const st = S.st, L = lens(), items = shown(), gs = groups(items);
+  const st = S.st, L = lens(), list = S.list;
   renderLenses();
-  const total = lensCount(L), distinct = new Set(items.map((i) => i.key)).size;
-  $("lenshint").innerHTML = `${S.filter.trim() ? `<b>${distinct}</b> of ${total} match the filter · ` : `<b>${total}</b> left · `}${esc(L.hint)}`;
-  // With one group, that group is open; open() opens the selection's group.
+  if (!list) return;
+  const total = list.total;
+  $("lenshint").innerHTML = `${S.filter.trim() ? `<b>${list.shown}</b> of ${total} match the filter · ` : `<b>${total}</b> left · `}${esc(L.hint)}`;
   const html = [];
-  for (const g of gs) {
-    const open = gs.length === 1 || S.openGroups.has(gid(g.key));
-    const acc = acceptable(g);
-    const desc = S.group === "cause" ? (g.items[0].kind === "unit" && g.items.length === 1 ? g.items[0].path : g.items[0].reason) : S.group === "file" ? [...new Set(g.items.flatMap(causes))].join(", ") : "";
-    html.push(`<div class="grp${open ? " open" : ""}" data-grp="${esc(g.key)}" role="button" aria-expanded="${open}"><span class="chev">▶</span><span class="k" title="${esc(groupTitle(g))}">${S.group === "file" ? pathHtml(g.key) : esc(groupTitle(g))}</span><span class="n">${g.items.length}</span>${desc ? `<span class="d" title="${esc(desc)}">${esc(desc)}</span>` : ""}${acc.length > 1 ? `<span class="acts"><button class="outline" data-accept="${esc(g.key)}" title="Select the ${acc.length} units with this open assumption for one bulk accept: one decision per unit, with your name and reason">Accept for all ${acc.length}…</button></span>` : ""}</div>`);
+  for (const g of list.groups) {
+    const open = isOpen(g);
+    html.push(`<div class="grp${open ? " open" : ""}" data-grp="${esc(g.key)}" role="button" aria-expanded="${open}"><span class="chev">▶</span><span class="k" title="${esc(groupTitle(g))}">${S.group === "file" ? pathHtml(g.key) : esc(groupTitle(g))}</span><span class="n">${g.n}</span>${g.desc ? `<span class="d" title="${esc(g.desc)}">${esc(g.desc)}</span>` : ""}${g.accept > 1 ? `<span class="acts"><button class="outline" data-accept="${esc(g.key)}" title="Select the ${g.accept} units with this open assumption for one bulk accept: one decision per unit, with your name and reason">Accept for all ${g.accept}…</button></span>` : ""}</div>`);
     if (!open) continue;
-    const rows = S.full.has(gid(g.key)) ? g.items : g.items.slice(0, ROWS);
-    html.push(`<div class="rows">${rows.map((it) => itemRow(it, S.group === "cause" ? g.key : undefined)).join("")}${rows.length < g.items.length ? `<button class="showmore" data-more="${esc(g.key)}">Show all ${g.items.length}</button>` : ""}</div>`);
+    const r = S.rows.get(gid(g.key));
+    if (!r) { html.push(`<div class="rows"><div class="empty">Loading…</div></div>`); continue; }
+    html.push(`<div class="rows">${r.rows.map((it) => itemRow(it, S.group === "cause" ? g.key : undefined)).join("")}${r.rows.length < r.n ? `<button class="showmore" data-more="${esc(g.key)}">Show ${Math.min(ROWS, r.n - r.rows.length)} more of ${r.n}</button>` : ""}</div>`);
   }
+  if (list.groups.length < list.groups_total) html.push(`<button class="showmore" data-moregroups="1">Show more groups (${list.groups_total - list.groups.length} left)</button>`);
   $("queue").innerHTML = html.join("") || `<div class="empty">${S.filter.trim() ? "Nothing in this lens matches the filter." : `Nothing in ${esc(L.label)}.`} ${LENSES.filter((l) => l !== L && l.id !== "found" && lensCount(l)).map((l) => `${lensCount(l)} in ${esc(l.label)}`).join(", ")}${L.id === "found" ? "" : ". Nothing is ever listed as safe."}</div>`;
   const d = $("done");
-  d.querySelector("summary").textContent = `Accepted in review (${st.reviewed.length})`;
-  d.querySelector(".list").innerHTML = st.reviewed.map((r) => `<div class="row" data-path="${esc(r.path)}" data-unit="${esc(r.unit)}"><span></span><span class="dot" style="background:var(--focus)"></span><span class="p">${esc(r.path)} (source ${r.src_line})</span><span class="r">accepted in review by ${esc(r.by.join(", ") || "?")} · status ${esc(LABEL[r.status])}</span></div>`).join("") || `<div class="empty">None yet.</div>`;
+  d.querySelector("summary").textContent = `Accepted in review (${st.reviewed_total})`;
+  d.querySelector(".list").innerHTML = (S.reviewed.map((r) => `<div class="row" data-path="${esc(r.path)}" data-unit="${esc(r.unit)}"><span></span><span class="dot" style="background:var(--focus)"></span><span class="p">${esc(r.path)} (source ${r.src_line})</span><span class="r">accepted in review by ${esc(r.by.join(", ") || "?")} · status ${esc(LABEL[r.status])}</span></div>`).join("") || `<div class="empty">None yet.</div>`)
+    + (S.reviewed.length < st.reviewed_total ? `<button class="showmore" data-revmore="1">Show more (${st.reviewed_total - S.reviewed.length} left)</button>` : "");
   renderBulk();
 }
 
-function acceptAll(rule) {
-  const g = groups(shown()).find((x) => x.key === rule);
-  if (!g) return;
-  S.picked = new Set(acceptable(g).map((i) => i.key));
+// Picks the units of the group `rule` that have it as an open assumption.
+async function acceptAll(rule) {
+  const items = await api(`/api/accept?${lq()}&key=${encodeURIComponent(rule)}`);
+  for (const it of items) S.items.set(it.key, it);
+  S.picked = new Set(items.map((i) => i.key));
   S.confirm = 0;
   renderQueue();
   $("bulkrule").value = rule; renderBulk();
   $("bulkreason").focus();
 }
 
+const pickedItems = () => [...S.picked].map((k) => S.items.get(k)).filter(Boolean);
+
 function renderBulk() {
-  const items = S.st.items.filter((i) => S.picked.has(i.key));
+  const items = pickedItems();
   $("bulk").classList.toggle("on", items.length > 0);
   if (!items.length) return;
   const count = {};
@@ -469,7 +487,7 @@ async function bulkAccept() {
   const rule = $("bulkrule").value, reason = $("bulkreason").value.trim();
   if (!author()) { needAuthor(); return; }
   if (!reason) { toast("Say why it holds: every decision needs a reason.", true); $("bulkreason").focus(); return; }
-  const items = S.st.items.filter((i) => S.picked.has(i.key) && i.open_assumptions.includes(rule));
+  const items = pickedItems().filter((i) => i.open_assumptions.includes(rule));
   // Several units at once: say how many first, then record on a second click.
   if (items.length > 1 && !S.confirm) {
     S.confirm = setTimeout(() => { S.confirm = 0; renderBulk(); }, 6000);
@@ -505,26 +523,32 @@ async function submit(body, after) {
 }
 
 async function apply(st, advance) {
-  const before = order(), idx = before.indexOf(S.sel);
-  S.st = st;
-  for (const k of [...S.picked]) if (!st.items.some((i) => i.key === k && i.open_assumptions.length)) S.picked.delete(k);
+  const idx = S.selIndex;
+  S.st = st; S.reviewed = st.reviewed;
+  await loadList();
+  // A pick stays while its unit is listed with an open assumption.
+  for (const k of [...S.picked]) if (!(S.items.get(k) || { open_assumptions: [] }).open_assumptions.length) S.picked.delete(k);
   renderHeader(); renderQueue();
-  const now = order();
-  if (S.sel && now.includes(S.sel)) await open(S.sel, { keepUnit: true });
+  const here = S.sel && !S.sel.startsWith("@") ? await near(`from=${encodeURIComponent(S.sel)}`) : null;
+  if (here) await open(S.sel, { keepUnit: true });
   else if (S.sel && !S.sel.startsWith("@") && advance) {
     // The item left this lens: go on with the one that took its place.
-    const next = now[Math.min(Math.max(idx, 0), now.length - 1)];
-    if (next) await open(next); else showNone();
+    const next = await near(`index=${idx}`);
+    if (next) await open(next.key); else showNone();
   } else if (S.sel && S.sel.startsWith("@")) await openUnit(S.view.units[0].path, S.view.units[0].unit);
-  else if (now.length) await open(now[0]);
-  else showNone();
+  else await openFirst();
 }
 
 async function reload() { await apply(await api(`/api/state?${allQ().slice(1)}`), false); }
 
+async function openFirst() {
+  const p = await near("index=0");
+  if (p) await open(p.key); else showNone();
+}
+
 function showNone() {
   S.sel = null; S.view = null;
-  $("item").innerHTML = `<div class="empty">Nothing selected. ${order().length ? "Pick an item on the left." : `Nothing left in ${esc(lens().label)}.`}</div>`;
+  $("item").innerHTML = `<div class="empty">Nothing selected. ${S.list && S.list.shown ? "Pick an item on the left." : `Nothing left in ${esc(lens().label)}.`}</div>`;
 }
 
 async function open(key, { keepUnit = false } = {}) {
@@ -533,10 +557,13 @@ async function open(key, { keepUnit = false } = {}) {
   catch { showNone(); return; }
   S.sel = key; S.view = v;
   if (!keepUnit || S.unit >= v.units.length) S.unit = 0;
-  if (!document.querySelector(`#queue .row[data-key="${CSS.escape(key)}"]`)) {
-    // Its group is folded, or the row is past the first ones shown.
-    const g = groups(shown()).find((x) => x.items.some((i) => i.key === key));
-    if (g) { S.openGroups.add(gid(g.key)); if (g.items.findIndex((i) => i.key === key) >= ROWS) S.full.add(gid(g.key)); renderQueue(); }
+  const p = await near(`from=${encodeURIComponent(key)}`);
+  if (p) {
+    S.selIndex = p.index;
+    if (!document.querySelector(`#queue .row[data-key="${CSS.escape(key)}"]`)) {
+      // Its group is folded or not loaded, or the row is past those loaded.
+      await reveal(p); renderQueue();
+    }
   }
   document.querySelectorAll("#queue .row").forEach((r) => r.classList.toggle("sel", r.dataset.key === key));
   const row = document.querySelector(`#queue .row[data-key="${CSS.escape(key)}"]`);
@@ -711,21 +738,17 @@ function record(u) {
   submit({ action: S.action, rule, reason, author: author(), targets: [{ path: u.path, unit: u.unit, input_hash: u.input_hash, output_hash: u.output_hash }] });
 }
 
-function step(d) {
-  const keys = order();
-  if (!keys.length) return;
-  const i = keys.indexOf(S.sel);
-  open(keys[Math.max(0, Math.min(keys.length - 1, i < 0 ? 0 : i + d))]);
+async function step(d) {
+  const p = await near(S.sel ? `from=${encodeURIComponent(S.sel)}&step=${d}` : "index=0");
+  if (p) open(p.key);
 }
 
 // To the first item of the next or previous group.
-function stepGroup(d) {
-  const gs = groups(shown());
-  if (!gs.length) return;
-  const i = gs.findIndex((g) => g.items.some((x) => x.key === S.sel));
-  const g = gs[Math.max(0, Math.min(gs.length - 1, i < 0 ? 0 : i + d))];
-  S.openGroups.add(gid(g.key));
-  open(g.items[0].key);
+async function stepGroup(d) {
+  const p = await near(S.sel ? `from=${encodeURIComponent(S.sel)}&jump=${d}` : "index=0");
+  if (!p) return;
+  await reveal(p); renderQueue();
+  open(p.key);
 }
 
 async function setLens(id) {
@@ -734,29 +757,53 @@ async function setLens(id) {
   S.lens = id; S.picked.clear(); saveView();
   // Plainly converted units come with their own lens only.
   if ((was === "found") !== (id === "found")) { S.sel = null; await reload(); return; }
-  renderQueue();
-  const keys = order();
-  if (keys.length) open(keys[0]); else showNone();
+  await loadList(); renderQueue();
+  await openFirst();
 }
 
 $("queue").addEventListener("click", (e) => {
   const acc = e.target.closest("[data-accept]");
   if (acc) { acceptAll(acc.dataset.accept); return; }
   const more = e.target.closest("[data-more]");
-  if (more) { S.full.add(gid(more.dataset.more)); renderQueue(); return; }
+  if (more) { const k = more.dataset.more; loadRows(k, S.rows.get(gid(k)).rows.length).then(renderQueue, (x) => toast(x.message, true)); return; }
+  if (e.target.closest("[data-moregroups]")) {
+    api(`/api/list?${lq()}&from=${S.list.groups.length}&count=${GROUPS}`).then((m) => { S.list.groups = S.list.groups.concat(m.groups); renderQueue(); }, (x) => toast(x.message, true));
+    return;
+  }
   const grp = e.target.closest(".grp");
-  if (grp) { const k = gid(grp.dataset.grp); S.openGroups.has(k) ? S.openGroups.delete(k) : S.openGroups.add(k); renderQueue(); return; }
+  if (grp) {
+    const key = grp.dataset.grp, k = gid(key);
+    if (S.openGroups.has(k)) { S.openGroups.delete(k); renderQueue(); return; }
+    S.openGroups.add(k); renderQueue();
+    if (!S.rows.has(k)) loadRows(key, 0).then(renderQueue, (x) => toast(x.message, true));
+    return;
+  }
   const box = e.target.closest("input[data-pick]");
   if (box) { box.checked ? S.picked.add(box.dataset.pick) : S.picked.delete(box.dataset.pick); renderBulk(); return; }
   const row = e.target.closest(".row"); if (row) open(row.dataset.key);
 });
-$("done").addEventListener("click", (e) => { const row = e.target.closest(".row[data-unit]"); if (row) openUnit(row.dataset.path, row.dataset.unit); });
+$("done").addEventListener("click", (e) => {
+  if (e.target.closest("[data-revmore]")) {
+    api(`/api/reviewed?from=${S.reviewed.length}`).then((m) => { S.reviewed = S.reviewed.concat(m); renderQueue(); }, (x) => toast(x.message, true));
+    return;
+  }
+  const row = e.target.closest(".row[data-unit]"); if (row) openUnit(row.dataset.path, row.dataset.unit);
+});
 $("item").addEventListener("click", (e) => { const t = e.target.closest("[data-tab]"); if (t) { S.unit = +t.dataset.tab; renderItem(); } });
 $("bulkrule").addEventListener("change", () => { clearTimeout(S.confirm); S.confirm = 0; renderBulk(); });
 $("lenses").addEventListener("click", (e) => { const b = e.target.closest("[data-lens]"); if (b) setLens(b.dataset.lens); });
-$("filter").addEventListener("input", () => { S.filter = $("filter").value; renderQueue(); });
-$("filter").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); const k = order(); if (k.length) open(k[0]); } });
-$("groupby").addEventListener("change", () => { S.group = $("groupby").value; S.openGroups.clear(); S.full.clear(); saveView(); renderQueue(); if (S.sel) open(S.sel); });
+// The filter asks the server once typing pauses.
+$("filter").addEventListener("input", () => {
+  S.filter = $("filter").value;
+  clearTimeout(S.filterT);
+  S.filterT = setTimeout(() => loadList().then(renderQueue, (x) => toast(x.message, true)), 250);
+});
+$("filter").addEventListener("keydown", async (e) => {
+  if (e.key !== "Enter") return;
+  e.preventDefault(); clearTimeout(S.filterT);
+  await loadList(); renderQueue(); await openFirst();
+});
+$("groupby").addEventListener("change", async () => { S.group = $("groupby").value; S.openGroups.clear(); saveView(); await loadList(); renderQueue(); if (S.sel) open(S.sel); });
 $("bulkclear").addEventListener("click", () => { clearTimeout(S.confirm); S.confirm = 0; S.picked.clear(); renderQueue(); });
 $("bulkgo").addEventListener("click", bulkAccept);
 $("bulkreason").addEventListener("keydown", (e) => { if (e.key === "Enter") bulkAccept(); });
@@ -791,14 +838,14 @@ document.addEventListener("keydown", (e) => {
   else if (e.key >= "1" && e.key <= "4") setLens(LENSES[+e.key - 1].id);
   else if (e.key === "r") $("refresh").click();
   else if (e.key === "x" && S.sel) {
-    const it = S.st.items.find((i) => i.key === S.sel);
+    const it = S.items.get(S.sel);
     if (it && it.open_assumptions.length) { S.picked.has(it.key) ? S.picked.delete(it.key) : S.picked.add(it.key); clearTimeout(S.confirm); S.confirm = 0; renderQueue(); }
   }
 });
 
 renderHeader(); renderQueue();
 if (S.lens === "found" && !S.st.all) reload();
-else if (order().length) open(order()[0]); else showNone();
+else loadList().then(() => { renderQueue(); return openFirst(); }, (e) => toast(e.message, true));
 </script>
 </body>
 </html>
