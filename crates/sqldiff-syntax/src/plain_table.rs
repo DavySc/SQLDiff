@@ -46,25 +46,105 @@ pub struct PlainCol {
 
 /// (C3c) A plain column type. PostgreSQL has no `nvarchar`: its
 /// `varchar(n)` and `character varying(n)` are [`ColType::Varchar`].
+/// (C2c) The types the checker's slice holds beyond `int` and strings,
+/// named for both dialects: T-SQL `bit` and PostgreSQL `boolean` are
+/// [`ColType::Bool`], T-SQL `datetime2(p)` and PostgreSQL `timestamp(p)`
+/// are [`ColType::Timestamp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColType {
-    /// T-SQL `int`/`integer`, PostgreSQL `integer`/`int`.
+    /// T-SQL `int`/`integer`, PostgreSQL `integer`/`int`/`int4`.
     Int,
+    /// `bigint` (PostgreSQL also `int8`).
+    BigInt,
+    /// `smallint` (PostgreSQL also `int2`).
+    SmallInt,
     /// `varchar(n)` (also `character varying(n)`, `char varying(n)`),
     /// `1 <= n <= 4000`.
     Varchar(u32),
     /// T-SQL `nvarchar(n)`, `1 <= n <= 4000`.
     NVarchar(u32),
+    /// T-SQL `bit`, PostgreSQL `boolean`/`bool`.
+    Bool,
+    /// `date`.
+    Date,
+    /// T-SQL `datetime2(p)`, PostgreSQL `timestamp(p)` (also `timestamp`,
+    /// which is `timestamp(6)`, and `without time zone`), `p <= 6`.
+    Timestamp(u32),
 }
 
-/// (C3c) A constant default: an integer in the 32-bit range for an `int`
+/// (C3c) A constant default: an integer in the 32-bit range for an integer
 /// column, or a string literal of printable ASCII without a backslash that
 /// fits a string column (`'..'`; T-SQL also `N'..'`), in any number of
-/// parentheses.
+/// parentheses. (C2c) For a `bit` column T-SQL `0`/`1` ([`ColDefault::Int`])
+/// and PostgreSQL `FALSE`/`TRUE` ([`ColDefault::Bool`]); for a `date` or
+/// `datetime2(p)` column a string literal in the ISO 8601 form the checker
+/// reads (`'YYYY-MM-DD'`, `'YYYY-MM-DDThh:mm:ss[.f]'` with at most `p`
+/// fractional digits).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColDefault {
     Int(i32),
     Str(String),
+    Bool(bool),
+}
+
+/// (C2c) `s` is `YYYY-MM-DD`, a date of the Gregorian calendar within
+/// 0001-01-01 and 9999-12-31 (`Sqldiff.Mirror.dateLit?`).
+pub fn is_iso_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return false;
+    }
+    let digits = |r: std::ops::Range<usize>| -> Option<u32> {
+        s.get(r)
+            .filter(|t| t.bytes().all(|c| c.is_ascii_digit()))
+            .and_then(|t| t.parse().ok())
+    };
+    let (Some(y), Some(m), Some(d)) = (digits(0..4), digits(5..7), digits(8..10)) else {
+        return false;
+    };
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let days = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=9999).contains(&y) && (1..=days).contains(&d)
+}
+
+/// (C2c) `s` is `YYYY-MM-DDThh:mm:ss[.f]` with at most `p` fractional
+/// digits (`Sqldiff.Mirror.tsLit?`).
+pub fn is_iso_timestamp(s: &str, p: u32) -> bool {
+    let Some((date, time)) = s.split_once('T') else {
+        return false;
+    };
+    if !is_iso_date(date) {
+        return false;
+    }
+    let (hms, frac) = match time.split_once('.') {
+        Some((hms, frac)) => (hms, Some(frac)),
+        None => (time, None),
+    };
+    let b = hms.as_bytes();
+    let two = |i: usize| -> Option<u32> {
+        hms.get(i..i + 2)
+            .filter(|t| t.bytes().all(|c| c.is_ascii_digit()))
+            .and_then(|t| t.parse().ok())
+    };
+    if b.len() != 8 || b[2] != b':' || b[5] != b':' {
+        return false;
+    }
+    let (Some(h), Some(mi), Some(se)) = (two(0), two(3), two(6)) else {
+        return false;
+    };
+    if h >= 24 || mi >= 60 || se >= 60 {
+        return false;
+    }
+    match frac {
+        None => true,
+        Some(f) => !f.is_empty() && f.len() <= p as usize && f.bytes().all(|c| c.is_ascii_digit()),
+    }
 }
 
 /// The largest string length the slice takes (`Sqldiff.Mirror.tsqlMaxLen`).
@@ -122,21 +202,59 @@ fn length(p: &mut Parser) -> Result<u32, String> {
     Ok(n)
 }
 
+/// (C2c) A precision in parentheses, `(p)` with `p <= 6`; without, `dflt`
+/// (`None`: a precision is required).
+fn precision(p: &mut Parser, dflt: Option<u32>) -> Result<u32, String> {
+    if !p.eat_kind(K::LParen) {
+        return dflt.ok_or_else(|| p.err("a precision of 0 to 6"));
+    }
+    let n = match p.peek() {
+        Some(t) if t.kind == K::Num && t.text.bytes().all(|b| b.is_ascii_digit()) => {
+            t.text.parse::<u32>().ok()
+        }
+        _ => None,
+    };
+    let n = n
+        .filter(|n| *n <= 6)
+        .ok_or_else(|| p.err("a precision of 0 to 6"))?;
+    p.i += 1;
+    p.expect_kind(K::RParen)?;
+    Ok(n)
+}
+
 /// (C3c) The column type at the cursor.
 fn col_type(p: &mut Parser, d: Dialect) -> Result<ColType, String> {
     let up = match p.peek() {
         Some(x) if x.kind == K::Word => x.up.clone(),
-        _ => return Err(p.err("only int and varchar(n) columns are plain")),
+        _ => return Err(p.err("only int, varchar(n) and the typed-value columns are plain")),
     };
     p.i += 1;
     match up.as_str() {
         "INT" | "INTEGER" => Ok(ColType::Int),
+        "INT4" if d == Dialect::Postgres => Ok(ColType::Int),
+        "BIGINT" => Ok(ColType::BigInt),
+        "INT8" if d == Dialect::Postgres => Ok(ColType::BigInt),
+        "SMALLINT" => Ok(ColType::SmallInt),
+        "INT2" if d == Dialect::Postgres => Ok(ColType::SmallInt),
         "VARCHAR" => Ok(ColType::Varchar(length(p)?)),
         "NVARCHAR" if d == Dialect::Tsql => Ok(ColType::NVarchar(length(p)?)),
         "CHARACTER" | "CHAR" if p.eat_kw("VARYING") => Ok(ColType::Varchar(length(p)?)),
+        "BIT" if d == Dialect::Tsql => Ok(ColType::Bool),
+        "BOOLEAN" | "BOOL" if d == Dialect::Postgres => Ok(ColType::Bool),
+        "DATE" => Ok(ColType::Date),
+        // `datetime2` without a precision is `datetime2(7)`: not plain.
+        "DATETIME2" if d == Dialect::Tsql => Ok(ColType::Timestamp(precision(p, None)?)),
+        "TIMESTAMP" if d == Dialect::Postgres => {
+            let n = precision(p, Some(6))?;
+            if p.eat_kw("WITHOUT") {
+                p.expect_kw("TIME")?;
+                p.expect_kw("ZONE")?;
+            }
+            Ok(ColType::Timestamp(n))
+        }
         _ => {
             p.i -= 1;
-            Err(p.err("only int and varchar(n) columns are plain"))
+            Err(p.err("only int, varchar(n) and the typed-value columns are plain"))
         }
     }
 }
@@ -151,6 +269,15 @@ fn default_value(p: &mut Parser, d: Dialect) -> Result<Option<ColDefault>, Strin
     let neg = p.eat_op("-");
     let v = match p.peek() {
         Some(t) if t.kind == K::Word && t.up == "NULL" && !neg => None,
+        // C2c: PostgreSQL `TRUE`/`FALSE` for a boolean column.
+        Some(t)
+            if t.kind == K::Word
+                && (t.up == "TRUE" || t.up == "FALSE")
+                && !neg
+                && d == Dialect::Postgres =>
+        {
+            Some(ColDefault::Bool(t.up == "TRUE"))
+        }
         Some(t) if t.kind == K::Num => {
             let (minus, digits) = match t.text.strip_prefix('-') {
                 Some(rest) => (!neg, rest),
@@ -198,12 +325,19 @@ fn default_clause(p: &mut Parser, d: Dialect) -> Result<Option<Option<ColDefault
 /// (C3c) A default the column can take as it is: an integer for an `int`
 /// column; printable ASCII without a backslash, within the length, for a
 /// string column (`Sqldiff.Mirror.CatCol.ok`).
-fn default_fits(ty: ColType, v: &ColDefault) -> bool {
+fn default_fits(d: Dialect, ty: ColType, v: &ColDefault) -> bool {
     match (ty, v) {
-        (ColType::Int, ColDefault::Int(_)) => true,
+        (ColType::Int | ColType::BigInt, ColDefault::Int(_)) => true,
+        (ColType::SmallInt, ColDefault::Int(i)) => i16::try_from(*i).is_ok(),
         (ColType::Varchar(n) | ColType::NVarchar(n), ColDefault::Str(s)) => {
             s.bytes().all(|b| (b' '..=b'~').contains(&b) && b != b'\\') && s.len() <= n as usize
         }
+        // C2c: a bit from T-SQL `0`/`1` or PostgreSQL `FALSE`/`TRUE`; dates
+        // and timestamps from the ISO literals the checker reads.
+        (ColType::Bool, ColDefault::Int(i)) => d == Dialect::Tsql && (*i == 0 || *i == 1),
+        (ColType::Bool, ColDefault::Bool(_)) => true,
+        (ColType::Date, ColDefault::Str(s)) => is_iso_date(s),
+        (ColType::Timestamp(p), ColDefault::Str(s)) => is_iso_timestamp(s, p),
         _ => false,
     }
 }
@@ -279,7 +413,7 @@ pub fn read(n: &SyntaxNode, d: Dialect) -> Result<PlainTable, String> {
                 ));
             }
             let default = default.flatten();
-            if default.as_ref().is_some_and(|v| !default_fits(ty, v)) {
+            if default.as_ref().is_some_and(|v| !default_fits(d, ty, v)) {
                 return Err(format!(
                     "column {col} has a default it cannot take as it is"
                 ));
@@ -319,9 +453,17 @@ pub fn read(n: &SyntaxNode, d: Dialect) -> Result<PlainTable, String> {
             return Err(format!("key column {k} twice"));
         }
         // SQL Server compares string keys as `=` does, padding trailing
-        // spaces (eval/tables T6); PostgreSQL compares them exactly.
-        if c.ty != ColType::Int {
-            return Err(format!("key column {k} is a string"));
+        // spaces (eval/tables T6); PostgreSQL compares them exactly. A bit
+        // is no key column of the slice (C2c).
+        if !matches!(
+            c.ty,
+            ColType::Int
+                | ColType::BigInt
+                | ColType::SmallInt
+                | ColType::Date
+                | ColType::Timestamp(_)
+        ) {
+            return Err(format!("key column {k} is a string or a bit"));
         }
         c.key = true;
         c.not_null = true;
@@ -431,19 +573,20 @@ impl PlainIndex {
         let mut size: u32 = 0;
         for c in &self.cols {
             size += match (d, ty(c)?) {
-                (Dialect::Tsql, ColType::Int) => 4,
                 (Dialect::Tsql, ColType::Varchar(n)) => n,
                 (Dialect::Tsql, ColType::NVarchar(n)) => 2 * n,
-                (_, ColType::Int) => 8,
+                // C2c: the fixed-size types, at most 8 bytes each.
+                (Dialect::Tsql, _) => 8,
                 (_, ColType::Varchar(n) | ColType::NVarchar(n)) => 4 * n + 8,
+                (_, _) => 8,
             };
         }
         for c in &self.include {
             let s = ty(c)?;
             if d != Dialect::Tsql {
                 size += match s {
-                    ColType::Int => 8,
                     ColType::Varchar(n) | ColType::NVarchar(n) => 4 * n + 8,
+                    _ => 8,
                 };
             }
         }
@@ -520,7 +663,7 @@ mod tests {
             ("CREATE TABLE t (a int NULL CHECK (a > 0));", Dialect::Tsql),
             ("CREATE TABLE t (a int NOT NULL, b AS (a + 1));", Dialect::Tsql),
             ("CREATE TABLE #t (a int NULL);", Dialect::Tsql),
-            ("CREATE TABLE t (a bigint NULL);", Dialect::Tsql),
+            ("CREATE TABLE t (a decimal(10, 2) NULL);", Dialect::Tsql),
             ("CREATE TABLE t (a int NOT NULL, UNIQUE (a));", Dialect::Tsql),
             (
                 "CREATE TABLE t (a int NOT NULL, CONSTRAINT pk PRIMARY KEY (a) WITH (IGNORE_DUP_KEY = ON));",
@@ -687,6 +830,109 @@ mod tests {
         assert_eq!(e.cols[0].default, Some(ColDefault::Int(i32::MIN)));
         assert_eq!(e.cols[1].default, Some(ColDefault::Str(String::new())));
         assert_eq!(e.cols[2].default, Some(ColDefault::Str("a'b".into())));
+    }
+
+    /// C2c: the typed-value columns (eval/values V8) and their defaults.
+    #[test]
+    fn typed_value_columns_are_plain() {
+        let t = table(
+            "CREATE TABLE dbo.Ev (D date NOT NULL CONSTRAINT pk_ev PRIMARY KEY, N bigint NULL, \
+             S smallint NULL CONSTRAINT df_ev_s DEFAULT 0, B bit NOT NULL CONSTRAINT df_ev_b DEFAULT 0, \
+             T datetime2(6) NULL CONSTRAINT df_ev_t DEFAULT '2000-01-01T00:00:00', \
+             U datetime2(3) NULL DEFAULT '2024-02-29T23:59:59.999', W date NULL DEFAULT '2024-02-29');",
+            Dialect::Tsql,
+        )
+        .unwrap();
+        let got: Vec<(&str, ColType, Option<ColDefault>, bool)> = t
+            .cols
+            .iter()
+            .map(|c| (c.name.as_str(), c.ty, c.default.clone(), c.key))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("D", ColType::Date, None, true),
+                ("N", ColType::BigInt, None, false),
+                ("S", ColType::SmallInt, Some(ColDefault::Int(0)), false),
+                ("B", ColType::Bool, Some(ColDefault::Int(0)), false),
+                (
+                    "T",
+                    ColType::Timestamp(6),
+                    Some(ColDefault::Str("2000-01-01T00:00:00".into())),
+                    false
+                ),
+                (
+                    "U",
+                    ColType::Timestamp(3),
+                    Some(ColDefault::Str("2024-02-29T23:59:59.999".into())),
+                    false
+                ),
+                (
+                    "W",
+                    ColType::Date,
+                    Some(ColDefault::Str("2024-02-29".into())),
+                    false
+                ),
+            ]
+        );
+        let pg = table(
+            "CREATE TABLE ev (d date NOT NULL CONSTRAINT pk_ev PRIMARY KEY, n int8 NULL, \
+             s int2 NULL DEFAULT 0, b boolean NOT NULL DEFAULT FALSE, \
+             t timestamp(6) NULL DEFAULT '2000-01-01T00:00:00', u timestamp without time zone NULL, \
+             v timestamp(3) without time zone NULL, w bool NULL DEFAULT TRUE, x timestamp NULL);",
+            Dialect::Postgres,
+        )
+        .unwrap();
+        let tys: Vec<(ColType, Option<ColDefault>)> =
+            pg.cols.iter().map(|c| (c.ty, c.default.clone())).collect();
+        assert_eq!(
+            tys,
+            vec![
+                (ColType::Date, None),
+                (ColType::BigInt, None),
+                (ColType::SmallInt, Some(ColDefault::Int(0))),
+                (ColType::Bool, Some(ColDefault::Bool(false))),
+                (
+                    ColType::Timestamp(6),
+                    Some(ColDefault::Str("2000-01-01T00:00:00".into()))
+                ),
+                (ColType::Timestamp(6), None),
+                (ColType::Timestamp(3), None),
+                (ColType::Bool, Some(ColDefault::Bool(true))),
+                (ColType::Timestamp(6), None),
+            ]
+        );
+        // Outside: datetime2 without a precision or with 7, a bit key, a bit
+        // default of 2, a date default in another form, a timestamp default
+        // with more digits than kept, a smallint default out of range,
+        // T-SQL `boolean`, PostgreSQL `bit`.
+        for (sql, d) in [
+            ("CREATE TABLE t (a datetime2 NULL, b int NOT NULL PRIMARY KEY);", Dialect::Tsql),
+            ("CREATE TABLE t (a datetime2(7) NULL, b int NOT NULL PRIMARY KEY);", Dialect::Tsql),
+            ("CREATE TABLE t (a timestamp(7) NULL, b int NOT NULL PRIMARY KEY);", Dialect::Postgres),
+            ("CREATE TABLE t (a bit NOT NULL PRIMARY KEY);", Dialect::Tsql),
+            ("CREATE TABLE t (a bit NOT NULL DEFAULT 2, b int NOT NULL PRIMARY KEY);", Dialect::Tsql),
+            ("CREATE TABLE t (a date NULL DEFAULT '20240229', b int NOT NULL PRIMARY KEY);", Dialect::Tsql),
+            ("CREATE TABLE t (a date NULL DEFAULT '2023-02-29', b int NOT NULL PRIMARY KEY);", Dialect::Tsql),
+            ("CREATE TABLE t (a datetime2(3) NULL DEFAULT '2024-01-01T00:00:00.1234', b int NOT NULL PRIMARY KEY);", Dialect::Tsql),
+            ("CREATE TABLE t (a datetime2(3) NULL DEFAULT '2024-01-01 00:00:00', b int NOT NULL PRIMARY KEY);", Dialect::Tsql),
+            ("CREATE TABLE t (a smallint NULL DEFAULT 40000, b int NOT NULL PRIMARY KEY);", Dialect::Tsql),
+            ("CREATE TABLE t (a boolean NULL, b int NOT NULL PRIMARY KEY);", Dialect::Tsql),
+            ("CREATE TABLE t (a bit NULL, b int NOT NULL PRIMARY KEY);", Dialect::Postgres),
+            ("CREATE TABLE t (a boolean NULL DEFAULT 1, b int NOT NULL PRIMARY KEY);", Dialect::Postgres),
+            ("CREATE TABLE t (a timestamptz NULL, b int NOT NULL PRIMARY KEY);", Dialect::Postgres),
+        ] {
+            assert!(table(sql, d).is_err(), "{sql}");
+        }
+        assert!(
+            is_iso_date("2024-02-29") && !is_iso_date("2024-02-30") && !is_iso_date("0000-01-01")
+        );
+        assert!(is_iso_timestamp("2024-02-29T23:59:59.999999", 6));
+        assert!(!is_iso_timestamp("2024-02-29T23:59:59.9999999", 6));
+        assert!(
+            !is_iso_timestamp("2024-02-29T24:00:00", 6)
+                && !is_iso_timestamp("2024-02-29T00:00:00.", 6)
+        );
     }
 
     #[test]

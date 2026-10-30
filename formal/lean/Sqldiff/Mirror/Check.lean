@@ -133,6 +133,17 @@ And, for strings (C2b, `Sqldiff.Mirror`, "The C2b slice: strings"):
   page), so T-SQL does not truncate or replace it on entry and the
   PostgreSQL routine sees the same value.
 
+And, for dates (C2c, `Sqldiff.Mirror`, "The C2c slice: typed values"):
+
+* `ASM-DATEADD-RANGE`, when an expression adds to a date or timestamp
+  (`DATEADD`, the converter's `+ n` and `+ make_interval(...)`): the
+  result stays within 0001-01-01 and 9999-12-31, where T-SQL raises 517
+  and PostgreSQL returns the value (eval/values V6); the core holds every
+  day number.
+* `ASM-DATEADD-YEAR-END`, when an expression adds years: February 29
+  plus a year is February 28, which both engines do (eval/values V6) but
+  Microsoft's page states for months only.
+
 And, for errors and transactions (C4, `Sqldiff.Mirror`, "The C4 rules"):
 
 * `ASM-CATCH-CORE-ERRORS`, when the routine has a handler: inside a
@@ -163,6 +174,8 @@ def residual (a : Ast.Routine) (ca : Core.Routine) (bTxn : Bool := false) : List
     (if ca.hasStrEq then ["ASM-BINARY-COLLATION"] else []) ++
     (if ca.hasLen then ["ASM-TSQL-LEN-BMP"] else []) ++
     (if tsqlStringParams a then ["ASM-TSQL-STRING-ARGS"] else []) ++
+    (if ca.hasDateAdd then ["ASM-DATEADD-RANGE"] else []) ++
+    (if ca.hasYearAdd then ["ASM-DATEADD-YEAR-END"] else []) ++
     (if ca.hasCatch then ["ASM-CATCH-CORE-ERRORS"] else []) ++
     (if ca.catches || ca.hasCommit || tsqlTxn a || bTxn then ["ASM-NO-CALLER-TXN"] else []) ++
     (if ca.raisesUser then ["ASM-THROW-ERRCODE"] else [])
@@ -175,6 +188,42 @@ def usesC4 (a : Ast.Routine) (ca : Core.Routine) (bTxn : Bool := false) : Bool :
 /-- The residual of a T-SQL routine, when it lowers. -/
 def residualOf (dep : Deployment) (Γ : Catalog) (a : Ast.Routine) : Option (List String) :=
   (lowerT dep Γ a).map (residual a)
+
+/-- (C2c) A T-SQL variable's declared type and that of the PL/pgSQL
+variable the certificate gives it correspond: the same slice type (a
+string type of the slice on both, any lengths, as `sigCorr`). Both
+engines convert a value stored into a variable to its declared type, so
+two variables of different types keep different values: T-SQL `DECLARE
+@x datetime` and PL/pgSQL `v_x timestamp` given one `datetime2(6)` value
+hold `.123333` and `.123456` (review of C2c, on the C1 path). A type
+outside the slice corresponds to nothing, not even to the type of the
+same name: the same name is not the same type (T-SQL `time` is
+`time(7)`, PostgreSQL's `time(6)`; at one precision they round
+differently: `time(6)` `.1234565` against `.1234566` compares 0 on SQL
+Server, 1 on PostgreSQL; T-SQL `numeric` is `numeric(18,0)` and rounds
+1.5 to 2, PostgreSQL's keeps 1.5; `money` keeps four decimals in T-SQL;
+re-review of C2c). A pair would join only with a probe showing every
+store the lowering admits to be identical, and none has one. -/
+def localTyCorr (ta tp : Ast.Ty) : Bool :=
+  let dt : Dialect := .tsql { rowCounts := false, routines := [] } ∅
+  let dp : Dialect := .pg ∅ []
+  match valTypeOf dt ta, valTypeOf dp tp with
+  | some (.str ..), some (.str ..) => true
+  | some x, some y => x == y
+  | _, _ => false
+
+/-- Every variable the certificate pairs, declared on both sides (the
+T-SQL routine's parameters and locals, `envT`; the PL/pgSQL routine's as
+declared, `envPDecl`), is declared with corresponding types; a name the
+T-SQL side does not declare (the status) is not compared. -/
+def varsCorr (cert : Cert) (a b : Ast.Routine) : Bool :=
+  let ea := envT a
+  let eb := envPDecl b
+  cert.vars.all fun (x, y) => match lookup ea x, lookup eb (pgName y) with
+    | some ta, some tp => localTyCorr ta tp
+    -- An undeclared PL/pgSQL name is refused by the scope check and the
+    -- renaming test; the status is not a T-SQL declaration.
+    | _, _ => true
 
 def theoremC1 : String := "Sqldiff.Mirror.check_sound"
 def theoremC2a : String := "Sqldiff.Mirror.check_sound_c2a"
@@ -195,6 +244,8 @@ def check (dep : Deployment) (Γ : Catalog) (cert : Cert) (a b : Ast.Routine) : 
       .unconfirmed "the routines run with different privileges"
     else if !sigCorr a b then
       .unconfirmed "the parameter or return types do not correspond"
+    else if !varsCorr cert a b then
+      .unconfirmed "the declared types of the variables do not correspond"
     else if !cert.consistent then
       .unconfirmed "certificate: a T-SQL variable is given two PL/pgSQL names"
     else if !cert.injective then
@@ -251,6 +302,8 @@ theorem check_sound (dep : Deployment) (Γ : Catalog) (cert : Cert) (a b : Ast.R
     split at h
     · cases h
     split at h
+    · cases h
+    split at h
     · next hok =>
       obtain ⟨inj, heq⟩ := hok
       rw [heq]
@@ -275,6 +328,8 @@ theorem check_sound_c2a (dep : Deployment) (Γ : Catalog) (cert : Cert) (a b : A
     unfold check at h
     rw [ha, hb] at h
     simp only at h
+    split at h
+    · cases h
     split at h
     · cases h
     split at h
