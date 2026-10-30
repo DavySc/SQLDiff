@@ -133,7 +133,7 @@ fn script_with_variables_becomes_a_do_block() {
     let c = tsql(src);
     assert_eq!(
         c.output,
-        "DO $$\nDECLARE\n  v_n integer;\nBEGIN\n  -- DECLARE @n: moved to the DECLARE section\n  SELECT COUNT(*) INTO v_n FROM t;\n  RAISE NOTICE '%', v_n;\nEND\n$$;\n"
+        "DO $$\nDECLARE\n  v_n integer;\nBEGIN\n  -- DECLARE @n: moved to the DECLARE section\n  SELECT COUNT(*) INTO v_n FROM t;\n  RAISE NOTICE '%', COALESCE(CAST(v_n AS text), '');\nEND\n$$;\n"
     );
     // An aggregate without grouping returns exactly one row: nothing to assume.
     assert!(!has_rule(
@@ -170,7 +170,7 @@ fn rollback_rethrow_idiom_lets_the_error_propagate() {
 fn try_catch_becomes_an_exception_block() {
     let src = "CREATE PROCEDURE p AS\nBEGIN\n  BEGIN TRY\n    DELETE FROM t;\n  END TRY\n  BEGIN CATCH\n    PRINT ERROR_MESSAGE();\n  END CATCH\nEND\n";
     let c = tsql(src);
-    assert!(c.output.contains("  BEGIN\n    DELETE FROM t;\n  EXCEPTION WHEN OTHERS THEN\n    RAISE NOTICE '%', SQLERRM;\n  END;\n"), "{}", c.output);
+    assert!(c.output.contains("  BEGIN\n    DELETE FROM t;\n  EXCEPTION WHEN OTHERS THEN\n    RAISE NOTICE '%', COALESCE(CAST(SQLERRM AS text), '');\n  END;\n"), "{}", c.output);
     assert!(has_rule(
         unit(&c, src, "BEGIN TRY"),
         "ASM-TRY-SUBTRANSACTION"

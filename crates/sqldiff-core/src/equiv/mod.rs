@@ -54,6 +54,11 @@ pub struct Outcome {
     pub refinements: Vec<String>,
     /// The statement pairs decided here (`coverage::unreceipted`).
     pub receipts: Vec<crate::coverage::Receipt>,
+    /// Transaction statements between data statements, which statement-level
+    /// equivalence does not compare: (side A?, where the statement starts,
+    /// the unknown reason). The engine keeps the reason unless the
+    /// behaviour model compared the routine that holds the statement.
+    pub txn_unknown: Vec<(bool, usize, String)>,
 }
 
 impl Outcome {
@@ -261,8 +266,8 @@ pub fn compare(
         }
         return out;
     }
-    let pairs =
-        script::segment_pairs(a, b).unwrap_or_else(|| vec![(lower::lower(a), lower::lower(b))]);
+    let pairs = script::segment_pairs(a, b, anchors, &mut out)
+        .unwrap_or_else(|| vec![(lower::lower(a), lower::lower(b))]);
     for (mut ua, mut ub) in pairs {
         script::name_locals(&mut ua, &mut ub);
         tv_names(a, b, &mut ua, &mut ub);
@@ -283,6 +288,64 @@ fn tv_names(a: &Analyzed, b: &Analyzed, ua: &mut Unit, ub: &mut Unit) {
     }
 }
 
+/// `schema` with the tables the unit creates for its own use, under the
+/// keys its statements name them by: a column of a table variable or a
+/// temporary table has its declared type, as a catalog table's column has.
+fn local_schema<'s>(schema: &'s Schema, u: &Unit) -> std::borrow::Cow<'s, Schema> {
+    let mut tables = Vec::new();
+    for node in &u.local_tables {
+        let text = node.text().to_string();
+        let words = cst::first_words(node, 2);
+        // `DECLARE @t [AS] TABLE (columns)` as `CREATE TABLE t (columns)`.
+        if u.dialect == Dialect::Tsql && words.first().is_some_and(|w| w == "DECLARE") {
+            let Some(open) = text.find('(') else {
+                continue;
+            };
+            let var = ast::tokens(node).get(1).map(|t| t.text.clone());
+            tables.push((format!("CREATE TABLE local_table {}", &text[open..]), var));
+        } else {
+            tables.push((text, None));
+        }
+    }
+    let key_of = |var: &Option<String>, schema: Option<&str>, name: &str| {
+        let parts: Vec<String> = match (var, schema) {
+            (Some(v), _) => vec![v.clone()],
+            (None, Some(s)) => vec![s.to_string(), name.to_string()],
+            (None, None) => vec![name.to_string()],
+        };
+        Canon::table_name(&parts, &u.other_temps, &u.local_temps, u.routine.as_deref())
+            .0
+            .to_lowercase()
+    };
+    // A name created twice in the unit (dropped and created again) has no
+    // one column list for all its statements: it stays untyped.
+    let mut keys: BTreeMap<String, usize> = BTreeMap::new();
+    for (ddl, var) in &tables {
+        let mut key = None;
+        Schema::default().with_local(ddl, u.dialect, |s, n| {
+            let k = key_of(var, s, n);
+            key = Some(k.clone());
+            k
+        });
+        if let Some(k) = key {
+            *keys.entry(k).or_default() += 1;
+        }
+    }
+    let mut out = std::borrow::Cow::Borrowed(schema);
+    for (ddl, var) in &tables {
+        let once = |k: &str| keys.get(k) == Some(&1);
+        let mut key = String::new();
+        let s = out.with_local(ddl, u.dialect, |s, n| {
+            key = key_of(var, s, n);
+            key.clone()
+        });
+        if let Some(s) = s.filter(|_| once(&key)) {
+            out = std::borrow::Cow::Owned(s);
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compare_units(
     a: &Analyzed,
@@ -294,13 +357,20 @@ fn compare_units(
     anchors: &[Anchor],
     out: &mut Outcome,
 ) {
+    let (la, lb) = (local_schema(sa, ua), local_schema(sb, ub));
+    let (sa, sb) = (la.as_ref(), lb.as_ref());
     let (na, nb) = (side_name(a), side_name(b));
     for (side, u, name) in [(a, ua, &na), (b, ub, &nb)] {
         for (node, what) in &u.uncovered {
             let at = side.line_of(node);
-            out.unknown_reasons.push(format!(
-                "{name} line {at}: {what} is not covered by statement-level equivalence"
-            ));
+            let why =
+                format!("{name} line {at}: {what} is not covered by statement-level equivalence");
+            if u.txn_placed.contains(node) {
+                let start = usize::from(node.text_range().start());
+                out.txn_unknown.push((std::ptr::eq(side, a), start, why));
+                continue;
+            }
+            out.unknown_reasons.push(why);
             // The statements inside anything uncovered (an IF, loop, CATCH,
             // handler, or a routine beside others) were not compared either:
             // each is named on its own line, so none of them counts as
@@ -1114,13 +1184,7 @@ fn same_stmt(
         }
     }
     let m = &c.mismatches[0];
-    Same::Unknown(compare::describe_unknown(m, na, nb).unwrap_or_else(|| {
-        format!(
-            "A has `{}` where B has `{}`",
-            compare::render(&m.a),
-            compare::render(&m.b)
-        )
-    }))
+    Same::Unknown(compare::describe_unknown(m, na, nb).unwrap_or_else(|| compare::mismatch_text(m)))
 }
 
 /// The rest of the line from byte `off`, white space trimmed.
@@ -2194,6 +2258,30 @@ fn ddl_stmts(
         if let Some(why) = second {
             unknown(out, why.into());
             continue;
+        }
+        // A TRUNCATE inside a branch, loop or handler is placed by count
+        // only; and a row count read after it may count it.
+        if matches!(dx, ddl::Ddl::Truncate(_)) {
+            if !runs_once(x.node) || !runs_once(y.node) {
+                unknown(out, "it sits inside a branch, loop or error handler".into());
+                continue;
+            }
+            let counts = |side: &Analyzed| {
+                side.root
+                    .descendants_with_tokens()
+                    .filter_map(|e| e.into_token())
+                    .any(|t| {
+                        let up = t.text().to_ascii_uppercase();
+                        matches!(up.as_str(), "@@ROWCOUNT" | "ROWCOUNT_BIG" | "ROW_COUNT")
+                    })
+            };
+            if counts(a) || counts(b) {
+                unknown(
+                    out,
+                    "the file reads a row count, which the statement may set".into(),
+                );
+                continue;
+            }
         }
         // PostgreSQL names are compared up to letter case only where no
         // other name differs from them only in case.
@@ -3391,12 +3479,27 @@ fn pair_items(
                     } else {
                         (&na, &gaps[0][x.gap])
                     };
+                    // With a trace the gap was written from this very
+                    // statement: the reason names the gap's line, so it
+                    // lands on the output piece that left the statement
+                    // uncompared, not on every piece written from it (a
+                    // declaration moved to the top of the block is compared
+                    // on its own).
+                    if is_a && !anchors.is_empty() {
+                        format!(
+                            "{gname} line {}: the statement at {name} line {} is not paired: its counterpart may be in this {}, which is not compared",
+                            g.line,
+                            line(side, &it.nodes),
+                            g.what
+                        )
+                    } else {
                     format!(
                         "{name} line {}: statement is not paired: its counterpart may be in {} at {gname} line {}, which is not compared",
                         line(side, &it.nodes),
                         g.what,
                         g.line
                     )
+                    }
                 }
                 None if moved.contains(&(is_a, i)) => format!(
                     "{name} line {}: statement is not paired: the conversion put it in another order among the statements it is paired with",
@@ -3939,13 +4042,7 @@ fn compare_pair(
         }
     }
     let m = unexplained[0];
-    let what = compare::describe_unknown(m, &na, &nb).unwrap_or_else(|| {
-        format!(
-            "A has `{}` where B has `{}`",
-            compare::render(&m.a),
-            compare::render(&m.b)
-        )
-    });
+    let what = compare::describe_unknown(m, &na, &nb).unwrap_or_else(|| compare::mismatch_text(m));
     push(
         out,
         "equiv.unproven",

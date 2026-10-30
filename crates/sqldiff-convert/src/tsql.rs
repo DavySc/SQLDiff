@@ -73,11 +73,13 @@ pub(crate) fn convert(
         return_code: false,
         txn_control: false,
         wrapper: None,
+        autocommit: Vec::new(),
         decls: Vec::new(),
         context: false,
         dynamic: Vec::new(),
         scope: None,
         local: std::cell::OnceCell::new(),
+        own_tables: Vec::new(),
         bit_cols: Vec::new(),
         bit_unhandled: Vec::new(),
         bit_outer: None,
@@ -213,6 +215,10 @@ struct Cx<'a> {
     /// that wraps all the durable work of the routine or script start
     /// ([`txn_wrapper`]); both are dropped.
     wrapper: Option<(usize, usize)>,
+    /// PostgreSQL: where the T-SQL body commits a statement on its own
+    /// (autocommit outside an explicit transaction, [`autocommit_points`]);
+    /// a COMMIT follows each of them.
+    autocommit: Vec<usize>,
     decls: Vec<Decl>,
     /// The unit being converted was refused because of where it stands, not
     /// for want of a rule: the idiom rules, which see statements out of
@@ -225,6 +231,9 @@ struct Cx<'a> {
     scope: Option<Scope>,
     /// Without a tree catalog: one read from this input, made when needed.
     local: std::cell::OnceCell<sqldiff_core::catalog::Catalog>,
+    /// The table variables and `#` tables this routine or script declared
+    /// so far, for the types of their columns (names lower case).
+    own_tables: Vec<sqldiff_core::catalog::Table>,
     /// The BIT columns of the table being created or altered (lower case).
     bit_cols: Vec<String>,
     /// PostgreSQL: places where a bit meets a number with no exact rewrite.
@@ -436,11 +445,13 @@ impl<'a> Cx<'a> {
         self.xact_abort = false;
         self.seen_work = false;
         self.tables.clear();
+        self.own_tables.clear();
         self.routine = None;
         self.rolls_back = false;
         self.savepoints.clear();
         self.dynamic.clear();
         self.wrapper = None;
+        self.autocommit.clear();
     }
 
     fn do_block(&mut self, out: &mut Out, b: &SyntaxNode) {
@@ -451,6 +462,9 @@ impl<'a> Cx<'a> {
         self.drop_known_dynamic(b);
         if !self.db2() {
             self.wrapper = txn_wrapper(b);
+            if self.wrapper.is_none() {
+                self.autocommit = autocommit_points(b).unwrap_or_default();
+            }
         }
         let mut body = Out::default();
         self.body_elements(&mut body, b, INDENT);
@@ -461,11 +475,15 @@ impl<'a> Cx<'a> {
             out.append(body);
             out.push("END;\n");
         } else {
-            out.push("DO $$\n");
-            self.write_decls(out);
-            out.push("BEGIN\n");
-            out.append(body);
-            out.push("END\n$$;\n");
+            let mut inner = Out::default();
+            self.write_decls(&mut inner);
+            inner.push("BEGIN\n");
+            inner.append(body);
+            inner.push("END\n");
+            let tag = dollar_tag(&[&inner.text]);
+            out.push(&format!("DO {tag}\n"));
+            out.append(inner);
+            out.push(&format!("{tag};\n"));
         }
         self.mode = Mode::Top;
     }
@@ -737,6 +755,10 @@ impl<'a> Cx<'a> {
         ))?;
         if !self.db2() && !func {
             self.wrapper = txn_wrapper(&body);
+            // A SECURITY DEFINER procedure may not commit.
+            if self.wrapper.is_none() && !owner {
+                self.autocommit = autocommit_points(&body).unwrap_or_default();
+            }
         }
         let mut b = Out::default();
         let block = body.children().find(|c| c.kind() == BLOCK);
@@ -797,8 +819,15 @@ impl<'a> Cx<'a> {
                 );
             }
         }
+        let decls: Vec<&str> = self
+            .decls
+            .iter()
+            .chain(&self.cursors)
+            .flat_map(|d| d.lines.iter().map(String::as_str))
+            .collect();
+        let tag = dollar_tag(&[&b.text, &decls.join("\n")]);
         let header = format!(
-            "CREATE OR REPLACE {} {name}({}){returns}\nLANGUAGE plpgsql{security}\nAS $$",
+            "CREATE OR REPLACE {} {name}({}){returns}\nLANGUAGE plpgsql{security}\nAS {tag}",
             if func { "FUNCTION" } else { "PROCEDURE" },
             params.join(", ")
         );
@@ -812,7 +841,7 @@ impl<'a> Cx<'a> {
             out.push(&format!("{}return_code := 0;\n", " ".repeat(INDENT)));
         }
         out.append(b);
-        out.push("END;\n$$;\n");
+        out.push(&format!("END;\n{tag};\n"));
         self.mode = Mode::Top;
         Ok(None)
     }
@@ -1146,6 +1175,7 @@ impl<'a> Cx<'a> {
                     Ok(_) if self.blocked().is_some() => self.blocked().unwrap(),
                     Ok(text) => {
                         self.dynamic_text(n);
+                        let text = self.autocommit_after(n, text);
                         return self.emit(out, Self::range(n), indent, &text);
                     }
                     Err(No(reason)) => reason,
@@ -1406,7 +1436,15 @@ impl<'a> Cx<'a> {
                 if self.db2() {
                     ts = dummy_from(&ts, false);
                 }
-                self.expr(&ts).trim().to_string()
+                // The tables its subqueries read, for the types of their
+                // columns (a bit column compared with 0 or 1).
+                let outer = std::mem::replace(&mut self.scope, scope_of(&ts));
+                let aliases = self.bit_aliases_of(&ts);
+                let outer_aliases = std::mem::replace(&mut self.bit_aliases, aliases);
+                let cond = self.expr(&ts).trim().to_string();
+                self.scope = outer;
+                self.bit_aliases = outer_aliases;
+                cond
             })
             .unwrap_or_default();
         // The engine does not compare conditions: what has no exact rewrite is refused.
@@ -1753,8 +1791,25 @@ impl<'a> Cx<'a> {
             "PRINT" => {
                 let at = *s.get(1).ok_or(No("PRINT without a value".into()))?;
                 self.step_ts_with("tsql.stmt.print", &ts, "raise-notice");
-                let e = self.expr(&ts[at..]);
-                format!("RAISE NOTICE '%', {}", e.trim())
+                // PRINT shows NULL as an empty line, RAISE as <NULL>; RAISE
+                // shows any value through its text.
+                let end = ts
+                    .iter()
+                    .rposition(|t| t.sig() && t.k != SEMICOLON)
+                    .map_or(ts.len(), |j| j + 1);
+                let value = &ts[at..end.max(at)];
+                let e = self.expr(value);
+                let rest = self.expr(&ts[end.max(at)..]);
+                let e = e.trim();
+                let lit = matches!(sig(trimmed(value)).as_slice(), [i] if trimmed(value)[*i].k == STRING);
+                let shown = if lit {
+                    e.to_string()
+                } else if self.expr_dt(value) == Some(Dt::Text) {
+                    format!("COALESCE({e}, '')")
+                } else {
+                    format!("COALESCE(CAST({e} AS text), '')")
+                };
+                format!("RAISE NOTICE '%', {shown}{}", rest.trim())
             }
             "RETURN" => self.ret(&ts)?,
             "BREAK" | "CONTINUE" if self.db2() => {
@@ -1807,14 +1862,25 @@ impl<'a> Cx<'a> {
                 if self.db2() && w(2) == "IF" {
                     return no("DROP … IF EXISTS: not checked for Db2 for i; test for the object in QSYS2 (for example QSYS2.SYSTABLES) first");
                 }
+                if !self.db2() && w(1) == "TRIGGER" {
+                    return no("DROP TRIGGER: PostgreSQL drops a trigger by name ON its table, which the T-SQL statement does not name; a converted trigger may also have a trigger function to drop");
+                }
                 self.expr(&ts)
+            }
+            "TRUNCATE" if ts.iter().any(|t| t.is("WITH")) => {
+                return no("TRUNCATE TABLE … WITH (PARTITIONS …): no rule yet");
             }
             "TRUNCATE" if self.db2() => {
                 self.note(Status::Assumptions, "ASM-DB2-TRUNCATE", "TRUNCATE TABLE gets RESTART IDENTITY, since T-SQL resets the identity seed. Not checked on a real system: whether Db2 for i can roll a TRUNCATE back as T-SQL can (IMMEDIATE certainly cannot).");
                 self.step_ts("tsql.stmt.truncate", &ts);
                 format!("{} RESTART IDENTITY", self.expr(&Self::body_toks(&ts)).trim_end())
             }
-            "TRUNCATE" => self.expr(&ts),
+            "TRUNCATE" => {
+                // T-SQL resets the identity to its seed; PostgreSQL keeps it
+                // unless asked.
+                self.step_ts("tsql.stmt.truncate", &ts);
+                format!("{} RESTART IDENTITY", self.expr(&Self::body_toks(&ts)).trim_end())
+            }
             "USE" => return no(self.pick(
                 "USE: connect to the other database instead; PostgreSQL cannot switch databases in a session",
                 "USE: Db2 for i has one database per system; use SET SCHEMA or qualify names with the library",
@@ -3090,6 +3156,7 @@ impl<'a> Cx<'a> {
         }
         self.tables
             .insert(v.s[1..].to_ascii_lowercase(), table.clone());
+        self.own_table(&v.s, &ts[open + 1..close]);
         self.step_ts_with("tsql.decl.table-variable", ts, table.clone());
         if self.db2() {
             self.note(Status::Assumptions, "ASM-TABLE-VARIABLE", "The table variable becomes a NOT LOGGED global temporary table with ON ROLLBACK PRESERVE ROWS, so a rollback keeps its rows as T-SQL does (fact V16; under *NONE the ON ROLLBACK clause does not apply). It lives until the job ends rather than the batch; WITH REPLACE empties it when the code runs again. Its name carries the routine's, so a routine it calls does not replace it; assumes the routine is not re-entered (called from itself, directly or through other routines) while the table is in use.");
@@ -3304,6 +3371,23 @@ impl<'a> Cx<'a> {
         self.step_ts_with("tsql.stmt.raiserror", &ts, "raise-notice");
         self.note(Status::Assumptions, "ASM-RAISERROR-INFO", "Callers read the message by its text: a T-SQL informational RAISERROR also carries message number 50000, its severity and state, which a PostgreSQL notice does not.");
         Ok(format!("RAISE NOTICE '{fmt}'{values}"))
+    }
+
+    /// A statement T-SQL commits on its own (autocommit under
+    /// `SET XACT_ABORT ON`): a COMMIT after it, so that a failure later in
+    /// the procedure leaves it durable on both sides.
+    fn autocommit_after(&mut self, n: &SyntaxNode, text: String) -> String {
+        let at = tokens(n).iter().find(|t| t.sig()).map(|t| t.pos.0);
+        if self.db2()
+            || !matches!(self.mode, Mode::Proc | Mode::Do)
+            || !at.is_some_and(|a| self.autocommit.contains(&a))
+        {
+            return text;
+        }
+        self.step_node("tsql.txn.autocommit", n);
+        self.note(Status::Assumptions, "ASM-NO-CALLER-TXN", "T-SQL commits this statement on its own (no transaction is open), so a COMMIT follows it: a later failure leaves it durable on both sides. That holds when the procedure is CALLed outside a transaction block (autocommit); inside a caller's transaction T-SQL leaves it to the caller, where PostgreSQL refuses the COMMIT.");
+        self.txn_control = true;
+        format!("{text}\nCOMMIT;")
     }
 
     /// `ALTER DATABASE name ADD FILEGROUP fg [CONTAINS MEMORY_OPTIMIZED_DATA |
@@ -4383,7 +4467,11 @@ impl<'a> Cx<'a> {
         while i < ts.len() {
             let after_paren = prev_sig(ts, i).is_some_and(|p| ts[p].k == R_PAREN);
             if ds[i] == 0 && after_paren && (ts[i].is("ON") || ts[i].is("TEXTIMAGE_ON")) {
-                let nx = next_sig(ts, i).unwrap_or(i);
+                let mut nx = next_sig(ts, i).unwrap_or(i);
+                // `ON scheme (column)`: a partition scheme with its column.
+                if let Some(open) = next_sig(ts, nx).filter(|&p| ts[p].k == L_PAREN) {
+                    nx = matching(ts, open).ok_or(No("unbalanced parentheses".into()))?;
+                }
                 cut[i..=nx].iter_mut().for_each(|c| *c = true);
                 self.step_ts("tsql.storage-options", &ts[i..=nx]);
                 dropped = true;
@@ -4622,6 +4710,11 @@ impl<'a> Cx<'a> {
             }
             cols.push(col);
         }
+        if temp {
+            if let Some(&n) = sig(&name_t).first() {
+                self.own_table(&name_t[n].s.clone(), &ts[open + 1..close]);
+            }
+        }
         let tail = self.expr(&ts[close + 1..]);
         if let Some(t) = temporal {
             let table = Ok(format!(
@@ -4777,34 +4870,7 @@ impl<'a> Cx<'a> {
             return no("empty item in the column list (a trailing comma)");
         };
         if constraint_item(first) {
-            // PRIMARY KEY (a ASC): the targets take no sort order in a key's
-            // column list. The order only shapes the key's index.
-            let key = it.iter().any(|t| t.is("PRIMARY") || t.is("UNIQUE"));
-            let ds = crate::tok::depths(it);
-            let order = |j: usize| key && ds[j] == 1 && (it[j].is("ASC") || it[j].is("DESC"));
-            if (0..it.len()).any(|j| order(j) && it[j].is("DESC")) {
-                let text = self.pick(
-                    "DESC in a key's column list was dropped: PostgreSQL keys take no sort order. Results are the same; only the key's index is built ascending.",
-                    "DESC in a key's column list was dropped: Db2 for i keys take no sort order. Results are the same; only the key's index is built ascending.",
-                ).to_string();
-                self.note(Status::Converted, "tsql.key-order", &text);
-            }
-            for j in 0..it.len() {
-                if it[j].is("CLUSTERED") || it[j].is("NONCLUSTERED") {
-                    self.step_ts("tsql.index.clustered", &it[j..=j]);
-                } else if order(j) {
-                    self.step_ts("tsql.key-order", &it[j..=j]);
-                }
-            }
-            let kept: Vec<T> = (0..it.len())
-                .filter(|&j| {
-                    let t = &it[j];
-                    let before_order = !t.sig() && next_sig(it, j).is_some_and(order);
-                    !(t.is("CLUSTERED") || t.is("NONCLUSTERED") || order(j) || before_order)
-                })
-                .map(|j| it[j].clone())
-                .collect();
-            return Ok(format!("{lead}{}", collapse_spaces(&self.expr(&kept))));
+            return Ok(format!("{lead}{}", self.constraint_def(it)?));
         }
         if first.is("INDEX") {
             return no(
@@ -4813,6 +4879,95 @@ impl<'a> Cx<'a> {
         }
         let pk_col = pk.contains(&tsql_unquote(&first.s).to_ascii_lowercase());
         Ok(format!("{lead}{}", self.column_def(it, pk_col)?))
+    }
+
+    /// A table constraint (`[CONSTRAINT n] PRIMARY KEY CLUSTERED (a ASC)`)
+    /// without what only shapes the key's index: CLUSTERED / NONCLUSTERED
+    /// and a sort order in the key's column list.
+    fn constraint_def(&mut self, it: &[T]) -> R<String> {
+        // The key's index: storage options (not IGNORE_DUP_KEY = ON, which
+        // changes what the key accepts), a filegroup or a partition scheme.
+        let it = &self.strip_constraint_storage(it)?;
+        let ds = crate::tok::depths(it);
+        // PRIMARY KEY (a ASC): the targets take no sort order in a key's
+        // column list. The order only shapes the key's index.
+        let key = it.iter().any(|t| t.is("PRIMARY") || t.is("UNIQUE"));
+        let order = |j: usize| key && ds[j] == 1 && (it[j].is("ASC") || it[j].is("DESC"));
+        if (0..it.len()).any(|j| order(j) && it[j].is("DESC")) {
+            let text = self.pick(
+                "DESC in a key's column list was dropped: PostgreSQL keys take no sort order. Results are the same; only the key's index is built ascending.",
+                "DESC in a key's column list was dropped: Db2 for i keys take no sort order. Results are the same; only the key's index is built ascending.",
+            ).to_string();
+            self.note(Status::Converted, "tsql.key-order", &text);
+        }
+        for j in 0..it.len() {
+            if it[j].is("CLUSTERED") || it[j].is("NONCLUSTERED") {
+                self.step_ts("tsql.index.clustered", &it[j..=j]);
+            } else if order(j) {
+                self.step_ts("tsql.key-order", &it[j..=j]);
+            }
+        }
+        let kept: Vec<T> = (0..it.len())
+            .filter(|&j| {
+                let t = &it[j];
+                let before_order = !t.sig() && next_sig(it, j).is_some_and(order);
+                !(t.is("CLUSTERED") || t.is("NONCLUSTERED") || order(j) || before_order)
+            })
+            .map(|j| it[j].clone())
+            .collect();
+        Ok(collapse_spaces(&self.expr(&kept)))
+    }
+
+    /// A table constraint's `WITH (…)` storage options and `ON filegroup` /
+    /// `ON scheme (column)`, removed (`ON DELETE` / `ON UPDATE` stay).
+    fn strip_constraint_storage(&mut self, it: &[T]) -> R<Vec<T>> {
+        let ds = crate::tok::depths(it);
+        let mut cut = vec![false; it.len()];
+        let mut dropped = false;
+        let mut i = 0;
+        while i < it.len() {
+            if ds[i] != 0 {
+                i += 1;
+                continue;
+            }
+            if it[i].is("WITH") {
+                let open = next_sig(it, i).filter(|&p| it[p].k == L_PAREN).ok_or(No(
+                    "constraint WITH option without parentheses: no rule yet".into(),
+                ))?;
+                let r = matching(it, open).ok_or(No("unbalanced parentheses".into()))?;
+                for opt in split_commas(&it[open + 1..r]) {
+                    storage_option(opt)?;
+                }
+                cut[i..=r].iter_mut().for_each(|c| *c = true);
+                self.step_ts("tsql.storage-options", &it[i..=r]);
+                dropped = true;
+                i = r + 1;
+                continue;
+            }
+            let action = next_sig(it, i).is_some_and(|k| it[k].is("DELETE") || it[k].is("UPDATE"));
+            if it[i].is("ON") && !action {
+                let name = next_sig(it, i).ok_or(No("ON without a filegroup".into()))?;
+                let end = match next_sig(it, name).filter(|&p| it[p].k == L_PAREN) {
+                    Some(open) => matching(it, open).ok_or(No("unbalanced parentheses".into()))?,
+                    None => name,
+                };
+                cut[i..=end].iter_mut().for_each(|c| *c = true);
+                self.step_ts("tsql.storage-options", &it[i..=end]);
+                dropped = true;
+                i = end + 1;
+                continue;
+            }
+            i += 1;
+        }
+        if dropped {
+            self.note(Status::Converted, "tsql.storage-options", "Filegroup, partition scheme and storage options of a key (ON [PRIMARY], ON scheme (column), WITH (…)) were dropped; they place rows and shape the key's index, they do not change results.");
+        }
+        Ok(it
+            .iter()
+            .zip(cut)
+            .filter(|(_, c)| !c)
+            .map(|(t, _)| t.clone())
+            .collect())
     }
 
     /// `pk_col`: (Db2) the column is in a table-level PRIMARY KEY.
@@ -5347,7 +5502,18 @@ impl<'a> Cx<'a> {
                 let cols = find_word(&ts, 0, "TABLE")
                     .map(|t| self.table_bit_cols(&ts[t + 1..name_end]))
                     .unwrap_or_default();
-                return self.with_bit_cols(cols, |cx| Ok(cx.expr(&ts)));
+                // Each constraint as a table constraint is (CLUSTERED and a
+                // key's sort order dropped); the targets repeat ADD.
+                let head = self.expr(&ts[..nx]);
+                let items: Vec<Vec<T>> = split_commas(&ts[nx..])
+                    .into_iter()
+                    .map(|c| trimmed(c).to_vec())
+                    .collect();
+                let sep = self.pick(", ADD ", " ADD ");
+                return self.with_bit_cols(cols, |cx| {
+                    let defs: R<Vec<String>> = items.iter().map(|c| cx.constraint_def(c)).collect();
+                    Ok(format!("{head}{}", defs?.join(sep)))
+                });
             }
             let head = self.expr(&ts[..nx]);
             let cols: R<Vec<String>> = split_commas(&ts[nx..])
@@ -6838,6 +7004,146 @@ fn primary_key_columns(items: &[T]) -> Vec<String> {
         }
     }
     out
+}
+
+/// Where a T-SQL body commits a statement on its own, for a PostgreSQL
+/// procedure or DO block, which is one transaction unless it commits: the
+/// start of every statement that writes (a table, a temporary table, a
+/// call, DDL) while no explicit transaction is open. Only when the body runs
+/// with `SET XACT_ABORT ON` (set before anything writes, never turned off),
+/// so that a failure ends the routine on both sides and what T-SQL had
+/// committed stays; and only when that matters, that is when the body
+/// commits at least twice (counting explicit transactions, and a loop as
+/// twice). Checked on SQL Server 2022 and PostgreSQL 18.
+///
+/// The open transaction must be known statically: `BEGIN TRAN` and its
+/// `COMMIT` in the same statement list, never nested, every IF branch and
+/// loop body leaving it as it found it, no RETURN, BREAK or CONTINUE inside
+/// one. Refused: ROLLBACK, SAVE, @@TRANCOUNT, XACT_STATE, TRY/CATCH (a
+/// PostgreSQL block with an EXCEPTION clause cannot commit), RAISERROR
+/// (it ignores XACT_ABORT), cursors, GOTO, IMPLICIT_TRANSACTIONS and
+/// isolation levels (a PostgreSQL COMMIT resets them).
+fn autocommit_points(body: &SyntaxNode) -> Option<Vec<usize>> {
+    struct W {
+        points: Vec<usize>,
+        commits: usize,
+    }
+    fn neutral(n: &SyntaxNode) -> bool {
+        match first_word(n).as_str() {
+            "DECLARE" | "SET" | "PRINT" | "THROW" => true,
+            "SELECT" => !tokens(n).iter().any(|t| t.is("INTO")),
+            _ => false,
+        }
+    }
+    fn walk(n: &SyntaxNode, depth: &mut u32, in_loop: bool, w: &mut W) -> Option<()> {
+        for c in n.children() {
+            match c.kind() {
+                BLOCK => walk(&c, depth, in_loop, w)?,
+                k if k.is_container() => walk(&c, depth, in_loop, w)?,
+                IF_STMT | LOOP_STMT => {
+                    let looped = in_loop || c.kind() == LOOP_STMT;
+                    for b in c.children().filter(|b| b.kind() == BRANCH) {
+                        let mut d = *depth;
+                        walk(&b, &mut d, looped, w)?;
+                        if d != *depth {
+                            return None;
+                        }
+                    }
+                }
+                STATEMENT => {
+                    let w0 = first_word(&c);
+                    let second = tokens(&c)
+                        .into_iter()
+                        .filter(|t| t.sig())
+                        .nth(1)
+                        .map(|t| t.up())
+                        .unwrap_or_default();
+                    let weight = if in_loop { 2 } else { 1 };
+                    match w0.as_str() {
+                        "BEGIN" if matches!(second.as_str(), "TRAN" | "TRANSACTION") => {
+                            if *depth > 0 {
+                                return None;
+                            }
+                            *depth = 1;
+                        }
+                        "COMMIT" => {
+                            if *depth != 1 {
+                                return None;
+                            }
+                            *depth = 0;
+                            w.commits += weight;
+                        }
+                        "RETURN" | "BREAK" | "CONTINUE" if *depth > 0 => return None,
+                        "RETURN" | "BREAK" | "CONTINUE" => {}
+                        _ if neutral(&c) => {}
+                        _ if *depth == 0 => {
+                            let at = tokens(&c).iter().find(|t| t.sig())?.pos.0;
+                            w.points.push(at);
+                            w.commits += weight;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some(())
+    }
+    let all: Vec<T> = tokens(body).into_iter().filter(|t| t.sig()).collect();
+    let banned = all.iter().any(|t| {
+        [
+            "ROLLBACK",
+            "SAVE",
+            "XACT_STATE",
+            "RAISERROR",
+            "CURSOR",
+            "GOTO",
+            "IMPLICIT_TRANSACTIONS",
+            "ISOLATION",
+        ]
+        .iter()
+        .any(|w| t.is(w))
+            || t.s.eq_ignore_ascii_case("@@TRANCOUNT")
+    }) || all
+        .windows(2)
+        .any(|w| w[0].is("XACT_ABORT") && w[1].is("OFF"))
+        || body.descendants().any(|d| d.kind() == TRY_CATCH);
+    if banned {
+        return None;
+    }
+    // XACT_ABORT ON before the first statement that is not neutral.
+    let mut top = Vec::new();
+    fn flat(n: &SyntaxNode, out: &mut Vec<SyntaxNode>) {
+        for c in n.children() {
+            if c.kind() == BLOCK || c.kind().is_container() {
+                flat(&c, out);
+            } else if c.kind().is_unit() {
+                out.push(c);
+            }
+        }
+    }
+    flat(body, &mut top);
+    let on = top.iter().position(|n| {
+        let w: Vec<String> = tokens(n)
+            .iter()
+            .filter(|t| t.sig() && t.k != SEMICOLON)
+            .map(|t| t.up())
+            .collect();
+        w == ["SET", "XACT_ABORT", "ON"]
+    })?;
+    if top[..on]
+        .iter()
+        .any(|n| n.kind() != STATEMENT || !neutral(n))
+    {
+        return None;
+    }
+    let mut w = W {
+        points: Vec::new(),
+        commits: 0,
+    };
+    let mut depth = 0;
+    walk(body, &mut depth, false, &mut w)?;
+    (depth == 0 && w.commits >= 2 && !w.points.is_empty()).then_some(w.points)
 }
 
 /// The `BEGIN TRAN` and `COMMIT` (where each starts) of a body whose durable
@@ -8525,7 +8831,11 @@ fn scope_of(ts: &[T]) -> Option<Scope> {
                 if let Some(&j) = s.get(k).filter(|&&j| ts[j].k == L_PAREN) {
                     let end = matching(ts, j).unwrap_or(ts.len() - 1);
                     k = s.partition_point(|&x| x <= end);
-                } else if s.get(k).is_some_and(|&j| ts[j].k == VARIABLE) {
+                } else if let Some(&j) = s.get(k).filter(|&&j| ts[j].k == VARIABLE) {
+                    // A table variable: its columns are typed when this
+                    // routine declared it (`own_tables`).
+                    name.push(ts[j].s.to_ascii_lowercase());
+                    named = true;
                     k += 1;
                 }
             }
@@ -8646,11 +8956,37 @@ impl Cx<'_> {
             .into()
     }
 
+    /// Records a table variable or `#` table `name` with the column list
+    /// `cols` (the tokens between its parentheses), replacing one of that name.
+    fn own_table(&mut self, name: &str, cols: &[T]) {
+        let text: String = cols.iter().map(|t| t.s.as_str()).collect();
+        let cat = sqldiff_core::catalog::ddl::load(
+            &format!("CREATE TABLE own_table ({text})"),
+            Dialect::Tsql,
+            "routine",
+        );
+        let name = name.to_ascii_lowercase();
+        self.own_tables.retain(|t| t.name != name);
+        if let [t] = cat.tables.as_slice() {
+            let mut t = t.clone();
+            t.name = name;
+            self.own_tables.push(t);
+        }
+    }
+
     /// The catalog table of a scope entry whose columns are known.
     fn entry_table(&self, e: &ScopeEntry) -> Option<&sqldiff_core::catalog::Table> {
         use sqldiff_core::catalog::{table_position, Ident};
         if !e.named {
             return None;
+        }
+        if let [n] = e.name.as_slice() {
+            if let Some(t) = self.own_tables.iter().find(|t| &t.name == n) {
+                return t.columns_known.then_some(t);
+            }
+            if n.starts_with('@') {
+                return None;
+            }
         }
         let cat = self.type_catalog()?;
         let parts: Vec<Ident> = match self.image_table(&e.name) {
@@ -8998,4 +9334,18 @@ fn has_aggregate(item: &[T]) -> bool {
         }
     }
     found
+}
+
+/// The dollar quote for a PostgreSQL body: `$$`, or `$sqldiff$` (then
+/// `$sqldiff1$`, ...) when the body holds the shorter one (a string literal
+/// with `$$` in it would end a `$$` body).
+fn dollar_tag(texts: &[&str]) -> String {
+    (0..)
+        .map(|k| match k {
+            0 => "$$".to_string(),
+            1 => "$sqldiff$".to_string(),
+            _ => format!("$sqldiff{}$", k - 1),
+        })
+        .find(|t| !texts.iter().any(|x| x.contains(t.as_str())))
+        .unwrap_or_default()
 }

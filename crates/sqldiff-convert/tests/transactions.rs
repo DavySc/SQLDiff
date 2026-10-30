@@ -173,19 +173,43 @@ END;
     assert!(decisions(&c).is_empty());
 }
 
-#[test]
-fn work_outside_the_pair_keeps_it() {
-    // The first UPDATE autocommits on its own in T-SQL.
-    let c = pg("CREATE PROCEDURE dbo.Move @Id int AS
+const OUTSIDE: &str = "CREATE PROCEDURE dbo.Move @Id int AS
 BEGIN
     SET XACT_ABORT ON;
     UPDATE dbo.A SET Qty = 0 WHERE Id = @Id;
     BEGIN TRAN;
     UPDATE dbo.B SET Qty = Qty + 1 WHERE Id = @Id;
+    UPDATE dbo.A SET Qty = Qty + 1 WHERE Id = @Id;
     COMMIT;
 END;
-");
-    assert_eq!(commits(&c), 1, "{}", c.output);
+";
+
+#[test]
+fn work_outside_the_pair_commits_on_its_own() {
+    // T-SQL commits the first UPDATE on its own (no transaction is open):
+    // a COMMIT follows it, so a failure in the transaction leaves it.
+    let c = pg(OUTSIDE);
+    assert_eq!(commits(&c), 2, "{}", c.output);
+    assert!(
+        c.output
+            .contains("WHERE Id = p_id;\n  COMMIT;\n  -- BEGIN TRANSACTION"),
+        "{}",
+        c.output
+    );
+    assert!(txn_differences(&c).is_empty(), "{:?}", txn_differences(&c));
+    assert_eq!(
+        c.report.verdict(),
+        Verdict::EqualUnderAssumptions,
+        "{:?}",
+        c.report
+    );
+    assert!(
+        c.units.iter().all(|u| u.status == Status::Assumptions),
+        "{:#?}",
+        c.units
+    );
+    // Inside a caller's transaction they differ: what ASM-NO-CALLER-TXN covers.
+    assert!(!txn_differences(&pg_in(OUTSIDE, true)).is_empty());
 }
 
 #[test]
@@ -277,4 +301,113 @@ fn a_statement_after_the_commit_keeps_it() {
         "    COMMIT;\n    SET @n = (SELECT Qty FROM dbo.A WHERE Id = @Id);\n",
     ));
     assert_eq!(commits(&c), 1, "{}", c.output);
+}
+
+const NO_TRAN: &str = "CREATE PROCEDURE dbo.Load @N int AS
+BEGIN
+    SET XACT_ABORT ON;
+    DECLARE @i int = 0;
+    INSERT dbo.A (Id, Qty) VALUES (@N, 0);
+    WHILE @i < @N
+    BEGIN
+        SET @i = @i + 1;
+        UPDATE dbo.A SET Qty = Qty + 1 WHERE Id = @N;
+    END;
+    IF @N > 10
+        DELETE FROM dbo.B WHERE Id = @N;
+END;
+";
+
+#[test]
+fn statements_without_a_transaction_commit_one_by_one() {
+    // SQL Server 2022 commits each statement on its own; PostgreSQL 18
+    // allows COMMIT inside an IF of a CALLed procedure.
+    let src = NO_TRAN.replace(
+        "    WHILE @i < @N\n    BEGIN\n        SET @i = @i + 1;\n        UPDATE",
+        "    BEGIN\n        SET @i = @i + 1;\n        UPDATE",
+    );
+    let c = pg(&src);
+    assert_eq!(commits(&c), 3, "{}", c.output);
+    assert!(has_note(&c, "ASM-NO-CALLER-TXN"), "{}", c.output);
+    assert!(txn_differences(&c).is_empty(), "{:?}", txn_differences(&c));
+    assert_eq!(
+        c.report.verdict(),
+        Verdict::EqualUnderAssumptions,
+        "{:?}",
+        c.report
+    );
+    assert!(
+        c.units.iter().all(|u| u.status == Status::Assumptions),
+        "{:#?}",
+        c.units
+    );
+    assert!(!txn_differences(&pg_in(&src, true)).is_empty());
+}
+
+#[test]
+fn a_commit_inside_a_loop_is_emitted_but_not_proven() {
+    // PostgreSQL 18 allows COMMIT inside a WHILE of a CALLed procedure, but
+    // the behaviour model summarizes loops after two iterations: the
+    // statements stay unproven.
+    let c = pg(NO_TRAN);
+    assert_eq!(commits(&c), 3, "{}", c.output);
+    assert!(
+        c.output
+            .contains("Qty + 1 WHERE Id = p_n;\n    COMMIT;\n  END LOOP;"),
+        "{}",
+        c.output
+    );
+    assert_eq!(c.report.verdict(), Verdict::Unknown, "{:?}", c.report);
+    assert!(
+        c.units.iter().any(|u| u.status == Status::Unproven),
+        "{:#?}",
+        c.units
+    );
+}
+
+#[test]
+fn without_xact_abort_on_nothing_is_emulated() {
+    // An error leaves the batch running or not by error class: not exact.
+    let c = pg(&NO_TRAN.replace("    SET XACT_ABORT ON;\n", ""));
+    assert_eq!(commits(&c), 0, "{}", c.output);
+    let c = pg(&NO_TRAN.replace("XACT_ABORT ON", "XACT_ABORT OFF"));
+    assert_eq!(commits(&c), 0, "{}", c.output);
+}
+
+#[test]
+fn a_single_write_needs_no_commit() {
+    // A statement is atomic on both sides: one write is one transaction.
+    let c = pg("CREATE PROCEDURE dbo.Zero @Id int AS
+BEGIN
+    SET XACT_ABORT ON;
+    UPDATE dbo.A SET Qty = 0 WHERE Id = @Id;
+END;
+");
+    assert_eq!(commits(&c), 0, "{}", c.output);
+    assert_eq!(commits(&c), 0, "{}", c.output);
+}
+
+#[test]
+fn try_catch_or_rollback_is_not_emulated() {
+    for src in [
+        NO_TRAN.replace(
+            "    IF @N > 10",
+            "    BEGIN TRY\n        DELETE FROM dbo.B WHERE Id = 0;\n    END TRY\n    BEGIN CATCH\n        PRINT 'x';\n    END CATCH;\n    IF @N > 10",
+        ),
+        NO_TRAN.replace(
+            "        DELETE FROM dbo.B WHERE Id = @N;",
+            "        BEGIN BEGIN TRAN; DELETE FROM dbo.B WHERE Id = @N; ROLLBACK; END;",
+        ),
+    ] {
+        let c = pg(&src);
+        assert_eq!(commits(&c), 0, "{}", c.output);
+    }
+}
+
+#[test]
+fn an_owner_procedure_is_not_emulated() {
+    // PostgreSQL 18 refuses COMMIT in a SECURITY DEFINER procedure.
+    let c = pg(&NO_TRAN.replace(" AS\nBEGIN", "\nWITH EXECUTE AS OWNER\nAS\nBEGIN"));
+    assert!(c.output.contains("SECURITY DEFINER"), "{}", c.output);
+    assert_eq!(commits(&c), 0, "{}", c.output);
 }

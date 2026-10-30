@@ -42,8 +42,19 @@ pub const VARIABLE_LENGTH: (&str, &str) = (
 /// artifact is not a script, when neither is split (one plain segment each:
 /// the whole artifact is one unit), or when the segments do not line up
 /// (then the artifacts are compared whole, and the blocks stay not compared).
-pub(super) fn segment_pairs(a: &Analyzed, b: &Analyzed) -> Option<Vec<(Unit, Unit)>> {
+///
+/// With a conversion's trace (`anchors`), a plain segment of side A the
+/// conversion wrote nothing for (a refused statement left as a comment) has
+/// no partner: it is left out of the pairing and each of its statements is
+/// reported as not compared.
+pub(super) fn segment_pairs(
+    a: &Analyzed,
+    b: &Analyzed,
+    anchors: &[super::Anchor],
+    out: &mut Outcome,
+) -> Option<Vec<(Unit, Unit)>> {
     let (sa, sb) = (lower::segments(a)?, lower::segments(b)?);
+    let (sa, unwritten) = written(sa, &sb, anchors);
     let split = |s: &[Segment]| s.len() > 1 || s.iter().any(|x| x.block);
     if !split(&sa) && !split(&sb) {
         return None;
@@ -65,7 +76,7 @@ pub(super) fn segment_pairs(a: &Analyzed, b: &Analyzed) -> Option<Vec<(Unit, Uni
     {
         return None;
     }
-    let mut out = Vec::new();
+    let mut pairs = Vec::new();
     for ((gx, mut ux), (gy, uy)) in ua.into_iter().zip(ub) {
         if gx.routine {
             // Routines meet in order and by name, or the scripts are compared
@@ -73,9 +84,36 @@ pub(super) fn segment_pairs(a: &Analyzed, b: &Analyzed) -> Option<Vec<(Unit, Uni
             let asms = same_routine(&gx.nodes[0], a.dialect(), &gy.nodes[0], b.dialect())?;
             ux.assumptions.extend(asms);
         }
-        out.push((ux, uy));
+        pairs.push((ux, uy));
     }
-    Some(out)
+    let name = super::side_name(a);
+    for g in &unwritten {
+        for node in &g.nodes {
+            // `SET ANSI_NULLS ON` and the like: nothing to compare.
+            let one = Segment {
+                nodes: vec![node.clone()],
+                ..g.clone()
+            };
+            let u = lower::lower_segment(a.dialect(), &one);
+            if nothing(&u) {
+                continue;
+            }
+            if !u.uncovered.is_empty() {
+                for (n, what) in &u.uncovered {
+                    out.unknown_reasons.push(format!(
+                        "{name} line {}: {what} is not covered by statement-level equivalence",
+                        a.line_of(n)
+                    ));
+                }
+                continue;
+            }
+            out.unknown_reasons.push(format!(
+                "{name} line {}: statement has no counterpart on the other side: its conversion wrote no statement",
+                a.line_of(node)
+            ));
+        }
+    }
+    Some(pairs)
 }
 
 /// Whether two routines of paired scripts are the same object: the same kind
@@ -115,6 +153,45 @@ fn routine_key(r: &SyntaxNode, d: Dialect) -> Option<(&'static str, (Option<Stri
     };
     let (name, _) = table::dotted(&toks, kw + 1).ok()?;
     Some((kind, super::ddl::object_key(&name, d).ok()?))
+}
+
+/// Splits side A's segments into those the trace links to output and the
+/// plain ones it links to no segment of side B: every anchor that starts in
+/// such a segment wrote only text outside B's segments (comments). A segment
+/// with no anchor in it is kept: the trace says nothing about it.
+fn written(
+    sa: Vec<Segment>,
+    sb: &[Segment],
+    anchors: &[super::Anchor],
+) -> (Vec<Segment>, Vec<Segment>) {
+    if anchors.is_empty() {
+        return (sa, Vec::new());
+    }
+    let span = |g: &Segment| {
+        let r: Vec<(usize, usize)> = g.nodes.iter().map(cst::sig_range).collect();
+        (
+            r.iter().map(|x| x.0).min().unwrap_or(0),
+            r.iter().map(|x| x.1).max().unwrap_or(0),
+        )
+    };
+    let targets: Vec<(usize, usize)> = sb.iter().map(span).collect();
+    let (mut kept, mut left) = (Vec::new(), Vec::new());
+    for g in sa {
+        let (s, e) = span(&g);
+        let inside: Vec<&super::Anchor> = anchors
+            .iter()
+            .filter(|x| s <= x.a.0 && x.a.1 <= e && x.a.0 < x.a.1)
+            .collect();
+        let reaches = inside
+            .iter()
+            .any(|x| targets.iter().any(|&(c, d)| x.b.0 < d && c < x.b.1));
+        if g.block || g.routine || inside.is_empty() || reaches {
+            kept.push(g);
+        } else {
+            left.push(g);
+        }
+    }
+    (kept, left)
 }
 
 /// A segment with nothing to compare (only statements that lower to notes,
