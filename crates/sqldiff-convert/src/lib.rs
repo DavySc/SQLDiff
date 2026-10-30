@@ -531,6 +531,14 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
         );
         for i in hits {
             let u = &mut units[i];
+            // A dropped `:r` include: there is nothing to compare, and the
+            // unit's outcome is the decision to run the included file's
+            // conversion there (`tsql.sqlcmd-include`).
+            if reason_text(reason).starts_with("a SQLCMD directive `:r`")
+                && u.notes.iter().any(|n| n.rule == "tsql.sqlcmd-include")
+            {
+                continue;
+            }
             u.status = u.status.max(Status::Unproven);
             u.checked = u.checked.max(Status::Unproven);
             if !u.notes.iter().any(|n| n.text == text) {

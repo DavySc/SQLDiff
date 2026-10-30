@@ -378,3 +378,71 @@ fn a_truncate_kept_by_t_sql_after_a_failure_is_found() {
         .replace("  DELETE FROM Log WHERE id < 0;\n", "");
     differs(&t, &p, "txn.atomicity");
 }
+
+const VIEWS: &str = "CREATE TABLE dbo.T (id int NOT NULL PRIMARY KEY, a varchar(10) NOT NULL, b varchar(10) NOT NULL);
+GO
+CREATE VIEW dbo.v1
+AS
+SELECT id, a FROM dbo.T
+GO
+CREATE VIEW dbo.v2
+AS
+SELECT id, a + '-' AS ab FROM dbo.T
+GO
+";
+
+fn views_pg(n1: &str, n2: &str, col: &str) -> String {
+    format!(
+        "CREATE TABLE T (id integer NOT NULL PRIMARY KEY, a varchar(10) NOT NULL, b varchar(10) NOT NULL);
+CREATE OR REPLACE VIEW {n1} AS
+SELECT id, a FROM T;
+CREATE OR REPLACE VIEW {n2} AS
+SELECT id, {col} || '-' AS ab FROM T;
+"
+    )
+}
+
+#[test]
+fn several_views_meet_their_conversions_by_name() {
+    // A T-SQL view is a batch of its own; on PostgreSQL it is a plain
+    // statement among the others, and still meets its own conversion.
+    equal(VIEWS, &views_pg("v1", "v2", "a"));
+    // The second view is compared too (as a view alone in its file, a
+    // changed column is found but not shown different without a catalog).
+    let r = run(VIEWS, &views_pg("v1", "v2", "b"));
+    assert!(
+        r.findings
+            .iter()
+            .any(|f| f.rule == "equiv.unproven" && f.witness.contains("(A line 9, B line 4)")),
+        "{:#?}",
+        r.findings
+    );
+    assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
+    // Views in another order are not paired.
+    let r = run(VIEWS, &views_pg("v2", "v1", "a"));
+    assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
+    assert_ne!(r.verdict(), Verdict::Equal);
+    // A view beside a routine: each is a routine segment.
+    let a = format!("{VIEWS}CREATE PROCEDURE dbo.p\nAS\nBEGIN\n  DELETE FROM dbo.T;\nEND;\nGO\n");
+    let b = format!(
+        "{}CREATE OR REPLACE PROCEDURE p()\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  DELETE FROM T;\nEND;\n$$;\n",
+        views_pg("v1", "v2", "a")
+    );
+    equal(&a, &b);
+}
+
+#[test]
+fn ansi_settings_on_are_what_t_sql_is_compared_under() {
+    let proc = "CREATE PROCEDURE dbo.p\nAS\nBEGIN\n  DELETE FROM dbo.T WHERE id = 1;\nEND;\nGO\n";
+    let pg = "CREATE TABLE T (id integer NOT NULL PRIMARY KEY);\nCREATE OR REPLACE PROCEDURE p()\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  DELETE FROM T WHERE id = 1;\nEND;\n$$;\n";
+    let t = "CREATE TABLE dbo.T (id int NOT NULL PRIMARY KEY);\nGO\n";
+    let on = format!("SET ANSI_NULLS ON\nGO\nSET QUOTED_IDENTIFIER ON\nGO\n{t}{proc}");
+    equal(&on, pg);
+    // With several routines too.
+    let a = format!("SET ANSI_NULLS ON\nGO\n{TWO}");
+    equal(&a, &two_pg("p1", "p2", "2"));
+    // OFF changes how T-SQL compares NULLs and reads double quotes.
+    for off in ["SET ANSI_NULLS OFF", "SET QUOTED_IDENTIFIER OFF"] {
+        unknown(&format!("{off}\nGO\n{t}{proc}"), pg, "line 1:");
+    }
+}

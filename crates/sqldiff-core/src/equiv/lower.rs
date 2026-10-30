@@ -481,6 +481,8 @@ fn lower_with(a: &Analyzed, catch_branches: bool) -> Unit {
                         ));
                     } else if is_create_ddl(&n, d) {
                         u.ddl.push((n.clone(), usize::from(after)));
+                    } else if ansi_on(&n, d) {
+                        // What the routine is compared under anyway.
                     } else {
                         u.uncovered
                             .push((n.clone(), "a statement outside the routine".into()));
@@ -521,6 +523,8 @@ fn lower_with(a: &Analyzed, catch_branches: bool) -> Unit {
                     u.tables.push((n.clone(), before));
                 } else if is_create_ddl(&n, d) {
                     u.ddl.push((n.clone(), before));
+                } else if ansi_on(&n, d) {
+                    // What the routines are compared under anyway.
                 } else if is_comment(&n, d) {
                     // Object comments around the routines are still compared.
                     let at = CallAt {
@@ -719,7 +723,10 @@ pub struct Segment {
 /// T-SQL batch with variables or control flow into one block and leaves the
 /// others' statements as they are. A script that creates several routines
 /// gets one segment for each, so that each routine meets its own conversion
-/// (`script::segment_pairs` pairs them by name).
+/// (`script::segment_pairs` pairs them by name). A T-SQL view is a routine
+/// (a batch of its own); on the other side `CREATE [OR REPLACE] VIEW` is a
+/// plain statement, so among several routines each view statement gets a
+/// routine segment too.
 pub fn segments(a: &Analyzed) -> Option<Vec<Segment>> {
     let d = a.dialect();
     let mut out: Vec<Segment> = Vec::new();
@@ -743,8 +750,22 @@ pub fn segments(a: &Analyzed) -> Option<Vec<Segment>> {
         .descendants()
         .filter(|n| n.kind() == SyntaxKind::ROUTINE && !(d == Dialect::Postgres && is_do(n)))
         .collect();
-    let several = routines.len() >= 2;
     let top: Vec<SyntaxNode> = cst::structural_children(&a.root);
+    let views = if d == Dialect::Tsql {
+        0
+    } else {
+        top.iter()
+            .flat_map(|n| {
+                if n.kind() == SyntaxKind::BATCH {
+                    cst::structural_children(n)
+                } else {
+                    vec![n.clone()]
+                }
+            })
+            .filter(view_stmt)
+            .count()
+    };
+    let several = routines.len() + views >= 2;
     if d == Dialect::Tsql {
         if !routines.is_empty() && !several {
             return None;
@@ -809,11 +830,39 @@ pub fn segments(a: &Analyzed) -> Option<Vec<Segment>> {
                 push(vec![n], false, true);
             }
             SyntaxKind::ROUTINE => return None,
+            _ if several && view_stmt(&n) => push(vec![n], false, true),
             SyntaxKind::BLOCK if d == Dialect::Db2i => push(vec![n], true, false),
             _ => push(vec![n], false, false),
         }
     }
     (seen == routines.len()).then_some(out)
+}
+
+/// T-SQL `SET ANSI_NULLS ON` or `SET QUOTED_IDENTIFIER ON`: it changes no
+/// data and cannot fail, and it sets what T-SQL is compared under (NULL
+/// comparisons as in PostgreSQL, double quotes delimit names), which a
+/// routine created after it keeps (ASM-TSQL-ANSI-NULLS,
+/// ASM-TSQL-QUOTED-IDENTIFIER). OFF changes behaviour and stays not covered.
+fn ansi_on(n: &SyntaxNode, d: Dialect) -> bool {
+    if d != Dialect::Tsql {
+        return false;
+    }
+    let w = cst::first_words(n, 4);
+    let w: Vec<&str> = w.iter().map(|s| s.as_str()).filter(|s| *s != ";").collect();
+    matches!(
+        w.as_slice(),
+        ["SET", "ANSI_NULLS" | "QUOTED_IDENTIFIER", "ON"]
+    )
+}
+
+/// A PostgreSQL or Db2 for i statement `CREATE [OR REPLACE] VIEW …`.
+fn view_stmt(n: &SyntaxNode) -> bool {
+    let w = cst::first_words(n, 4);
+    let w: Vec<&str> = w.iter().map(|s| s.as_str()).collect();
+    matches!(
+        w.as_slice(),
+        ["CREATE", "VIEW", ..] | ["CREATE", "OR", "REPLACE", "VIEW"]
+    )
 }
 
 /// Whether a T-SQL statement needs a block to run elsewhere: control flow,
@@ -849,6 +898,14 @@ pub fn lower_segment(d: Dialect, seg: &Segment, other: Dialect) -> Unit {
     let mut u = empty(d);
     u.catch_branches = catch_branches(d, other);
     if let (true, [r]) = (seg.routine, seg.nodes.as_slice()) {
+        if r.kind() != SyntaxKind::ROUTINE {
+            // A view statement (`segments`): lowered as `lower` lowers an
+            // artifact that holds only it.
+            unit(r, &mut u);
+            cursors_done(&mut u);
+            place_txn(&mut u);
+            return u;
+        }
         // As `lower` lowers the one routine of an artifact.
         u.in_block = true;
         header(r, &mut u);
@@ -2070,6 +2127,10 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                     .push((c.clone(), format!("a DDL statement `{}`", words.join(" ")))),
             }
         }
+        _ if ansi_on(c, d) => note(
+            u,
+            "SET ANSI_NULLS ON / SET QUOTED_IDENTIFIER ON: the behaviour T-SQL is compared under (ASM-TSQL-ANSI-NULLS, ASM-TSQL-QUOTED-IDENTIFIER) and PostgreSQL's own",
+        ),
         StmtKind::SessionSetting if d == Dialect::Tsql && w(1) == "NOCOUNT" => {
             note(
                 u,
