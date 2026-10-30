@@ -6626,12 +6626,19 @@ impl<'a> Cx<'a> {
             ("CHARINDEX", 2) => {
                 self.ci_note();
                 let (x, y) = (e(self, 0), e(self, 1));
-                // CHARINDEX finds an empty string nowhere (0); strpos finds it
-                // at 1. A literal needle shows it is not empty.
+                // CHARINDEX finds an empty needle nowhere, strpos at 1, and
+                // both are NULL for a NULL argument: CHARINDEX('', 'abc') = 0
+                // and CHARINDEX('', NULL) IS NULL (SQL Server 2022). A literal
+                // needle shows it is not empty. Otherwise strpos is corrected
+                // by one for an empty needle, which keeps NULL: NULL - 0,
+                // NULL - 1 and strpos(s, NULL) - NULL are NULL. (A CASE that
+                // gives 0 for an empty needle gives 0 for a NULL haystack
+                // too.) The haystack is read once, the needle twice, so the
+                // needle must be safe to evaluate twice.
                 if nonempty_literal(a[0]) || self.nonempty_concat(a[0]) {
                     format!("strpos({y}, {x})")
                 } else if simple_operand(a[0]) {
-                    format!("(CASE WHEN length({x}) = 0 THEN 0 ELSE strpos({y}, {x}) END)")
+                    format!("(strpos({y}, {x}) - (length({x}) = 0)::int)")
                 } else {
                     self.note(Status::NotConverted, "tsql.charindex", "CHARINDEX of a computed needle: CHARINDEX finds an empty needle nowhere (0), strpos at 1, so the needle must be tested first. Store it in a variable, then convert.");
                     return None;
