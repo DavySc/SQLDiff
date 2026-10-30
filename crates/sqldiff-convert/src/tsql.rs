@@ -2224,6 +2224,9 @@ impl<'a> Cx<'a> {
     fn with_dml(&mut self, ts: &[T]) -> R<String> {
         let ts = Self::body_toks(ts);
         let (names, verb) = cte_list(&ts).ok_or(No("unreadable WITH list".into()))?;
+        if !self.db2() && find_word(&ts, verb, "OUTPUT").is_some() {
+            return no("OUTPUT clause in a statement with a WITH list: not converted yet");
+        }
         let what = ts[verb].up();
         if self.db2() {
             return no(format!(
@@ -2320,11 +2323,11 @@ impl<'a> Cx<'a> {
     fn dml(&mut self, ts: &[T]) -> R<String> {
         let ts = Self::body_toks(ts);
         let s = sig(&ts);
-        if find_word(&ts, 0, "OUTPUT").is_some() {
-            return no(self.pick(
-                "OUTPUT clause: use RETURNING (inserted.x → the new row, deleted.x needs a CTE)",
-                "OUTPUT clause: use SELECT … FROM FINAL TABLE (INSERT …) or OLD TABLE (DELETE …)",
-            ));
+        if let Some(o) = find_word(&ts, 0, "OUTPUT") {
+            if self.db2() {
+                return no("OUTPUT clause: use SELECT … FROM FINAL TABLE (INSERT …) or OLD TABLE (DELETE …)");
+            }
+            return self.output_into(&ts, o);
         }
         if ts[*s.get(1).ok_or(No("incomplete statement".into()))?].is("TOP") {
             return no(self.pick(
@@ -2373,6 +2376,158 @@ impl<'a> Cx<'a> {
             return Ok(self.expr(&ts));
         }
         Ok(format!("{pre}{}", self.expr(&ts[from..]).trim_start()))
+    }
+
+    /// `INSERT/UPDATE/DELETE … OUTPUT items INTO t (cols) …` (PostgreSQL):
+    /// `WITH sqldiff_output AS (<the statement> RETURNING items) INSERT INTO
+    /// t (cols) SELECT cols FROM sqldiff_output`. T-SQL's `inserted` row is
+    /// PostgreSQL 18's `new`, `deleted` is `old` (checked on both engines).
+    /// The data-modifying CTE runs once and the INSERT gets each row it
+    /// returns, as OUTPUT … INTO writes one row per changed row. Items are
+    /// columns of `inserted`/`deleted`, variables and constants; the FROM
+    /// list of an UPDATE or DELETE join, `*`, expressions and OUTPUT without
+    /// INTO (rows returned to the caller, which a PostgreSQL procedure
+    /// cannot do) are refused. The engine compares the result.
+    fn output_into(&mut self, ts: &[T], o: usize) -> R<String> {
+        let why = |w: &str| No(format!("OUTPUT clause: {w}"));
+        let s = sig(ts);
+        let verb = ts[s[0]].up();
+        let ends: &[&str] = if verb == "INSERT" {
+            &["VALUES", "SELECT", "DEFAULT", "EXEC", "EXECUTE"]
+        } else {
+            &["FROM", "WHERE", "OPTION"]
+        };
+        let e = ends
+            .iter()
+            .filter_map(|w| find_word(ts, o + 1, w))
+            .min()
+            .unwrap_or(ts.len());
+        if verb == "INSERT" && e == ts.len() {
+            return Err(why("the INSERT's rows are not a VALUES list or a query"));
+        }
+        if verb != "INSERT" && find_word(ts, o + 1, "FROM").is_some() {
+            return Err(why(
+                "an UPDATE or DELETE with a FROM list (OUTPUT may read its tables); not converted yet",
+            ));
+        }
+        let Some(into) = find_word(ts, o + 1, "INTO").filter(|&i| i < e) else {
+            return Err(why("OUTPUT without INTO returns the rows to the caller, and a PostgreSQL procedure cannot return a result set; use a function RETURNS TABLE with RETURN QUERY … RETURNING, or OUTPUT … INTO a table variable"));
+        };
+        let target_ts = trimmed(&ts[into + 1..e]);
+        let open = target_ts.iter().position(|t| t.k == L_PAREN);
+        let Some(open) = open else {
+            return Err(why(
+                "OUTPUT … INTO without a column list: list the columns of the table it writes",
+            ));
+        };
+        let close = matching(target_ts, open).ok_or(why("unbalanced parentheses"))?;
+        if trimmed(&target_ts[close + 1..]).iter().any(|t| t.sig()) {
+            return Err(why("unexpected text after the OUTPUT … INTO column list"));
+        }
+        let name = trimmed(&target_ts[..open]);
+        match name {
+            [v] if v.k == VARIABLE => {
+                if !self
+                    .tables
+                    .contains_key(&v.s.trim_start_matches('@').to_ascii_lowercase())
+                {
+                    return Err(why("OUTPUT … INTO a table variable that was not converted"));
+                }
+            }
+            [t] if t.s.starts_with('#') => {}
+            _ if name_parts(name).is_some_and(|p| p.len() <= 3) => {}
+            _ => return Err(why("the OUTPUT … INTO target is not a table name")),
+        }
+        let target_name = self.expr(name).trim().to_string();
+        let mut cols = Vec::new();
+        for c in split_commas(&target_ts[open + 1..close]) {
+            let c = trimmed(c);
+            if !name_parts(c).is_some_and(|p| p.len() == 1) {
+                return Err(why(
+                    "the OUTPUT … INTO column list holds something other than column names",
+                ));
+            }
+            cols.push(self.expr(c).trim().to_string());
+        }
+        let items = split_commas(&ts[o + 1..into]);
+        if items.len() != cols.len() {
+            return Err(why(
+                "OUTPUT … INTO lists a different number of items and columns",
+            ));
+        }
+        let target = match verb.as_str() {
+            "UPDATE" => trimmed(&ts[s[0] + 1..find_word(ts, 0, "SET").unwrap_or(o)]).to_vec(),
+            _ => {
+                let from = s[1..]
+                    .iter()
+                    .copied()
+                    .find(|&j| !ts[j].is("INTO") && !ts[j].is("FROM"))
+                    .unwrap_or(o);
+                let end = (from..o)
+                    .find(|&j| ts[j].k == L_PAREN || ts[j].is("WITH") || ts[j].is("OUTPUT"))
+                    .unwrap_or(o);
+                trimmed(&ts[from..end]).to_vec()
+            }
+        };
+        if find_word(&ts[..o], 0, "WITH").is_some() || hinted(&ts[..o]) {
+            return Err(why("table hints on the target are not converted"));
+        }
+        if name_parts(&target)
+            .and_then(|p| p.last().cloned())
+            .is_some_and(|n| n == "new" || n == "old")
+        {
+            return Err(why(
+                "the table is named new or old, which RETURNING reads as the row images",
+            ));
+        }
+        let mut out = Vec::new();
+        for (item, col) in items.iter().zip(&cols) {
+            let item = trimmed(item);
+            let si = sig(item);
+            // `x [AS] alias`: the alias names nothing once the row goes INTO a table.
+            let n = match si.len() {
+                2 if item[si[1]].k == IDENT || item[si[1]].k == QUOTED_IDENT => 1,
+                3 if item[si[1]].is("AS") => 1,
+                4 if item[si[3]].k != DOT && item[si[1]].k == DOT => 3,
+                5 if item[si[3]].is("AS") && item[si[1]].k == DOT => 3,
+                k => k,
+            };
+            let text = match &si[..n] {
+                [q, d, c]
+                    if item[*d].k == DOT
+                        && (item[*q].is("INSERTED") || item[*q].is("DELETED"))
+                        && matches!(item[*c].k, IDENT | QUOTED_IDENT) =>
+                {
+                    let image = match (item[*q].is("INSERTED"), verb.as_str()) {
+                        (true, "DELETE") => return Err(why("inserted in a DELETE")),
+                        (false, "INSERT") => return Err(why("deleted in an INSERT")),
+                        (true, _) => "new",
+                        (false, _) => "old",
+                    };
+                    let c = self.expr(&item[*c..=*c]);
+                    format!("{image}.{}", c.trim())
+                }
+                [v] if (item[*v].k == VARIABLE && !item[*v].s.starts_with("@@"))
+                    || matches!(item[*v].k, NUMBER | STRING)
+                    || item[*v].is("NULL") =>
+                {
+                    self.expr(&item[*v..=*v]).trim().to_string()
+                }
+                _ => return Err(why(
+                    "an item other than a column of inserted or deleted, a variable or a constant",
+                )),
+            };
+            out.push(format!("{text} AS {col}"));
+        }
+        let rest: Vec<T> = ts[..o].iter().chain(&ts[e..]).cloned().collect();
+        let body = self.dml(&rest)?;
+        self.step_ts_with("tsql.dml.output-into", &ts[o..e], "returning");
+        let cols = cols.join(", ");
+        Ok(format!(
+            "WITH sqldiff_output AS (\n  {}\n  RETURNING {}\n)\nINSERT INTO {target_name} ({cols})\nSELECT {cols} FROM sqldiff_output",
+            body.trim(),
+            out.join(", ")
+        ))
     }
 
     /// `DELETE t FROM <tables> WHERE w` (or `DELETE FROM t FROM …`): T-SQL
