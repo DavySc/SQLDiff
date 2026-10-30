@@ -64,6 +64,9 @@ NOTICE:  V6 timestamp + 1 month keeps the time: 2024-02-29T10:20:30.123456
 NOTICE:  V6 timestamp + 2 days keeps the time: 2024-02-02T10:20:30.123456
 NOTICE:  V6 timestamp + 1 year: 2025-02-28T01:02:03.000000
 NOTICE:  V6 result types: date date timestamp without time zone
+NOTICE:  V6 date + make_interval without a cast: type=timestamp without time zone
+NOTICE:  V6 nested: ((d + make_interval(months => 1))::date + 1) = 2024-03-01; ((d + make_interval(months => 1))::date - date 2024-01-01) = 59
+NOTICE:  V6 (date + make_interval) + 1 without a cast: error 42883
 NOTICE:  V6 NULL number: NULL; NULL date: NULL
 NOTICE:  V6 9999-12-31 + 1 day: no error, 10000-01-01
 NOTICE:  V6 0001-06-01 - 1 year: no error, 0001-06-01 BC

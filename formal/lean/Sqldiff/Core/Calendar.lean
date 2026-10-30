@@ -80,6 +80,20 @@ def dayOf (us : Int) : Int := us.fdiv usPerDay
 def addToTs (f : Int → Int) (us : Int) : Int :=
   f (dayOf us) * usPerDay + us.fmod usPerDay
 
+/-- A date at midnight, as a timestamp, has that date. -/
+theorem dayOf_mul (d : Int) : dayOf (d * usPerDay) = d := by
+  unfold dayOf usPerDay
+  exact Int.mul_fdiv_cancel d (by decide)
+
+theorem fmod_mul (d : Int) : (d * usPerDay).fmod usPerDay = 0 := by
+  unfold usPerDay
+  simp [Int.fmod_eq_emod_of_nonneg _ (by decide : (0:Int) ≤ 86400000000), Int.mul_emod_left]
+
+/-- Moving a midnight by whole days and taking its date is moving the date. -/
+theorem dayOf_addToTs (f : Int → Int) (d : Int) : dayOf (addToTs f (d * usPerDay)) = f d := by
+  unfold addToTs
+  rw [dayOf_mul, fmod_mul, Int.add_zero, dayOf_mul]
+
 -- The vendors' own values: V7 counts 3652058 days from 0001-01-01 to
 -- 9999-12-31; the Unix epoch; the clamps of V6.
 #guard daysFromCivil 1 1 1 = 0

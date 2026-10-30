@@ -314,6 +314,10 @@ BEGIN
   PRINT 'V6 datetime2 + 1 month keeps the time: ' + CONVERT(varchar(30), DATEADD(mm, 1, @t), 126);
   PRINT 'V6 datetime2 + 2 days keeps the time: ' + CONVERT(varchar(30), DATEADD(day, 2, @t), 126);
   PRINT 'V6 datetime2 + 1 year: ' + CONVERT(varchar(30), DATEADD(year, 1, CAST('2024-02-29T01:02:03' AS datetime2(6))), 126);
+  PRINT 'V6 nested: DATEADD(day, 1, DATEADD(month, 1, 2024-01-31)) = '
+    + CONVERT(varchar(30), DATEADD(day, 1, DATEADD(month, 1, @d)), 126)
+    + '; DATEDIFF(day, 2024-01-01, DATEADD(month, 1, 2024-01-31)) = '
+    + CAST(DATEDIFF(day, CAST('2024-01-01' AS date), DATEADD(month, 1, @d)) AS varchar(11));
   PRINT 'V6 DATEADD types: ' + CAST(SQL_VARIANT_PROPERTY(DATEADD(day, 1, @d), 'BaseType') AS varchar(20))
     + ' ' + CAST(SQL_VARIANT_PROPERTY(DATEADD(day, 1, @t), 'BaseType') AS varchar(20))
     + '(' + CAST(SQL_VARIANT_PROPERTY(DATEADD(day, 1, @t), 'Scale') AS varchar(20)) + ')';

@@ -253,6 +253,16 @@ BEGIN
   RAISE NOTICE 'V6 timestamp + 2 days keeps the time: %', to_char((t + make_interval(days => 2)), 'YYYY-MM-DD"T"HH24:MI:SS.US');
   RAISE NOTICE 'V6 timestamp + 1 year: %', to_char((CAST('2024-02-29T01:02:03' AS timestamp(6)) + make_interval(years => 1)), 'YYYY-MM-DD"T"HH24:MI:SS.US');
   RAISE NOTICE 'V6 result types: % % %', pg_typeof(d + 1), pg_typeof((d + make_interval(months => 1))::date), pg_typeof(t + make_interval(days => 1));
+  RAISE NOTICE 'V6 date + make_interval without a cast: type=%', pg_typeof(d + make_interval(months => 1));
+  RAISE NOTICE 'V6 nested: ((d + make_interval(months => 1))::date + 1) = %; ((d + make_interval(months => 1))::date - date 2024-01-01) = %',
+    to_char(((d + make_interval(months => 1))::date + 1), 'YYYY-MM-DD'),
+    ((d + make_interval(months => 1))::date - CAST('2024-01-01' AS date));
+  BEGIN
+    EXECUTE 'SELECT (CAST(''2024-01-31'' AS date) + make_interval(months => 1)) + 1';
+    RAISE NOTICE 'V6 (date + make_interval) + 1 without a cast: no error';
+  EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'V6 (date + make_interval) + 1 without a cast: error %', SQLSTATE;
+  END;
   RAISE NOTICE 'V6 NULL number: %; NULL date: %', COALESCE(to_char(d + NULL::integer, 'YYYY-MM-DD'), 'NULL'), COALESCE(to_char(NULL::date + 1, 'YYYY-MM-DD'), 'NULL');
   BEGIN
     r := CAST('9999-12-31' AS date) + 1;

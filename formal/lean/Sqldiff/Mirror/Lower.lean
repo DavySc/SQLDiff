@@ -956,6 +956,12 @@ in range by `ASM-DATEADD-RANGE` below; the core holds every day number.
   `(d + make_interval(months => n))::date`, `(d + make_interval(years
   => n))::date`; on a `datetime2(p)`, `(d + make_interval(days | months
   | years => n))`; `n` an `int` (or `smallint`) expression of the slice.
+  `date + make_interval(...)` without the `::date` is a `timestamp` in
+  PostgreSQL (probed, V6: `pg_typeof`; `(d + make_interval(months =>
+  1)) + 1` raises 42883), so it is typed `ts 6` (`pgIntervalAddTy`) and
+  only the cast makes it a date again (`mkToDate`, whose fold is
+  `mkToDate_dateAdd_eval`); the converter always writes the cast
+  (probed, V6: a nested `DATEADD` gives 2024-03-01 and 59 days on both).
   Both lower to `dateAdd part n d`: days are added to the day number;
   months and years move the month, keeping the day of the month or
   clamping it to the result month's last day ("DATEADD (Transact-SQL)":
@@ -1368,7 +1374,8 @@ def binTy (d : Dialect) (o : String) : SExpr × STy → SExpr × STy → Option 
     match d with
     | .pg _ _ =>
       if o == "+" && v.le .i32 then some (.dateAdd .day b a, .date)
-      else if o == "-" then match b with
+      -- Only an `int` literal: `d - 2147483648` is `date - bigint`.
+      else if o == "-" && v.le .i32 then match b with
         | .int k => some (.dateAdd .day (.int (-k)) a, .date)
         | _ => none
       else none
@@ -1457,8 +1464,30 @@ def datePart? (e : Ast.Expr) : Option DPart :=
 /-- (C2c) The date of a date or timestamp value: itself, or `toDate`. -/
 def mkToDate : SExpr × STy → Option SExpr
   | (a, .date) => some a
+  -- PostgreSQL `(d + make_interval(...))::date` with `d` a date: the
+  -- timestamp at midnight moved by the interval, then its date, which is
+  -- the date moved (`mkToDate_dateAdd_eval`).
+  | (.dateAdd p n (.toTs a), .ts _) => some (.dateAdd p n a)
   | (a, .ts _) => some (.toDate a)
   | _ => none
+
+/-- (C2c) The fold of `mkToDate` means the same on a date (or NULL): the
+date at midnight moved by days, months or years, then its date, is the
+date moved. Which values a date variable can hold is the typing's
+business (`typed` puts `toTs` only on date-typed expressions). -/
+theorem mkToDate_dateAdd_eval {U : Type} (σ ρ : Core.Store U) (p : DPart) (n a : SExpr)
+    (ha : a.eval σ ρ = .ok .null ∨ ∃ d, a.eval σ ρ = .ok (.date d)) :
+    (SExpr.toDate (.dateAdd p n (.toTs a))).eval σ ρ = (SExpr.dateAdd p n a).eval σ ρ := by
+  simp only [SExpr.eval]
+  rcases ha with ha | ⟨d, ha⟩
+  · rw [ha]; cases n.eval σ ρ with
+    | err k => rfl
+    | ok v => cases v <;> rfl
+  · rw [ha]; cases hn : n.eval σ ρ with
+    | err k => rfl
+    | ok v =>
+      cases v <;> simp [Core.bind2, Core.dateAddVal, Core.dayVal, Core.typeErr,
+        Core.Calendar.dayOf_addToTs]
 
 /-- (C2c) The one part a PostgreSQL `make_interval(...)` call sets, with
 its number, as the parser hands the call over: seven positional
@@ -1481,6 +1510,19 @@ def dateAddTy (p : DPart) : SExpr × STy → SExpr × STy → Option (SExpr × S
   | (n, .int w), (dt, .date) => if w.le .i32 then some (.dateAdd p n dt, .date) else none
   | (n, .int w), (dt, .ts q) => if w.le .i32 then some (.dateAdd p n dt, .ts q) else none
   | _, _ => none
+
+/-- (C2c) PostgreSQL `dt + make_interval(...)`: on a timestamp, a
+timestamp; on a date, also a timestamp (`date + interval →
+timestamp`, PostgreSQL 9.9, Table 9.33; probed: `pg_typeof(date
+'2024-01-31' + make_interval(months => 1))` is `timestamp without time
+zone`), the date at midnight moved, of six fractional digits. Only an
+explicit `::date` or `CAST(... AS date)` makes it a date again
+(`mkToDate`); `+ 1`, `- k` and `- date` on it are outside the slice
+(PostgreSQL: no `timestamp + integer`; `timestamp - date` is an
+`interval`). -/
+def pgIntervalAddTy (p : DPart) : SExpr × STy → SExpr × STy → Option (SExpr × STy)
+  | (n, .int w), (dt, .date) => if w.le .i32 then some (.dateAdd p n (.toTs dt), .ts 6) else none
+  | n, dt => dateAddTy p n dt
 
 /-- `cond c1 r1 (cond c2 r2 ... e)`. -/
 def caseBuild : List ((SExpr × STy) × (SExpr × STy)) → SExpr → Option SExpr
@@ -1543,7 +1585,7 @@ mutual
           | 0 => typed d env sc y
           | 1 => typed d env sc mo
           | _ => typed d env sc dd
-        guardC (dateAddTy p n' dt')
+        guardC (pgIntervalAddTy p n' dt')
       else do
         let a' ← typed d env sc dt
         let b' ← typed d env sc rhs
