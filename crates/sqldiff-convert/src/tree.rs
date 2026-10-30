@@ -653,9 +653,15 @@ fn convert_files(
             None => catalog(texts, a.from, &a.src, None),
         })
     });
+    // The temporary table names the whole tree's table variables claim, so
+    // no two routines that may be active in one session share one.
+    let claims = crate::table_vars::Claims::of(
+        inputs.iter().map(|i| (i.rel.as_str(), i.text.as_str())),
+        a.from,
+    );
     // Pass 1: rules only.
     let mut drafts = parallel(jobs, inputs, |i| {
-        crate::rewrite_in(&i.text, a.from, a.to, source.as_deref())
+        crate::rewrite_in_tree(&i.text, a.from, a.to, source.as_deref(), Some(&claims))
     });
     // Hand-written output replaces the rules' before anything is checked,
     // so it is checked like theirs and the target catalog has it.
