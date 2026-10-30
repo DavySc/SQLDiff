@@ -226,3 +226,120 @@ fn json_key_case_matters_between_tsql_versions() {
         r
     );
 }
+
+fn iso126(x: &str) -> String {
+    sqldiff_core::equiv::canon::pg_template(sqldiff_core::equiv::canon::ISO126_PG, x)
+}
+
+#[test]
+fn try_convert_style_126_reads_iso_text() {
+    // In a conversion check: datetime2(7) against timestamp under
+    // ASM-FRACTIONAL-SECONDS.
+    let _ci = sqldiff_core::equiv::compare::ci_collation_scope(true);
+    let jv = "CAST(Notes AS json) ->> 'DeliveredWhen'";
+    let r = equal(
+        &tsql("Delivered AS (TRY_CONVERT([datetime2](7),json_value([Notes],N'$.DeliveredWhen'),(126)))"),
+        &pg(&format!("Delivered timestamp GENERATED ALWAYS AS ({}) STORED", iso126(jv))),
+    );
+    for id in [
+        "ASM-ISO126-VALUES",
+        "ASM-JSON-PATH-VALUES",
+        "ASM-FRACTIONAL-SECONDS",
+    ] {
+        assert!(r.assumptions.iter().any(|x| x.id == id), "{id}");
+    }
+    // Of a string column.
+    equal(
+        &tsql("Delivered AS (TRY_CONVERT(datetime2, FullName, 126))"),
+        &pg(&format!(
+            "Delivered timestamp GENERATED ALWAYS AS ({}) STORED",
+            iso126("FullName")
+        )),
+    );
+}
+
+#[test]
+fn try_convert_near_misses() {
+    let _ci = sqldiff_core::equiv::compare::ci_collation_scope(true);
+    let t = tsql(
+        "Delivered AS (TRY_CONVERT([datetime2](7),json_value([Notes],N'$.DeliveredWhen'),(126)))",
+    );
+    let jv = "CAST(Notes AS json) ->> 'DeliveredWhen'";
+    let gen = |e: String| {
+        pg(&format!(
+            "Delivered timestamp GENERATED ALWAYS AS ({e}) STORED"
+        ))
+    };
+    for (from, to) in [
+        // A trailing '.' (what WWI writes) must stay NULL, as in SQL Server.
+        ("{1,7}", "{0,7}"),
+        // Year 0000 is out of range.
+        ("^(?!0000)", "^"),
+        // Without the date check 2013-02-30 would roll over to March.
+        ("date_part('day'", "date_part('month'"),
+        // The fraction in microseconds.
+        ("rpad(substr", "lpad(substr"),
+        ("'1 microsecond'", "'1 millisecond'"),
+        (
+            "(substr(__x__, 18, 2) AS double precision)",
+            "(substr(__x__, 18, 4) AS double precision)",
+        ),
+    ] {
+        let tpl = sqldiff_core::equiv::canon::ISO126_PG.replace(from, to);
+        assert_ne!(tpl, sqldiff_core::equiv::canon::ISO126_PG, "{from}");
+        not_equal(
+            &t,
+            &gen(sqldiff_core::equiv::canon::pg_template(&tpl, jv)),
+            "Delivered",
+        );
+    }
+    // Another key, and the plain cast PostgreSQL refuses in a generated column.
+    not_equal(
+        &t,
+        &gen(iso126("CAST(Notes AS json) ->> 'deliveredWhen'")),
+        "Delivered",
+    );
+    not_equal(&t, &gen(format!("CAST({jv} AS timestamp(6))")), "Delivered");
+    // Other styles and types.
+    for other in [
+        "TRY_CONVERT([datetime2](7),json_value([Notes],N'$.DeliveredWhen'),(127))",
+        "TRY_CONVERT([datetime2](3),json_value([Notes],N'$.DeliveredWhen'),(126))",
+        "TRY_CONVERT([datetime],json_value([Notes],N'$.DeliveredWhen'),(126))",
+    ] {
+        not_equal(
+            &tsql(&format!("Delivered AS ({other})")),
+            &gen(iso126(jv)),
+            "Delivered",
+        );
+    }
+}
+
+#[test]
+fn isjson_check_rejects_the_same_rows() {
+    let isjson =
+        sqldiff_core::equiv::canon::pg_template(sqldiff_core::equiv::canon::ISJSON_PG, "Notes");
+    let r = equal(
+        &tsql("CONSTRAINT CK_json CHECK ([Notes] IS NULL OR isjson([Notes])<>(0))"),
+        &pg(&format!(
+            "CONSTRAINT CK_json CHECK (Notes IS NULL OR {isjson}<>(0))"
+        )),
+    );
+    assert!(r.assumptions.iter().any(|x| x.id == "ASM-JSON-PATH-VALUES"));
+    // Only an object, or no NULL arm.
+    not_equal(
+        &tsql("CONSTRAINT CK_json CHECK (isjson([Notes])<>(0))"),
+        &pg(&format!(
+            "CONSTRAINT CK_json CHECK ({}<>(0))",
+            isjson.replace("('object', 'array')", "('object')")
+        )),
+        "CHECK",
+    );
+    not_equal(
+        &tsql("CONSTRAINT CK_json CHECK (isjson([Notes])=(1))"),
+        &pg(&format!(
+            "CONSTRAINT CK_json CHECK ({}=(1))",
+            isjson.replace("WHEN Notes IS NULL THEN NULL ", "")
+        )),
+        "CHECK",
+    );
+}

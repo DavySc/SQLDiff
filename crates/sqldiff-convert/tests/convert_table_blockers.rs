@@ -395,3 +395,69 @@ fn pg_computed_json_reads_the_key_with_json_operators() {
     );
     assert!(has(&c, "ASM-JSON-PATH-VALUES"));
 }
+
+#[test]
+fn pg_invoices_json_date_and_isjson_check() {
+    let src = "CREATE TABLE [Sales].[Invoices] (\n    [InvoiceID] INT NOT NULL,\n    [ReturnedDeliveryData] NVARCHAR (MAX) NULL,\n    [ConfirmedDeliveryTime] AS (TRY_CONVERT([datetime2](7),json_value([ReturnedDeliveryData],N'$.DeliveredWhen'),(126))),\n    [ConfirmedReceivedBy] AS (json_value([ReturnedDeliveryData],N'$.ReceivedBy')),\n    CONSTRAINT [PK_Sales_Invoices] PRIMARY KEY CLUSTERED ([InvoiceID] ASC),\n    CONSTRAINT [CK_Sales_Invoices_ReturnedDeliveryData_Must_Be_Valid_JSON] CHECK ([ReturnedDeliveryData] IS NULL OR isjson([ReturnedDeliveryData])<>(0))\n);\n";
+    let c = pg(src);
+    let iso = sqldiff_core::equiv::canon::pg_template(
+        sqldiff_core::equiv::canon::ISO126_PG,
+        "CAST(ReturnedDeliveryData AS json) ->> 'DeliveredWhen'",
+    );
+    assert!(
+        c.output.contains(&format!(
+            "    ConfirmedDeliveryTime timestamp GENERATED ALWAYS AS ({iso}) STORED,\n"
+        )),
+        "{}",
+        c.output
+    );
+    assert!(
+        c.output.contains("CHECK (ReturnedDeliveryData IS NULL OR CASE WHEN ReturnedDeliveryData IS NULL THEN NULL WHEN json_typeof(CAST(ReturnedDeliveryData AS json)) IN ('object', 'array') THEN 1 ELSE 0 END<>(0))"),
+        "{}",
+        c.output
+    );
+    assert_eq!(
+        c.units[0].checked,
+        Status::Converted,
+        "{:#?}",
+        c.units[0].notes
+    );
+    assert_eq!(
+        c.units[0].status,
+        Status::Assumptions,
+        "{:#?}",
+        c.units[0].notes
+    );
+    for id in [
+        "ASM-ISO126-VALUES",
+        "ASM-JSON-PATH-VALUES",
+        "ASM-FRACTIONAL-SECONDS",
+    ] {
+        assert!(has(&c, id), "{id}");
+    }
+}
+
+#[test]
+fn pg_try_convert_and_isjson_without_a_rule_stay_refused() {
+    for expr in [
+        "(TRY_CONVERT([datetime2](3),json_value([a],N'$.d'),(126)))",
+        "(TRY_CONVERT([datetime],json_value([a],N'$.d'),(126)))",
+        "(TRY_CONVERT([datetime2](7),json_value([a],N'$.d'),(127)))",
+        "(TRY_CONVERT([datetime2](7),json_query([a],N'$.d'),(126)))",
+        "(TRY_CONVERT([datetime2](7),[n],(126)))",
+        "(TRY_CONVERT([datetime2](7),upper([a]),(126)))",
+        "(isjson([a]))",
+    ] {
+        let src = format!("CREATE TABLE s.t (a NVARCHAR(10) NULL, n INT NULL, c AS {expr});\n");
+        let c = pg(&src);
+        assert_eq!(
+            c.units[0].status,
+            Status::NotConverted,
+            "{expr}\n{}",
+            c.output
+        );
+    }
+    // ISJSON outside a CHECK constraint keeps its refusal.
+    let c = pg("SELECT ISJSON(N'{}');\n");
+    assert_eq!(c.units[0].status, Status::NotConverted, "{}", c.output);
+}

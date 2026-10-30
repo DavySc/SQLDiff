@@ -1129,6 +1129,12 @@ proof = "engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.table.computed-iso126"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
 id = "tsql.table.computed-json"
 kind = "converter"
 proof = "engine"

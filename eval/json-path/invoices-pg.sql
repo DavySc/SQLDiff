@@ -1,0 +1,13 @@
+create schema if not exists sales;
+CREATE TABLE Sales.Invoices (
+    InvoiceID integer NOT NULL,
+    ReturnedDeliveryData text NULL,
+    ConfirmedDeliveryTime timestamp GENERATED ALWAYS AS (CASE WHEN regexp_like((CAST(ReturnedDeliveryData AS json) ->> 'DeliveredWhen'), '^(?!0000)[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\.[0-9]{1,7})?$') THEN CASE WHEN date_part('day', make_date(CAST(substr((CAST(ReturnedDeliveryData AS json) ->> 'DeliveredWhen'), 1, 4) AS integer), CAST(substr((CAST(ReturnedDeliveryData AS json) ->> 'DeliveredWhen'), 6, 2) AS integer), 1) + CAST(substr((CAST(ReturnedDeliveryData AS json) ->> 'DeliveredWhen'), 9, 2) AS integer) - 1) = CAST(substr((CAST(ReturnedDeliveryData AS json) ->> 'DeliveredWhen'), 9, 2) AS integer) THEN make_timestamp(CAST(substr((CAST(ReturnedDeliveryData AS json) ->> 'DeliveredWhen'), 1, 4) AS integer), CAST(substr((CAST(ReturnedDeliveryData AS json) ->> 'DeliveredWhen'), 6, 2) AS integer), CAST(substr((CAST(ReturnedDeliveryData AS json) ->> 'DeliveredWhen'), 9, 2) AS integer), CAST(substr((CAST(ReturnedDeliveryData AS json) ->> 'DeliveredWhen'), 12, 2) AS integer), CAST(substr((CAST(ReturnedDeliveryData AS json) ->> 'DeliveredWhen'), 15, 2) AS integer), CAST(substr((CAST(ReturnedDeliveryData AS json) ->> 'DeliveredWhen'), 18, 2) AS double precision)) + CAST(rpad(substr((CAST(ReturnedDeliveryData AS json) ->> 'DeliveredWhen'), 21, 6), 6, '0') AS integer) * interval '1 microsecond' END END) STORED,
+    ConfirmedReceivedBy varchar(4000) GENERATED ALWAYS AS (CASE WHEN json_typeof(CAST(ReturnedDeliveryData AS json) -> 'ReceivedBy') NOT IN ('object', 'array') THEN CAST(ReturnedDeliveryData AS json) ->> 'ReceivedBy' END) STORED,
+    CONSTRAINT PK_Sales_Invoices PRIMARY KEY (InvoiceID),
+    CONSTRAINT CK_Sales_Invoices_ReturnedDeliveryData_Must_Be_Valid_JSON CHECK (ReturnedDeliveryData IS NULL OR CASE WHEN ReturnedDeliveryData IS NULL THEN NULL WHEN json_typeof(CAST(ReturnedDeliveryData AS json)) IN ('object', 'array') THEN 1 ELSE 0 END<>(0))
+);
+insert into sales.invoices (InvoiceID, ReturnedDeliveryData) values (1, '{"Events":[],"DeliveredWhen":"2013-01-01T12:34:56.","ReceivedBy":"Aakriti Byrraju"}'), (2, '{"DeliveredWhen":"2013-01-01T12:34:56","ReceivedBy":{"a":1}}'), (3, NULL), (4, '{"DeliveredWhen":"2016-02-29T23:59:59.123456"}'), (5, '{"DeliveredWhen":"2013-02-30T00:00:00"}'), (6, '{"DeliveredWhen":{"x":"2013-01-01T00:00:00"}}');
+select InvoiceID || '|' || coalesce(to_char(ConfirmedDeliveryTime, 'YYYY-MM-DD HH24:MI:SS.US'),'NULL') || '|' || coalesce(ConfirmedReceivedBy,'NULL') from sales.invoices order by 1;
+insert into sales.invoices (InvoiceID, ReturnedDeliveryData) values (7, '5');
+drop schema sales cascade;
