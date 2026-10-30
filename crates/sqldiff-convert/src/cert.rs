@@ -1094,7 +1094,12 @@ fn request_with(
         }
         let (to, dbo) = target_routine(w);
         let Some(t) = tables.get(&to) else { continue };
-        if trusted.binary_collation && tables.declared(&to) != Some(w.as_slice()) {
+        // Spelt exactly as the DDL declares it, whatever the collation the
+        // deployment states: in a case-sensitive SQL Server database
+        // `dbo.ORD` does not reach `dbo.Ord` (208, Invalid object name),
+        // while PostgreSQL folds both to `ord`. A table named any other way
+        // is not sent, so the checker refuses what reads or writes it.
+        if tables.declared(&to) != Some(w.as_slice()) {
             continue;
         }
         if dbo && !assumptions.iter().any(|x| x == "ASM-DBO-SCHEMA") {
@@ -1740,6 +1745,37 @@ END
         assert!(asm.iter().any(|x| x == TABLES_AS_DECLARED), "{asm:?}");
         // Reads send no rows-affected count.
         assert!(!asm.iter().any(|x| x == "ASM-OBSERVER-ROWCOUNT"), "{asm:?}");
+        // A table named in another case than its DDL, or without the schema
+        // its DDL gives, is not sent, whatever the collation the deployment
+        // states: a case-sensitive SQL Server database raises 208 for
+        // `dbo.ORD` where PostgreSQL folds it to `ord` (review of C3d).
+        for (spelt, binary) in [
+            ("dbo.ORD", false),
+            ("dbo.ord", false),
+            ("ORD", false),
+            ("Ord", false),
+            ("DBO.Ord", false),
+            ("dbo.ORD", true),
+        ] {
+            let p = format!(
+                "CREATE PROCEDURE dbo.p @id int, @q int OUTPUT AS\nBEGIN\n  \
+                 SELECT @q = c.Score FROM {spelt} AS o JOIN dbo.Cust c ON c.Id = o.CustId \
+                 WHERE o.Id = @id;\nEND\n"
+            );
+            let a = routines(&p, Dialect::Tsql).remove(0).2.unwrap();
+            let b = routines(&convert(&p), Dialect::Postgres)
+                .remove(0)
+                .2
+                .unwrap();
+            let trusted = Trusted {
+                tables: t.clone(),
+                binary_collation: binary,
+                ..Default::default()
+            };
+            let (r, _) = mirror_request(&a, &b, &[], &trusted).unwrap();
+            let names: Vec<&str> = r.table_catalog.iter().map(|t| t.name.as_str()).collect();
+            assert_eq!(names, ["cust"], "{spelt}: {r:?}");
+        }
     }
 
     #[test]

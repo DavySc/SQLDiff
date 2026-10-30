@@ -676,6 +676,24 @@ fn the_real_checker_confirms_a_join_read_by_key() {
         .map(|a| a.as_str().unwrap())
         .collect();
     assert_eq!(why, ["stmt:select:many-rows"], "{r}");
+    // The table named in another case than its DDL: a case-sensitive SQL
+    // Server database raises 208 where PostgreSQL folds the name, so the
+    // table is not sent and the read is refused (review of C3d).
+    write(
+        &src,
+        "look.sql",
+        &look("c.Id = o.CustId").replace("FROM dbo.Ord AS o JOIN", "FROM dbo.ORD AS o JOIN"),
+    );
+    let r = run();
+    assert_eq!(r["answer"], "unconfirmed", "{r}");
+    assert!(
+        r["why"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "stmt:select:table:unknown"),
+        "{r}"
+    );
 }
 
 /// C3c end to end: a procedure over a table with a `varchar` and an
