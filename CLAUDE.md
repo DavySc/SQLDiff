@@ -36,6 +36,10 @@ coordinate through GitHub, which every session can read:
   you will.
 - **Do not start an item or change an area another open PR claims.** If you
   must, comment on that PR first and wait for an answer.
+- **A claim ends when its PR merges or closes.** After that the area is free:
+  change it without asking, but merge `main` first and build on the merged
+  work (its tests, behaviour and doc comments), not on the code as it was
+  before.
 - **When done**, mark the PR ready for review and drop `[claim]` from the
   title. If you give the item up, close the draft with a line saying so.
 - Fixes that span claims (a false "equal" found in someone else's area) go
