@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 181 | 35 (19%) | 6 (3%) | 140 (77%) |
+| `converter` | 182 | 35 (19%) | 6 (3%) | 141 (77%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 210 | 38 (18%) | 8 (4%) | 164 (78%) |
+| **All** | 211 | 38 (18%) | 8 (4%) | 165 (78%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
