@@ -164,17 +164,66 @@ fn creation_in_a_loop_is_not_proven() {
 
 #[test]
 fn a_rollback_is_not_proven_on_postgresql() {
+    // The PostgreSQL side's ROLLBACK empties the temporary table, where
+    // T-SQL keeps the table variable's rows.
     let a = TSQL.replace(
         "  DELETE FROM @Errors WHERE Severity < 10;\n",
         "  DELETE FROM @Errors WHERE Severity < 10;\n  BEGIN TRAN;\n  ROLLBACK;\n",
     );
-    let r = run(&a, &pg(CREATE), P);
+    let b = pg(CREATE).replace(
+        "  DELETE FROM pg_temp.tv_p_errors WHERE Severity < 10;\n",
+        "  DELETE FROM pg_temp.tv_p_errors WHERE Severity < 10;\n  ROLLBACK;\n",
+    );
+    let r = run(&a, &b, P);
     assert!(
         r.unknown_reasons.iter().any(|x| x.contains("rolls back")),
         "{}",
         reasons(&r)
     );
     assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
+    // A T-SQL ROLLBACK with none on the PostgreSQL side (the converter
+    // refuses one inside TRY or CATCH) leaves the table alone; the missing
+    // ROLLBACK is still not equal.
+    let r = run(&a, &pg(CREATE), P);
+    assert!(
+        !r.unknown_reasons
+            .iter()
+            .any(|x| x.contains("table variable") && x.contains("rolls back")),
+        "{}",
+        reasons(&r)
+    );
+    assert_ne!(
+        r.verdict(),
+        Verdict::EqualUnderAssumptions,
+        "{}",
+        reasons(&r)
+    );
+    assert_ne!(r.verdict(), Verdict::Equal, "{}", reasons(&r));
+}
+
+#[test]
+fn every_table_variable_of_a_routine_pairs_with_its_own_drop() {
+    // Ola's DatabaseBackup declares fifteen: the converter writes each DROP
+    // and CREATE where its DECLARE stands, so they sit at one place.
+    let a = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  SET XACT_ABORT ON;\n  DECLARE @A TABLE (ID int, Done bit DEFAULT 0);\n  DECLARE @B TABLE (ID int, Name nvarchar(10) DEFAULT N'x');\n  INSERT INTO @A (ID) VALUES (1);\n  INSERT INTO @B (ID) VALUES (2);\nEND\n";
+    let b = |second_drop: &str| {
+        format!("CREATE OR REPLACE PROCEDURE p()\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  DROP TABLE IF EXISTS pg_temp.tv_p_a;\n  CREATE TEMP TABLE pg_temp.tv_p_a (\n    ID integer,\n    Done boolean DEFAULT FALSE\n  );\n  DROP TABLE IF EXISTS pg_temp.{second_drop};\n  CREATE TEMP TABLE pg_temp.tv_p_b (\n    ID integer,\n    Name varchar(10) DEFAULT 'x'\n  );\n  INSERT INTO pg_temp.tv_p_a (ID) VALUES (1);\n  INSERT INTO pg_temp.tv_p_b (ID) VALUES (2);\nEND;\n$$;\n")
+    };
+    let r = run(a, &b("tv_p_b"), P);
+    assert_eq!(
+        r.verdict(),
+        Verdict::EqualUnderAssumptions,
+        "{}",
+        reasons(&r)
+    );
+    assert!(r.unknown_reasons.is_empty(), "{}", reasons(&r));
+    // Without its own drop the second table is not proven.
+    let r = run(a, &b("tv_p_other"), P);
+    assert!(
+        r.unknown_reasons.iter().any(|x| x.contains("@B")),
+        "{}",
+        reasons(&r)
+    );
 }
 
 #[test]

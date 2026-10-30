@@ -15,7 +15,7 @@ use sqldiff_syntax::{Dialect, SyntaxElement, SyntaxKind, SyntaxNode};
 use SyntaxKind::*;
 
 use sqldiff_core::catalog::ParamMode;
-use sqldiff_core::classify::{rollback_rethrow, rolls_back};
+use sqldiff_core::classify::{pg_rolls_back, rollback_rethrow};
 
 use crate::out::Out;
 use crate::tok::{
@@ -471,7 +471,7 @@ impl<'a> Cx<'a> {
     fn do_block(&mut self, out: &mut Out, b: &SyntaxNode) {
         self.mode = Mode::Do;
         self.reset();
-        self.rolls_back = rolls_back(b);
+        self.rolls_back = pg_rolls_back(b);
         self.dynamic = dynamic_sql_vars(&tokens(b));
         self.drop_known_dynamic(b);
         if !self.db2() {
@@ -616,7 +616,7 @@ impl<'a> Cx<'a> {
         self.reset();
         self.routine = sqldiff_syntax::ast::routine_name(r);
         self.routine_parts = sqldiff_syntax::ast::routine_name_parts(r);
-        self.rolls_back = rolls_back(r);
+        self.rolls_back = pg_rolls_back(r);
         self.ret_bit = false;
         self.return_code = false;
         self.txn_control = false;
@@ -9313,6 +9313,7 @@ fn scope_of(ts: &[T]) -> Option<Scope> {
     }
     let s = sig(ts);
     let mut entries = Vec::new();
+    let mut nested = Vec::new();
     let mut updates = Vec::new();
     let mut k = 0;
     while k < s.len() {
@@ -9364,6 +9365,11 @@ fn scope_of(ts: &[T]) -> Option<Scope> {
                 // skip to its end.
                 if let Some(&j) = s.get(k).filter(|&&j| ts[j].k == L_PAREN) {
                     let end = matching(ts, j).unwrap_or(ts.len() - 1);
+                    // A derived table's own tables type the columns its
+                    // query names (`d.Selected = 1` inside it).
+                    if let Some(inner) = scope_of(&ts[j + 1..end]) {
+                        nested.extend(inner.entries);
+                    }
                     k = s.partition_point(|&x| x <= end);
                 } else if let Some(&j) = s.get(k).filter(|&&j| ts[j].k == VARIABLE) {
                     // A table variable: its columns are typed when this
@@ -9403,6 +9409,7 @@ fn scope_of(ts: &[T]) -> Option<Scope> {
             entries.remove(u);
         }
     }
+    entries.extend(nested);
     Some(Scope { entries })
 }
 
