@@ -969,9 +969,9 @@ sites = ["sqldiff-convert/src/refused.rs"]
 
 [[assumption]]
 id = "ASM-TABLE-VARIABLE"
-statement = "A table variable converted to a session- or job-scoped temporary table is not read after the batch that filled it, its routine is not re-entered while the table is in use, and on PostgreSQL no transaction is rolled back while it holds rows."
+statement = "A table variable converted to a session- or job-scoped temporary table is not read after the batch that filled it, its routine is not re-entered while the table is in use, no routine outside the converted tree that can be active in the same session declares a table variable whose converted name (`tv__<schema>__<routine>__<variable>`) is the same, and on PostgreSQL no transaction is rolled back while it holds rows."
 discharge = "deployment"
-fact = "How the job or session runs the code, and what the routines it calls do."
+fact = "How the job or session runs the code, what the routines it calls do, and which routines outside the tree share its sessions."
 sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/mod.rs"]
 
 [[assumption]]

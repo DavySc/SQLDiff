@@ -27,6 +27,7 @@ mod out;
 pub mod queue;
 mod refused;
 pub mod review;
+mod table_vars;
 mod template;
 mod tok;
 pub mod tree;
@@ -323,10 +324,36 @@ pub fn rewrite_in(
     to: Dialect,
     source: Option<&sqldiff_core::catalog::Catalog>,
 ) -> Draft {
+    rewrite_in_tree(text, from, to, source, None)
+}
+
+/// [`rewrite_in`] with the temporary table names the whole tree's table
+/// variables claim (`table_vars::Claims`), so a table variable of this
+/// text that would take another routine's name is refused. Without
+/// `claims`, the text's own routines are checked against each other.
+pub(crate) fn rewrite_in_tree(
+    text: &str,
+    from: Dialect,
+    to: Dialect,
+    source: Option<&sqldiff_core::catalog::Catalog>,
+    claims: Option<&table_vars::Claims>,
+) -> Draft {
     let root = parse(text, from).syntax();
+    let own;
+    let claims = match claims {
+        Some(c) => c,
+        None => {
+            let mut c = table_vars::Claims::default();
+            if from == Dialect::Tsql {
+                c.add_root(&root, "");
+            }
+            own = c;
+            &own
+        }
+    };
     let raw = guarded(&root, text, || match (from, to) {
         (Dialect::Tsql, Dialect::Postgres | Dialect::Db2i) => {
-            tsql::convert(&root, text, to, source)
+            tsql::convert(&root, text, to, source, claims)
         }
         _ => no_rules(&root, text, from, to),
     });

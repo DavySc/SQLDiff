@@ -261,7 +261,7 @@ fn temp_tables_and_table_variables_are_global_temporary_tables() {
     // V16: only NOT LOGGED ON ROLLBACK PRESERVE ROWS keeps a table variable's rows.
     // The name carries the routine's, so a called routine's @seen is another table.
     assert!(
-        o.contains("DECLARE GLOBAL TEMPORARY TABLE SESSION.tv_p_seen ("),
+        o.contains("DECLARE GLOBAL TEMPORARY TABLE SESSION.tv__p__seen ("),
         "{o}"
     );
     assert!(o.contains("id INTEGER NOT NULL PRIMARY KEY"), "{o}");
@@ -270,7 +270,7 @@ fn temp_tables_and_table_variables_are_global_temporary_tables() {
         "{o}"
     );
     assert!(
-        o.contains("INSERT INTO SESSION.work (id) SELECT id FROM SESSION.tv_p_seen;"),
+        o.contains("INSERT INTO SESSION.work (id) SELECT id FROM SESSION.tv__p__seen;"),
         "{o}"
     );
     assert!(o.contains("DROP TABLE SESSION.work;"), "{o}");

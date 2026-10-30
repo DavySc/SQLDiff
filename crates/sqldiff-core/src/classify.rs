@@ -441,35 +441,85 @@ pub fn is_temp_target(parts: &[String]) -> bool {
 /// (PostgreSQL `pg_temp.<name>`, Db2 for i `SESSION.<name>`). The converter
 /// writes it and the engine expects it, so the two pair up.
 ///
-/// `tv_<routine>_<variable>` inside a routine, `tv__<variable>` in a script.
-/// The routine part (letters and digits of the routine's own name) keeps a
-/// called routine from replacing its caller's table: both live in the one
-/// session-wide temporary schema. Names over 63 bytes (PostgreSQL's limit)
-/// are cut and end in a hash of the whole name.
+/// Every routine that can be active in one session (a routine and its
+/// callers, transitively) creates its tables in the one session-wide
+/// temporary schema, and the conversion drops and creates a table where the
+/// DECLARE stands. So the name must be injective over (routine, variable):
+/// a called routine's DROP TABLE IF EXISTS must never hit its caller's
+/// table, whatever the two are called.
+///
+/// `tv__<part>__…__<part>__<variable>`: the routine's name parts as its
+/// header writes them (schema and name, unquoted; `dbo.ab` and `dbo.a_b`,
+/// `app.p` and `dbo.p` are different routines) and the variable, lower-cased
+/// and joined with `__`. That is the name when every part is *tidy* (only
+/// `a-z`, `0-9` and `_`, with no leading, trailing or doubled underscore)
+/// and it fits PostgreSQL's 63 bytes. A tidy part holds no `__`, so the
+/// `__` runs of the name are exactly its separators and the name reads back
+/// to its parts: two different keys give two different names. A script's
+/// `tv__<variable>` has one part, a routine's at least two.
+///
+/// Otherwise the parts are sanitised (every other character becomes `_`),
+/// the name is cut to 52 bytes, and `___` and the 32-bit FNV-1a hash of the
+/// key `<parts joined by '.'>@<variable>` (lower case) follow as eight hex
+/// digits. A tidy name never holds three underscores in a row, so the two
+/// forms cannot meet, and two keys with different hashes get different
+/// names whatever was cut. The hash is stable across builds and platforms
+/// and ASCII, so the name is the same wherever it is computed. Two keys
+/// with the same hash and the same sanitised text would collide: the
+/// converter refuses the later of two such routines in a tree.
 pub fn table_variable_table(routine: Option<&str>, variable: &str) -> String {
-    let v = snake_case(variable.trim_start_matches('@'));
-    let r = routine.map_or(String::new(), |r| {
-        let last = r.rsplit('.').next().unwrap_or(r);
-        let key: String = last
-            .chars()
-            .filter(char::is_ascii_alphanumeric)
-            .map(|c| c.to_ascii_lowercase())
-            .collect();
-        if key.is_empty() {
-            format!("{:08x}", fnv1a(r))
-        } else {
-            key
-        }
-    });
-    let name = format!("tv_{r}_{v}");
-    if name.len() <= 63 {
-        return name;
+    let mut parts: Vec<String> = routine.map(name_parts).unwrap_or_default();
+    parts.push(variable.trim_start_matches('@').to_lowercase());
+    let ok = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_';
+    let tidy = |p: &str| {
+        !p.is_empty()
+            && !p.starts_with('_')
+            && !p.ends_with('_')
+            && !p.contains("__")
+            && p.bytes().all(ok)
+    };
+    let plain = format!("tv__{}", parts.join("__"));
+    if parts.iter().all(|p| tidy(p)) && plain.len() <= 63 {
+        return plain;
     }
-    let cut = (0..=54)
-        .rev()
-        .find(|&i| name.is_char_boundary(i))
-        .unwrap_or(0);
-    format!("{}_{:08x}", &name[..cut], fnv1a(&name))
+    let (var, routine) = parts.split_last().expect("the variable is a part");
+    let key = format!("{}@{var}", routine.join("."));
+    let sanitised: Vec<String> = parts
+        .iter()
+        .map(|p| {
+            p.bytes()
+                .map(|b| if ok(b) { b as char } else { '_' })
+                .collect()
+        })
+        .collect();
+    let readable = format!("tv__{}", sanitised.join("__"));
+    // All ASCII now, so any cut is a character boundary.
+    let cut = readable.len().min(52);
+    format!("{}___{:08x}", &readable[..cut], fnv1a(&key))
+}
+
+/// A routine name's parts, lower-cased and unquoted: `[dbo].[Command_Execute]`
+/// gives `dbo`, `command_execute`. Dots inside brackets or double quotes do
+/// not split.
+fn name_parts(routine: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for c in routine.chars() {
+        match (quote, c) {
+            (None, '[') => quote = Some(']'),
+            (None, '"') => quote = Some('"'),
+            (Some(q), c) if c == q => quote = None,
+            (None, '.') => parts.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    parts.push(cur);
+    parts
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_lowercase())
+        .collect()
 }
 
 /// Lower-case names of the temporary tables `root` names as `pg_temp.x` or
@@ -531,23 +581,6 @@ pub fn rollback_rethrow(catch: &SyntaxNode) -> bool {
         w.as_slice(),
         ["IF", "@@TRANCOUNT", ">", "0", "ROLLBACK", "THROW"] | ["ROLLBACK", "THROW"]
     )
-}
-
-/// `CamelCase` → `camel_case`, as the converter names variables.
-fn snake_case(name: &str) -> String {
-    let mut out = String::new();
-    let cs: Vec<char> = name.chars().collect();
-    for (i, &c) in cs.iter().enumerate() {
-        if c.is_uppercase() && i > 0 {
-            let prev = cs[i - 1];
-            let next_lower = cs.get(i + 1).is_some_and(|n| n.is_lowercase());
-            if prev.is_lowercase() || prev.is_ascii_digit() || (prev.is_uppercase() && next_lower) {
-                out.push('_');
-            }
-        }
-        out.extend(c.to_lowercase());
-    }
-    out
 }
 
 /// 32-bit FNV-1a: stable across builds and platforms, unlike `DefaultHasher`.
