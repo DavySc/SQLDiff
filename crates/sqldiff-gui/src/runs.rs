@@ -790,7 +790,7 @@ impl Run {
                 Ok(g) => GateView {
                     complete: g.complete,
                     counts: g.counts,
-                    blockers: g.blockers.len(),
+                    blockers: g.blockers_total,
                     accepted: g.accepted,
                     error: None,
                 },
