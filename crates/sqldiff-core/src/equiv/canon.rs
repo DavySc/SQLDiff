@@ -2416,7 +2416,15 @@ impl<'a> Canon<'a> {
             ));
         }
         let mut args = Vec::new();
-        for x in &c.args {
+        for (k, x) in c.args.iter().enumerate() {
+            // A date part is a word, never a column, even where the FROM
+            // table has a column named `minute`.
+            if let (0, Dialect::Tsql, Expr::Name(p)) = (k, d, x) {
+                if p.len() == 1 && DATEPART_FNS.contains(&name.as_str()) {
+                    args.push((n("dpart", vec![a(lc(&p[0]))]), None));
+                    continue;
+                }
+            }
             args.push(self.expr(x)?);
         }
         // SQL Server refuses text and ntext in most built-ins (Msg 8116,
@@ -2798,8 +2806,8 @@ impl<'a> Canon<'a> {
             }
             (Dialect::Tsql, "datediff", 3) => {
                 let part = args[0].0.clone();
-                let unit = part.kid(1).and_then(Term::atom).unwrap_or("");
-                if part.is("col") && matches!(unit, "day" | "dd" | "d") {
+                let unit = part.kid(0).and_then(Term::atom).unwrap_or("");
+                if part.is("dpart") && matches!(unit, "day" | "dd" | "d") {
                     (
                         n("daydiff", vec![args[1].0.clone(), args[2].0.clone()]),
                         Some(Ty {
@@ -2931,7 +2939,14 @@ impl<'a> Canon<'a> {
         let dty = dty?;
         let ok = match dty.fam {
             Fam::Date => matches!(field, "years" | "months" | "weeks" | "days"),
-            Fam::Timestamp => dty.scale.is_none(),
+            // Whole units keep datetime on its 1/300 s ticks and
+            // smalldatetime on whole minutes, except seconds, which
+            // smalldatetime rounds to the minute (SQL Server 2022, PG 18).
+            Fam::Timestamp => match dty.scale {
+                None | Some(300) => true,
+                Some(60) => field != "secs",
+                Some(_) => false,
+            },
             _ => false,
         };
         if !ok {
@@ -7602,6 +7617,17 @@ fn is_zero_literal(e: &Expr) -> bool {
 
 /// The make_interval field a T-SQL DATEADD datepart adds; the parts whose
 /// amounts round (milliseconds and smaller) and quarters have none.
+/// T-SQL functions whose first argument is a date part keyword.
+const DATEPART_FNS: [&str; 7] = [
+    "dateadd",
+    "datediff",
+    "datediff_big",
+    "datepart",
+    "datename",
+    "datetrunc",
+    "date_bucket",
+];
+
 fn dateadd_field(e: &Expr) -> Option<&'static str> {
     let Expr::Name(p) = e else {
         return None;
