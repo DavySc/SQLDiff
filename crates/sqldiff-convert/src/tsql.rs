@@ -2499,8 +2499,21 @@ impl<'a> Cx<'a> {
                 }
             }
         }
-        if self.wrapper.is_none() && commit_units(body) > 1 {
-            return Err("it writes in several statements, which T-SQL commits one by one, and a function RETURNS TABLE cannot commit".into());
+        // The function runs in its caller's statement, so an error undoes
+        // all of it and returns no rows (`equiv::result_set_atomic`): before
+        // the result set nothing T-SQL commits on its own, unless the one
+        // wrapping transaction spans it; after it nothing that can fail.
+        let (start, end) = (n.text_range().start(), n.text_range().end());
+        for d in body
+            .descendants()
+            .filter(|d| d.kind() == STATEMENT && d != n)
+        {
+            if d.text_range().end() <= start && self.wrapper.is_none() && !quiet(&d) {
+                return Err("it writes before the statement that returns the rows, which T-SQL commits on its own, so the write stays when that statement fails, while a function RETURNS TABLE undoes it with the error".into());
+            }
+            if d.text_range().start() >= end && !matches!(first_word(&d).as_str(), "RETURN" | "COMMIT") {
+                return Err("it runs statements after the one that returns the rows, and one that fails there does so after T-SQL sent the rows, while a function RETURNS TABLE then returns none".into());
+            }
         }
         let ts = tokens(n);
         let outer = std::mem::replace(&mut self.scope, scope_of(&ts));
@@ -7901,27 +7914,16 @@ fn primary_key_columns(items: &[T]) -> Vec<String> {
     out
 }
 
-/// How many statements of a T-SQL body may write (a table, a temporary
-/// table, a call, DDL), a loop's counting twice: each commits on its own
-/// outside an explicit transaction.
-fn commit_units(body: &SyntaxNode) -> usize {
-    body.descendants()
-        .filter(|n| n.kind() == STATEMENT)
-        .map(|n| {
-            let ts = tokens(&n);
-            let s = sig(&ts);
-            let quiet = match s.first().map(|&i| ts[i].up()).as_deref() {
-                Some("DECLARE" | "SET" | "PRINT" | "THROW" | "RETURN" | "BEGIN" | "COMMIT") => true,
-                Some("SELECT") => find_word(&ts, 0, "INTO").is_none(),
-                _ => false,
-            };
-            match (quiet, n.ancestors().any(|a| a.kind() == LOOP_STMT)) {
-                (true, _) => 0,
-                (false, false) => 1,
-                (false, true) => 2,
-            }
-        })
-        .sum()
+/// A statement that commits nothing on its own: declarations, settings,
+/// messages, RETURN, transaction statements and a SELECT that stores nothing.
+fn quiet(n: &SyntaxNode) -> bool {
+    let ts = tokens(n);
+    let s = sig(&ts);
+    match s.first().map(|&i| ts[i].up()).as_deref() {
+        Some("DECLARE" | "SET" | "PRINT" | "THROW" | "RETURN" | "BEGIN" | "COMMIT") => true,
+        Some("SELECT") => find_word(&ts, 0, "INTO").is_none(),
+        _ => false,
+    }
 }
 
 /// Whether the rows of a T-SQL procedure's statement reach the caller: a

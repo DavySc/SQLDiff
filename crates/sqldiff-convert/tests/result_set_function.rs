@@ -153,7 +153,19 @@ fn other_result_sets_stay_refused_with_the_reason() {
         ("SELECT ItemID + 1 FROM dbo.Item;", "result column 1 has no name"),
         (
             "UPDATE dbo.Item SET Qty = 0 WHERE ItemID = @ItemID;\n    DELETE FROM dbo.Item WHERE Qty IS NULL;\n    SELECT ItemID FROM dbo.Item;",
-            "writes in several statements",
+            "writes before the statement that returns the rows",
+        ),
+        (
+            "SET XACT_ABORT ON;\n    UPDATE dbo.Item SET Qty = 0 WHERE ItemID = @ItemID;\n    SELECT ItemID FROM dbo.Item WHERE ItemID = 1 / @ItemID;",
+            "writes before the statement that returns the rows",
+        ),
+        (
+            "SET XACT_ABORT ON;\n    BEGIN TRAN;\n    UPDATE dbo.Item SET Qty = 0 WHERE ItemID = @ItemID;\n    COMMIT;\n    SELECT ItemID FROM dbo.Item;",
+            "writes before the statement that returns the rows",
+        ),
+        (
+            "SELECT ItemID FROM dbo.Item;\n    UPDATE dbo.Item SET Qty = 0 WHERE ItemID = @ItemID;",
+            "runs statements after the one that returns the rows",
         ),
         (
             "SELECT ItemID FROM dbo.Item UNION ALL SELECT ItemID FROM dbo.Item;",
@@ -186,4 +198,20 @@ fn other_result_sets_stay_refused_with_the_reason() {
         "{}",
         c.output
     );
+}
+
+/// One transaction around the writes and the result set, under
+/// SET XACT_ABORT ON, fails as a whole, as the function does.
+#[test]
+fn a_transaction_spanning_the_result_set_converts() {
+    let c = convert(&proc(
+        "SET XACT_ABORT ON;\n    BEGIN TRAN;\n    UPDATE dbo.Item SET Qty = 0 WHERE ItemID = @ItemID;\n    SELECT ItemID FROM dbo.Item WHERE ItemID = @ItemID;\n    COMMIT;",
+    ));
+    assert!(
+        c.output.contains("RETURNS TABLE (ItemID integer)")
+            && c.output.contains("RETURN QUERY SELECT"),
+        "{}",
+        c.output
+    );
+    under_assumptions(&c);
 }

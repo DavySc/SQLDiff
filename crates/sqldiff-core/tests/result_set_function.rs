@@ -271,3 +271,60 @@ fn return_query_is_compared_only_in_a_plpgsql_table_function() {
         "SELECT without INTO",
     );
 }
+
+/// T-SQL autocommits each statement outside an explicit transaction, so a
+/// write before a failing statement stays; the PostgreSQL function runs in
+/// the caller's one statement, and the error undoes the write.
+#[test]
+fn autocommitted_writes_before_a_failure_differ() {
+    not_equal(
+        &ts("UPDATE dbo.item SET qty = 0 WHERE item_id = @id;\n  SELECT i.name FROM dbo.item i WHERE i.item_id = 1 / (@id - 1);"),
+        &pg(
+            "name varchar(100)",
+            "UPDATE item SET qty = 0 WHERE item_id = p_id;\n  RETURN QUERY SELECT CAST(i.name AS varchar(100)) FROM item i WHERE i.item_id = 1 / (p_id - 1);",
+        ),
+        "write then failing result set",
+    );
+    not_equal(
+        &ts("UPDATE dbo.item SET qty = 0 WHERE item_id = @id;\n  UPDATE dbo.item SET qty = 1 / (@id - 1) WHERE item_id = @id;\n  SELECT i.name FROM dbo.item i WHERE i.item_id = @id;"),
+        &pg(
+            "name varchar(100)",
+            "UPDATE item SET qty = 0 WHERE item_id = p_id;\n  UPDATE item SET qty = 1 / (p_id - 1) WHERE item_id = p_id;\n  RETURN QUERY SELECT CAST(i.name AS varchar(100)) FROM item i WHERE i.item_id = p_id;",
+        ),
+        "write then failing write",
+    );
+}
+
+/// One BEGIN TRAN … COMMIT around every write and the result set, under
+/// XACT_ABORT ON, is as atomic as the function; a result set after the
+/// COMMIT can still fail with the writes committed.
+#[test]
+fn one_wrapped_transaction_stays_equal() {
+    equal(
+        &ts("BEGIN TRAN;\n  UPDATE dbo.item SET qty = 0 WHERE item_id = @id;\n  UPDATE dbo.item SET qty = 1 / (@id - 1) WHERE item_id = @id;\n  SELECT i.name FROM dbo.item i WHERE i.item_id = @id;\n  COMMIT;"),
+        &pg(
+            "name varchar(100)",
+            "UPDATE item SET qty = 0 WHERE item_id = p_id;\n  UPDATE item SET qty = 1 / (p_id - 1) WHERE item_id = p_id;\n  RETURN QUERY SELECT CAST(i.name AS varchar(100)) FROM item i WHERE i.item_id = p_id;",
+        ),
+    );
+}
+
+#[test]
+fn result_set_after_the_commit_or_before_more_work_differs() {
+    not_equal(
+        &ts("BEGIN TRAN;\n  UPDATE dbo.item SET qty = 0 WHERE item_id = @id;\n  COMMIT;\n  SELECT i.name FROM dbo.item i WHERE i.item_id = 1 / (@id - 1);"),
+        &pg(
+            "name varchar(100)",
+            "UPDATE item SET qty = 0 WHERE item_id = p_id;\n  RETURN QUERY SELECT CAST(i.name AS varchar(100)) FROM item i WHERE i.item_id = 1 / (p_id - 1);",
+        ),
+        "result set after the COMMIT",
+    );
+    not_equal(
+        &ts("SELECT i.name FROM dbo.item i WHERE i.item_id = @id;\n  UPDATE dbo.item SET qty = 1 / (@id - 1) WHERE item_id = @id;"),
+        &pg(
+            "name varchar(100)",
+            "RETURN QUERY SELECT CAST(i.name AS varchar(100)) FROM item i WHERE i.item_id = p_id;\n  UPDATE item SET qty = 1 / (p_id - 1) WHERE item_id = p_id;",
+        ),
+        "write after the result set",
+    );
+}

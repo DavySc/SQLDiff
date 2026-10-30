@@ -3289,8 +3289,85 @@ fn result_set_function(ua: &Unit, ub: &Unit, na: &str, nb: &str) -> Option<Resul
             ));
         }
         one(p, np, "result set")?;
-        one(f, nf, "RETURN QUERY")
+        one(f, nf, "RETURN QUERY")?;
+        result_set_atomic(p, np, nf)
     })())
+}
+
+/// The function runs inside its caller's statement, so an error anywhere in
+/// it undoes all of its writes and returns no rows. The T-SQL procedure
+/// matches that only when no work it commits on its own comes before its
+/// result set, and nothing that can still fail comes after it: a durable
+/// write before the result set is autocommitted unless one explicit
+/// transaction (under SET XACT_ABORT ON) spans both, and a statement after
+/// it fails once the rows have reached the client.
+fn result_set_atomic(p: &Unit, np: &str, nf: &str) -> Result<(), String> {
+    use crate::classify::{is_temp_target, stmt_kind, write_target, StmtKind as K};
+    use sqldiff_syntax::SyntaxKind as SK;
+    let r = &p.stmts[p.results[0].at].node;
+    let (rs, re) = (r.text_range().start(), r.text_range().end());
+    let Some(body) = r
+        .ancestors()
+        .find(|a| matches!(a.kind(), SK::ROUTINE_BODY | SK::ROUTINE))
+    else {
+        return Err(format!("{np}: the body of the routine is not known"));
+    };
+    let durable = |d: &SyntaxNode| match stmt_kind(d, Dialect::Tsql) {
+        K::Select => cst::sig_tokens(d).any(|t| t.text().eq_ignore_ascii_case("INTO")),
+        k if k.is_write() => !write_target(d).is_some_and(|t| is_temp_target(&t)),
+        K::Assign
+        | K::SessionSetting
+        | K::Declare
+        | K::TxnSetting
+        | K::TxnBegin
+        | K::TxnCommit
+        | K::Raise
+        | K::Return
+        | K::Block
+        | K::If
+        | K::Loop
+        | K::Case
+        | K::Label
+        | K::Container => false,
+        _ => true,
+    };
+    let mut first_write = None;
+    let mut begin = None;
+    let mut commit = None;
+    for d in body.descendants().filter(|d| d.kind().is_unit() && d != r) {
+        let range = d.text_range();
+        let kind = stmt_kind(&d, Dialect::Tsql);
+        match kind {
+            K::TxnRollback | K::Savepoint => {
+                return Err(format!(
+                    "{np} rolls back explicitly, and {nf}, a function RETURNS TABLE, cannot"
+                ))
+            }
+            K::TxnBegin if begin.is_none() => begin = Some(range.start()),
+            K::TxnCommit if commit.is_none() => commit = Some(range.start()),
+            K::TxnBegin | K::TxnCommit => {
+                return Err(format!(
+                    "{np} runs several transactions, which T-SQL commits one by one, and {nf} runs in its caller's one statement"
+                ))
+            }
+            _ => {}
+        }
+        if range.end() <= rs && durable(&d) {
+            first_write.get_or_insert(range.start());
+        }
+        if range.start() >= re && !matches!(kind, K::Return | K::TxnCommit) {
+            return Err(format!(
+                "{np} runs statements after its result set: one that fails does so after the rows reached the T-SQL client, while {nf} then returns no rows"
+            ));
+        }
+    }
+    let Some(w) = first_write else { return Ok(()) };
+    match (begin, commit) {
+        (Some(b), Some(c)) if p.stops_on_error && b <= w && c >= re => Ok(()),
+        _ => Err(format!(
+            "{np} writes before its result set outside one transaction that also spans the result set: T-SQL commits that write on its own, so it stays when the result set fails, while {nf} runs in its caller's statement and the error undoes it"
+        )),
+    }
 }
 
 /// `u` with each T-SQL `RETURN 0` read as `RETURN` (see `compare_units`).
