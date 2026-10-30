@@ -227,6 +227,10 @@ pub mod asm {
         "ASM-UDF-CALLEE",
         "The user function a call names on side B is the conversion of the one it names on side A, and that conversion is shown equal, or equal under the assumptions its file lists, in the file that creates it",
     );
+    pub const PG_UNQUALIFIED_FUNCTION: (&str, &str) = (
+        "ASM-PG-UNQUALIFIED-FUNCTION",
+        "An unqualified PostgreSQL function call reaches the user function of that name in the default schema: no function of that name and arguments sits in a schema search_path lists before it, and pg_catalog, which PostgreSQL searches first unless search_path lists it later, has no function of that name (checked against PostgreSQL 18's)",
+    );
     pub const UDF_CALL_CONTEXT: (&str, &str) = (
         "ASM-UDF-CALL-CONTEXT",
         "A user function called in a statement returns the same value for the same arguments throughout the statement, however often each side runs it: it reads no data the calling statement or another session changes while the statement runs, and no clock (SQL Server reads SYSDATETIME() at each call inside a function, PostgreSQL's statement_timestamp() and now() give the calling statement's or transaction's start)",
@@ -305,6 +309,10 @@ pub struct Canon<'a> {
     /// PostgreSQL compared with T-SQL: quoted names may fold to lower case
     /// (see `stmt`).
     pub fold_quoted: bool,
+    /// The dialect of the statements this one is compared with, when known:
+    /// an unqualified PostgreSQL call may then be the conversion of a T-SQL
+    /// `dbo` function (`user_fn`).
+    pub other: Option<Dialect>,
     /// Table names of the statement being lowered (see `Item::names`).
     pub names: Vec<(String, Option<String>)>,
     /// Bit and boolean columns of derived tables (`sub:alias`), by name: a
@@ -469,6 +477,18 @@ fn lc(s: &str) -> String {
     }
 }
 
+/// The names of PostgreSQL 18's pg_catalog functions (profiles/).
+const PG_CATALOG_FUNCTIONS: &str = include_str!("../../profiles/pg18_catalog_functions.txt");
+
+/// pg_catalog has a function named `name` (as written, folded), which an
+/// unqualified call may reach before a user function of the same name.
+fn pg_catalog_function(name: &str) -> bool {
+    let k = name.to_lowercase();
+    PG_CATALOG_FUNCTIONS
+        .lines()
+        .any(|l| !l.starts_with('#') && l == k)
+}
+
 /// How `lc` treats a PostgreSQL statement's names.
 enum Folding {
     Off,
@@ -553,6 +573,7 @@ impl<'a> Canon<'a> {
             cursor_failed: HashMap::new(),
             by_name: false,
             fold_quoted: false,
+            other: None,
             names: Vec::new(),
             output: None,
         }
@@ -1874,8 +1895,16 @@ impl<'a> Canon<'a> {
     /// in a statement it may run once per row or fewer times
     /// (`ASM-UDF-CALL-CONTEXT`). `None` when the call is not of that form.
     fn user_fn(&mut self, c: &Call) -> R<Option<(Term, Option<Ty>)>> {
+        // The converter writes T-SQL `dbo.f(x)` as `f(x)`: unqualified, a
+        // PostgreSQL call compared with T-SQL may be that conversion, unless
+        // a pg_catalog function of the name could take it first.
+        let unqualified = c.name.len() == 1
+            && self.d == Dialect::Postgres
+            && self.other == Some(Dialect::Tsql)
+            && !c.name[0].starts_with('"')
+            && !pg_catalog_function(&c.name[0]);
         if !matches!(self.d, Dialect::Tsql | Dialect::Postgres)
-            || c.name.len() != 2
+            || (c.name.len() != 2 && !unqualified)
             || c.distinct
             || c.star
             || c.over
@@ -1920,11 +1949,15 @@ impl<'a> Canon<'a> {
             Dialect::Postgres => untypmod(t),
             _ => t,
         };
-        let (schema, name) = (lc(&c.name[0]), lc(&c.name[1]));
-        let default = matches!(
-            (self.d, schema.as_str()),
-            (Dialect::Tsql, "dbo") | (Dialect::Postgres, "public")
-        );
+        let (schema, name) = match c.name.as_slice() {
+            [n] => (String::new(), lc(n)),
+            _ => (lc(&c.name[0]), lc(&c.name[1])),
+        };
+        let default = unqualified
+            || matches!(
+                (self.d, schema.as_str()),
+                (Dialect::Tsql, "dbo") | (Dialect::Postgres, "public")
+            );
         let key = if default {
             name
         } else {
@@ -1947,6 +1980,9 @@ impl<'a> Canon<'a> {
         if default {
             self.assume(asm::DEFAULT_SCHEMA);
         }
+        if unqualified {
+            self.assume(asm::PG_UNQUALIFIED_FUNCTION);
+        }
         let id = format!("{}:{key}", asm::UDF_CALLEE.0);
         if !self.asm.iter().any(|y| y.id == id) {
             self.asm.push(Assumption::default(
@@ -1961,6 +1997,11 @@ impl<'a> Canon<'a> {
     fn call(&mut self, c: &Call) -> R<(Term, Option<Ty>)> {
         if c.over {
             return self.window(c);
+        }
+        if c.name.len() == 1 && self.other == Some(Dialect::Tsql) && self.d == Dialect::Postgres {
+            if let Some(t) = self.user_fn(c)? {
+                return Ok(t);
+            }
         }
         let name = lc(c.name.last().map(String::as_str).unwrap_or(""));
         // A qualified name is a user function, even `dbo.max`: T-SQL calls a

@@ -12,9 +12,9 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 |---|---|---|
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 54 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 21 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 98 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 99 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 29 |
-| | Total | 202 |
+| | Total | 203 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -148,6 +148,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-PARAM-NAMES` | The called procedure was converted with the same parameter names. | `generated` | The callee converted in the same tree. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-PG-NAME-TRUNCATED` | Every reference to a name longer than PostgreSQL's limit truncates to the same name, and no other name does. | `catalog` | The target schema's names. | `sqldiff-convert/src/names.rs` |
 | `ASM-PG-PARAMETER-TYPMOD` | Arguments and assigned OUTPUT values already have the parameter's declared length, precision and scale. | `deployment` | Callers pass values that fit the declared parameter types. | `sqldiff-core/src/equiv/call.rs` |
+| `ASM-PG-UNQUALIFIED-FUNCTION` | An unqualified PostgreSQL function call reaches the user function of that name in the default schema: no schema search_path lists before it has a function of that name and arguments, and pg_catalog (searched first) has no function of that name (checked against PostgreSQL 18's). | `deployment` | The server's search_path and the functions of the schemas it lists. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-PG-VARIABLE-CONFLICT-ERROR` | plpgsql.variable_conflict is `error` (the default) for the function. | `deployment` | The server's and the function's plpgsql.variable_conflict setting. (fact key `pg_variable_conflict`) | `sqldiff-core/src/bind/query.rs` |
 | `ASM-PLUS-NUMERIC` | The operands of a `+` kept as addition are numbers. | `catalog` | The operands' types. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-POSTGIS-GEOGRAPHY` | PostgreSQL: the postgis extension is installed and its types are on the search path; a T-SQL GEOGRAPHY value is carried unchanged as a PostGIS geography (spatial methods are converted, or refused, on their own). | `deployment` | The target database has CREATE EXTENSION postgis. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/bind/mod.rs` |
