@@ -1,0 +1,18 @@
+Changed database context to 'probe_c3d2'.
+Q16 count: table=2 plain=2
+Q16 pick by key across a join: table=7 plain=7
+Q16 scalar subquery: table=1 plain=1
+Q16 exists select 1: TRUE
+Q16 exists select * (raising computed column): TRUE
+Q16 rows sharing the key part ord_id=1: 2
+Q16 the raising column named: error 8134
+Q16 the persisted computed column: 10
+Q17 system-versioned table: count=2 pick id=1 n=11 deleted id=3 rows=0 history rows=2
+Q18 no policy, dbo: count=3
+Q18 no policy, probe_u: count=3
+Q18 filter predicate, dbo: count=1
+Q18 filter predicate, probe_u: count=1
+Q19 decimal and int column, unqualified: error 209
+Q19 decimal and int column, qualified: no error
+Q19 raising computed column of one table named in WHERE: error 8134
+Changed database context to 'master'.
