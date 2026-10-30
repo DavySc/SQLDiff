@@ -285,9 +285,15 @@ The T-SQL text must be one statement that runs the same as a batch and as a
 PostgreSQL `EXECUTE`: no query that returns rows (T-SQL sends them to the
 client, `EXECUTE` discards them), no `OUTPUT` clause, no variables (the
 batch cannot see the caller's), no `#temp` table (dropped when the batch
-ends), no `SET`, `USE`, transaction control or nested dynamic SQL, and only
-one statement (without XACT_ABORT a failing statement lets the next one in
-the batch run). The two texts are then compared as two files, and the pair
+ends), no `SET`, `USE`, transaction control or nested dynamic SQL, no
+procedure call (`EXEC dbo.q`: a procedure called through PL/pgSQL `EXECUTE`
+cannot commit, and PostgreSQL raises 2D000 "invalid transaction termination"
+when the callee's conversion holds `COMMIT`, as `tsql.txn.autocommit` writes
+one after each autocommitted write; the callee's body may be outside the
+tree, so the call is refused rather than proven harmless, and a static `EXEC
+dbo.q` is compared as a call), and only one statement (without XACT_ABORT a
+failing statement lets the next one in the batch run). The two texts are
+then compared as two files, and the pair
 is equal exactly when that comparison is; its assumptions carry over, plus
 `ASM-TSQL-DYNAMIC-SESSION-OPTIONS` (a dynamic batch takes ANSI_NULLS and
 QUOTED_IDENTIFIER from the session, not from the procedure). A difference
@@ -308,7 +314,11 @@ the scalar variable"); `EXEC (N'INSERT … 1/0; INSERT …')` runs the second
 INSERT without XACT_ABORT and neither with it. PostgreSQL `EXECUTE NULL`
 fails ("query string argument of EXECUTE is null"), `EXECUTE ''` does nothing,
 `EXECUTE 'SELECT 1'` discards the row, and one `EXECUTE` may run several
-statements; `format('%I', NULL)` fails.
+statements; `format('%I', NULL)` fails. Run 2026-10-30: `EXEC (N'EXEC dbo.q')`
+where `q` writes two rows under `XACT_ABORT ON` writes both on SQL Server;
+`EXECUTE 'CALL q()'` where `q`'s conversion holds `COMMIT` after each write
+fails on PostgreSQL 18 with 2D000 "invalid transaction termination" and
+writes nothing.
 
 ### Parameters: `sp_executesql` against `EXECUTE … USING`
 
