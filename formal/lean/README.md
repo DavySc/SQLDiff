@@ -583,9 +583,14 @@ shadows it). The Rust side (`cert.rs`, `plain_table::read_only`,
 read-only when both sides define it once, the definitions pair by column
 name, and nothing else in either tree names it but statements that
 cannot change a read; the trees include the base catalogs' DDL. Since
-the review, dynamic SQL is an allow-list (any `EXEC` of a procedure the
-tree does not declare, a PostgreSQL `DO` block, a routine body no scan
-reads, a top-level call of an undeclared routine keeps every table out),
+the reviews, what a tree runs is an allow-list
+(`crates/sqldiff-convert/src/scan.rs`): every top-level statement of a
+listed kind, every call in a body, default, view or data statement of a
+declared routine or a pure built-in, no node the parser cannot read and
+no `U&` name, else every table is out; a table name part of 63 bytes or
+more is not sent, and a pair whose output routine has a longer
+identifier, or a name another routine's truncates to, is refused on the
+Rust side (`pair:name-too-long`),
 `EXCLUDE`, `PERIOD` and `INDEX` start a constraint only in their dialect
 and form, only `GENERATED ... AS IDENTITY` is an identity, any
 `INITIALLY` leaves a table without a key, and a `pg_` table or one another
