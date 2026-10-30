@@ -1453,10 +1453,15 @@ fn table_vars(
         // Nothing on B uses the table before it is created: T-SQL accepts
         // no use of a table variable before its DECLARE.
         let start = usize::from(xb.text_range().start());
-        let drop_at = ub
-            .temp_drops
-            .iter()
-            .find(|(d, p)| p == pb && d.text_range().end() <= xb.text_range().start());
+        // Its own drop just before the creation (the routine's other table
+        // variables are dropped at the same place).
+        let drop_at = ub.temp_drops.iter().find(|(d, p)| {
+            let ts = ast::tokens(d);
+            p == pb
+                && d.text_range().end() <= xb.text_range().start()
+                && ts.len() > 4
+                && name_at(&ts, 4).0 == [temp_schema.to_string(), want.clone()]
+        });
         let used_before = b
             .root
             .descendants_with_tokens()
@@ -1517,8 +1522,14 @@ fn table_vars(
                 continue;
             };
             used_drop[k] = true;
-            if crate::classify::rolls_back(&a.root) {
-                unknown(out, format!("{na} rolls back, and a PostgreSQL ROLLBACK empties the temporary table where T-SQL keeps the table variable's rows"));
+            // The ROLLBACKs that run on B: a T-SQL one with none in its place
+            // (refused there) leaves both tables as they are.
+            let routine = xb
+                .ancestors()
+                .find(|n| n.kind() == sqldiff_syntax::SyntaxKind::ROUTINE)
+                .unwrap_or_else(|| b.root.clone());
+            if crate::classify::rolls_back(&routine) {
+                unknown(out, format!("{nb} rolls back, and a PostgreSQL ROLLBACK empties the temporary table where T-SQL keeps the table variable's rows"));
                 continue;
             }
         }
@@ -1974,6 +1985,19 @@ fn table_pair(
     out: &mut Outcome,
 ) {
     use ast::K;
+    // A default or CHECK is evaluated by the statement that writes the row,
+    // outside any routine body: a table a routine creates (a table variable)
+    // has its expressions compared as a script's, not as PL/pgSQL statements.
+    let script = |u: &Unit| {
+        (u.kind != UnitKind::Script).then(|| {
+            let mut u = u.clone();
+            u.kind = UnitKind::Script;
+            u.sql_body = false;
+            u
+        })
+    };
+    let (sua, sub) = (script(ua), script(ub));
+    let (ua, ub) = (sua.as_ref().unwrap_or(ua), sub.as_ref().unwrap_or(ub));
     let (na, nb) = (side_name(a), side_name(b));
     let (xa, xb) = (p.xa, p.xb);
     let (la, lb) = (a.line_of(xa), b.line_of(xb));

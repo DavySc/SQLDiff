@@ -501,6 +501,20 @@ pub fn rolls_back(node: &SyntaxNode) -> bool {
         })
 }
 
+/// A T-SQL ROLLBACK that its PostgreSQL conversion runs: one outside TRY
+/// and CATCH. The converter refuses transaction control inside either (a
+/// block with an EXCEPTION clause is a subtransaction), and the
+/// rollback-and-rethrow CATCH becomes the error itself.
+pub fn pg_rolls_back(node: &SyntaxNode) -> bool {
+    node.descendants()
+        .filter(|n| n.kind() == SyntaxKind::STATEMENT)
+        .filter(|n| ast::starts_with_kw(n, "ROLLBACK"))
+        .any(|n| {
+            !n.ancestors()
+                .any(|a| matches!(a.kind(), SyntaxKind::TRY_BLOCK | SyntaxKind::CATCH_BLOCK))
+        })
+}
+
 /// CATCH body that is only `IF @@TRANCOUNT > 0 ROLLBACK [TRAN]` and `THROW;`.
 pub fn rollback_rethrow(catch: &SyntaxNode) -> bool {
     let words: Vec<String> = ast::sig_tokens(catch)
