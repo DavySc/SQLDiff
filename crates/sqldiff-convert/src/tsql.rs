@@ -6432,12 +6432,12 @@ impl<'a> Cx<'a> {
         Some(r)
     }
 
-    /// The running routine's own name (`OBJECT_NAME(@@PROCID)`) or schema
+    /// The running procedure's own name (`OBJECT_NAME(@@PROCID)`) or schema
     /// (`OBJECT_SCHEMA_NAME(@@PROCID)`), as its header writes it, or why it
     /// is not known.
     fn own_name_part(&self, schema: bool) -> Result<String, &'static str> {
-        if !matches!(self.mode, Mode::Proc | Mode::Func) || self.trigger.is_some() {
-            return Err("only a procedure's or function's own name is known here (outside a module @@PROCID is 0, in a trigger it is the trigger's id)");
+        if self.mode != Mode::Proc || self.trigger.is_some() {
+            return Err("only a procedure's own name is known here (outside a module @@PROCID is 0, in a trigger it is the trigger's id, and an inlined function may see its caller's)");
         }
         let parts = &self.routine_parts;
         let Some(last) = parts.last() else {

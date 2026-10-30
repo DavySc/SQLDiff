@@ -432,3 +432,28 @@ fn own_name_from_procid() {
         assert!(!equal(&r), "{header} {a} = {b}: {:?}", r.verdict());
     }
 }
+
+/// A function's `@@PROCID` may be its caller's: SQL Server runs an inline
+/// table-valued function, and a scalar function it inlines, inside the
+/// calling query. Never folded there.
+#[test]
+fn own_name_from_procid_not_in_functions() {
+    let r = diff(
+        &Artifact::new(
+            "a.sql",
+            Dialect::Tsql,
+            "CREATE FUNCTION dbo.F()\nRETURNS nvarchar(128)\nAS\nBEGIN\n    RETURN OBJECT_NAME(@@PROCID);\nEND\n",
+        ),
+        &Artifact::new(
+            "b.sql",
+            Dialect::Postgres,
+            "CREATE OR REPLACE FUNCTION F() RETURNS text\nLANGUAGE plpgsql\nAS $$\nBEGIN\n    RETURN 'F';\nEND;\n$$;\n",
+        ),
+        &Options::default(),
+    );
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.verdict()
+    );
+}

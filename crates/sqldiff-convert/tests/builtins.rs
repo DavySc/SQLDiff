@@ -249,6 +249,12 @@ fn own_name_from_procid_needs_a_named_module() {
         u.notes
     );
     assert!(out.contains("v_r := 'Get Name';"), "{out}");
+    // A function may run inlined in its caller's query.
+    let (u, out) = unit_at(
+        "CREATE FUNCTION dbo.F()\nRETURNS nvarchar(128)\nAS\nBEGIN\n    RETURN OBJECT_NAME(@@PROCID);\nEND\n",
+        5,
+    );
+    assert_eq!(u.status, Status::NotConverted, "{out}");
     // A script outside any module: @@PROCID is 0.
     let (u, out) = unit_at(
         "DECLARE @r nvarchar(max);\nSET @r = OBJECT_NAME(@@PROCID);\nPRINT @r;\n",

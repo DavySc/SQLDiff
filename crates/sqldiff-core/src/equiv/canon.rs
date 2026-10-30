@@ -310,10 +310,11 @@ pub struct Canon<'a> {
 }
 
 /// T-SQL `OBJECT_NAME(@@PROCID)` / `OBJECT_SCHEMA_NAME(@@PROCID)` in a
-/// procedure or function: its own name or schema as the header writes it
+/// procedure: its own name or schema as the header writes it
 /// (`asm::PROCID_NAME`). `None` elsewhere (a script's @@PROCID is 0, a
-/// trigger's is the trigger), for a temporary procedure, and for a schema
-/// the header leaves out (the creator's default schema).
+/// trigger's is the trigger, an inline table-valued function or an inlined
+/// scalar function runs in its caller's query), for a temporary procedure,
+/// and for a schema the header leaves out (the creator's default schema).
 pub(super) fn own_name(u: &Unit, c: &Call) -> Option<String> {
     let name = c.name.last()?.to_ascii_lowercase();
     let schema = match name.as_str() {
@@ -327,10 +328,7 @@ pub(super) fn own_name(u: &Unit, c: &Call) -> Option<String> {
         || !procid
         || c.distinct
         || c.star
-        || !matches!(
-            u.kind,
-            UnitKind::Proc | UnitKind::ScalarFn | UnitKind::TableFn
-        )
+        || u.kind != UnitKind::Proc
     {
         return None;
     }
@@ -343,16 +341,11 @@ pub(super) fn own_name(u: &Unit, c: &Call) -> Option<String> {
 }
 
 /// T-SQL `(SELECT uses_ansi_nulls FROM sys.sql_modules WHERE object_id =
-/// @@PROCID) = 1` (or `uses_quoted_identifier`) in a procedure or function:
+/// @@PROCID) = 1` (or `uses_quoted_identifier`) in a procedure:
 /// the running routine tests its own setting, which every converted routine
 /// is assumed to have been created with (the converter writes `true`).
 fn module_setting_test(u: &Unit, e: &Expr) -> Option<(&'static str, &'static str)> {
-    if u.dialect != Dialect::Tsql
-        || !matches!(
-            u.kind,
-            UnitKind::Proc | UnitKind::ScalarFn | UnitKind::TableFn
-        )
-    {
+    if u.dialect != Dialect::Tsql || u.kind != UnitKind::Proc {
         return None;
     }
     let Expr::Bin(op, l, r) = e else { return None };
