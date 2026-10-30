@@ -127,6 +127,30 @@ pub struct SetDefault {
     pub off: usize,
 }
 
+/// What `ALTER TABLE … ADD CONSTRAINT` adds.
+#[derive(Debug, Clone)]
+pub enum Added {
+    Key(super::table::Key),
+    Fk(super::table::ForeignKey),
+}
+
+/// T-SQL `ALTER TABLE t [WITH CHECK] ADD CONSTRAINT n {PRIMARY KEY | UNIQUE
+/// | FOREIGN KEY} …`; PostgreSQL `ALTER TABLE [ONLY] t ADD CONSTRAINT n …`.
+/// One named key or foreign key, checked against the rows already there
+/// (not WITH NOCHECK, not NOT VALID).
+#[derive(Debug, Clone)]
+pub struct AddConstraint {
+    pub dialect: Dialect,
+    pub table: Vec<Name>,
+    pub table_toks: Vec<Tok>,
+    pub name: Name,
+    pub added: Added,
+    /// T-SQL: a primary key without NONCLUSTERED, or CLUSTERED.
+    pub clustered: bool,
+    pub storage: Vec<String>,
+    pub off: usize,
+}
+
 /// T-SQL `TRUNCATE TABLE t`; PostgreSQL `TRUNCATE [TABLE] t [RESTART |
 /// CONTINUE IDENTITY] [RESTRICT]`. One table.
 #[derive(Debug, Clone)]
@@ -147,6 +171,7 @@ pub enum Ddl {
     Drop(DropDef),
     Default(SetDefault),
     Truncate(Truncate),
+    Constraint(AddConstraint),
 }
 
 impl Ddl {
@@ -166,6 +191,11 @@ impl Ddl {
             },
             Ddl::Default(_) => "column default",
             Ddl::Truncate(_) => "TRUNCATE TABLE",
+            Ddl::Constraint(c) => match &c.added {
+                Added::Key(k) if k.primary => "ADD PRIMARY KEY",
+                Added::Key(_) => "ADD UNIQUE",
+                Added::Fk(_) => "ADD FOREIGN KEY",
+            },
         }
     }
 }
@@ -313,6 +343,24 @@ pub fn case_check(x: &Ddl, schema: &super::schema::Schema) -> R<()> {
                 schema.case_check(&stored(n), true)?;
             }
         }
+        Ddl::Constraint(x) if x.dialect == Dialect::Postgres => {
+            for n in &x.table {
+                schema.case_check(&stored(n), true)?;
+            }
+            let (cols, refs): (&[Name], &[Name]) = match &x.added {
+                Added::Key(k) => (&k.cols, &[]),
+                Added::Fk(f) => (&f.cols, f.ref_cols.as_deref().unwrap_or(&[])),
+            };
+            for n in cols.iter().chain(refs) {
+                schema.case_check(&stored(n), true)?;
+            }
+            if let Added::Fk(f) = &x.added {
+                for n in &f.table {
+                    schema.case_check(&stored(n), true)?;
+                }
+            }
+            schema.case_check(&stored(&x.name), false)?;
+        }
         _ => {}
     }
     Ok(())
@@ -368,6 +416,14 @@ pub fn pair_key(x: &Ddl) -> R<String> {
             let (s, t) = object_key(&x.table, x.dialect)?;
             format!("truncate {}.{t}", s.unwrap_or_default())
         }
+        Ddl::Constraint(x) => {
+            let (s, t) = object_key(&x.table, x.dialect)?;
+            format!(
+                "constraint {}.{t}.{}",
+                s.unwrap_or_default(),
+                fold(&x.name, x.dialect)?
+            )
+        }
     })
 }
 
@@ -381,6 +437,9 @@ pub fn parse(ts: &[Tok], d: Dialect) -> R<Ddl> {
         return drop(ts, d).map(Ddl::Drop);
     }
     if word(ts.first(), "ALTER") {
+        if adds_constraint(ts) {
+            return add_constraint(ts, d).map(Ddl::Constraint);
+        }
         return set_default(ts, d).map(Ddl::Default);
     }
     if word(ts.first(), "TRUNCATE") {
@@ -942,6 +1001,76 @@ fn truncate(ts: &[Tok], d: Dialect) -> R<Truncate> {
     })
 }
 
+/// Whether `ALTER TABLE … ADD CONSTRAINT n` adds a key, a foreign key or a
+/// check (not a T-SQL default).
+pub(super) fn adds_constraint(ts: &[Tok]) -> bool {
+    ts.iter().enumerate().any(|(i, t)| {
+        t.up == "ADD"
+            && word(ts.get(i + 1), "CONSTRAINT")
+            && ["PRIMARY", "UNIQUE", "FOREIGN", "CHECK"]
+                .iter()
+                .any(|w| word(ts.get(i + 3), w))
+    })
+}
+
+fn add_constraint(ts: &[Tok], d: Dialect) -> R<AddConstraint> {
+    let what = || format!("the ALTER TABLE `{}`", text(ts));
+    if d == Dialect::Db2i {
+        return Err("ALTER TABLE … ADD CONSTRAINT on Db2 for i is not compared yet".into());
+    }
+    if !word(ts.get(1), "TABLE") {
+        return Err(what());
+    }
+    let mut i = 2;
+    if d == Dialect::Postgres && word(ts.get(i), "ONLY") {
+        i += 1;
+    }
+    let at = i;
+    let (table, mut i) = dotted(ts, i)?;
+    let table_toks = ts[at..i].to_vec();
+    if d == Dialect::Tsql && word(ts.get(i), "WITH") {
+        if !word(ts.get(i + 1), "CHECK") {
+            return Err(
+                "WITH NOCHECK: the rows already in the table are not checked against the constraint"
+                    .into(),
+            );
+        }
+        i += 2;
+    }
+    if !word(ts.get(i), "ADD") || !word(ts.get(i + 1), "CONSTRAINT") {
+        return Err(what());
+    }
+    let item = &ts[i + 1..];
+    let n = item.len();
+    if n >= 2 && word(item.get(n - 2), "NOT") && word(item.get(n - 1), "VALID") {
+        return Err(
+            "NOT VALID: the rows already in the table are not checked against the constraint"
+                .into(),
+        );
+    }
+    let name = item.get(1).and_then(name_of).ok_or_else(what)?;
+    let (keys, fks, checks, storage) = super::table::constraint_item(item, d)?;
+    let added = match (keys.as_slice(), fks.as_slice(), checks.is_empty()) {
+        ([k], [], true) => Added::Key(k.clone()),
+        ([], [f], true) => Added::Fk(f.clone()),
+        _ => return Err("a CHECK constraint added to a table is not compared".into()),
+    };
+    let clustered = d == Dialect::Tsql
+        && (storage.iter().any(|s| s == "CLUSTERED")
+            || matches!(&added, Added::Key(k) if k.primary)
+                && !storage.iter().any(|s| s == "NONCLUSTERED"));
+    Ok(AddConstraint {
+        dialect: d,
+        table,
+        table_toks,
+        name,
+        added,
+        clustered,
+        storage,
+        off: ts[0].off,
+    })
+}
+
 /// T-SQL `ALTER TABLE t ADD [CONSTRAINT n] DEFAULT v FOR c`; PostgreSQL
 /// `ALTER TABLE [ONLY] t ALTER [COLUMN] c SET DEFAULT v`.
 fn set_default(ts: &[Tok], d: Dialect) -> R<SetDefault> {
@@ -1314,6 +1443,7 @@ pub fn compare(
         (Ddl::Drop(a), Ddl::Drop(b)) => drops(a, b, na, nb, &mut ev),
         (Ddl::Default(a), Ddl::Default(b)) => defaults(a, b, na, nb, &mut ev),
         (Ddl::Truncate(a), Ddl::Truncate(b)) => truncates(a, b, na, nb, &mut ev),
+        (Ddl::Constraint(a), Ddl::Constraint(b)) => constraints(a, b, na, nb, cols, &mut ev),
         _ => Err(format!("{} against {}", x.what(), y.what())),
     };
     if let Err(e) = r {
@@ -2092,6 +2222,239 @@ fn truncates(x: &Truncate, y: &Truncate, na: &str, nb: &str, ev: &mut Vec<Event>
         ev.push(Event::Asm(super::canon::asm::DEFAULT_SCHEMA));
     }
     ev.push(Event::Asm(asm::TRUNCATE));
+    Ok(())
+}
+
+/// Two added keys or foreign keys. Both check the rows already in the
+/// table and fail the same way when one breaks the constraint, so they
+/// agree when the constraint is the same: same table, name, kind and
+/// columns, the same referenced table, columns and actions, and the same
+/// rows rejected (NULLs in a unique key, letter case and trailing spaces in
+/// string columns). A primary key on a column that allows NULL is not
+/// compared: SQL Server refuses it (Msg 8111), PostgreSQL makes the column
+/// NOT NULL.
+fn constraints(
+    x: &AddConstraint,
+    y: &AddConstraint,
+    na: &str,
+    nb: &str,
+    cols: &dyn Fn(bool, &str) -> Option<ColFacts>,
+    ev: &mut Vec<Event>,
+) -> R<()> {
+    let (da, db) = (x.dialect, y.dialect);
+    tsql_pg(da, db)?;
+    let tsql_a = da == Dialect::Tsql;
+    let (tn, on) = if tsql_a { (na, nb) } else { (nb, na) };
+    let t = if tsql_a { x } else { y };
+    let side = |s: String| side_text(s, tn, on);
+    let at = (x.off, y.off);
+    let diff = |rule: &'static str, witness: String| Event::Diff {
+        rule,
+        witness: side(witness),
+        at,
+    };
+    let (ka, kb) = (object_key(&x.table, da)?, object_key(&y.table, db)?);
+    ev.push(Event::Asm(super::canon::asm::IDENT_FOLD));
+    if ka.0.is_none() && kb.0.is_none() {
+        ev.push(Event::Asm(super::canon::asm::DEFAULT_SCHEMA));
+    }
+    if ka != kb {
+        ev.push(diff(
+            "equiv.constraint-table",
+            format!(
+                "{na} adds the constraint to {} and {nb} to {}",
+                text(&x.table_toks),
+                text(&y.table_toks)
+            ),
+        ));
+        return Ok(());
+    }
+    if fold(&x.name, da)? != fold(&y.name, db)? {
+        ev.push(diff(
+            "equiv.constraint-name",
+            format!(
+                "the constraint is named {} on {na} and {} on {nb}, so a statement that names it finds it on one side only",
+                x.name.text, y.name.text
+            ),
+        ));
+    }
+    for (c, n) in [(x, na), (y, nb)] {
+        for s in &c.storage {
+            ev.push(Event::Note(format!(
+                "constraint clause passed over on {n}: {s} (storage or how its index is built)"
+            )));
+        }
+    }
+    if t.clustered {
+        ev.push(Event::Asm(asm::CLUSTERED));
+    }
+    let names =
+        |ns: &[Name], d: Dialect| -> R<Vec<String>> { ns.iter().map(|n| fold(n, d)).collect() };
+    // The columns whose values the constraint compares.
+    let compared: Vec<String> = match (&x.added, &y.added) {
+        (Added::Key(kx), Added::Key(ky)) => {
+            let what = |k: &super::table::Key| {
+                if k.primary {
+                    "primary key"
+                } else {
+                    "unique constraint"
+                }
+            };
+            if kx.primary != ky.primary {
+                ev.push(diff(
+                    "equiv.constraint-kind",
+                    format!("{na} adds a {} and {nb} a {}", what(kx), what(ky)),
+                ));
+                return Ok(());
+            }
+            let (mut sx, mut sy) = (names(&kx.cols, da)?, names(&ky.cols, db)?);
+            sx.sort();
+            sy.sort();
+            if sx != sy {
+                ev.push(diff(
+                    "equiv.table-key",
+                    format!(
+                        "the {} covers ({}) on {na} and ({}) on {nb}: rows that agree on one set and not the other are rejected on one side only",
+                        what(kx),
+                        sx.join(", "),
+                        sy.join(", ")
+                    ),
+                ));
+                return Ok(());
+            }
+            let (kt, ko) = if tsql_a { (kx, ky) } else { (ky, kx) };
+            let mut null_cols = Vec::new();
+            for c in &sx {
+                let (Some(ft), Some(fo)) = (cols(tsql_a, c), cols(!tsql_a, c)) else {
+                    return Err(format!(
+                        "the {}'s column {c} is not in a table both sides know (CREATE TABLE in the file or the catalog)",
+                        what(kx)
+                    ));
+                };
+                if kt.primary && (ft.nullable || fo.nullable) {
+                    return Err(format!(
+                        "the primary key's column {c} allows NULL: SQL Server refuses the constraint (Msg 8111), PostgreSQL makes the column NOT NULL"
+                    ));
+                }
+                if !kt.primary && !ko.nulls_not_distinct && ft.nullable && fo.nullable {
+                    null_cols.push(c.clone());
+                }
+            }
+            if !null_cols.is_empty() {
+                ev.push(diff(
+                    "equiv.unique-nulls",
+                    format!(
+                        "two rows with NULL in {}: {{T}} rejects the second as a duplicate of the unique constraint, {{O}} accepts it (UNIQUE NULLS NOT DISTINCT would reject it)",
+                        null_cols.join(", ")
+                    ),
+                ));
+            }
+            sx
+        }
+        (Added::Fk(fx), Added::Fk(fy)) => {
+            let (cx, cy) = (names(&fx.cols, da)?, names(&fy.cols, db)?);
+            if cx != cy {
+                ev.push(diff(
+                    "equiv.foreign-key",
+                    format!(
+                        "the foreign key is on ({}) on {na} and on ({}) on {nb}",
+                        cx.join(", "),
+                        cy.join(", ")
+                    ),
+                ));
+                return Ok(());
+            }
+            if object_key(&fx.table, da)? != object_key(&fy.table, db)? {
+                ev.push(diff(
+                    "equiv.foreign-key",
+                    format!(
+                        "the foreign key on ({}) references {} on {na} and {} on {nb}",
+                        cx.join(", "),
+                        text_name(&fx.table),
+                        text_name(&fy.table)
+                    ),
+                ));
+                return Ok(());
+            }
+            match (&fx.ref_cols, &fy.ref_cols) {
+                (Some(a), Some(b)) if names(a, da)? != names(b, db)? => {
+                    ev.push(diff(
+                        "equiv.foreign-key",
+                        format!(
+                            "the foreign key on ({}) references ({}) on {na} and ({}) on {nb}",
+                            cx.join(", "),
+                            names(a, da)?.join(", "),
+                            names(b, db)?.join(", ")
+                        ),
+                    ));
+                    return Ok(());
+                }
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(format!(
+                        "the foreign key on ({}) names the referenced columns on one side only",
+                        cx.join(", ")
+                    ))
+                }
+                _ => {}
+            }
+            for (what, a, b) in [
+                ("deleting", &fx.on_delete, &fy.on_delete),
+                ("updating", &fx.on_update, &fy.on_update),
+            ] {
+                if a != b {
+                    ev.push(diff(
+                        "equiv.foreign-key-action",
+                        format!(
+                            "{what} a referenced row of {}: {na} does {a}, {nb} does {b}",
+                            text_name(&fx.table)
+                        ),
+                    ));
+                }
+            }
+            for c in &cx {
+                if cols(tsql_a, c).is_none() || cols(!tsql_a, c).is_none() {
+                    return Err(format!(
+                        "the foreign key's column {c} is not in a table both sides know (CREATE TABLE in the file or the catalog)"
+                    ));
+                }
+            }
+            cx
+        }
+        _ => {
+            ev.push(diff(
+                "equiv.constraint-kind",
+                format!("{na} and {nb} add different kinds of constraint"),
+            ));
+            return Ok(());
+        }
+    };
+    // String columns: T-SQL's default collation ignores case and trailing
+    // spaces when it compares the key (or looks up the referenced row).
+    for c in &compared {
+        let (Some(ft), Some(fo)) = (cols(tsql_a, c), cols(!tsql_a, c)) else {
+            continue;
+        };
+        if ft.string.is_some() && fo.string.is_some() && super::compare::ci_collation() {
+            ev.push(Event::Asm(super::canon::asm::TSQL_CI));
+            ev.push(Event::Asm(super::canon::asm::CI_COLLATION));
+        } else if ft.string.is_some() {
+            ev.push(Event::Asm(super::canon::asm::TSQL_CI));
+            ev.push(diff(
+                "equiv.case-sensitivity",
+                format!(
+                    "for values of {c} that differ only in letter case ('A' and 'a'), {{T}} treats them as the same value under the constraint and {{O}} does not"
+                ),
+            ));
+            if fo.string == Some(false) {
+                ev.push(diff(
+                    "equiv.trailing-spaces",
+                    format!(
+                        "for values of {c} that differ only in trailing spaces ('a' and 'a '), {{T}} treats them as the same value under the constraint and {{O}} does not"
+                    ),
+                ));
+            }
+        }
+    }
     Ok(())
 }
 

@@ -1945,6 +1945,12 @@ fn object_events(
 /// no enclosing branch, loop, handler or TRY/CATCH, and no enclosing block
 /// with an EXCEPTION section (a PostgreSQL subtransaction that undoes it
 /// before its handler runs).
+/// Whether `x` sits in a routine's body (a DO block counts).
+fn in_routine(x: &SyntaxNode) -> bool {
+    x.ancestors()
+        .any(|a| a.kind() == sqldiff_syntax::SyntaxKind::ROUTINE_BODY)
+}
+
 fn runs_once(x: &SyntaxNode) -> bool {
     use sqldiff_syntax::SyntaxKind as S;
     for a in x.ancestors().skip(1) {
@@ -2532,11 +2538,17 @@ fn ddl_stmts(
                 ),
             });
         }
-        // An index must follow its table on both sides when the file creates it.
-        if let (ddl::Ddl::Index(ix), ddl::Ddl::Index(iy)) = (dx, dy) {
-            let before = |side: &Analyzed, u: &Unit, ix: &ddl::Index, at: &SyntaxNode| {
+        // An index or a constraint must follow its table on both sides when
+        // the file creates it.
+        let on_table = |dd: &ddl::Ddl| match dd {
+            ddl::Ddl::Index(i) => Some(i.table.clone()),
+            ddl::Ddl::Constraint(c) => Some(c.table.clone()),
+            _ => None,
+        };
+        if let (Some(tx), Some(ty)) = (on_table(dx), on_table(dy)) {
+            let before = |side: &Analyzed, u: &Unit, table: &[table::Name], at: &SyntaxNode| {
                 let d = side.dialect();
-                let want = ddl::stored_key(&ix.table, d).ok();
+                let want = ddl::stored_key(table, d).ok();
                 u.tables.iter().any(|(n, _)| {
                     table::parse(&ast::tokens(n), d)
                         .ok()
@@ -2545,10 +2557,10 @@ fn ddl_stmts(
                         && n.text_range().start() > at.text_range().start()
                 })
             };
-            if before(a, ua, ix, x.node) || before(b, ub, iy, y.node) {
+            if before(a, ua, &tx, x.node) || before(b, ub, &ty, y.node) {
                 unknown(
                     out,
-                    "the file creates the index's table after the index on one side".into(),
+                    format!("the file creates the table of the {what} after it on one side"),
                 );
                 continue;
             }
@@ -2590,9 +2602,14 @@ fn ddl_stmts(
             unknown(out, why.into());
             continue;
         }
-        // A TRUNCATE inside a branch, loop or handler is placed by count
-        // only; and a row count read after it may count it.
-        if matches!(dx, ddl::Ddl::Truncate(_)) {
+        // A TRUNCATE (or a routine's index or constraint) inside a branch,
+        // loop or handler is placed by count only; and a row count read
+        // after it may count it.
+        if matches!(
+            dx,
+            ddl::Ddl::Truncate(_) | ddl::Ddl::Index(_) | ddl::Ddl::Constraint(_)
+        ) && (matches!(dx, ddl::Ddl::Truncate(_)) || in_routine(x.node) || in_routine(y.node))
+        {
             if !runs_once(x.node) || !runs_once(y.node) {
                 unknown(out, "it sits inside a branch, loop or error handler".into());
                 continue;
@@ -2670,6 +2687,7 @@ fn ddl_stmts(
         }
         let table_of = |d: &ddl::Ddl| match d {
             ddl::Ddl::Index(i) => Some((i.table.clone(), i.table_toks.clone())),
+            ddl::Ddl::Constraint(c) => Some((c.table.clone(), c.table_toks.clone())),
             _ => None,
         };
         let (tx, ty) = (table_of(dx), table_of(dy));
