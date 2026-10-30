@@ -901,6 +901,170 @@ END
     );
 }
 
+/// C3d part 2, review end to end: each false confirmation the review found
+/// is refused, with the base catalogs of the test above. A column named
+/// `exclude` added by `ALTER TABLE` (F1), a generated column followed by a
+/// constraint named `identity` (F2), a key `INITIALLY DEFERRED` (F3), DDL
+/// run where no scan sees it (F4: `EXEC [sp_executesql]`, a `DO` block, a
+/// quoted SQL function body called at the top level), a `pg_` table (F5)
+/// and another schema's table of the same name (F7). An extended property
+/// set by `EXEC` changes nothing.
+#[test]
+fn the_real_checker_refuses_what_the_review_found() {
+    let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
+        return;
+    };
+    let _turn = turn();
+    let d = scratch("c3d2-review");
+    let src = d.join("src");
+    let cat = d.join("cat");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&cat).unwrap();
+    const TABLES: &str = "CREATE TABLE dbo.Item (Id int IDENTITY(1,1) NOT NULL PRIMARY KEY,\n  \
+         Name varchar(20) NOT NULL, Price decimal(12,2) NOT NULL);\nGO\n\
+         CREATE TABLE dbo.Line (OrdId int NOT NULL, LineNo int NOT NULL,\n  \
+         ItemId int NOT NULL REFERENCES dbo.Item (Id), Qty int NOT NULL,\n  \
+         CONSTRAINT PK_Line PRIMARY KEY (OrdId, LineNo));\nGO\n";
+    const PG: &str = "CREATE TABLE item (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n  \
+         name varchar(20) NOT NULL, price numeric(12,2) NOT NULL);\n\
+         CREATE TABLE line (ordid integer NOT NULL, lineno integer NOT NULL,\n  \
+         itemid integer NOT NULL REFERENCES item (id), qty integer NOT NULL,\n  \
+         PRIMARY KEY (ordid, lineno));\n";
+    write(
+        &src,
+        "look.sql",
+        "CREATE PROCEDURE dbo.look @ord int, @line int, @q int OUTPUT, @n int OUTPUT\nAS\nBEGIN\n  \
+         SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  \
+         SELECT @q = l.Qty FROM dbo.Line l JOIN dbo.Item i ON i.Id = l.ItemId \
+         WHERE l.OrdId = @ord AND l.LineNo = @line;\n  \
+         SELECT @n = COUNT(*) FROM dbo.Line WHERE OrdId = @ord;\nEND\n",
+    );
+    let run = |a: &str, b: &str| {
+        let a = write(&cat, "tsql.sql", a);
+        let b = write(&cat, "pg.sql", b);
+        let o = Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+            .args([
+                "convert",
+                &src.display().to_string(),
+                "--to",
+                "postgres",
+                "--out",
+            ])
+            .arg(d.join("out"))
+            .args(["--overwrite", "--isolated", "--proof", "report"])
+            .args(["--catalog", &a, "--catalog-b", &b])
+            .env("SQLDIFF_CHECK", &real)
+            .output()
+            .unwrap();
+        assert!(d.join("out/certificates.json").exists(), "{o:?}");
+        let c: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(d.join("out/certificates.json")).unwrap(),
+        )
+        .unwrap();
+        let r = c["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|f| f["routines"].as_array().unwrap().clone())
+            .find(|r| r["routine"] == "dbo.look")
+            .unwrap();
+        let why: Vec<String> = r["why"]
+            .as_array()
+            .map(|a| a.iter().map(|x| x.as_str().unwrap().to_string()).collect())
+            .unwrap_or_default();
+        (r["answer"].as_str().unwrap().to_string(), why)
+    };
+    let refused = |a: &str, b: &str, code: &str| {
+        let (answer, why) = run(a, b);
+        assert_eq!(answer, "unconfirmed", "{a}\n{b}");
+        assert!(
+            why.iter().any(|c| c == code),
+            "{code} not in {why:?}: {a}\n{b}"
+        );
+    };
+    // The pair is confirmed as it stands, and with an extended property.
+    assert_eq!(run(TABLES, PG).0, "confirmed");
+    let prop = format!(
+        "{TABLES}EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'x', \
+         @level0type = N'SCHEMA', @level0name = 'dbo';\nGO\n"
+    );
+    assert_eq!(run(&prop, PG).0, "confirmed");
+    let unknown = "stmt:select:table:unknown";
+    // F1: PostgreSQL `ADD exclude integer` adds a column.
+    refused(
+        TABLES,
+        &format!("{PG}ALTER TABLE line ADD exclude integer;\n"),
+        unknown,
+    );
+    // F2: a virtual generated column, not an identity.
+    refused(
+        TABLES,
+        &PG.replace(
+            "qty integer NOT NULL",
+            "qty integer GENERATED ALWAYS AS (1 / (ordid - ordid)) CONSTRAINT identity CHECK (true)",
+        ),
+        "stmt:select:column:opaque",
+    );
+    // F3: a key that is initially deferred may hold two equal keys.
+    refused(
+        TABLES,
+        &PG.replace(
+            "PRIMARY KEY (ordid, lineno)",
+            "PRIMARY KEY (ordid, lineno) INITIALLY DEFERRED",
+        ),
+        "stmt:select:many-rows",
+    );
+    // F4: DDL no scan sees.
+    refused(
+        &format!(
+            "{TABLES}DECLARE @s nvarchar(100) = N'ALTER TABLE dbo.' + NCHAR(76) + N'ine DROP COLUMN Qty';\n\
+             EXEC [sp_executesql] @s;\nGO\n"
+        ),
+        PG,
+        unknown,
+    );
+    refused(
+        TABLES,
+        &format!("{PG}DO $$ BEGIN EXECUTE 'CREATE POLICY p ON ' || chr(108) || 'ine USING (false)'; END $$;\n"),
+        unknown,
+    );
+    refused(
+        TABLES,
+        &format!(
+            "{PG}CREATE FUNCTION f() RETURNS void LANGUAGE sql AS \
+             'ALTER TABLE line ENABLE ROW LEVEL SECURITY';\nSELECT f();\n"
+        ),
+        unknown,
+    );
+    // F7: another schema's table of the same name.
+    refused(
+        TABLES,
+        &format!("{PG}CREATE SCHEMA s;\nCREATE TABLE s.line (ordid integer NOT NULL);\n"),
+        unknown,
+    );
+    // F5: a `pg_` table is read from `pg_catalog` first; the same count of
+    // `line` is confirmed.
+    let count = |t: &str| {
+        write(
+            &src,
+            "look.sql",
+            &format!(
+                "CREATE PROCEDURE dbo.look @ord int, @n int OUTPUT\nAS\nBEGIN\n  \
+                 SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  \
+                 SELECT @n = COUNT(*) FROM dbo.{t} WHERE OrdId = @ord;\nEND\n"
+            ),
+        );
+    };
+    count("Line");
+    assert_eq!(run(TABLES, PG).0, "confirmed");
+    count("pg_line");
+    refused(
+        &TABLES.replace("dbo.Line", "dbo.pg_line"),
+        &PG.replace("TABLE line", "TABLE pg_line"),
+        unknown,
+    );
+}
+
 /// C3c end to end: a procedure over a table with a `varchar` and an
 /// `nvarchar` column, two constant defaults and a non-unique index inserts
 /// (the left-out columns get their defaults), updates the string columns
