@@ -137,7 +137,14 @@ fn pg_computed_columns_without_an_exact_rule_stay_refused() {
         "(concat([a],N' ',upper([b])))",
         "(concat([a],[w],[w]))",
         "(concat([a]))",
-        "(json_query([a],N'$.Tags'))",
+        "(json_query([a],N'strict $.Tags'))",
+        "(json_query([a],N'$.x.Tags'))",
+        "(json_query([a],N'$.\"Tags\"'))",
+        "(json_query([a],N'$'))",
+        "(json_value([n],N'$.Tags'))",
+        "(json_value([ch],N'$.Tags'))",
+        "(json_value(upper([a]),N'$.Tags'))",
+        "(json_value([a],N'$.Tags',1))",
         "([n]*(2))",
         "(case when [a] IS NULL then CONVERT([bit],(2)) else CONVERT([bit],(1)) end)",
         "(case when [a] IS NULL then CONVERT([int],(0)) else CONVERT([int],(1)) end)",
@@ -357,4 +364,34 @@ fn pg_clustered_columnstore_index_is_left_out() {
     assert_eq!(u.status, Status::NotConverted);
     // Db2 for i keeps the refusal.
     assert_eq!(db2(src).units[0].status, Status::NotConverted);
+}
+
+#[test]
+fn pg_computed_json_reads_the_key_with_json_operators() {
+    let src = "CREATE TABLE [Warehouse].[StockItems] (\n    [StockItemID] INT NOT NULL,\n    [CustomFields] NVARCHAR (MAX) NULL,\n    [Tags] AS (json_query([CustomFields],N'$.Tags')),\n    [Brand] AS (json_value([CustomFields],N'$.Brand')),\n    CONSTRAINT [PK_StockItems] PRIMARY KEY CLUSTERED ([StockItemID] ASC)\n);\n";
+    let c = pg(src);
+    assert!(
+        c.output.contains("    Tags text GENERATED ALWAYS AS (CASE WHEN json_typeof(CAST(CustomFields AS json) -> 'Tags') IN ('object', 'array') THEN CAST(CAST(CustomFields AS json) -> 'Tags' AS text) END) STORED,\n"),
+        "{}",
+        c.output
+    );
+    assert!(
+        c.output.contains("    Brand varchar(4000) GENERATED ALWAYS AS (CASE WHEN json_typeof(CAST(CustomFields AS json) -> 'Brand') NOT IN ('object', 'array') THEN CAST(CustomFields AS json) ->> 'Brand' END) STORED,\n"),
+        "{}",
+        c.output
+    );
+    // The engine compared the table, generated columns included.
+    assert_eq!(
+        c.units[0].checked,
+        Status::Converted,
+        "{:#?}",
+        c.units[0].notes
+    );
+    assert_eq!(
+        c.units[0].status,
+        Status::Assumptions,
+        "{:#?}",
+        c.units[0].notes
+    );
+    assert!(has(&c, "ASM-JSON-PATH-VALUES"));
 }

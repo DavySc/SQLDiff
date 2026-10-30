@@ -1,0 +1,18 @@
+SET NOCOUNT ON;
+DECLARE @e nvarchar(max) = N'', @w nvarchar(max) = N'  ';
+BEGIN TRY SELECT N'esckey|' + ISNULL(JSON_QUERY(N'{"\u0054ags":[1]}', N'$.Tags'), N'NULL'); END TRY BEGIN CATCH SELECT N'esckey|ERR ' + CAST(ERROR_NUMBER() AS nvarchar(10)); END CATCH;
+BEGIN TRY SELECT N'esckeyv|' + ISNULL(JSON_VALUE(N'{"\u0052":"x"}', N'$.R'), N'NULL'); END TRY BEGIN CATCH SELECT N'esckeyv|ERR ' + CAST(ERROR_NUMBER() AS nvarchar(10)); END CATCH;
+BEGIN TRY SELECT N'len4000|' + ISNULL(CAST(LEN(JSON_VALUE(N'{"R":"' + REPLICATE(CAST(N'a' AS nvarchar(max)), 4000) + N'"}', N'$.R')) AS nvarchar(10)), N'NULL'); END TRY BEGIN CATCH SELECT N'len4000|ERR ' + CAST(ERROR_NUMBER() AS nvarchar(10)); END CATCH;
+BEGIN TRY SELECT N'len4001|' + ISNULL(CAST(LEN(JSON_VALUE(N'{"R":"' + REPLICATE(CAST(N'a' AS nvarchar(max)), 4001) + N'"}', N'$.R')) AS nvarchar(10)), N'NULL'); END TRY BEGIN CATCH SELECT N'len4001|ERR ' + CAST(ERROR_NUMBER() AS nvarchar(10)); END CATCH;
+BEGIN TRY SELECT N'big|' + ISNULL(CAST(LEN(JSON_QUERY(N'{"Tags":["' + REPLICATE(CAST(N'a' AS nvarchar(max)), 9000) + N'"]}', N'$.Tags')) AS nvarchar(10)), N'NULL'); END TRY BEGIN CATCH SELECT N'big|ERR ' + CAST(ERROR_NUMBER() AS nvarchar(10)); END CATCH;
+BEGIN TRY SELECT N'emptyarr|' + ISNULL(JSON_QUERY(N'{"Tags":[]}', N'$.Tags'), N'NULL'); END TRY BEGIN CATCH SELECT N'emptyarr|ERR ' + CAST(ERROR_NUMBER() AS nvarchar(10)); END CATCH;
+BEGIN TRY SELECT N'emptystr|' + ISNULL(JSON_VALUE(@e, N'$.R'), N'NULL'); END TRY BEGIN CATCH SELECT N'emptystr|ERR ' + CAST(ERROR_NUMBER() AS nvarchar(10)); END CATCH;
+BEGIN TRY SELECT N'emptystrq|' + ISNULL(JSON_QUERY(@e, N'$.Tags'), N'NULL'); END TRY BEGIN CATCH SELECT N'emptystrq|ERR ' + CAST(ERROR_NUMBER() AS nvarchar(10)); END CATCH;
+BEGIN TRY SELECT N'ws|' + ISNULL(JSON_VALUE(@w, N'$.R'), N'NULL'); END TRY BEGIN CATCH SELECT N'ws|ERR ' + CAST(ERROR_NUMBER() AS nvarchar(10)); END CATCH;
+BEGIN TRY SELECT N'nullin|' + ISNULL(JSON_VALUE(NULL, N'$.R'), N'NULL'); END TRY BEGIN CATCH SELECT N'nullin|ERR ' + CAST(ERROR_NUMBER() AS nvarchar(10)); END CATCH;
+BEGIN TRY SELECT N'q-quotedpath|' + ISNULL(JSON_QUERY(N'{"Tags":[1]}', N'$."Tags"'), N'NULL'); END TRY BEGIN CATCH SELECT N'q-quotedpath|ERR ' + CAST(ERROR_NUMBER() AS nvarchar(10)); END CATCH;
+BEGIN TRY SELECT N'v-type|' + ISNULL(CAST(SQL_VARIANT_PROPERTY(JSON_VALUE(N'{"R":"x"}', N'$.R'),'MaxLength') AS nvarchar(10)), N'NULL'); END TRY BEGIN CATCH SELECT N'v-type|ERR ' + CAST(ERROR_NUMBER() AS nvarchar(10)); END CATCH;
+CREATE TABLE #t (c nvarchar(max), q AS JSON_QUERY(c, N'$.Tags'), v AS JSON_VALUE(c, N'$.R'));
+BEGIN TRY INSERT INTO #t (c) VALUES (N'5'); SELECT N'scalarinsert|ok'; END TRY BEGIN CATCH SELECT N'scalarinsert|ERR'; END CATCH;
+BEGIN TRY SELECT N'scalarread|' + ISNULL(q,N'NULL') FROM #t; END TRY BEGIN CATCH SELECT N'scalarread|ERR ' + CAST(ERROR_NUMBER() AS nvarchar(10)); END CATCH;
+SELECT N'coltype|' + c.name + N' ' + TYPE_NAME(c.system_type_id) + N' ' + CAST(c.max_length AS nvarchar(10)) FROM tempdb.sys.columns c WHERE c.object_id = OBJECT_ID(N'tempdb..#t');

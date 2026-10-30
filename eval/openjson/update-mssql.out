@@ -1,0 +1,6 @@
+CityID|CityName|StateProvinceID|LatestRecordedPopulation|LastEditedBy
+------|--------|---------------|------------------------|------------
+1|Zürich😀|7|NULL|9
+2|B|2|20|0
+Msg 13608, Level 16, State 6, Server 5de789c13795, Procedure WebApi.UpdateCityFromJson, Line 4
+Property cannot be found on the specified JSON path.

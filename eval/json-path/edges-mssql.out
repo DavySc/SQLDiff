@@ -1,0 +1,17 @@
+esckey|NULL
+esckeyv|NULL
+len4000|4000
+len4001|NULL
+big|9004
+emptyarr|[]
+emptystr|ERR 13609
+emptystrq|ERR 13609
+ws|ERR 13609
+nullin|NULL
+q-quotedpath|[1]
+v-type|8000
+scalarinsert|ok
+scalarread|ERR 13609
+coltype|c nvarchar -1
+coltype|q nvarchar -1
+coltype|v nvarchar 8000

@@ -1,0 +1,13 @@
+ 
+-
+dec-long => 0.13
+dec-38 => 0.13
+dec-int => 5.00
+date-y1 => 0001-01-01
+int-negzero-str => -12
+int-min => -2147483648
+int-dot0 => ERR Conversion failed when converting the nvarchar value '12.0' to data type int.
+quoted-path => 1
+lax-explicit => 1
+colname-case => 2
+bracket-col => 1

@@ -400,3 +400,37 @@ fn temporal_queries_are_refused() {
         );
     }
 }
+
+#[test]
+fn the_history_table_matches_computed_column_types() {
+    // SQL Server types the computed columns nvarchar(max) (JSON_QUERY),
+    // nvarchar(4000) (JSON_VALUE) and nvarchar(101) (the CONCAT of two
+    // nvarchar(50) and a space); the history table declares them so.
+    let main = MAIN.replace(
+        "    [ValidFrom]",
+        "    [Fields]    NVARCHAR (MAX) NULL,\n    [Tags]      AS (json_query([Fields],N'$.Tags')),\n    [Brand]     AS (json_value([Fields],N'$.Brand')),\n    [Search]    AS (concat([Name],N' ',[Name])) PERSISTED NOT NULL,\n    [ValidFrom]",
+    );
+    let archive = |tags: &str| {
+        ARCHIVE.replace(
+            "    [ValidFrom]",
+            &format!("    [Fields]    NVARCHAR (MAX) NULL,\n    [Tags]      {tags} NULL,\n    [Brand]     nvarchar(4000) NULL,\n    [Search]    NVARCHAR (101) NOT NULL,\n    [ValidFrom]"),
+        )
+    };
+    let c = in_tree(&main, &[&main, &archive("NVARCHAR (MAX)")]);
+    assert_ne!(c.units[0].status, Status::NotConverted, "{}", c.output);
+    assert!(
+        c.output.contains("    Tags text GENERATED ALWAYS AS (CASE WHEN json_typeof(CAST(Fields AS json) -> 'Tags') IN ('object', 'array')"),
+        "{}",
+        c.output
+    );
+    // Another type: SQL Server refuses it.
+    let c = in_tree(&main, &[&main, &archive("NVARCHAR (4000)")]);
+    assert_eq!(c.units[0].status, Status::NotConverted, "{}", c.output);
+    assert!(
+        c.units[0].notes[0]
+            .text
+            .contains("column Tags has another type"),
+        "{:?}",
+        c.units[0].notes
+    );
+}

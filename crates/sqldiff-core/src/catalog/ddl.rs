@@ -350,6 +350,8 @@ pub fn column_defs(tb: &mut Table, inner: &[Tok], dialect: Dialect) {
                     col.generated = true;
                     if let Some(ty) = computed_case_type(&opts[1..]) {
                         col.data_type = DataType::parse(&tokens::texts(ty));
+                    } else if let Some(ty) = computed_call_type(&opts[1..], tb, dialect) {
+                        col.data_type = ty;
                     }
                 }
                 _ => {}
@@ -360,6 +362,69 @@ pub fn column_defs(tb: &mut Table, inner: &[Tok], dialect: Dialect) {
             .retain(|c| super::key(dialect, &c.name) != super::key(dialect, &name));
         tb.columns.push(col);
     }
+}
+
+/// The type SQL Server gives a T-SQL computed column `(f(…)) [PERSISTED …]`
+/// (checked in `sys.columns` on SQL Server 2022, as `equiv::table` does):
+/// `JSON_QUERY` is `nvarchar(max)`, `JSON_VALUE` `nvarchar(4000)`, and
+/// `CONCAT` of string literals and varying-string columns declared before
+/// it a string as long as its parts together (`(n)varchar(max)` when one
+/// part is). `None` for anything else, and for a CONCAT longer than 4,000
+/// characters (SQL Server cuts it there).
+fn computed_call_type(el: &[Tok], tb: &Table, dialect: Dialect) -> Option<DataType> {
+    el.first().filter(|x| x.is(SyntaxKind::L_PAREN))?;
+    let mut e = el.get(1..close_paren(el, 0))?;
+    while e.len() > 2 && e[0].is(SyntaxKind::L_PAREN) && close_paren(e, 0) == e.len() - 1 {
+        e = &e[1..e.len() - 1];
+    }
+    if e.len() < 4 || !e[1].is(SyntaxKind::L_PAREN) || close_paren(e, 1) != e.len() - 1 {
+        return None;
+    }
+    let args = split_commas(&e[2..e.len() - 1]);
+    let text = match e[0].upper().as_str() {
+        "JSON_QUERY" if args.len() == 2 => "NVARCHAR(MAX)".to_string(),
+        "JSON_VALUE" if args.len() == 2 => "NVARCHAR(4000)".to_string(),
+        "CONCAT" if args.len() >= 2 => {
+            let (mut len, mut national) = (Some(0u32), false);
+            for a in args {
+                let [x] = a else { return None };
+                if x.is(SyntaxKind::STRING) {
+                    let n = x.text.starts_with(['N', 'n']);
+                    let body = x.text[usize::from(n)..]
+                        .strip_prefix('\'')?
+                        .strip_suffix('\'')?;
+                    national |= n;
+                    len = len.map(|l| l + body.replace("''", "'").encode_utf16().count() as u32);
+                } else if x.is_name() {
+                    let c = tb.column(dialect, &x.ident())?;
+                    let n = match c.data_type.base.as_str() {
+                        "NVARCHAR" => true,
+                        "VARCHAR" => false,
+                        _ => return None,
+                    };
+                    national |= n;
+                    len = match (len, c.data_type.max, c.data_type.args.as_slice()) {
+                        (_, true, _) => None,
+                        (Some(l), false, [m]) => Some(l + m),
+                        (None, false, [_]) => None,
+                        _ => return None,
+                    };
+                } else {
+                    return None;
+                }
+            }
+            if len.is_some_and(|l| l > 4000) {
+                return None;
+            }
+            format!(
+                "{}VARCHAR({})",
+                if national { "N" } else { "" },
+                len.map_or("MAX".to_string(), |l| l.to_string())
+            )
+        }
+        _ => return None,
+    };
+    Some(DataType::parse_str(&text))
 }
 
 /// The type of a T-SQL computed column `(CASE … END) [PERSISTED …]` whose

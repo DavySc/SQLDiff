@@ -1,0 +1,38 @@
+d
+-
+-.13
+.12
+Msg 8115, Level 16, State 8, Server 5de789c13795, Line 2
+Arithmetic overflow error converting nvarchar to data type numeric.
+i
+-
+0
+-2147483648
+2147483647
+b
+-
+1
+0
+0
+1
+N
+N
+d
+-
+0001-01-01
+9999-12-31
+2020-02-29
+s|l
+-|-
+abc  |3
+é	"x|4
+abcde|5
+x
+-
+NULL
+NULL
+NULL
+Msg 13608, Level 16, State 6, Server 5de789c13795, Line 1
+Property cannot be found on the specified JSON path.
+Msg 8115, Level 16, State 8, Server 5de789c13795, Line 1
+Arithmetic overflow error converting nvarchar to data type numeric.

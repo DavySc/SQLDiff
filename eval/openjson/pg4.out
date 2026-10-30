@@ -1,0 +1,25 @@
+-0.13
+0.12
+0.00
+ERROR:  numeric field overflow
+DETAIL:  A field with precision 18, scale 2 must round to an absolute value less than 10^16.
+0
+-2147483648
+2147483647
+t
+f
+f
+t
+
+
+0001-01-01
+9999-12-31
+2020-02-29
+abc  |5
+é	"x|4
+abcde|5
+
+
+
+ERROR:  jsonpath member accessor can only be applied to an object
+t

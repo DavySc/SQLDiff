@@ -12,7 +12,7 @@ use sqldiff_core::Dialect;
 
 const PEOPLE: (&str, &str) = (
     "src/tables/people.sql",
-    "CREATE TABLE app.people (\n    person_id int NOT NULL PRIMARY KEY,\n    full_name nvarchar(50) NOT NULL,\n    preferred_name nvarchar(50) NOT NULL,\n    search_name AS (concat(preferred_name, N' ', full_name)) PERSISTED NOT NULL,\n    custom_fields nvarchar(max) NULL,\n    other_languages AS (json_query(custom_fields, N'$.OtherLanguages'))\n);\nGO\nCREATE INDEX ix_people_full_name ON app.people (full_name);\nGO\n",
+    "CREATE TABLE app.people (\n    person_id int NOT NULL PRIMARY KEY,\n    full_name nvarchar(50) NOT NULL,\n    preferred_name nvarchar(50) NOT NULL,\n    search_name AS (concat(preferred_name, N' ', full_name)) PERSISTED NOT NULL,\n    custom_fields nvarchar(max) NULL,\n    other_languages AS (json_query(custom_fields, N'strict $.OtherLanguages'))\n);\nGO\nCREATE INDEX ix_people_full_name ON app.people (full_name);\nGO\n",
 );
 
 struct Fixture {

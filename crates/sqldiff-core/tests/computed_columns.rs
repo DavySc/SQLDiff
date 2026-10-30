@@ -114,3 +114,115 @@ fn concat_near_misses() {
         "equiv.column-null",
     );
 }
+
+const JQ: &str = "CASE WHEN json_typeof(CAST(Notes AS json) -> 'Tags') IN ('object', 'array') THEN CAST(CAST(Notes AS json) -> 'Tags' AS text) END";
+const JV: &str = "CASE WHEN json_typeof(CAST(Notes AS json) -> 'Tags') NOT IN ('object', 'array') THEN CAST(Notes AS json) ->> 'Tags' END";
+
+#[test]
+fn json_query_and_value_read_the_same_key() {
+    let r = equal(
+        &tsql("Tags AS (json_query([Notes],N'$.Tags'))"),
+        &pg(&format!("Tags text GENERATED ALWAYS AS ({JQ}) STORED")),
+    );
+    assert!(r.assumptions.iter().any(|x| x.id == "ASM-JSON-PATH-VALUES"));
+    equal(
+        &tsql("Tags AS (json_value([Notes],N'$.Tags'))"),
+        &pg(&format!(
+            "Tags varchar(4000) GENERATED ALWAYS AS ({JV}) STORED"
+        )),
+    );
+    // `lax` is the default mode.
+    equal(
+        &tsql("Tags AS (json_value(Notes, 'lax $.Tags'))"),
+        &pg(&format!(
+            "Tags varchar(4000) GENERATED ALWAYS AS ({JV}) STORED"
+        )),
+    );
+}
+
+#[test]
+fn json_near_misses() {
+    let q = tsql("Tags AS (json_query([Notes],N'$.Tags'))");
+    let v = tsql("Tags AS (json_value([Notes],N'$.Tags'))");
+    let gen = |ty: &str, e: &str| pg(&format!("Tags {ty} GENERATED ALWAYS AS ({e}) STORED"));
+    // The value form for JSON_QUERY and the other way round.
+    not_equal(&q, &gen("text", JV), "Tags");
+    not_equal(&v, &gen("varchar(4000)", JQ), "Tags");
+    // Another key, a key in another case, another source column.
+    not_equal(&q, &gen("text", &JQ.replace("'Tags'", "'Tag'")), "Tags");
+    not_equal(&q, &gen("text", &JQ.replace("'Tags'", "'tags'")), "Tags");
+    not_equal(&q, &gen("text", &JQ.replace("Notes", "FullName")), "Tags");
+    // jsonb rewrites the text of fragments and numbers.
+    not_equal(
+        &q,
+        &gen(
+            "text",
+            &JQ.replace("AS json)", "AS jsonb)")
+                .replace("json_typeof", "jsonb_typeof"),
+        ),
+        "Tags",
+    );
+    not_equal(
+        &v,
+        &gen(
+            "varchar(4000)",
+            &JV.replace("AS json)", "AS jsonb)")
+                .replace("json_typeof", "jsonb_typeof"),
+        ),
+        "Tags",
+    );
+    // Without the type test: JSON_VALUE of an object is NULL, ->> its text.
+    not_equal(
+        &v,
+        &gen("varchar(4000)", "CAST(Notes AS json) ->> 'Tags'"),
+        "Tags",
+    );
+    not_equal(
+        &q,
+        &gen("text", "CAST(CAST(Notes AS json) -> 'Tags' AS text)"),
+        "Tags",
+    );
+    // Only an object, or only an array, counts as a fragment.
+    not_equal(
+        &q,
+        &gen("text", &JQ.replace("('object', 'array')", "('object')")),
+        "Tags",
+    );
+    not_equal(
+        &q,
+        &gen(
+            "text",
+            &JQ.replace("('object', 'array')", "('array', 'object')"),
+        ),
+        "Tags",
+    );
+    // A shorter column type: JSON_VALUE is nvarchar(4000).
+    not_equal(&v, &gen("varchar(3999)", JV), "equiv.column-type");
+    // Strict mode raises an error where lax mode gives NULL.
+    not_equal(
+        &tsql("Tags AS (json_query([Notes],N'strict $.Tags'))"),
+        &gen("text", JQ),
+        "Tags",
+    );
+    // A nested path.
+    not_equal(
+        &tsql("Tags AS (json_query([Notes],N'$.a.Tags'))"),
+        &gen("text", JQ),
+        "Tags",
+    );
+}
+
+#[test]
+fn json_key_case_matters_between_tsql_versions() {
+    // JSON keys are case-sensitive, whatever the collation does to names.
+    let r = diff(
+        &Artifact::new("a.sql", T, tsql("Tags AS (json_query([Notes],N'$.Tags'))")),
+        &Artifact::new("b.sql", T, tsql("Tags AS (json_query([Notes],N'$.tags'))")),
+        &Options::default(),
+    );
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:#?}",
+        r
+    );
+}

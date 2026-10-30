@@ -326,6 +326,47 @@ Db2 for i takes no `NEXT VALUE FOR` in a column default, so the converter writes
 - An INSERT that gives the column takes no sequence value.
 - Open, no expectation: an INSERT that writes NULL into the column (T-SQL refuses it; the trigger would fill it, as `ASM-SEQUENCE-DEFAULT-TRIGGER` states) and one that writes `DEFAULT`.
 
+### JSON_QUERY, JSON_VALUE and PostgreSQL json — Confirmed (SQL Server, PostgreSQL)
+
+The PostgreSQL conversion of a computed column `JSON_QUERY(col, '$.key')` or `JSON_VALUE(col, '$.key')` (see `canon::pg_json_path`) was checked on SQL Server 2022 and PostgreSQL 18.6 on 2026-10-29 and 2026-10-30. The probes and their output are in [eval/json-path](../eval/json-path/).
+
+- **Same.** `json_typeof(CAST(x AS json) -> 'key')` tells an object or array from a scalar. `CAST(… -> 'key' AS text)` gives a fragment's text as written (whitespace kept), and `->> 'key'` gives a scalar as SQL Server's JSON_VALUE does: strings de-escaped, numbers as written (`12.50e1`, `1E400`), `true`, NULL for JSON null and for a missing key. Keys match case-sensitively on both. Lax mode gives NULL for the other kind of value, as the `CASE` does. A 9,000-character fragment comes back whole on both. SQL Server types the computed columns `nvarchar(max)` (JSON_QUERY) and `nvarchar(4000)` (JSON_VALUE).
+- **Different**, and excluded by `ASM-JSON-PATH-VALUES`:
+  - duplicate keys: SQL Server reads the first, PostgreSQL `json ->` the last;
+  - a `\u0000` or unpaired surrogate escape anywhere in the document: PostgreSQL raises an error;
+  - a top-level scalar: SQL Server raises an error, PostgreSQL gives NULL;
+  - invalid JSON that SQL Server reads far enough to find the key (text after the value, a trailing comma, a missing `}`): PostgreSQL raises an error;
+  - a key written with escapes (`{"\u0054ags":[1]}`): SQL Server does not match it to `$.Tags`, PostgreSQL does (OPENJSON, by contrast, matches it);
+  - JSON_VALUE of a string over 4,000 characters: SQL Server gives NULL, and the PostgreSQL `varchar(4000)` column rejects the write.
+- `jsonb` would not do: it rewrites fragments (`{"a":1}` becomes `{"a": 1}`) and numbers (`1e2` becomes `100`).
+- A generated column cannot cast text to `timestamp` in PostgreSQL ("generation expression is not immutable"), so `TRY_CONVERT(datetime2, JSON_VALUE(…), 126)` has no plain form.
+
+### OPENJSON and PostgreSQL jsonb — Confirmed (SQL Server, PostgreSQL)
+
+The PostgreSQL conversion of `OPENJSON(@v) WITH (col type ['[lax|strict] $.key'], ...)` (see `canon::pg_json_rows`) was checked on SQL Server 2022 and PostgreSQL 18.6 on 2026-10-29. The probes and their output are in [eval/openjson](../eval/openjson/): `ms*.sql` for SQL Server (`sqlcmd -I -W`), `pg*.sql` for PostgreSQL (`psql -At`).
+
+- **Rows.** OPENJSON reads an object as one row, except `{}`, which has none. It reads an array as one row per element, also for `{}`, scalar and array elements. NULL gives no rows. A scalar document, a string document and `''` are errors. `jsonb_array_elements` over `CASE jsonb_typeof(j) WHEN 'object' THEN CASE j WHEN '{}' THEN '[]' ELSE jsonb_build_array(j) END ELSE j END` gives the same rows and the same errors. One exception: SQL Server accepts text after a complete array (`[{"a":1}] x`), and PostgreSQL rejects it.
+- **Paths.**
+  - A lax path (the default) reads NULL where the key is missing or the element is not an object; so does `e ->> 'key'`.
+  - A strict path fails on a missing key or a non-object element, and reads NULL for JSON null; so does `jsonb_path_query_first(e, 'strict $."key"') #>> '{}'`.
+  - Keys are case-sensitive on both. The default path is `$.` followed by the column name as written.
+  - Where the two differ, the conversion relies on `ASM-OPENJSON-VALUES`:
+    - On an object or array value, OPENJSON reads NULL (lax) or fails (strict), while PostgreSQL returns its text.
+    - With duplicate keys, SQL Server takes the first and jsonb the last.
+    - jsonb rewrites numbers (`1e2` reads as `100`).
+- **Types.** A column's value converts like `CONVERT(type, text)` in SQL Server and like `CAST(text AS type)` in PostgreSQL. They agree on plain values:
+  - Strings into nvarchar(n) / varchar(n) are cut silently. Each side counts in its own units (UTF-16 code units, characters), which are the same within the BMP. Trailing blanks are kept.
+  - Integers convert alike, and overflow is an error on both. Both reject a fraction (`12.7`, `12.0`).
+  - Decimals round half away from zero (0.125 → 0.13, -0.125 → -0.13), and overflow is an error on both.
+  - `yyyy-mm-dd` dates convert alike from 0001-01-01 to 9999-12-31.
+  - For bit / boolean, `true`, `false`, `1` and `0` convert alike.
+
+  Where they differ:
+  - `''` is 0, 1900-01-01 or 0 in SQL Server, and an error in PostgreSQL.
+  - The bit `2` is 1 in SQL Server, and an error as a boolean in PostgreSQL.
+  - Exponents are not accepted the same way.
+  - varbinary decodes base64; there is no conversion for it.
+
 ## Follow-up
 
 IBM Documentation refused most automated fetches, so V4, V9, V15 and parts of V3, V5, V7, V14 and V19 need either a manual read of the [7.5 SQL Reference PDF](https://www.ibm.com/docs/en/ssw_ibm_i_75/pdf/rbafzpdf.pdf) or, better, a small probe script run on an IBM i system. These probes belong in the per-dialect conformance tests (design doc section 12).

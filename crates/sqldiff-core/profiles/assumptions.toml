@@ -651,6 +651,27 @@ fact = "The converted statement takes the value once (a variable), or a reading 
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-OPENJSON-ONE-ROW"
+statement = "The JSON document an UPDATE … FROM reads with OPENJSON is one object, not an array, so each target row meets at most one of its rows."
+discharge = "deployment"
+fact = "The callers pass one JSON object (as the WWI WebApi Update…FromJson procedures do), never an array."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-OPENJSON-VALUES"
+statement = "The JSON documents OPENJSON reads are valid JSON (an object or an array of objects, nothing after it) without duplicate keys, \\u0000 or unpaired surrogate escapes, and each value a WITH column reads is null or a plain value of its type (BMP strings for nvarchar, integers in range for int and bigint, numbers without exponent for decimal, 'yyyy-mm-dd' for date, true, false, 0 or 1 for bit)."
+discharge = "deployment"
+fact = "The callers pass such documents: on these, OPENJSON and PostgreSQL's jsonb functions read the same rows and values (checked on SQL Server 2022 and PostgreSQL 18)."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-JSON-PATH-VALUES"
+statement = "The JSON documents read with JSON_QUERY or JSON_VALUE of a top-level key are valid JSON objects or arrays (nothing after the value) with no duplicate keys, no key written with escapes, no \\u0000 or unpaired surrogate escapes, and each string JSON_VALUE reads is at most 4,000 characters."
+discharge = "deployment"
+fact = "The application writes such documents: on these, JSON_QUERY and JSON_VALUE in lax mode and PostgreSQL's json operators (->, ->> and json_typeof) read the same values, fragments and numbers as written (checked on SQL Server 2022 and PostgreSQL 18)."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-OUTPUT-INTO-TARGET"
 statement = "The table an OUTPUT … INTO writes has no enabled trigger, CHECK constraint or rule and is on neither side of a foreign key (SQL Server rejects the statement otherwise, Msg 331 to 333; the PostgreSQL insert runs)."
 discharge = "catalog"
