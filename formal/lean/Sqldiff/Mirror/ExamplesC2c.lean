@@ -381,12 +381,15 @@ def tP (e : Ast.Expr) : Option (SExpr × STy) := typed (.pg Γv []) envP {} e
 #guard tT (.Bin "<" (tv "@s") (tv "@big")) == some (.cmp .lt (.var "@s") (.var "@big"), .bool)
 #guard tT (.Unary "-" (tv "@s")) == some (.neg .i16 (.var "@s"), .int .i16)
 #guard tP (.Bin "+" (pv "p_id") (pv "p_big")) == some (.arith .i64 .add (.var "p_id") (.var "p_big"), .int .i64)
--- Two smallints divide only by a literal other than 0 and -1 (V1); a
--- literal is an `int`, so `@s / 2` is an `int` division.
+-- Two smallints divide at 16 bits (`-32768 / -1` raises on both, V1); a
+-- literal is an `int`, so `@s / 2` and `@s / -1` are `int` divisions.
 #guard tT (.Bin "/" (tv "@s") (num 2)) == some (.arith .i32 .div (.var "@s") (.int 2), .int .i32)
-#guard (tT (.Bin "/" (tv "@s") (tv "@s"))).isNone
+#guard tT (.Bin "/" (tv "@s") (tv "@s")) == some (.arith .i16 .div (.var "@s") (.var "@s"), .int .i16)
 #guard (tT (.Bin "/" (tv "@s") (.Num "-1"))).isSome
-#guard (tT (.Bin "/" (.Cast (tv "@s") smallint) (tv "@s"))).isNone
+#guard evl (.arith .i16 .div (.var "a") (.var "b")) (I (-32768)) (I (-1)) == .err .overflow
+#guard evl (.arith .i32 .div (.var "a") (.int (-1))) (I (-32768)) N == .ok (I 32768)
+-- `%` keeps its literal-divisor rule (`-32768 % -1` on smallints: 8115 against 0).
+#guard (tT (.Bin "%" (tv "@s") (tv "@s"))).isNone
 #guard tT (.Bin "/" (tv "@big") (tv "@s")) == some (.arith .i64 .div (.var "@big") (.var "@s"), .int .i64)
 -- A bigint constant: PostgreSQL types it, T-SQL only as a stored value (V2).
 #guard tP (.Num "2147483648") == some (.int 2147483648, .int .i64)
@@ -649,9 +652,9 @@ def wP (b : Ast.Routine) : List String := whyP Γv b
   ["store:assign:datetime2_6", "expr:date-literal"]
 #guard wT (storeT "@t" (dateadd "hour" (num 1) (tv "@t"))) == ["expr:dateadd:part"]
 #guard wT (storeT "@id" (datediff "month" (tv "@t") (tv "@t"))) == ["expr:datediff:part"]
-#guard isC1 (checkS "@s" (.Bin "/" (tv "@s") (tv "@s")) "p_s" (.Bin "/" (pv "p_s") (pv "p_s")))
+#guard isC2a (checkS "@s" (.Bin "/" (tv "@s") (tv "@s")) "p_s" (.Bin "/" (pv "p_s") (pv "p_s")))
 #guard wT (procT [declT "@s" smallint none, ins ["dbo", "Ev"] ["Id", "B", "S"]
-  [[num 1, num 1, .Bin "/" (tv "@s") (tv "@s")]]]) == ["stmt:insert:value", "expr:div:smallint"]
+  [[num 1, num 1, .Bin "%" (tv "@s") (tv "@s")]]]) == ["stmt:insert:value", "expr:bin"]
 #guard wT (tsqlProc ["dbo", "s"] [] [xactAbort, declT "@x" (dt2 7) none,
   set (tv "@x") (dateadd "day" (num 1) (tv "@x"))]) == ["type:datetime2_7"]
 #guard wT (tsqlProc ["dbo", "s"] [] [xactAbort, declT "@x" (.Ty "DATETIME" []) none, declT "@i" int none,

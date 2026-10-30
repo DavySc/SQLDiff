@@ -13,8 +13,9 @@ USE probe_c2c;
 GO
 
 -- V1 integer widths: the result type of arithmetic on each width, and the
--- overflow errors. smallint + smallint is int (not smallint); int + bigint
--- is bigint; int and bigint overflow raise 8115.
+-- overflow errors. smallint + smallint is smallint (and overflows at
+-- 32767); int + bigint is bigint; smallint, int and bigint overflow raise
+-- 8115; a literal divisor is an int, so @s / -1 is an int division.
 CREATE OR ALTER PROCEDURE dbo.v1 AS
 BEGIN
   SET NOCOUNT ON;
@@ -100,6 +101,21 @@ BEGIN
     PRINT 'V1 bigint / 0: error ' + CAST(ERROR_NUMBER() AS varchar(11));
   END CATCH
   PRINT 'V1 bigint / 7 truncates: value=' + CAST(CAST(-100000000000 AS bigint) / 7 AS varchar(20));
+  DECLARE @sm smallint = -32768, @sn smallint = -1;
+  BEGIN TRY
+    SET @r = @sm / @sn;
+    PRINT 'V1 smallint -32768 / smallint -1: no error, value=' + CAST(@r AS varchar(20));
+  END TRY
+  BEGIN CATCH
+    PRINT 'V1 smallint -32768 / smallint -1: error ' + CAST(ERROR_NUMBER() AS varchar(11));
+  END CATCH
+  BEGIN TRY
+    SET @r = @sm % @sn;
+    PRINT 'V1 smallint -32768 % smallint -1: no error, value=' + CAST(@r AS varchar(20));
+  END TRY
+  BEGIN CATCH
+    PRINT 'V1 smallint -32768 % smallint -1: error ' + CAST(ERROR_NUMBER() AS varchar(11));
+  END CATCH
 END
 GO
 EXEC dbo.v1;
@@ -120,6 +136,17 @@ BEGIN
     + '(' + CAST(SQL_VARIANT_PROPERTY(2147483648, 'Precision') AS varchar(20)) + ','
     + CAST(SQL_VARIANT_PROPERTY(2147483648, 'Scale') AS varchar(20)) + ')';
   PRINT 'V2 literal 32767: type=' + CAST(SQL_VARIANT_PROPERTY(32767, 'BaseType') AS varchar(20));
+  PRINT 'V2 literal -2147483648: type=' + CAST(SQL_VARIANT_PROPERTY(-2147483648, 'BaseType') AS varchar(20))
+    + '; -2147483648 + 0: type=' + CAST(SQL_VARIANT_PROPERTY(-2147483648 + 0, 'BaseType') AS varchar(20))
+    + '; -9223372036854775808: type=' + CAST(SQL_VARIANT_PROPERTY(-9223372036854775808, 'BaseType') AS varchar(20));
+  DECLARE @ny int = -1, @nz int = -1, @nx int;
+  BEGIN TRY
+    SET @nx = (-2147483648 + @ny) - @nz;
+    PRINT 'V2 (-2147483648 + -1) - -1: no error, value=' + CAST(@nx AS varchar(20));
+  END TRY
+  BEGIN CATCH
+    PRINT 'V2 (-2147483648 + -1) - -1: error ' + CAST(ERROR_NUMBER() AS varchar(11));
+  END CATCH
   SET @s = 32767;
   SET @b = @s;
   SET @i = @s;

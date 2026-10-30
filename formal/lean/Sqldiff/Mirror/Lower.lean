@@ -822,11 +822,12 @@ bigint, smallint, and tinyint (Transact-SQL)"; PostgreSQL 8.1.1, Table
   8115 against 22003; `bigint / 7` truncates alike; `bigint / 0` is 8134
   against 22012). The core computes at the result's width
   (`Sqldiff.Core.arithInt`, `toIntW`). **Division of two `smallint`s**
-  is in the slice only with a literal divisor other than 0 and -1: both
-  engines give 32768 for `-32768 / -1` on `smallint` without an error
-  (probed, V1), which the core, raising, does not model. `%` keeps its
-  literal-divisor rule at every width (`bigint % -1` of the minimum is
-  8115 against 0, probed V1).
+  is a `smallint` division and raises on `-32768 / -1` on both engines
+  (probed, V1: 8115 against 22003), as the core's 16-bit overflow does.
+  A literal divisor is an `int`, so `@s / -1` is an `int` division and
+  gives 32768 on both (probed, V1). `%` keeps its literal-divisor rule
+  at every width (`smallint % smallint` of `-32768 % -1` is 8115 against
+  0, `bigint % -1` of the minimum is 8115 against 0, probed V1).
 * **Negation** `-x` keeps the width and raises on `-(-32768)` for a
   `smallint` in both (probed, V1: 8115 against 22003).
 * **Comparisons** of two integers of any widths are the slice's
@@ -1359,11 +1360,6 @@ def binTy (d : Dialect) (o : String) : SExpr × STy → SExpr × STy → Option 
     | some .mod, _ => match b with
       | .int k => if k = 0 ∨ k = -1 then none else some (.arith r .mod a b, .int r)
       | _ => none
-    -- Two smallints: `-32768 / -1` is 32768 on both engines, no error.
-    | some .div, _ => if r == .i16 then (match b with
-        | .int k => if k = 0 ∨ k = -1 then none else some (.arith r .div a b, .int r)
-        | _ => none)
-      else some (.arith r .div a b, .int r)
     | some op, _ => some (.arith r op a b, .int r)
     | none, some c => some (.cmp c a b, .bool)
     | none, none => none

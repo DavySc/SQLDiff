@@ -19,9 +19,13 @@ V1 bigint min / -1: error 8115
 V1 bigint min % -1: error 8115
 V1 bigint / 0: error 8134
 V1 bigint / 7 truncates: value=-14285714285
+V1 smallint -32768 / smallint -1: error 8115
+V1 smallint -32768 % smallint -1: error 8115
 V2 literal 2147483647: type=int
 V2 literal 2147483648: type=numeric(10,0)
 V2 literal 32767: type=int
+V2 literal -2147483648: type=int; -2147483648 + 0: type=int; -9223372036854775808: type=numeric
+V2 (-2147483648 + -1) - -1: error 8115
 V2 widening stores keep the value: int=32767 bigint=32767
 V2 int 40000 into smallint: error 220
 V2 bigint 3000000000 into int: error 8115

@@ -205,14 +205,7 @@ partial def whyExpr (d : Dialect) (env : TyEnv) (sc : Scope) (ok : Ast.Expr → 
           ([dt, y, mo, dd].filter fun k => !typedOk k).flatMap (whyExpr d env sc typedOk)
         else ((subExprs e).filter fun k => !ok k).flatMap (whyExpr d env sc ok)
       | _, _ => ((subExprs e).filter fun k => !ok k).flatMap (whyExpr d env sc ok)
-    -- C2c: a division of two smallints without a literal divisor.
-    let own : String := match e with
-      | .Bin "/" a b =>
-        match typed d env sc a, typed d env sc b with
-        | some (_, .int .i16), some (_, .int .i16) => "expr:div:smallint"
-        | _, _ => exprFallback e
-      | _ => exprFallback e
-    orElse inner own
+    orElse inner (exprFallback e)
 
 /-- Why `lowerExpr` refuses `e`. -/
 def whyLower (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) : List String :=

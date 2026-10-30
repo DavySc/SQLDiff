@@ -19,9 +19,13 @@ NOTICE:  V1 bigint min / -1: error 22003
 NOTICE:  V1 bigint min % -1: no error, value=0
 NOTICE:  V1 bigint / 0: error 22012
 NOTICE:  V1 bigint / 7 truncates: value=-14285714285
+NOTICE:  V1 smallint -32768 / smallint -1: error 22003
+NOTICE:  V1 smallint -32768 % smallint -1: no error, value=0
 NOTICE:  V2 literal 2147483647: type=integer
 NOTICE:  V2 literal 2147483648: type=bigint
 NOTICE:  V2 literal 32767: type=integer
+NOTICE:  V2 literal -2147483648: type=integer; -2147483648 + 0: type=integer; -9223372036854775808: type=bigint
+NOTICE:  V2 (-2147483648 + -1) - -1: error 22003
 NOTICE:  V2 widening stores keep the value: int=32767 bigint=32767
 NOTICE:  V2 int 40000 into smallint: error 22003
 NOTICE:  V2 bigint 3000000000 into int: error 22003

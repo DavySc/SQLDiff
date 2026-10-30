@@ -86,6 +86,21 @@ BEGIN
     RAISE NOTICE 'V1 bigint / 0: error %', SQLSTATE;
   END;
   RAISE NOTICE 'V1 bigint / 7 truncates: value=%', (-100000000000)::bigint / 7;
+  DECLARE sm smallint := -32768; sn smallint := -1;
+  BEGIN
+    BEGIN
+      r := sm / sn;
+      RAISE NOTICE 'V1 smallint -32768 / smallint -1: no error, value=%', r;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE NOTICE 'V1 smallint -32768 / smallint -1: error %', SQLSTATE;
+    END;
+    BEGIN
+      r := sm % sn;
+      RAISE NOTICE 'V1 smallint -32768 %% smallint -1: no error, value=%', r;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE NOTICE 'V1 smallint -32768 %% smallint -1: error %', SQLSTATE;
+    END;
+  END;
 END; $$;
 CALL v1();
 
@@ -100,6 +115,15 @@ BEGIN
   RAISE NOTICE 'V2 literal 2147483647: type=%', pg_typeof(2147483647);
   RAISE NOTICE 'V2 literal 2147483648: type=%', pg_typeof(2147483648);
   RAISE NOTICE 'V2 literal 32767: type=%', pg_typeof(32767);
+  RAISE NOTICE 'V2 literal -2147483648: type=%; -2147483648 + 0: type=%; -9223372036854775808: type=%',
+    pg_typeof(-2147483648), pg_typeof(-2147483648 + 0), pg_typeof(-9223372036854775808);
+  DECLARE ny integer := -1; nz integer := -1; nx integer;
+  BEGIN
+    nx := (-2147483648 + ny) - nz;
+    RAISE NOTICE 'V2 (-2147483648 + -1) - -1: no error, value=%', nx;
+  EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'V2 (-2147483648 + -1) - -1: error %', SQLSTATE;
+  END;
   s := 32767;
   b := s;
   i := s;
