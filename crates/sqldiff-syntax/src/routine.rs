@@ -159,6 +159,83 @@ pub struct Handler {
 
 /// The routine a `ROUTINE` node holds.
 pub fn read(n: &SyntaxNode, d: Dialect) -> RResult<Routine> {
+    read_with(n, &mut Reading { d, left_out: None })
+}
+
+/// The routine a `ROUTINE` node holds, with every statement of the body
+/// that [`read`] would refuse left out of the tree, and the message
+/// [`read`] would give for each, in the order [`read`] meets them: the
+/// first message is always the error [`read`] returns. A failure about
+/// the routine itself is an error, as in [`read`], even where [`read`]
+/// stops earlier at an unread statement (see [`Reading::statement`] for
+/// which failures are which).
+///
+/// For diagnostics only: the tree is not the routine (statements are
+/// missing), so nothing may be confirmed from it.
+pub fn read_collecting(n: &SyntaxNode, d: Dialect) -> RResult<(Routine, Vec<String>)> {
+    let mut rd = Reading {
+        d,
+        left_out: Some(Vec::new()),
+    };
+    let r = read_with(n, &mut rd)?;
+    Ok((r, rd.left_out.unwrap_or_default()))
+}
+
+/// How a read treats a statement of the body it cannot read.
+struct Reading {
+    d: Dialect,
+    /// `None`: strict ([`read`]), the first failure is the routine's.
+    /// `Some`: collecting ([`read_collecting`]), the messages of the
+    /// statements left out so far.
+    left_out: Option<Vec<String>>,
+}
+
+impl Reading {
+    /// The one place that decides which failures leave one statement out
+    /// (collecting) instead of failing the routine: `r` is the reading of
+    /// one unit of a statement list, or of one declaration of a PL/pgSQL
+    /// `DECLARE` section. Strict, a failure is the routine's; collecting,
+    /// it is recorded and the unit left out (`None`), whatever it nests.
+    ///
+    /// Per statement, then (every call of this function):
+    /// - a unit of a statement list: the routine's body (T-SQL `AS stmt
+    ///   ...` or the statements of its `BEGIN ... END`, the statements of
+    ///   the PL/pgSQL routine's block), a nested block's body, the
+    ///   branches of `IF`/`ELSE IF`/`ELSIF`/`ELSE`, the body of `WHILE`
+    ///   and `FOR`, the `TRY` and `CATCH` bodies, the body of a PL/pgSQL
+    ///   exception handler. Its failure is anything [`node`] refuses: a
+    ///   statement the statement reader does not read (`PRINT`, `CREATE
+    ///   TABLE #t`, dynamic `EXEC (@s)`, `FOR JSON`, a cursor, ...), a
+    ///   unit kind without a rule (`CASE_STMT`, `LABEL`, `ERROR`), or a
+    ///   compound statement's own shape (an `IF` or `WHILE` condition, a
+    ///   labelled nested block, a `TRY` without its `CATCH`, a nested
+    ///   block's exception section, a `FOR` loop not over a `SELECT`),
+    ///   which leaves the whole compound out with what it holds;
+    /// - a declaration of a PL/pgSQL `DECLARE` section (`CONSTANT`, `NOT
+    ///   NULL`), the counterpart of a T-SQL `DECLARE` statement.
+    ///
+    /// About the routine, an error in both reads (never passed here): not
+    /// a `ROUTINE` node (a view, a trigger, ...), no body; the header (not
+    /// a procedure or function, the name, the parameters and parameter
+    /// options, table-valued results, routine options, the language, a
+    /// function without `RETURNS`); the body's frame (a PL/pgSQL body
+    /// that is not one block, the routine's own block written with a
+    /// label or other tokens, an exception section on the routine's own
+    /// block); a Db2 for i routine.
+    fn statement<T>(&mut self, r: RResult<T>) -> RResult<Option<T>> {
+        match (r, &mut self.left_out) {
+            (Ok(v), _) => Ok(Some(v)),
+            (Err(e), Some(left_out)) => {
+                left_out.push(e);
+                Ok(None)
+            }
+            (Err(e), None) => Err(e),
+        }
+    }
+}
+
+fn read_with(n: &SyntaxNode, rd: &mut Reading) -> RResult<Routine> {
+    let d = rd.d;
     if n.kind() != ROUTINE {
         return Err(format!("{:?} is not a routine", n.kind()));
     }
@@ -177,7 +254,7 @@ pub fn read(n: &SyntaxNode, d: Dialect) -> RResult<Routine> {
         Dialect::Postgres => {
             let units: Vec<SyntaxNode> = body.children().filter(|c| c.kind().is_unit()).collect();
             match units.as_slice() {
-                [b] if b.kind() == BLOCK => match block(b, d)? {
+                [b] if b.kind() == BLOCK => match block(b, rd)? {
                     (blk, hs) if hs.is_empty() => blk,
                     _ => {
                         return Err(
@@ -193,10 +270,10 @@ pub fn read(n: &SyntaxNode, d: Dialect) -> RResult<Routine> {
             let units: Vec<SyntaxNode> = body.children().filter(|c| c.kind().is_unit()).collect();
             match units.as_slice() {
                 // `AS BEGIN ... END` and `AS stmt ...` run the same statements.
-                [b] if b.kind() == BLOCK => block(b, d)?.0,
+                [b] if b.kind() == BLOCK => block(b, rd)?.0,
                 _ => Block {
                     decls: Vec::new(),
-                    body: nodes(&units, d)?,
+                    body: nodes(&units, rd)?,
                 },
             }
         }
@@ -350,7 +427,8 @@ fn param(p: &mut Parser, d: Dialect) -> RResult<Param> {
 }
 
 /// A block and the handlers of its exception section (PL/pgSQL).
-fn block(b: &SyntaxNode, d: Dialect) -> RResult<(Block, Vec<Handler>)> {
+fn block(b: &SyntaxNode, rd: &mut Reading) -> RResult<(Block, Vec<Handler>)> {
+    let d = rd.d;
     let mut out = Block::default();
     let mut units = Vec::new();
     let mut handlers = Vec::new();
@@ -358,11 +436,11 @@ fn block(b: &SyntaxNode, d: Dialect) -> RResult<(Block, Vec<Handler>)> {
         match c.kind() {
             DECLARE_SECTION => {
                 for s in c.children().filter(|s| s.kind().is_unit()) {
-                    out.decls.push(declaration(&s, d)?);
+                    out.decls.extend(rd.statement(declaration(&s, d))?);
                 }
             }
             EXCEPTION_SECTION if d == Dialect::Postgres => {
-                handlers = exception_section(&c, d)?;
+                handlers = exception_section(&c, rd)?;
                 if handlers.is_empty() {
                     return Err("an exception section without a handler".into());
                 }
@@ -388,13 +466,13 @@ fn block(b: &SyntaxNode, d: Dialect) -> RResult<(Block, Vec<Handler>)> {
     if !plain {
         return Err(format!("a block written `{}`", own.join(" ")));
     }
-    out.body = nodes(&units, d)?;
+    out.body = nodes(&units, rd)?;
     Ok((out, handlers))
 }
 
 /// The handlers of a PL/pgSQL `EXCEPTION` section: `WHEN cond [OR cond
 /// ...] THEN statements`, a condition a name or `SQLSTATE 'xxxxx'`.
-fn exception_section(sec: &SyntaxNode, d: Dialect) -> RResult<Vec<Handler>> {
+fn exception_section(sec: &SyntaxNode, rd: &mut Reading) -> RResult<Vec<Handler>> {
     let own = upper_own(sec);
     if own != ["EXCEPTION"] {
         return Err(format!("an exception section written `{}`", own.join(" ")));
@@ -432,7 +510,7 @@ fn exception_section(sec: &SyntaxNode, d: Dialect) -> RResult<Vec<Handler>> {
         }
         out.push(Handler {
             conds,
-            body: branch(b, d)?,
+            body: branch(b, rd)?,
         });
     }
     Ok(out)
@@ -450,17 +528,17 @@ fn upper_own(n: &SyntaxNode) -> Vec<String> {
 
 /// The units of a node (`TRY_BLOCK`, `CATCH_BLOCK`), whose own tokens
 /// must be exactly `own`.
-fn units_of(n: &SyntaxNode, own: &[&str], d: Dialect) -> RResult<Vec<Node>> {
+fn units_of(n: &SyntaxNode, own: &[&str], rd: &mut Reading) -> RResult<Vec<Node>> {
     let toks = upper_own(n);
     if toks != own {
         return Err(format!("{:?} written `{}`", n.kind(), toks.join(" ")));
     }
     let units: Vec<SyntaxNode> = n.children().filter(|c| c.kind().is_unit()).collect();
-    nodes(&units, d)
+    nodes(&units, rd)
 }
 
 /// T-SQL `BEGIN TRY ... END TRY BEGIN CATCH ... END CATCH`.
-fn try_catch(u: &SyntaxNode, d: Dialect) -> RResult<Node> {
+fn try_catch(u: &SyntaxNode, rd: &mut Reading) -> RResult<Node> {
     let kids: Vec<SyntaxNode> = u.children().collect();
     let [t, c] = kids.as_slice() else {
         return Err("a TRY without its CATCH".into());
@@ -469,10 +547,10 @@ fn try_catch(u: &SyntaxNode, d: Dialect) -> RResult<Node> {
         return Err("a TRY/CATCH of an unexpected shape".into());
     }
     Ok(Node::Try {
-        body: units_of(t, &["BEGIN", "TRY", "END", "TRY"], d)?,
+        body: units_of(t, &["BEGIN", "TRY", "END", "TRY"], rd)?,
         handlers: vec![Handler {
             conds: Vec::new(),
-            body: units_of(c, &["BEGIN", "CATCH", "END", "CATCH"], d)?,
+            body: units_of(c, &["BEGIN", "CATCH", "END", "CATCH"], rd)?,
         }],
     })
 }
@@ -499,20 +577,27 @@ fn declaration(s: &SyntaxNode, d: Dialect) -> RResult<Stmt> {
     }
 }
 
-fn nodes(units: &[SyntaxNode], d: Dialect) -> RResult<Vec<Node>> {
-    units.iter().map(|u| node(u, d)).collect()
+/// A statement list, each unit through [`Reading::statement`].
+fn nodes(units: &[SyntaxNode], rd: &mut Reading) -> RResult<Vec<Node>> {
+    let mut out = Vec::new();
+    for u in units {
+        let n = node(u, rd);
+        out.extend(rd.statement(n)?);
+    }
+    Ok(out)
 }
 
 /// The units of a `BRANCH`.
-fn branch(b: &SyntaxNode, d: Dialect) -> RResult<Vec<Node>> {
+fn branch(b: &SyntaxNode, rd: &mut Reading) -> RResult<Vec<Node>> {
     let units: Vec<SyntaxNode> = b.children().filter(|c| c.kind().is_unit()).collect();
-    nodes(&units, d)
+    nodes(&units, rd)
 }
 
-fn node(u: &SyntaxNode, d: Dialect) -> RResult<Node> {
+fn node(u: &SyntaxNode, rd: &mut Reading) -> RResult<Node> {
+    let d = rd.d;
     match u.kind() {
         STATEMENT => statement(u, d),
-        BLOCK => match block(u, d)? {
+        BLOCK => match block(u, rd)? {
             (b, hs) if hs.is_empty() => Ok(Node::Block(b)),
             (b, _) if !b.decls.is_empty() => {
                 Err("a block with declarations and an exception section is not read yet".into())
@@ -522,12 +607,12 @@ fn node(u: &SyntaxNode, d: Dialect) -> RResult<Node> {
                 handlers,
             }),
         },
-        TRY_CATCH if d == Dialect::Tsql => try_catch(u, d),
-        IF_STMT => if_stmt(u, d),
+        TRY_CATCH if d == Dialect::Tsql => try_catch(u, rd),
+        IF_STMT => if_stmt(u, rd),
         LOOP_STMT => {
             let first = cst::first_words(u, 1);
             if d == Dialect::Postgres && first.first().map(String::as_str) == Some("FOR") {
-                return for_query(u, d);
+                return for_query(u, rd);
             }
             if first.first().map(String::as_str) != Some("WHILE") {
                 return Err("only WHILE loops are read".into());
@@ -541,7 +626,7 @@ fn node(u: &SyntaxNode, d: Dialect) -> RResult<Node> {
             };
             Ok(Node::While {
                 cond: condition(c, d)?,
-                body: branch(b, d)?,
+                body: branch(b, rd)?,
             })
         }
         k => Err(format!("{k:?} is not read yet")),
@@ -550,7 +635,8 @@ fn node(u: &SyntaxNode, d: Dialect) -> RResult<Node> {
 
 /// PL/pgSQL `FOR var IN SELECT ... LOOP body END LOOP`: no label, no
 /// `REVERSE`, no `EXECUTE`, no integer range or cursor.
-fn for_query(u: &SyntaxNode, d: Dialect) -> RResult<Node> {
+fn for_query(u: &SyntaxNode, rd: &mut Reading) -> RResult<Node> {
+    let d = rd.d;
     let own = upper_own(u);
     if own != ["FOR", "LOOP", "END", "LOOP"] {
         return Err(format!("a FOR loop written `{}`", own.join(" ")));
@@ -581,7 +667,7 @@ fn for_query(u: &SyntaxNode, d: Dialect) -> RResult<Node> {
     Ok(Node::ForQuery {
         var,
         query: Box::new(query),
-        body: branch(b, d)?,
+        body: branch(b, rd)?,
     })
 }
 
@@ -605,7 +691,8 @@ fn condition(c: &SyntaxNode, d: Dialect) -> RResult<Expr> {
     Ok(e)
 }
 
-fn if_stmt(u: &SyntaxNode, d: Dialect) -> RResult<Node> {
+fn if_stmt(u: &SyntaxNode, rd: &mut Reading) -> RResult<Node> {
+    let d = rd.d;
     // (CONDITION BRANCH)+ [BRANCH]: ELSIF pairs, then ELSE.
     let kids: Vec<SyntaxNode> = u
         .children()
@@ -617,11 +704,12 @@ fn if_stmt(u: &SyntaxNode, d: Dialect) -> RResult<Node> {
     while i < kids.len() {
         match (kids[i].kind(), kids.get(i + 1).map(|k| k.kind())) {
             (CONDITION, Some(BRANCH)) => {
-                arms.push((condition(&kids[i], d)?, branch(&kids[i + 1], d)?));
+                let cond = condition(&kids[i], d)?;
+                arms.push((cond, branch(&kids[i + 1], rd)?));
                 i += 2;
             }
             (BRANCH, None) if !arms.is_empty() => {
-                els = branch(&kids[i], d)?;
+                els = branch(&kids[i], rd)?;
                 i += 1;
             }
             _ => return Err("an IF of an unexpected shape".into()),
@@ -1079,4 +1167,219 @@ fn print_node(n: &Node, depth: usize, out: &mut String) -> RResult<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse;
+
+    fn the_routine(text: &str, d: Dialect) -> SyntaxNode {
+        parse(text, d)
+            .syntax()
+            .descendants()
+            .find(|n| n.kind() == ROUTINE)
+            .expect("a routine")
+    }
+
+    /// The strict read and the collecting read of `text`.
+    fn both(text: &str, d: Dialect) -> (RResult<Routine>, RResult<(Routine, Vec<String>)>) {
+        let n = the_routine(text, d);
+        (read(&n, d), read_collecting(&n, d))
+    }
+
+    /// `text` without the lines that contain `marker`.
+    fn without(text: &str, marker: &str) -> String {
+        text.lines()
+            .filter(|l| !l.contains(marker))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    }
+
+    const UNREAD: &str = "CREATE PROCEDURE dbo.p @s nvarchar(100)
+AS
+BEGIN
+  DECLARE @x int = 1;
+  PRINT 'start'; -- unread
+  SET @x = 2;
+  CREATE TABLE #t (a int); -- unread
+  SET @x = 3;
+  EXEC (@s); -- unread
+  SET @x = 4;
+  SELECT @x AS x FOR JSON PATH; -- unread
+  RETURN @x;
+END
+";
+
+    #[test]
+    fn a_collecting_read_leaves_out_each_unread_statement_and_says_why() {
+        let (strict, collecting) = both(UNREAD, Dialect::Tsql);
+        let (r, left_out) = collecting.unwrap();
+        // The readable statements, in order: the strict read of the text
+        // without the unread ones.
+        let (plain, none) = both(&without(UNREAD, "-- unread"), Dialect::Tsql);
+        assert_eq!(r, plain.unwrap());
+        assert_eq!(none.unwrap().1, Vec::<String>::new());
+        assert_eq!(r.body.body.len(), 5, "{r:?}");
+        // One message each, in order; the strict read stops at the first.
+        assert_eq!(left_out.len(), 4, "{left_out:?}");
+        assert!(left_out[0].contains("PRINT"), "{left_out:?}");
+        assert!(left_out[1].contains("CREATE"), "{left_out:?}");
+        assert_eq!(left_out[2], "dynamic SQL is not read");
+        assert!(left_out[3].contains("FOR JSON"), "{left_out:?}");
+        assert_eq!(strict.unwrap_err(), left_out[0]);
+    }
+
+    #[test]
+    fn statements_are_left_out_at_any_depth() {
+        let text = "CREATE PROCEDURE dbo.p @a int
+AS
+BEGIN
+  DECLARE @x int = 0;
+  IF @a > 1
+  BEGIN
+    PRINT 'then'; -- unread
+    SET @x = 1;
+  END
+  ELSE
+  BEGIN
+    SET @x = 2;
+    PRINT 'else'; -- unread
+  END
+  WHILE @x < 10
+  BEGIN
+    PRINT 'loop'; -- unread
+    SET @x = @x + 1;
+  END
+  BEGIN TRY
+    PRINT 'try'; -- unread
+    SET @x = @x / @a;
+  END TRY
+  BEGIN CATCH
+    SET @x = 0;
+    PRINT 'catch'; -- unread
+  END CATCH
+  BEGIN
+    BEGIN
+      PRINT 'nested'; -- unread
+      SET @x = 5;
+    END
+  END
+  RETURN @x;
+END
+";
+        let (strict, collecting) = both(text, Dialect::Tsql);
+        let (r, left_out) = collecting.unwrap();
+        let (plain, _) = both(&without(text, "-- unread"), Dialect::Tsql);
+        assert_eq!(r, plain.unwrap());
+        assert_eq!(left_out.len(), 6, "{left_out:?}");
+        assert!(left_out.iter().all(|m| m.contains("PRINT")), "{left_out:?}");
+        assert_eq!(strict.unwrap_err(), left_out[0]);
+    }
+
+    #[test]
+    fn a_compound_statement_whose_own_shape_fails_is_left_out_whole() {
+        // PL/pgSQL: a CONSTANT declaration, a label (a unit of its own),
+        // and a FOR loop over a range, left out with its body (whose
+        // unread `NULL` is never met).
+        let text = "CREATE PROCEDURE p(a integer)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  x integer := 1;
+  k CONSTANT integer := 2;
+BEGIN
+  x := 2;
+  <<inner>>
+  BEGIN
+    x := 3;
+  END;
+  FOR i IN 1..3 LOOP
+    NULL;
+  END LOOP;
+  x := 4;
+END;
+$$;
+";
+        let (strict, collecting) = both(text, Dialect::Postgres);
+        let (r, left_out) = collecting.unwrap();
+        assert_eq!(r.body.decls.len(), 1, "{r:?}");
+        assert!(
+            matches!(
+                r.body.body.as_slice(),
+                [Node::Stmt(_), Node::Block(b), Node::Stmt(_)] if b.body.len() == 1
+            ),
+            "{r:?}"
+        );
+        assert_eq!(
+            left_out,
+            [
+                "CONSTANT and NOT NULL declarations are not read yet",
+                "LABEL is not read yet",
+                "only FOR loops over a SELECT are read",
+            ]
+        );
+        assert_eq!(strict.unwrap_err(), left_out[0]);
+    }
+
+    /// Failures about the routine itself are errors in both reads, with
+    /// the same message, whatever its body holds.
+    #[test]
+    fn failures_about_the_routine_stay_errors() {
+        for (text, d) in [
+            // A routine option.
+            (
+                "CREATE PROCEDURE dbo.p WITH RECOMPILE AS BEGIN PRINT 'x'; SET NOCOUNT ON; END\n",
+                Dialect::Tsql,
+            ),
+            // A parameter option.
+            (
+                "CREATE PROCEDURE dbo.p @t dbo.tt READONLY AS BEGIN PRINT 'x'; END\n",
+                Dialect::Tsql,
+            ),
+            // Table-valued results.
+            (
+                "CREATE FUNCTION dbo.f() RETURNS TABLE AS RETURN (SELECT 1 AS a)\n",
+                Dialect::Tsql,
+            ),
+            // Not a procedure or function.
+            (
+                "CREATE TRIGGER dbo.t ON dbo.x AFTER INSERT AS BEGIN PRINT 'x'; END\n",
+                Dialect::Tsql,
+            ),
+            // An exception section on the routine's own block.
+            (
+                "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'x'; \
+                 EXCEPTION WHEN others THEN RETURN; END; $$;\n",
+                Dialect::Postgres,
+            ),
+            // Not plpgsql.
+            (
+                "CREATE FUNCTION f() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;\n",
+                Dialect::Postgres,
+            ),
+        ] {
+            let (strict, collecting) = both(text, d);
+            let strict = strict.unwrap_err();
+            assert_eq!(strict, collecting.unwrap_err(), "{text}");
+        }
+        // An unread statement met before the routine's own failure: the
+        // strict read stops at the statement, the collecting read still
+        // fails on the routine.
+        let text = "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'x'; \
+                    EXCEPTION WHEN others THEN NULL; END; $$;\n";
+        let (strict, collecting) = both(text, Dialect::Postgres);
+        assert_eq!(strict.unwrap_err(), "unsupported statement `NULL`");
+        assert_eq!(
+            collecting.unwrap_err(),
+            "an exception section on the routine's own block is not read yet"
+        );
+    }
+
+    #[test]
+    fn a_readable_routine_reads_the_same_both_ways() {
+        let text = without(UNREAD, "-- unread");
+        let (strict, collecting) = both(&text, Dialect::Tsql);
+        assert_eq!(collecting.unwrap(), (strict.unwrap(), Vec::new()));
+    }
 }

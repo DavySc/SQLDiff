@@ -354,7 +354,18 @@ fn mappable(parts: &[String]) -> bool {
     parts.len() >= 2 && parts.iter().all(|p| p.is_ascii())
 }
 
-type Read = (String, (usize, usize), Result<Routine, String>);
+/// A routine read past the statements the reader does not read, with the
+/// message for each one left out (`routine::read_collecting`).
+type Collected = Result<(Routine, Vec<String>), String>;
+
+/// A routine's name, span, strict read and, only when the strict read
+/// failed, its collecting read.
+type Read = (
+    String,
+    (usize, usize),
+    Result<Routine, String>,
+    Option<Collected>,
+);
 
 fn routines(text: &str, d: Dialect) -> Vec<Read> {
     parse(text, d)
@@ -364,7 +375,9 @@ fn routines(text: &str, d: Dialect) -> Vec<Read> {
         .map(|n| {
             let name = sqldiff_syntax::ast::routine_name(&n).unwrap_or_default();
             let span = sqldiff_syntax::ast::sig_range(&n);
-            (name, span, routine::read(&n, d))
+            let strict = routine::read(&n, d);
+            let collected = strict.is_err().then(|| routine::read_collecting(&n, d));
+            (name, span, strict, collected)
         })
         .collect()
 }
@@ -1029,8 +1042,19 @@ pub fn mirror_request(
     output_routines: &[Routine],
     trusted: &Trusted,
 ) -> Result<(MirrorRequest, Vec<String>), String> {
-    let (tables, row_counts) = (&trusted.tables, trusted.row_counts);
     let renaming = propose_renaming(a, b)?;
+    Ok(request_with(a, b, renaming, output_routines, trusted))
+}
+
+/// [`mirror_request`] with the renaming given.
+fn request_with(
+    a: &Routine,
+    b: &Routine,
+    renaming: Renaming,
+    output_routines: &[Routine],
+    trusted: &Trusted,
+) -> (MirrorRequest, Vec<String>) {
+    let (tables, row_counts) = (&trusted.tables, trusted.row_counts);
     let mut assumptions = Vec::new();
     if a.kind == RoutineKind::Procedure {
         assumptions.push("ASM-RETURN-CODE".to_string());
@@ -1161,7 +1185,7 @@ pub fn mirror_request(
             (name, types)
         })
         .collect();
-    Ok((
+    (
         MirrorRequest {
             row_counts,
             routines,
@@ -1175,7 +1199,7 @@ pub fn mirror_request(
             target: encode::routine(b),
         },
         assumptions,
-    ))
+    )
 }
 
 /// Certificates for the routines of one converted file, asked of `checker`
@@ -1190,14 +1214,17 @@ pub fn certify(
 ) -> Vec<Certificate> {
     let src = routines(input, from);
     let out = routines(output, to);
-    let mut readable: Vec<Routine> = out.iter().filter_map(|(_, _, r)| r.clone().ok()).collect();
+    let mut readable: Vec<Routine> = out
+        .iter()
+        .filter_map(|(_, _, r, _)| r.clone().ok())
+        .collect();
     for r in &trusted.output_routines {
         if !readable.iter().any(|x| x.name == r.name) {
             readable.push(r.clone());
         }
     }
     let mut certs = Vec::new();
-    for (name, span, a) in src {
+    for (name, span, a, a_collected) in src {
         let mut c = Certificate {
             routine: name.clone(),
             scalars: None,
@@ -1219,12 +1246,14 @@ pub fn certify(
         let key = pair_key(&name, from);
         let same: Vec<_> = out
             .iter()
-            .filter(|(n, _, _)| pair_key(n, to) == key)
+            .filter(|(n, _, _, _)| pair_key(n, to) == key)
             .collect();
-        let b = match same.as_slice() {
-            [(_, _, b)] => Some(b.clone()),
-            _ => None,
+        let (b, b_collected) = match same.as_slice() {
+            [(_, _, b, bc)] => (Some(b.clone()), bc.as_ref()),
+            _ => (None, None),
         };
+        // Computed before the strict reads are matched on below.
+        let unread = left_out(&a, a_collected.as_ref(), b.as_ref(), b_collected);
         let quoted = from == Dialect::Tsql
             && input
                 .get(span.0..span.1)
@@ -1294,9 +1323,155 @@ pub fn certify(
                 c.why = vec![reason_code(reason)];
             }
         }
+        if let Some(u) = unread {
+            // The checker diagnoses the trees without the unread
+            // statements; its answer only adds codes.
+            let checked = match (&u.trees, checker) {
+                (Some((a, b)), Some(k)) => {
+                    let renaming =
+                        propose_renaming(a, b).unwrap_or_else(|_| partial_renaming(a, b));
+                    Some(k.check_mirror(&request_with(a, b, renaming, &readable, trusted).0))
+                }
+                _ => None,
+            };
+            never_confirmed(&mut c, u.codes, checked);
+        }
         certs.push(c);
     }
     certs
+}
+
+/// What the reader left out of a routine pair whose strict read stopped
+/// at an unread statement (C0.10).
+#[derive(Debug)]
+struct Unread {
+    /// The `read:*` code of every statement left out, the source's first,
+    /// each once.
+    codes: Vec<String>,
+    /// The two trees without those statements, when both sides read that
+    /// far (the output routine exists and is not refused as a whole).
+    trees: Option<(Routine, Routine)>,
+}
+
+/// The pair read past its unread statements, when the strict read that
+/// gives the certificate its reason stopped at one: the source's, else
+/// the output's. `None` (today's answer and codes) when that read failed
+/// on the routine itself (`routine::read_collecting` fails too) or when
+/// both strict reads succeed.
+fn left_out(
+    a: &Result<Routine, String>,
+    a_collected: Option<&Collected>,
+    b: Option<&Result<Routine, String>>,
+    b_collected: Option<&Collected>,
+) -> Option<Unread> {
+    // A side's tree and its left-out messages; `None` when it does not
+    // read even past its unread statements.
+    fn side(
+        strict: &Result<Routine, String>,
+        collected: Option<&Collected>,
+    ) -> Option<(Routine, Vec<String>)> {
+        match (strict, collected) {
+            (Ok(r), _) => Some((r.clone(), Vec::new())),
+            (Err(_), Some(Ok((r, msgs)))) if !msgs.is_empty() => Some((r.clone(), msgs.clone())),
+            _ => None,
+        }
+    }
+    let (ra, ma) = side(a, a_collected)?;
+    let sb = b.and_then(|b| side(b, b_collected));
+    // The read that gives the reason: the source's when it failed, else
+    // the output's; it must have left statements out.
+    let reason_side = if a.is_err() { &ma } else { &sb.as_ref()?.1 };
+    if reason_side.is_empty() {
+        return None;
+    }
+    let mut codes = Vec::new();
+    let prefixed = ma
+        .iter()
+        .map(|m| format!("the source routine is outside the verified shape: {m}"))
+        .chain(sb.iter().flat_map(|(_, mb)| {
+            mb.iter()
+                .map(|m| format!("the output routine is outside the verified shape: {m}"))
+        }));
+    for reason in prefixed {
+        let code = reason_code(&reason);
+        if !codes.contains(&code) {
+            codes.push(code);
+        }
+    }
+    Some(Unread {
+        codes,
+        trees: sb.map(|(rb, _)| (ra, rb)),
+    })
+}
+
+/// A renaming for a diagnostic request when [`propose_renaming`] has none
+/// (a left-out statement declared a variable, so the locals no longer
+/// pair): parameters by position as far as both sides have them, and the
+/// return status. The checker lowers both routines before it looks at the
+/// renaming, so the codes of an outside-spec refusal do not depend on it.
+fn partial_renaming(a: &Routine, b: &Routine) -> Renaming {
+    let mut out: Renaming = a
+        .params
+        .iter()
+        .zip(&b.params)
+        .map(|(x, y)| (x.name.clone(), pg_name(&y.name)))
+        .collect();
+    if a.kind == RoutineKind::Procedure {
+        let to = if has_status(b) { STATUS_PARAM } else { STATUS };
+        out.push((STATUS.to_string(), to.to_string()));
+    }
+    out
+}
+
+/// The checker's code families that name a construct its lowering refused
+/// (formal/lean/README.md, "Refusal diagnostics"). Other codes of an
+/// answer about trees with statements left out (`check:differ`,
+/// `check:certificate`, `check:signature`, `pair:*`, ...) say only that
+/// the trees differ, which leaving statements out makes them do.
+const LOWERING_FAMILIES: [&str; 6] = ["routine:", "stmt:", "node:", "expr:", "store:", "type:"];
+
+/// A routine with a left-out statement is never confirmed (C0.10).
+///
+/// `c` is the certificate of a routine whose reader left statements out
+/// (`read_codes`, their `read:*` codes), and `checked` the checker's
+/// answer about the trees without them, if it was asked. Whatever that
+/// answer is, a confirmation included, `c` comes out unconfirmed: with
+/// its reason unchanged (the strict reader's refusal), nothing a
+/// confirmation carries, and `why` = `read_codes`, then the codes of the
+/// checker's refusal in [`LOWERING_FAMILIES`], each once. The checker's
+/// answer adds codes and nothing else.
+fn never_confirmed(
+    c: &mut Certificate,
+    read_codes: Vec<String>,
+    checked: Option<proof::MirrorAnswer>,
+) {
+    if let Answer::Confirmed { .. } = c.answer {
+        // Not reached: a left-out statement means a strict read failed,
+        // whose answer is a refusal. Kept so the invariant holds here.
+        c.answer = Answer::Unconfirmed {
+            reason: "the routine reader left statements out".into(),
+        };
+    }
+    c.assumptions.clear();
+    c.scalars = None;
+    c.statements = None;
+    c.errors = None;
+    let mut why = read_codes;
+    if let Some(m) = checked {
+        if let proof::Answer::Unconfirmed { .. } = m.answer {
+            for code in m.why {
+                if LOWERING_FAMILIES.iter().any(|f| code.starts_with(f)) && !why.contains(&code) {
+                    why.push(code);
+                }
+            }
+        }
+    }
+    if why.is_empty() {
+        if let Answer::Unconfirmed { reason } = &c.answer {
+            why.push(reason_code(reason));
+        }
+    }
+    c.why = why;
 }
 
 /// The routines of a converted tree that read back, for the target catalog.
@@ -1304,7 +1479,7 @@ pub fn output_routines(texts: &[&str], d: Dialect) -> Vec<Routine> {
     texts
         .iter()
         .flat_map(|t| routines(t, d))
-        .filter_map(|(_, _, r)| r.ok())
+        .filter_map(|(_, _, r, _)| r.ok())
         .collect()
 }
 
@@ -1313,7 +1488,7 @@ pub fn declared_routines(texts: &[&str], d: Dialect) -> Vec<Vec<String>> {
     texts
         .iter()
         .flat_map(|t| routines(t, d))
-        .map(|(name, _, _)| name.split('.').map(str::to_string).collect())
+        .map(|(name, _, _, _)| name.split('.').map(str::to_string).collect())
         .collect()
 }
 
@@ -1452,7 +1627,7 @@ END
             .to_string();
         let a = routines(src, Dialect::Tsql);
         let b = routines(&out, Dialect::Postgres);
-        let readable: Vec<Routine> = b.iter().filter_map(|(_, _, r)| r.clone().ok()).collect();
+        let readable: Vec<Routine> = b.iter().filter_map(|(_, _, r, _)| r.clone().ok()).collect();
         let (req, asm) = mirror_request(
             a[1].2.as_ref().unwrap(),
             b[1].2.as_ref().unwrap_or_else(|e| panic!("{e}\n{out}")),
@@ -1977,5 +2152,244 @@ END
             [STRING_ARGS]
         );
         assert!(C2A_RESIDUALS.contains(&ROWCOUNT_0));
+    }
+
+    /// A checker that answers every mirror request with `answer` and
+    /// counts the requests.
+    #[derive(Debug)]
+    struct Always {
+        answer: fn() -> proof::MirrorAnswer,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Always {
+        fn new(answer: fn() -> proof::MirrorAnswer) -> Always {
+            Always {
+                answer,
+                asked: Default::default(),
+            }
+        }
+        fn asked(&self) -> usize {
+            self.asked.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Checker for Always {
+        fn name(&self) -> String {
+            "always".into()
+        }
+        fn check(&self, _: &proof::Request) -> proof::Answer {
+            unreachable!()
+        }
+        fn check_mirror(&self, _: &MirrorRequest) -> proof::MirrorAnswer {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (self.answer)()
+        }
+    }
+
+    /// Four unread statements between readable ones; the `DECLARE` of
+    /// a table variable is one of them, so the locals no longer pair.
+    const UNREAD: &str = "CREATE PROCEDURE dbo.p @s nvarchar(100), @a int
+AS
+BEGIN
+  DECLARE @x int = 1;
+  PRINT 'start';
+  SET @x = @a;
+  CREATE TABLE #t (a int);
+  IF @a > 1
+  BEGIN
+    EXEC (@s);
+    SET @x = 2;
+  END
+  SELECT @x AS x FOR JSON PATH;
+  PRINT 'again';
+  RETURN @x;
+END
+";
+
+    fn certify_unread(k: &dyn Checker) -> Certificate {
+        let d = crate::rewrite(UNREAD, Dialect::Tsql, Dialect::Postgres);
+        let mut certs = certify(
+            UNREAD,
+            d.output(),
+            Dialect::Tsql,
+            Dialect::Postgres,
+            &Trusted::default(),
+            Some(k),
+        );
+        assert_eq!(certs.len(), 1, "{certs:?}");
+        certs.remove(0)
+    }
+
+    const UNREAD_REASON: &str =
+        "the source routine is outside the verified shape: unsupported statement `PRINT`";
+
+    /// The invariant: a checker that confirms everything is asked about
+    /// the trees without the unread statements, and the routine still
+    /// comes out unconfirmed, with today's reason and the codes of every
+    /// left-out statement.
+    #[test]
+    fn a_routine_with_a_left_out_statement_is_never_confirmed() {
+        fn confirmed() -> proof::MirrorAnswer {
+            let mut m = proof::MirrorAnswer::from(proof::Answer::Confirmed {
+                theorem: "Sqldiff.Mirror.check_sound_c2a".into(),
+            });
+            m.scalars = Some("c2a".into());
+            m.statements = Some("c1".into());
+            // Codes on a confirmation are ignored, as is the confirmation.
+            m.why = vec!["stmt:select:order".into()];
+            m
+        }
+        let k = Always::new(confirmed);
+        let c = certify_unread(&k);
+        assert_eq!(k.asked(), 1, "the checker is asked about the rest");
+        assert_eq!(
+            c.answer,
+            Answer::Unconfirmed {
+                reason: UNREAD_REASON.into()
+            }
+        );
+        assert_eq!(
+            c.why,
+            [
+                "read:stmt:print",
+                "read:stmt:create",
+                "read:dynamic-sql",
+                "read:for-json"
+            ],
+            "{c:?}"
+        );
+        assert!(c.assumptions.is_empty() && c.scalars.is_none() && c.statements.is_none());
+        assert!(c.source.is_none() && c.target.is_none(), "{c:?}");
+        // Without a checker: the same answer and the same codes.
+        let d = crate::rewrite(UNREAD, Dialect::Tsql, Dialect::Postgres);
+        let none = certify(
+            UNREAD,
+            d.output(),
+            Dialect::Tsql,
+            Dialect::Postgres,
+            &Trusted::default(),
+            None,
+        );
+        assert_eq!(none[0].answer, c.answer);
+        assert_eq!(none[0].why, c.why);
+    }
+
+    /// The invariant holds in the one function that applies it, whatever
+    /// the certificate it is handed.
+    #[test]
+    fn never_confirmed_refuses_even_a_confirmed_certificate() {
+        let d = crate::rewrite(TSQL, Dialect::Tsql, Dialect::Postgres);
+        let mut c = certify(
+            TSQL,
+            d.output(),
+            Dialect::Tsql,
+            Dialect::Postgres,
+            &Trusted::default(),
+            None,
+        )
+        .remove(0);
+        c.answer = Answer::Confirmed {
+            theorems: vec!["Sqldiff.Mirror.check_sound".into()],
+        };
+        c.assumptions = vec![C1_OPERATORS.into()];
+        c.scalars = Some("c2a".into());
+        let ok = proof::MirrorAnswer::from(proof::Answer::Confirmed {
+            theorem: "Sqldiff.Mirror.check_sound".into(),
+        });
+        never_confirmed(&mut c, vec!["read:stmt:print".into()], Some(ok));
+        assert!(matches!(c.answer, Answer::Unconfirmed { .. }), "{c:?}");
+        assert_eq!(c.why, ["read:stmt:print"]);
+        assert!(c.assumptions.is_empty() && c.scalars.is_none());
+    }
+
+    /// From the checker's refusal of the trees without the unread
+    /// statements, only the lowering's codes are kept, each once, after
+    /// the reader's.
+    #[test]
+    fn only_the_lowerings_codes_are_kept_past_an_unread_statement() {
+        fn outside() -> proof::MirrorAnswer {
+            let mut m = proof::MirrorAnswer::from(proof::Answer::Unconfirmed {
+                reason: "the T-SQL routine is outside the C1 spec".into(),
+            });
+            m.why = [
+                "stmt:select:from:join",
+                "check:differ",
+                "check:certificate",
+                "pair:renaming:locals",
+                "check:signature",
+                "check:kind",
+                "check:privileges",
+                "routine:scope:undeclared",
+                "node:call:type",
+                "expr:fn:sysdatetime",
+                "store:assign:int",
+                "type:datetime",
+                "stmt:select:from:join",
+                "read:stmt:print",
+            ]
+            .map(String::from)
+            .to_vec();
+            m
+        }
+        let k = Always::new(outside);
+        let c = certify_unread(&k);
+        assert_eq!(k.asked(), 1);
+        assert_eq!(
+            c.answer,
+            Answer::Unconfirmed {
+                reason: UNREAD_REASON.into()
+            }
+        );
+        assert_eq!(
+            c.why,
+            [
+                "read:stmt:print",
+                "read:stmt:create",
+                "read:dynamic-sql",
+                "read:for-json",
+                "stmt:select:from:join",
+                "routine:scope:undeclared",
+                "node:call:type",
+                "expr:fn:sysdatetime",
+                "store:assign:int",
+                "type:datetime",
+            ]
+        );
+        // A refusal that is not about the lowering adds nothing.
+        fn differ() -> proof::MirrorAnswer {
+            let mut m = proof::MirrorAnswer::from(proof::Answer::Unconfirmed {
+                reason: "the lowered routines differ beyond the renaming".into(),
+            });
+            m.why = vec!["check:differ:assign".into()];
+            m
+        }
+        let c = certify_unread(&Always::new(differ));
+        assert_eq!(c.why.len(), 4, "{c:?}");
+    }
+
+    /// A routine refused as a whole (here a routine option) is answered
+    /// as before: one code, and the checker is not asked.
+    #[test]
+    fn a_routine_refused_as_a_whole_is_not_diagnosed_further() {
+        let src = "CREATE PROCEDURE dbo.p WITH RECOMPILE AS BEGIN PRINT 'x'; SET NOCOUNT ON; END\n";
+        let d = crate::rewrite(src, Dialect::Tsql, Dialect::Postgres);
+        fn confirmed() -> proof::MirrorAnswer {
+            proof::MirrorAnswer::from(proof::Answer::Confirmed {
+                theorem: "Sqldiff.Mirror.check_sound".into(),
+            })
+        }
+        let k = Always::new(confirmed);
+        let certs = certify(
+            src,
+            d.output(),
+            Dialect::Tsql,
+            Dialect::Postgres,
+            &Trusted::default(),
+            Some(&k),
+        );
+        assert_eq!(k.asked(), 0);
+        assert!(matches!(certs[0].answer, Answer::Unconfirmed { .. }));
+        assert_eq!(certs[0].why, ["read:routine-option"]);
     }
 }
