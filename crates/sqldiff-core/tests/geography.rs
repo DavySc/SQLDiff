@@ -50,6 +50,39 @@ fn geography_built_compared_or_ordered_is_not_shown_equal() {
         ),
         ("SELECT Id FROM dbo.C ORDER BY L1;", "SELECT Id FROM C ORDER BY L1;"),
         ("SELECT MIN(L1) AS m FROM dbo.C;", "SELECT MIN(L1) AS m FROM C;"),
+        (
+            "SELECT L1, COUNT(*) AS n FROM dbo.C GROUP BY L1;",
+            "SELECT L1, COUNT(*) AS n FROM C GROUP BY L1;",
+        ),
+        ("SELECT DISTINCT L1 FROM dbo.C;", "SELECT DISTINCT L1 FROM C;"),
+        (
+            "SELECT COUNT(DISTINCT L1) AS n FROM dbo.C;",
+            "SELECT COUNT(DISTINCT L1) AS n FROM C;",
+        ),
+        (
+            "SELECT L1 FROM dbo.C UNION SELECT L2 FROM dbo.C;",
+            "SELECT L1 FROM C UNION SELECT L2 FROM C;",
+        ),
+        (
+            "SELECT L1 FROM dbo.C INTERSECT SELECT L2 FROM dbo.C;",
+            "SELECT L1 FROM C INTERSECT SELECT L2 FROM C;",
+        ),
+        (
+            "SELECT L1 FROM dbo.C EXCEPT SELECT L2 FROM dbo.C;",
+            "SELECT L1 FROM C EXCEPT SELECT L2 FROM C;",
+        ),
+        (
+            "SELECT Id FROM dbo.C WHERE L1 IN (L2);",
+            "SELECT Id FROM C WHERE L1 IN (L2);",
+        ),
+        (
+            "SELECT Id FROM dbo.C WHERE L1 IN (SELECT L2 FROM dbo.C);",
+            "SELECT Id FROM C WHERE L1 IN (SELECT L2 FROM C);",
+        ),
+        (
+            "SELECT CASE L1 WHEN L2 THEN 1 ELSE 0 END AS s FROM dbo.C;",
+            "SELECT CASE L1 WHEN L2 THEN 1 ELSE 0 END AS s FROM C;",
+        ),
     ] {
         if equal(a, b) {
             bad.push(format!("shown equal:\n  {a}\n  {b}"));

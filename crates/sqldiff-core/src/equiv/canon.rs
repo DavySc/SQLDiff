@@ -596,6 +596,14 @@ impl<'a> Canon<'a> {
         self.output = None;
     }
 
+    /// SQL Server cannot compare geography values (GROUP BY, DISTINCT, IN,
+    /// set operations, = all fail); PostGIS compares their bounding boxes.
+    /// The marker keeps such a comparison apart from the other dialect's;
+    /// no assumption discharges it.
+    fn geog_cmp(&self) -> Term {
+        n("geog-cmp", vec![self.dtag()])
+    }
+
     fn assume(&mut self, x: (&str, &str)) {
         if !self.asm.iter().any(|y| y.id == x.0) {
             self.asm.push(asm::make(x));
@@ -1305,7 +1313,14 @@ impl<'a> Canon<'a> {
                     items = items.into_iter().map(Self::bit_value).collect();
                 }
                 items.sort();
+                let geog = ty.is_some_and(|t| t.fam == Fam::Geography)
+                    || item_tys
+                        .iter()
+                        .any(|t| t.is_some_and(|t| t.fam == Fam::Geography));
                 let mut kids = vec![t, n("list", items), a(neg.to_string())];
+                if geog {
+                    kids.push(self.geog_cmp());
+                }
                 // Like `=`: string membership depends on the collation. With
                 // a string operand and string items it is string equality
                 // (`coll-eq`); otherwise a conversion may take part.
@@ -1330,6 +1345,8 @@ impl<'a> Canon<'a> {
                 // non-string operand avoids the collation.
                 if ty.map_or(true, |t| t.is_string()) {
                     kids.push(self.dtag());
+                } else if ty.is_some_and(|t| t.fam == Fam::Geography) {
+                    kids.push(self.geog_cmp());
                 }
                 (n("inq", kids), None)
             }
@@ -1511,6 +1528,8 @@ impl<'a> Canon<'a> {
                         let (t, ty) = self.expr(o)?;
                         if ty.map_or(true, |t| t.is_string()) {
                             kids.push(self.dtag());
+                        } else if ty.is_some_and(|t| t.fam == Fam::Geography) {
+                            kids.push(self.geog_cmp());
                         }
                         kids.push(t);
                     }
@@ -2099,8 +2118,22 @@ impl<'a> Canon<'a> {
                 if c.star {
                     kids.push(a("*"));
                 } else {
+                    let mut tys = Vec::new();
                     for x in &c.args {
-                        kids.push(self.expr(x)?.0);
+                        let (t, ty) = self.expr(x)?;
+                        kids.push(t);
+                        tys.push(ty);
+                    }
+                    // COUNT(DISTINCT …) compares its values as DISTINCT does.
+                    if c.distinct {
+                        if tys
+                            .iter()
+                            .any(|t| t.is_some_and(|t| t.fam == Fam::Geography))
+                        {
+                            kids.push(self.geog_cmp());
+                        } else if tys.iter().any(|t| t.is_some_and(|t| t.is_string())) {
+                            kids.push(n("distinct", vec![self.dtag()]));
+                        }
                     }
                 }
                 // COUNT returns int in T-SQL and bigint elsewhere; equal while it fits.
@@ -3636,6 +3669,13 @@ impl<'a> Canon<'a> {
                     {
                         kids.push(n("coll", vec![self.dtag()]));
                     }
+                    if h != "union-all"
+                        && col_tys
+                            .iter()
+                            .any(|t| t.is_some_and(|t| t.fam == Fam::Geography))
+                    {
+                        kids.push(self.geog_cmp());
+                    }
                     n("setop", kids)
                 }
                 (Some(_), None) => unreachable!("only the first branch has no operator"),
@@ -3749,6 +3789,7 @@ impl<'a> Canon<'a> {
             let (t, ty) = self.expr(g)?;
             group.push(match ty {
                 Some(t2) if t2.is_string() => n("collate", vec![self.dtag(), t]),
+                Some(t2) if t2.fam == Fam::Geography => n("geog-key", vec![self.geog_cmp(), t]),
                 None => {
                     self.assume(asm::UNTYPED);
                     t
@@ -3759,6 +3800,11 @@ impl<'a> Canon<'a> {
         // DISTINCT compares strings under each dialect's collation.
         let distinct = if !s.distinct {
             a("all")
+        } else if items
+            .iter()
+            .any(|x| x.1.is_some_and(|t| t.fam == Fam::Geography))
+        {
+            n("distinct-geog", vec![self.geog_cmp()])
         } else if items.iter().any(|x| x.1.is_some_and(|t| t.is_string())) {
             n("distinct", vec![self.dtag()])
         } else {
