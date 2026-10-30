@@ -677,6 +677,35 @@ impl Lowerer {
                 }
                 return Some(("Truncate".to_string(), parts.last()?.clone()));
             }
+            // An index or an added key or foreign key on a table: kept or
+            // undone with the transaction like a row write.
+            let up = |i: usize| toks.get(i).map(upper).unwrap_or_default();
+            if up(0) == "CREATE" {
+                if let Some(on) = (1..toks.len()).find(|&i| up(i) == "ON") {
+                    if (1..on).any(|i| up(i) == "INDEX") {
+                        let mut i = on + 1;
+                        if up(i) == "ONLY" {
+                            i += 1;
+                        }
+                        let parts = ast::qualified_name_at(&toks, i);
+                        if parts.is_empty() || self.temp_of(&parts).is_some() {
+                            return None;
+                        }
+                        return Some(("CreateIndex".to_string(), parts.last()?.clone()));
+                    }
+                }
+            }
+            if up(0) == "ALTER"
+                && up(1) == "TABLE"
+                && (2..toks.len()).any(|i| up(i) == "ADD" && up(i + 1) == "CONSTRAINT")
+            {
+                let i = if up(2) == "ONLY" { 3 } else { 2 };
+                let parts = ast::qualified_name_at(&toks, i);
+                if parts.is_empty() || self.temp_of(&parts).is_some() {
+                    return None;
+                }
+                return Some(("AddConstraint".to_string(), parts.last()?.clone()));
+            }
         }
         None
     }

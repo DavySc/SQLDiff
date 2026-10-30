@@ -25,7 +25,7 @@
 //! where records are built: a writer (CLI, GUI, MCP) sets `by` itself and
 //! never takes it from its caller.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -179,6 +179,17 @@ impl Ledger {
 
     pub fn records(&self) -> impl Iterator<Item = &Record> {
         self.records.values()
+    }
+
+    /// The records of each file, borrowed, in [`Ledger::records`] order:
+    /// read once for a whole tree, so applying the ledger costs its records
+    /// once and not once per unit.
+    pub fn by_path(&self) -> HashMap<&str, Vec<&Record>> {
+        let mut m: HashMap<&str, Vec<&Record>> = HashMap::new();
+        for r in self.records() {
+            m.entry(r.path.as_str()).or_default().push(r);
+        }
+        m
     }
 }
 
@@ -350,13 +361,37 @@ pub fn review_file_in(
     ledger: &Ledger,
     base: Option<&str>,
 ) -> FileReview {
+    let records: Vec<&Record> = ledger.records().filter(|r| r.path == path).collect();
+    review_records(path, input, c, &records, base)
+}
+
+/// [`review_file_in`] from the file's own records (`Ledger::by_path`), in
+/// ledger order.
+pub fn review_records(
+    path: &str,
+    input: &str,
+    c: &Conversion,
+    records: &[&Record],
+    base: Option<&str>,
+) -> FileReview {
     let ids = unit_ids(path, input, c);
     let (ih, oh) = (file_hash(input), file_hash(&c.output));
+    // By unit, in ledger order: decisions, and hand-written texts.
+    let mut decided: HashMap<&str, Vec<&Record>> = HashMap::new();
+    let mut texts: HashMap<&str, Vec<&Record>> = HashMap::new();
+    for &r in records {
+        match r.text {
+            None => decided.entry(r.unit.as_str()).or_default().push(r),
+            Some(_) => texts.entry(r.unit.as_str()).or_default().push(r),
+        }
+    }
     let mut units = Vec::new();
     for (u, id) in c.units.iter().zip(&ids) {
-        let mut decisions: Vec<Applied> = ledger
-            .records()
-            .filter(|r| r.path == path && &r.unit == id && r.text.is_none())
+        let mut decisions: Vec<Applied> = decided
+            .get(id.as_str())
+            .into_iter()
+            .flatten()
+            .copied()
             .map(|r| {
                 let why_not = if r.input_hash != ih || r.output_hash != oh {
                     Some(FILE_CHANGED.to_string())
@@ -376,10 +411,16 @@ pub fn review_file_in(
         // is current whatever the file's hashes (it changed the file); one
         // a person's text replaced is left out; one that was not put in
         // place (the unit's notes say why) never applies.
+        let key = u
+            .written
+            .as_ref()
+            .map_or(id.as_str(), |w| w.origin.as_str());
         decisions.extend(
-            ledger
-                .records()
-                .filter(|r| r.path == path && r.text.is_some())
+            texts
+                .get(key)
+                .into_iter()
+                .flatten()
+                .copied()
                 .filter_map(|r| match &u.written {
                     Some(w) if r.unit == w.origin => {
                         (r.by == w.by && r.author == w.author).then(|| Applied {
@@ -399,15 +440,19 @@ pub fn review_file_in(
         decisions.sort_by(|a, b| a.record.at.cmp(&b.record.at));
         units.push(judge(id, u, decisions));
     }
-    let origins: Vec<&str> = c
-        .units
+    let known: HashSet<&str> = ids
         .iter()
-        .filter_map(|u| u.written.as_ref().map(|w| w.origin.as_str()))
+        .map(String::as_str)
+        .chain(
+            c.units
+                .iter()
+                .filter_map(|u| u.written.as_ref().map(|w| w.origin.as_str())),
+        )
         .collect();
-    let orphaned = ledger
-        .records()
-        .filter(|r| r.path == path && !ids.contains(&r.unit) && !origins.contains(&r.unit.as_str()))
-        .cloned()
+    let orphaned = records
+        .iter()
+        .filter(|r| !known.contains(r.unit.as_str()))
+        .map(|&r| r.clone())
         .collect();
     let unplaced = c
         .unplaced

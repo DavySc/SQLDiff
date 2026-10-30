@@ -1,0 +1,9 @@
+CREATE TABLE
+INSERT 0 1
+CREATE PROCEDURE
+CALL
+NOTICE:  after commit found=t
+CALL
+NOTICE:  after commit found=f
+DROP PROCEDURE
+DROP TABLE

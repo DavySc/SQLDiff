@@ -647,6 +647,79 @@ Without catalogs a value's type is mostly unknown. Storing or assigning it
 states `ASM-UNTYPED-STORE`, and casting it to a number or string states
 `ASM-UNTYPED-CAST`; a cast of it to anything else is unknown.
 
+## Common table expressions
+
+A `WITH` list in front of a SELECT, or of an `INSERT … SELECT` (where only
+the query may name the CTEs), is compared CTE by CTE where the dialects read
+it alike. The runs behind each rule are in `eval/cte/2026-10-30/` (SQL
+Server 2022, PostgreSQL 18):
+
+- A one-part FROM name is the innermost CTE of that name in scope; a
+  qualified name is always a table. A CTE's query sees the CTEs before it.
+  T-SQL reads a name of a later CTE as a table, as PostgreSQL does without
+  RECURSIVE; with RECURSIVE it is the later CTE, so such a list is refused.
+  A PostgreSQL CTE that names itself without RECURSIVE reads the table,
+  where T-SQL recurses: refused.
+- A CTE read once is its query as a derived table, in both dialects. Read
+  twice it is refused: T-SQL computes it for each read (two reads of
+  `NEWID()` differ), PostgreSQL may compute it once (two reads of
+  `random()` agree). Its columns have the types of its query's items.
+- A recursive CTE is `anchor UNION ALL step`, the step reading the CTE as
+  its only FROM item, once. Both dialects return the anchor's rows, then
+  the step's rows for the rows the last round added, until a round adds
+  none. The step works row by row (no DISTINCT, GROUP BY, HAVING, window
+  function or `*`), so the order of work does not change the rows. Each
+  column has one known type, the same in anchor and step (both dialects
+  refuse others, Msg 240 and "recursive query … has type"). T-SQL stops
+  past MAXRECURSION (100 levels by default) with Msg 530, PostgreSQL never:
+  `ASM-CTE-MAXRECURSION`, also with `OPTION (MAXRECURSION 0)`, which the
+  lowering reads and leaves out. The term is `(rec-cte rec:N anchor step)`.
+- Not compared: MATERIALIZED, data-changing CTEs, a WITH list before
+  UPDATE, DELETE or MERGE (UPDATE … FROM has its own reading, see
+  `with_update`), INSERT into a CTE, and `WITH … INSERT` with OUTPUT,
+  RETURNING or ON CONFLICT.
+
+SUBSTRING(s, start, length) is the same for varchar on both sides (480
+combinations, errors for a negative length included) and NULLIF(a, b) for
+integers. T-SQL CHARINDEX in a varchar(max) or nvarchar(max) string returns
+bigint, as LEN does.
+
+### List splits
+
+Ola Hallengren's splits walk a delimited list with a recursive CTE. What
+they need, run on SQL Server 2022 and PostgreSQL 18:
+
+- A position in a MAX string is bigint in T-SQL, int in PostgreSQL. CAST of
+  a bigint to int is the same value when the value is a position: a
+  CHARINDEX, LEN or strpos (at most the string's length), a literal, or
+  sums of these. A recursive CTE's column gets such a bound by induction:
+  the anchor's value bounds it, and the step must keep within that bound
+  (`CAST(EndPosition AS int) + 1` where EndPosition is a position plus 1
+  does; `x + 1` growing each level does not). The cast then adds
+  `ASM-VALUE-SIZE-1GB`. CHARINDEX's start may be bigint (a start past the
+  end gives 0, `eval/cte/2026-10-30/charindex-max-tsql`).
+- LEFT(s, n) and RIGHT(s, n) of a string are substr from 1, and from
+  `length(s) - n + 1`, trailing spaces counted; the converter writes that
+  form for a non-literal count of a plain operand, and keeps PostgreSQL's
+  left/right for a literal count from 0 (176 cases, negative counts
+  included, `eval/builtins/2026-10-30-lr/`). PostgreSQL's right with a
+  count that is not a literal is not compared: a negative count drops
+  characters where T-SQL raises an error.
+- PARSENAME(s, k), k a literal from 1 to 4, against the converter's
+  pattern form (`parsename_pg(k)`): `[..]` and `".."` parts with doubled
+  closers, plain parts without `.`, `[`, `]` or `"`, at most 128 characters
+  each, at most four parts, an empty last part NULL. Identical on all
+  19,608 strings over `ab.[]" ` up to length 5, and at the 128/129
+  limits, with escapes and NULL (`eval/builtins/2026-10-30-parsename/`).
+  The result is nvarchar(128) on both sides; characters outside the Basic
+  Multilingual Plane count twice in T-SQL (`ASM-TSQL-LEN-BMP`).
+- `ROW_NUMBER() OVER (ORDER BY …)` without PARTITION BY is compared as a
+  numbering by the order keys, under `ASM-ORDER-TOTAL` (the keys order the
+  rows totally).
+- A number a CTE column holds and the INSERT stores in a bit column is
+  written `(x <> 0)` by the converter; a literal 0 or 1 becomes FALSE or
+  TRUE, also in `INSERT t (…) SELECT` without INTO.
+
 ## Benchmark
 
 `eval/cross-dialect/` in the project files: `bench.py` converts the
