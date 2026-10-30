@@ -545,23 +545,34 @@ def whyCall (d : Dialect) (env : TyEnv) (n : List String) (args : List Ast.Arg)
     (ret : Option Ast.Expr) : List String :=
   (if ret.isSome then ["node:call:ret"] else []) ++
     match d with
-    | .tsql dep _ =>
-      (if (lookup dep.routines (dotted n)).isNone then ["node:call:name"] else []) ++
-        args.flatMap fun a =>
-          if (lowerTsqlArg d env a).isSome then [] else
-          "node:call:args" :: match a with
-            | .Arg none e false => whyLower d env {} e
-            | _ => []
+    | .tsql dep Γ =>
+      match lookup dep.routines (dotted n) with
+      | none => ["node:call:name"]
+      | some callee =>
+        let tys := calleeTys Γ callee
+        (if args.length ≤ tys.length then [] else ["node:call:type"]) ++
+          (tys.zip args).flatMap fun (ty, a) =>
+            if (lowerTsqlArg d env ty a).isSome then []
+            else if (lowerTsqlArgShape d env a).isNone then
+              "node:call:args" :: match a with
+                | .Arg none e false => whyLower d env {} e
+                | _ => []
+            else ["node:call:type"]
     | .pg Γ _ =>
-      match lookup Γ.routines (dotted (n.map pgName)) with
+      let callee := dotted (n.map pgName)
+      match lookup Γ.routines callee with
       | none => ["node:call:name"]
       | some modes =>
+        let tys := calleeTys Γ callee
         (if args.length ≤ modes.length then [] else ["node:call:args"]) ++
-          (modes.zip args).flatMap fun (m, a) =>
-            if (lowerPgArg d env (m, a)).isSome then [] else
-            "node:call:args" :: match m, a with
-              | .In, .Arg none e false => whyLower d env {} e
-              | _, _ => []
+          (if args.length ≤ tys.length then [] else ["node:call:type"]) ++
+          ((modes.zip tys).zip args).flatMap fun ((m, ty), a) =>
+            if (lowerPgArg d env ty (m, a)).isSome then []
+            else if (lowerPgArgShape d env (m, a)).isNone then
+              "node:call:args" :: match m, a with
+                | .In, .Arg none e false => whyLower d env {} e
+                | _, _ => []
+            else ["node:call:type"]
 
 /-- Why `txnBracket` refuses a statement list: a `BEGIN TRAN` inside an
 open one (`nested`), a `COMMIT` with none open, one left open at the end,

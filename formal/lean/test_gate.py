@@ -152,7 +152,8 @@ def p_routine(status):
 P_MIRROR = p_routine(fn("COALESCE", pv("v_x"), num(0)))
 P_TODAY = p_routine(pv("v_x"))
 DEP = f"0,{hx('dbo.log_value')}:{hx('log_value')}"
-CAT = f"{hx('log_value')}:ibb"
+# (C2c) The callee's parameter types, `/`-separated, one per mode letter.
+CAT = f"{hx('log_value')}:ibb:" + "/".join([hx("INTEGER")] * 3)
 CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in
                 [("@a", "p_a"), ("@b", "p_b"), ("@x", "v_x"), ("%status", "return_code")])
 P3 = "sqldiff-check/3"
@@ -514,7 +515,7 @@ cases += [
     # OUTPUT copy-back into @r varchar(20): the callee's value has no bound.
     ("80", req3(80, a=s_t([call(["dbo", "log_value"], (tv("@a"), "f"), (tv("@r"), "t"))]),
                 b=s_p([call(["log_value"], (pv("a"), "f"), (pv("r"), "f"))]),
-                cat=CAT, cert=S_CERT), "unconfirmed"),
+                cat=f"{hx('log_value')}:ibb:" + "/".join([hx("TEXT")] * 3), cert=S_CERT), "unconfirmed"),
     # The PostgreSQL side alone: x varchar(3) := 'abcdef' raises (a local
     # keeps its length), where T-SQL's @x varchar(10) holds it.
     ("81", req3(81, a=s_t([C("NStmt", C("Declare", S("@x"), VC10, string("abcdef"))), assign(tv("@r"), tv("@x"))]),
@@ -839,7 +840,8 @@ THEOREMS = {
 # unconfirmed /3 answer whose routine is outside the spec adds `why` (0.13.0),
 # the reason codes of Sqldiff/Mirror/Diagnose.lean; no other answer does.
 EXTRA = {
-    "35": {"why": ["node:call:name"]},
+    # (C2c) Without a catalog the callee's parameter types are not known either.
+    "35": {"why": ["node:call:type"]},
     "36": {"why": ["node:call:name"]},
     # A T-SQL routine as the PL/pgSQL side: every construct named, in order.
     "38": {"why": ["stmt:declare:pg", "expr:pg-var", "stmt:assign:target", "node:call:name",

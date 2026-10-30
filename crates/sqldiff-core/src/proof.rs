@@ -253,6 +253,12 @@ pub struct MirrorRequest {
     /// Target routines (folded names) and their parameter modes, one of
     /// `i`, `o`, `b` (IN, OUT, INOUT) per parameter.
     pub catalog: Vec<(String, String)>,
+    /// (C2c) The declared types of those routines' parameters, by name, as
+    /// the PostgreSQL DDL spells them (type name and its arguments). A
+    /// call is in the checker's spec only when every argument has exactly
+    /// its parameter's type, so a routine without an entry here takes no
+    /// argument in the spec (`Sqldiff.Mirror.Catalog.routineTys`).
+    pub catalog_types: Vec<(String, Vec<ParamType>)>,
     /// T-SQL table names (`.`-joined, as written) and the target table
     /// each one is (trusted: the deployment's schema mapping, C3a).
     pub tables: Vec<(String, String)>,
@@ -269,6 +275,10 @@ pub struct MirrorRequest {
     pub source: String,
     pub target: String,
 }
+
+/// (C2c) A callee parameter's declared type: the type name as the DDL
+/// spells it and its arguments (`TIMESTAMP`, `["6"]`).
+pub type ParamType = (String, Vec<String>);
 
 /// A table of the target catalog for the C3a slice
 /// (`Sqldiff.Mirror.CatTable`). Sending one asserts that both databases
@@ -409,10 +419,32 @@ impl MirrorRequest {
                 .join("/");
             format!("{}={cols}", hex(&t.name))
         });
+        // ROUTINE (Request.lean): `NAME:MODES`, or (C2c) `NAME:MODES:TYPES`
+        // with one type per mode letter, `/`-separated, each the type's name
+        // then `.` and each argument, all hex.
+        let types_of = |n: &str| {
+            self.catalog_types
+                .iter()
+                .find(|(m, _)| m == n)
+                .map(|(_, ts)| {
+                    ts.iter()
+                        .map(|(t, args)| {
+                            std::iter::once(hex(t))
+                                .chain(args.iter().map(|a| hex(a)))
+                                .collect::<Vec<_>>()
+                                .join(".")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+        };
         let catalog = self
             .catalog
             .iter()
-            .map(|(n, m)| format!("{}:{m}", hex(n)))
+            .map(|(n, m)| match types_of(n) {
+                Some(ts) => format!("{}:{m}:{ts}", hex(n)),
+                None => format!("{}:{m}", hex(n)),
+            })
             .chain(tables)
             .chain(
                 self.binary_collation
@@ -793,6 +825,7 @@ mod tests {
                 ],
             }],
             binary_collation: true,
+            catalog_types: Vec::new(),
             renaming: Vec::new(),
             source: "(R)".into(),
             target: "(R)".into(),
@@ -886,6 +919,21 @@ mod tests {
         assert_eq!(
             l.split('\t').nth(5).unwrap(),
             "6576=64.d.64.d323032342d30322d3239"
+        );
+        // C2c: a callee's parameter types follow its modes.
+        r.catalog = vec![("p".into(), "ib".into())];
+        r.catalog_types = vec![(
+            "p".into(),
+            vec![
+                ("INTEGER".into(), Vec::new()),
+                ("TIMESTAMP".into(), vec!["6".into()]),
+            ],
+        )];
+        r.table_catalog = Vec::new();
+        let l = r.line(1).unwrap();
+        assert_eq!(
+            l.split('\t').nth(5).unwrap(),
+            "70:ib:494e5445474552/54494d455354414d50.36"
         );
     }
 }

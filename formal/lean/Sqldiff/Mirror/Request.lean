@@ -19,6 +19,13 @@ string in lower-case hex, two digits per byte:
                 ROUTINE NAME:MODES   a target routine (folded as
                                      `Sqldiff.Mirror.pgName` folds) and one
                                      letter per parameter: i IN, o OUT, b INOUT
+                        or NAME:MODES:TYPES (C2c) and the parameters'
+                                     declared PostgreSQL types, `/`-separated,
+                                     each the NAME of the type name then `.`
+                                     and the NAME of each type argument; one
+                                     per mode letter. A routine without
+                                     TYPES takes no argument in the spec
+                                     (`Catalog.routineTys`)
                 TABLE NAME=COL/COL/... a target table (folded, `.`-joined as
                                      the PL/pgSQL code names it) and its
                                      columns in declaration order, at least one
@@ -215,9 +222,22 @@ def col? (s : String) : Option CatCol := do
     | none => some none
   pure { name, tsql, notNull, key, kind, dflt }
 
-/-- A catalog entry: a routine, a table, or (C2b) the collation fact. -/
+/-- (C2c) A callee parameter's type: the hex of its name, then `.` and the
+hex of each type argument (`74494d455354414d50.36` is `TIMESTAMP(6)`). -/
+def ty? (s : String) : Option Ast.Ty :=
+  match s.splitOn "." with
+  | n :: as => do pure (.Ty (← name? n) (← as.mapM name?))
+  | [] => none
+
+/-- (C2c) The parameter types of a routine entry, `/`-separated; the
+empty text is no parameter. -/
+def tys? (s : String) : Option (List Ast.Ty) :=
+  if s.isEmpty then some [] else (s.splitOn "/").mapM ty?
+
+/-- A catalog entry: a routine (with (C2c) its parameter types, when
+given), a table, or (C2b) the collation fact. -/
 inductive Entry where
-  | routine (n : String) (modes : List Ast.Mode)
+  | routine (n : String) (modes : List Ast.Mode) (tys : Option (List Ast.Ty))
   | table (t : CatTable)
   | binaryCollation
 
@@ -230,13 +250,19 @@ def entry? (e : String) : Option Entry :=
     let cols ← (cs.splitOn "/").mapM col?
     pure (.table { name := ← name? n, cols })
   | [_] => match e.splitOn ":" with
-    | [n, ms] => do pure (.routine (← name? n) (← ms.toList.mapM mode?))
+    | [n, ms] => do pure (.routine (← name? n) (← ms.toList.mapM mode?) none)
+    | [n, ms, ts] => do
+      let modes ← ms.toList.mapM mode?
+      let tys ← tys? ts
+      if tys.length != modes.length then none else
+      pure (.routine (← name? n) modes (some tys))
     | _ => none
   | _ => none
 
 def catalog? (s : String) : Option Catalog :=
   (items? s entry?).map fun es =>
-    { routines := es.filterMap fun | .routine n ms => some (n, ms) | _ => none
+    { routines := es.filterMap fun | .routine n ms _ => some (n, ms) | _ => none
+      routineTys := es.filterMap fun | .routine n _ (some ts) => some (n, ts) | _ => none
       tables := es.filterMap fun | .table t => some t | _ => none
       binaryCollation := es.any fun | .binaryCollation => true | _ => false }
 
@@ -342,6 +368,15 @@ def extra (dep cat ra rb : String) (ans : Answer) : String :=
 #guard (cert? "-").map (·.vars) == some []
 #guard (catalog? "70:ib").isSome
 #guard (catalog? "70:ix").isNone
+-- C2c: parameter types, `integer` and `timestamp(6)`; one per mode.
+#guard (catalog? "70:ib:494e5445474552/54494d455354414d50.36").map
+    (fun g => g.routineTys.map fun (n, ts) => (n, ts.map tyName)) ==
+  some [("p", ["integer()", "timestamp(6)"])]
+#guard (catalog? "70::").map (fun g => (g.routines.length, g.routineTys.map (·.2.length))) ==
+  some (1, [0])
+#guard (catalog? "70:ib:494e5445474552").isNone
+#guard (catalog? "70:i:4").isNone
+#guard (catalog? "70:ib").map (·.routineTys.length) == some 0
 #guard (deployment? "0").map (·.rowCounts) == some false
 #guard (deployment? "2").isNone
 #guard (deployment? "0;64626f2e74:74").map (·.tables) == some [("dbo.t", "t")]

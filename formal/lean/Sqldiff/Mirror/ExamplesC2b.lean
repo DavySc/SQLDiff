@@ -427,6 +427,9 @@ def long26 : Ast.Expr := str "abcdefghijklmnopqrstuvwxyz"
 -- A certainly non-character type is not held to a length.
 #guard (lowerT dep ∅ (sT [.NStmt (.Declare "@x" (some bigint) (some (num 5)))])).isSome
 
+/-- (C2c) `log_value` with string `INOUT` parameters. -/
+def Γt : Catalog := { Γ with routineTys := [("log_value", [text, text, text])] }
+
 -- `RETURN` in a function, against the declared result: T-SQL truncates
 -- (`fT (vc 5)` above, and here `'abcdef'` from `RETURNS varchar(3)`);
 -- PostgreSQL keeps the whole value whatever the declared length (probed).
@@ -440,13 +443,18 @@ def long26 : Ast.Expr := str "abcdefghijklmnopqrstuvwxyz"
 -- varchar(20)`; PL/pgSQL `CALL log_value(a, x)` with `x` in an `INOUT`
 -- position, a local `varchar(20)`; into a parameter (no length kept) or
 -- a `text` it is kept.
-#guard (lowerT dep Γ (sT [.Call ["dbo", "log_value"] [arg ta false, arg tr true] none])).isNone
-#guard (lowerP Γ (sP [.Call ["log_value"] [arg pa false, arg (pv "x") false] none]
+-- (C2c) The callee's parameters are typed: `log_value(integer, INOUT
+-- text, INOUT text)` here (`Γt`); against the `integer` ones of `Γ` a
+-- string variable is no argument at all (PostgreSQL: not writable).
+#guard (lowerT dep Γt (sT [.Call ["dbo", "log_value"] [arg ta false, arg tr true] none])).isNone
+#guard (lowerP Γt (sP [.Call ["log_value"] [arg pa false, arg (pv "x") false] none]
     [.Declare "x" (some (vc 20)) none])).isNone
-#guard (lowerP Γ (sP [.Call ["log_value"] [arg pa false, arg (pv "x") false] none]
+#guard (lowerP Γt (sP [.Call ["log_value"] [arg pa false, arg (pv "x") false] none]
     [.Declare "x" (some text) none])).isSome
-#guard (lowerP Γ (sP [.Call ["log_value"] [arg pa false, arg pr false] none]
+#guard (lowerP Γt (sP [.Call ["log_value"] [arg pa false, arg pr false] none]
     (prt := vc 20))).isSome
+#guard (lowerP Γ (sP [.Call ["log_value"] [arg pa false, arg (pv "x") false] none]
+    [.Declare "x" (some text) none])).isNone
 -- Into an integer it is kept (the C1 pair at the top of `Examples`).
 #guard isConfirmed (check dep Γ cert srcT mirrorP)
 

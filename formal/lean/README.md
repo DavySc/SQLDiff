@@ -586,6 +586,7 @@ routine refused without any stage naming a reason gets
 | `node:for-query` | A `FOR` loop over a query outside the converter's block, or that block with another shape (record, aliases, body) |
 | `node:block-decls` | A nested block with declarations (other than the converter's `FOR` block) |
 | `node:call:handled`, `:args`, `:ret`, `:name` | A call inside a handled body; a named argument, too many arguments, or one that does not lower; `EXEC @rc = p`; a callee the deployment or the catalog does not name |
+| `node:call:type` | (0.14.0) An argument that does not have exactly its callee's parameter type, or a callee whose parameter types the request does not give |
 | `node:setting:<name>` | A `SET` the rules do not know, or off (`node:setting:ansi_nulls`, `:xact_abort` for `OFF`, `:nocount` while row counts are observed) |
 | `node:try:handlers` | A `TRY` with handlers other than one `CATCH` / one `WHEN OTHERS` |
 | `node:try:function` | `TRY`/`CATCH` in a T-SQL function |

@@ -122,7 +122,9 @@ def todayP : Ast.Routine :=
   pgProc ["p"] pgParams [declP "v_x" none] (pgBody [] (pv "v_x"))
 
 def dep : Deployment := { rowCounts := false, routines := [("dbo.log_value", "log_value")] }
-def Γ : Catalog := { routines := [("log_value", [.In, .InOut, .InOut])] }
+def Γ : Catalog :=
+  { routines := [("log_value", [.In, .InOut, .InOut])]
+    routineTys := [("log_value", [integer, integer, integer])] }
 def cert : Cert :=
   ⟨[("@a", "p_a"), ("@b", "p_b"), ("@x", "v_x"), (statusVar, "return_code")]⟩
 
@@ -209,7 +211,13 @@ the renamed source is not the target. -/
 -- A callee the deployment does not map, and one the target catalog lacks.
 #guard reasonOf (check { dep with routines := [] } Γ cert srcT mirrorP) ==
   "the T-SQL routine is outside the C1 spec"
-#guard reasonOf (check dep ∅ cert srcT mirrorP) == "the PL/pgSQL routine is outside the C1 spec"
+#guard reasonOf (check dep { Γ with routines := [] } cert srcT mirrorP) ==
+  "the PL/pgSQL routine is outside the C1 spec"
+-- (C2c) Without the callee's parameter types neither side's call is in
+-- the spec (the T-SQL routine is refused first).
+#guard reasonOf (check dep ∅ cert srcT mirrorP) == "the T-SQL routine is outside the C1 spec"
+#guard reasonOf (check dep { Γ with routineTys := [] } cert srcT mirrorP) ==
+  "the T-SQL routine is outside the C1 spec"
 
 /- `@I` and `@i` are one variable or two depending on the collation:
 outside the spec. -/
@@ -255,7 +263,7 @@ def oneP : Ast.Routine :=
 place without `p`'s arity, so this is outside C1. (Appending `@rc` after
 the arguments would have confirmed `CALL p(a, rc)` passing `rc` into an
 ordinary second parameter.) -/
-#guard reasonOf (check { dep with routines := [("p2", "p2")] } { routines := [("p2", [.In, .InOut, .InOut])] }
+#guard reasonOf (check { dep with routines := [("p2", "p2")] } { routines := [("p2", [.In, .InOut, .InOut])], routineTys := [("p2", [integer, integer, integer])] }
     ⟨[("@a", "a"), ("@rc", "rc"), (statusVar, "return_code")]⟩
     (tsqlProc ["r"] [.Param "@a" int .In none]
       [declT "@rc" none, .Call ["p2"] [arg (tv "@a") false] (some (tv "@rc"))])

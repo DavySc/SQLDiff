@@ -1119,11 +1119,31 @@ pub fn mirror_request(
             (name, r.params.iter().map(|p| mode_letter(p.mode)).collect())
         })
         .collect();
+    // C2c: the callees' parameter types, as their PostgreSQL DDL declares
+    // them; the checker holds each argument to its parameter's type.
+    let catalog_types = output_routines
+        .iter()
+        .map(|r| {
+            let name = r
+                .name
+                .iter()
+                .map(|p| pg_name(p))
+                .collect::<Vec<_>>()
+                .join(".");
+            let types = r
+                .params
+                .iter()
+                .map(|p| (p.ty.name.clone(), p.ty.args.clone()))
+                .collect();
+            (name, types)
+        })
+        .collect();
     Ok((
         MirrorRequest {
             row_counts,
             routines,
             catalog,
+            catalog_types,
             tables: table_pairs,
             table_catalog,
             binary_collation: trusted.binary_collation,

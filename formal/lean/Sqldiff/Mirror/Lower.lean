@@ -163,6 +163,12 @@ structure Catalog where
   answer names it as `ASM-BINARY-COLLATION` where a comparison uses it.
   See "The C2b slice: strings". -/
   binaryCollation : Bool := false
+  /-- (C2c) The declared parameter types of the PostgreSQL routines a
+  `CALL` can reach, as their DDL spells them, by folded name. A call is in
+  the spec only when every argument is shown to have exactly its
+  parameter's type ("Calls" below); a routine without an entry here takes
+  no arguments in the spec. -/
+  routineTys : List (String × List Ast.Ty) := []
 
 /-- The empty catalog. -/
 instance : EmptyCollection Catalog := ⟨{ routines := [] }⟩
@@ -852,9 +858,16 @@ bigint, smallint, and tinyint (Transact-SQL)"; PostgreSQL 8.1.1, Table
   widest (the highest precedence in T-SQL; PostgreSQL 10.5 resolves to
   the common type); `ISNULL(x, y)` keeps `x`'s type, so `y` must fit it.
 * Parameters and results: `bigint` and `smallint` correspond to
-  themselves (`tyCorr`); a `bigint` argument is outside the slice as a
-  call argument (`valTy`: the callee's parameter type is not known, and
-  PostgreSQL has no implicit `bigint` to `integer` conversion).
+  themselves (`tyCorr`). A call argument must have exactly its callee's
+  parameter type, which the request names ("Argument types" in
+  "Calls"): PostgreSQL has no implicit `integer` to `smallint` or
+  `boolean` conversion in procedure resolution (42883), and an `INOUT`
+  variable that needs one is not writable. The declared types of the
+  variables the certificate pairs must correspond too (`localTyCorr`,
+  `Check.lean`), and a slice value is not stored into a variable of a
+  type outside the slice (`storeOkTy`): both engines convert on the
+  store, differently (a `datetime2(6)` value into T-SQL `datetime` and
+  PostgreSQL `timestamp`: `.123333` against `.123456`).
 
 **`bit` against `boolean`** (`bitType`). The converter maps T-SQL `bit`
 to `boolean` (crates/sqldiff-convert/src/tsql/bits.rs). A `bit` holds
@@ -2681,34 +2694,118 @@ argument is a variable that receives the parameter's final value; without
 is renamed through the deployment. `EXEC @rc = p` is outside the spec: the
 status is the callee's *last* parameter in the core (above), so placing
 `@rc` needs the callee's arity, which the check does not take as input. -/
-def lowerTsqlArg (d : Dialect) (env : TyEnv) : Ast.Arg → Option Arg
+def lowerTsqlArgShape (d : Dialect) (env : TyEnv) : Ast.Arg → Option Arg
   | .Arg (some _) _ _ => none -- named arguments: the core binds by position
   | .Arg none e true => (target d e).map .ref
   | .Arg none e false => (lowerExpr d env {} e).map .val
+
+/-! ### Argument types (C2c)
+
+The core binds an argument to a parameter as it is, and neither engine
+does: T-SQL converts an argument to the parameter's type (an `int` into a
+`smallint` parameter is narrowed, raising 220 when it does not fit; a
+`bit` parameter takes any number as 0 or 1), and PostgreSQL resolves a
+`CALL` by the arguments' types, with implicit casts only: an `integer`
+argument finds no procedure with a `smallint` or `boolean` parameter
+(42883, "procedure cs(integer) does not exist"), and a variable in an
+`INOUT` position that needs a cast is "not writable" (probed on
+PostgreSQL 18 with the converter's output, review of C2c). Before C2c the
+callee's types were not looked at, which was sound only while every
+callee confirmed was an `int` routine; with `smallint`, `bigint`, `bit`
+and dates in signatures (`tyCorr`) it is not. So every argument must be
+shown to have exactly its parameter's type (`argKindOk`): the request
+names each callee's parameter types (`Catalog.routineTys`, PostgreSQL's
+DDL; the callee's own confirmation ties them to its T-SQL types by
+`sigCorr`, `ASM-CALLEE-CONFIRMED`), and a value argument must be a slice
+value of that type (or NULL; the T-SQL literals a `bit`, `date` or
+`datetime2` parameter reads, as for a store: `coerce`), an `OUTPUT` or
+`INOUT` variable must be declared with that type. A string parameter
+takes a string (any lengths, as `sigCorr`); a parameter of a type
+outside the slice takes no argument in the spec. -/
+
+/-- The slice type of a callee's parameter, from its PostgreSQL type. -/
+def paramWant (ty : Ast.Ty) : Option STy := valTypeOf (.pg ∅ []) ty
+
+/-- A value of type `t` is exactly of the parameter's type `want`: the
+same slice type, any string for a string, or the NULL literal. -/
+def sameKind (want t : STy) : Bool :=
+  match want, t with
+  | _, .nul => true
+  | .str .., .str .. => true
+  | w, t => w == t
+
+/-- A value argument of the parameter's type. -/
+def argValueOk (d : Dialect) (env : TyEnv) (want : STy) (e : Ast.Expr) : Bool :=
+  match typedTo d env {} (some want) e with
+  | some (_, t) => sameKind want t
+  | none => false
+
+/-- An `OUTPUT`/`INOUT` variable declared with the parameter's type. -/
+def argRefOk (d : Dialect) (env : TyEnv) (want : STy) (x : Var) : Bool :=
+  match varTy d env x with
+  | some t => t != .nul && sameKind want t
+  | none => false
+
+/-- The argument in a position whose parameter is declared `ty` has its
+type (`argValueOk`, `argRefOk`). -/
+def argKindOk (d : Dialect) (env : TyEnv) (ty : Ast.Ty) (a : Ast.Arg) (ref : Bool) : Bool :=
+  match paramWant ty, a with
+  | none, _ => false
+  | some w, .Arg _ e _ =>
+    if ref then (target d e).any (argRefOk d env w) else argValueOk d env w e
+
+/-- A value argument, lowered with the parameter's type (a `bit` literal
+`1` is the boolean, as `TRUE` is). -/
+def lowerArgValue (d : Dialect) (env : TyEnv) (ty : Ast.Ty) (e : Ast.Expr) : Option Core.Expr :=
+  lowerValue d env {} (paramWant ty) e
+
+def lowerTsqlArg (d : Dialect) (env : TyEnv) (ty : Ast.Ty) (a : Ast.Arg) : Option Arg :=
+  match a with
+  | .Arg (some _) _ _ => none
+  | .Arg none e out =>
+    if !argKindOk d env ty a out then none
+    else if out then (target d e).map .ref
+    else (lowerArgValue d env ty e).map .val
 
 /-- PostgreSQL `CALL p(args)`: positional arguments only; an argument in
 an `OUT` or `INOUT` position (the catalog says which) must be a variable,
 and receives the parameter's final value; trailing parameters without an
 argument take their defaults. -/
-def lowerPgArg (d : Dialect) (env : TyEnv) : Ast.Mode × Ast.Arg → Option Arg
+def lowerPgArgShape (d : Dialect) (env : TyEnv) : Ast.Mode × Ast.Arg → Option Arg
   | (_, .Arg (some _) _ _) => none
   | (_, .Arg none _ true) => none -- `OUTPUT` is T-SQL syntax
   | (.In, .Arg none e false) => (lowerExpr d env {} e).map .val
   | (_, .Arg none e false) => (target d e).map .ref
 
+def lowerPgArg (d : Dialect) (env : TyEnv) (ty : Ast.Ty) : Ast.Mode × Ast.Arg → Option Arg
+  | (m, a) => match lowerPgArgShape d env (m, a) with
+    | none => none
+    | some (.ref x) => if argKindOk d env ty a true then some (.ref x) else none
+    | some (.val _) => match a with
+      | .Arg _ e _ =>
+        if argKindOk d env ty a false then (lowerArgValue d env ty e).map .val else none
+
+/-- The parameter types of a callee (`Catalog.routineTys`); none when the
+request does not give them. -/
+def calleeTys (Γ : Catalog) (callee : String) : List Ast.Ty :=
+  (lookup Γ.routineTys callee).getD []
+
 def lowerCall (d : Dialect) (env : TyEnv) (n : List String) (args : List Ast.Arg)
     (ret : Option Ast.Expr) : Option Stmt :=
   match d with
-  | .tsql dep _ => do
+  | .tsql dep Γ => do
     if ret.isSome then none else
     let callee ← lookup dep.routines (dotted n)
-    let args' ← args.mapM (lowerTsqlArg d env)
+    let tys := calleeTys Γ callee
+    if args.length > tys.length then none else
+    let args' ← (tys.zip args).mapM fun (ty, a) => lowerTsqlArg d env ty a
     pure (.call callee args')
   | .pg Γ _ => do
     let callee := dotted (n.map pgName)
     let modes ← lookup Γ.routines callee
-    if args.length ≤ modes.length && ret.isNone then
-      let args' ← (modes.zip args).mapM (lowerPgArg d env)
+    let tys := calleeTys Γ callee
+    if args.length ≤ modes.length && args.length ≤ tys.length && ret.isNone then
+      let args' ← ((modes.zip tys).zip args).mapM fun ((m, ty), a) => lowerPgArg d env ty (m, a)
       pure (.call callee args')
     else none
 
@@ -3829,6 +3926,13 @@ def valueFits (d : Dialect) (env : TyEnv) (sc : Scope) (ty : Ast.Ty) (e : Ast.Ex
   | some v => fitsTy d ty v
   | none => false
 
+/-- (C2c) A call argument of the slice: a value of a slice type other
+than a string (`sliceNode`). -/
+def callArgOk (d : Dialect) (env : TyEnv) (e : Ast.Expr) : Bool :=
+  match typed d env {} e with
+  | some (_, t) => isVal t && !(t matches .str ..)
+  | none => false
+
 /-- A condition: a three-valued boolean of the slice. -/
 def condOk (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) : Bool :=
   match typed d env sc e with
@@ -3892,7 +3996,10 @@ mutual
     | .While c b => condOk d env {} c && sliceNodes d env wenv ret b
     -- C3b: the loop's body is the record's fields, checked by the lowering.
     | .ForQuery r q _ => querySlice (withRecord d r) env q
-    | .Call _ args _ => args.all fun | .Arg _ e _ => valueOk d env {} e
+    -- (C2c) Any value of the slice but a string: the lowering holds each
+    -- argument to its parameter's type (`argKindOk`); a string may be too
+    -- long for the T-SQL callee's parameter, which truncates it.
+    | .Call _ args _ => args.all fun | .Arg _ e _ => callArgOk d env e
     | .Setting .. => true
     -- The handler of the rollback-and-rethrow idiom is not lowered.
     | .Try b hs =>
