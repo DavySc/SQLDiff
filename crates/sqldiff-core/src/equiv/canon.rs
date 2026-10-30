@@ -1727,6 +1727,9 @@ impl<'a> Canon<'a> {
     }
 
     fn call(&mut self, c: &Call) -> R<(Term, Option<Ty>)> {
+        if c.over {
+            return self.window(c);
+        }
         let name = lc(c.name.last().map(String::as_str).unwrap_or(""));
         // A qualified name is a user function, even `dbo.max`: T-SQL calls a
         // built-in unqualified only.
@@ -2503,6 +2506,25 @@ impl<'a> Canon<'a> {
         Ok(Some(self.cast(dst, v)))
     }
 
+    /// An aggregate `OVER ()`: the aggregate of all the rows the query
+    /// returns (after WHERE, GROUP BY and HAVING, before DISTINCT, ORDER BY
+    /// and paging), repeated on each row, in both dialects. Only COUNT,
+    /// MIN, MAX, SUM and AVG, lowered as without OVER (so a string MIN or
+    /// a SUM keeps its dialect); ranking functions are refused, which
+    /// T-SQL requires an ORDER BY for.
+    fn window(&mut self, c: &Call) -> R<(Term, Option<Ty>)> {
+        let name = lc(c.name.last().map(String::as_str).unwrap_or(""));
+        if c.name.len() != 1 || !matches!(name.as_str(), "count" | "min" | "max" | "sum" | "avg") {
+            return Err(format!("{name}() OVER is not supported"));
+        }
+        let plain = Call {
+            over: false,
+            ..c.clone()
+        };
+        let (t, ty) = self.call(&plain)?;
+        Ok((n("win", vec![t]), ty))
+    }
+
     fn binary(&mut self, op: &str, l: &Expr, r: &Expr) -> R<(Term, Option<Ty>)> {
         if self.d == Dialect::Postgres && op == "+" {
             if let Some(t) = self.pg_date_add(l, r, false)? {
@@ -3142,6 +3164,9 @@ impl<'a> Canon<'a> {
 
     /// Query parts without the select list, plus the select items.
     fn query_parts(&mut self, s: &Select, ctx: QCtx) -> R<Parts> {
+        if !s.set_ops.is_empty() {
+            return self.set_query(s, ctx);
+        }
         if let Some(rows) = &s.values {
             let mut rs = Vec::new();
             for r in rows {
@@ -3160,6 +3185,174 @@ impl<'a> Canon<'a> {
         let r = self.query_inner(s, ctx);
         self.scopes.pop();
         r
+    }
+
+    /// `q1 UNION [ALL] q2 …`, EXCEPT, INTERSECT, with an ORDER BY of the
+    /// whole: `(setq (setop OP left right [coll]) (order …))`, the items
+    /// being the result columns `(ocol k)`. Left to right, as both T-SQL
+    /// and PostgreSQL group UNION and EXCEPT (the parser refuses INTERSECT
+    /// mixed with the others, which binds tighter in both). Only where both
+    /// give the same rows:
+    /// - each column has one known type in every branch, so neither
+    ///   dialect converts a branch's values to a common type (their rules
+    ///   for that differ);
+    /// - UNION, EXCEPT and INTERSECT without ALL remove duplicates by `=`,
+    ///   so string columns compare under each dialect's collation (kept as
+    ///   the dialect, as for DISTINCT);
+    /// - no branch has its own ORDER BY, TOP or paging, assignments or
+    ///   INTO, and the whole has no TOP, paging or locking (where a T-SQL
+    ///   TOP applies to the first branch and a PostgreSQL LIMIT to the
+    ///   whole);
+    /// - EXCEPT ALL and INTERSECT ALL, which T-SQL lacks, are refused;
+    /// - the ORDER BY names a result column (by its name in the first
+    ///   branch, or its position).
+    fn set_query(&mut self, s: &Select, ctx: QCtx) -> R<Parts> {
+        if s.top.is_some()
+            || s.limit.is_some()
+            || s.offset.is_some()
+            || !s.locking.is_empty()
+            || s.for_json
+            || !s.ctes.is_empty()
+            || !s.into.is_empty()
+        {
+            return Err("a set operation with TOP, paging, locking or INTO".into());
+        }
+        let mut head = s.clone();
+        head.set_ops.clear();
+        head.order_by.clear();
+        let mut branches: Vec<(Option<&str>, &Select)> = vec![(None, &head)];
+        for (op, b) in &s.set_ops {
+            branches.push((Some(op.as_str()), b));
+        }
+        let mut acc: Option<Term> = None;
+        let mut col_tys: Vec<Option<Ty>> = Vec::new();
+        let mut col_terms: Vec<Vec<Term>> = Vec::new();
+        for (op, b) in branches {
+            if b.top.is_some()
+                || b.limit.is_some()
+                || b.offset.is_some()
+                || !b.order_by.is_empty()
+                || !b.locking.is_empty()
+                || b.for_json
+                || !b.ctes.is_empty()
+                || !b.into.is_empty()
+                || !b.set_ops.is_empty()
+                || b.items.iter().any(|i| i.assign.is_some())
+            {
+                return Err(
+                    "a set operation branch with its own ORDER BY, TOP, paging, INTO or assignment"
+                        .into(),
+                );
+            }
+            let (mut parts, items) = self.query_parts(b, QCtx::Scalar)?;
+            if col_tys.is_empty() && acc.is_none() {
+                col_tys = items.iter().map(|x| x.1).collect();
+                col_terms = vec![Vec::new(); items.len()];
+            } else if items.len() != col_tys.len() {
+                return Err("set operation branches with different numbers of columns".into());
+            }
+            for (k, (t, ty)) in items.iter().enumerate() {
+                if ty.is_none() || *ty != col_tys[k] {
+                    return Err(format!(
+                        "set operation column {} has different or unknown types in its branches",
+                        k + 1
+                    ));
+                }
+                col_terms[k].push(t.clone());
+            }
+            parts.insert(1, n("items", items.into_iter().map(|x| x.0).collect()));
+            let q = n("q", parts);
+            acc = Some(match (acc, op) {
+                (None, _) => q,
+                (Some(l), Some(op)) => {
+                    let h = match op {
+                        "UNION ALL" => "union-all",
+                        "UNION" => "union",
+                        "EXCEPT" => "except",
+                        "INTERSECT" => "intersect",
+                        _ => return Err(format!("{op} is not supported")),
+                    };
+                    let mut kids = vec![a(h), l, q];
+                    if h != "union-all" && col_tys.iter().any(|t| t.is_some_and(|t| t.is_string()))
+                    {
+                        kids.push(n("coll", vec![self.dtag()]));
+                    }
+                    n("setop", kids)
+                }
+                (Some(_), None) => unreachable!("only the first branch has no operator"),
+            });
+        }
+        let acc = acc.ok_or("an empty set operation")?;
+        // Result columns, named as the first branch names them.
+        let names: Vec<Option<String>> = head
+            .items
+            .iter()
+            .map(|it| {
+                it.alias.clone().map(|x| lc(&x)).or_else(|| match &it.expr {
+                    Expr::Name(p) => p.last().map(|x| lc(x)),
+                    _ => None,
+                })
+            })
+            .collect();
+        let mut order = Vec::new();
+        for o in &s.order_by {
+            let k = match &o.expr {
+                Expr::Num(v) => v
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|k| (1..=col_tys.len()).contains(k))
+                    .map(|k| k - 1),
+                Expr::Name(p) if p.len() == 1 => {
+                    let want = lc(&p[0]);
+                    let hits: Vec<usize> = (0..names.len())
+                        .filter(|&k| names[k].as_deref() == Some(want.as_str()))
+                        .collect();
+                    match hits.as_slice() {
+                        [k] => Some(*k),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+            .ok_or("an ORDER BY of a set operation that is not one result column")?;
+            let nulls_first = o.nulls_first.unwrap_or(match self.d {
+                Dialect::Tsql => !o.desc,
+                Dialect::Postgres | Dialect::Db2i => o.desc,
+            });
+            let not_null = col_terms[k].iter().all(|t| self.not_null(t) == Some(true));
+            let nulls = match (not_null, nulls_first) {
+                (true, _) => "n/a",
+                (false, true) => "nf?",
+                (false, false) => "nl?",
+            };
+            let mut kids = vec![
+                n("ocol", vec![a(k.to_string())]),
+                a(if o.desc { "desc" } else { "asc" }),
+                a(nulls),
+            ];
+            if col_tys[k].is_some_and(|t| t.is_string()) {
+                kids.push(self.dtag());
+            }
+            order.push(n("ord", kids));
+        }
+        let items = col_tys
+            .iter()
+            .enumerate()
+            .map(|(k, ty)| {
+                let t = n("ocol", vec![a(k.to_string())]);
+                let t = match ctx {
+                    QCtx::Set => n("item", vec![t, a(names[k].clone().unwrap_or_default())]),
+                    _ => t,
+                };
+                (t, *ty)
+            })
+            .collect();
+        let items = if ctx == QCtx::Exists {
+            Vec::new()
+        } else {
+            items
+        };
+        Ok((vec![a("setq"), acc, n("order", order)], items))
     }
 
     fn query_inner(&mut self, s: &Select, ctx: QCtx) -> R<Parts> {
@@ -4276,6 +4469,7 @@ impl<'a> Canon<'a> {
     /// Db2 `SELECT c INTO v FROM FINAL TABLE (INSERT ...)`.
     fn final_table(&mut self, sel: &Select, kind: &str, stmt: &Stmt) -> R<Term> {
         if kind != "FINAL"
+            || !sel.set_ops.is_empty()
             || sel.where_.is_some()
             || !sel.group_by.is_empty()
             || !sel.order_by.is_empty()
@@ -4399,6 +4593,7 @@ impl<'a> Canon<'a> {
                 alias: Some(sa),
                 cols,
             } if query.from.is_empty()
+                && query.set_ops.is_empty()
                 && query.values.is_none()
                 && cols.is_empty()
                 && query.where_.is_none() =>
@@ -5507,7 +5702,8 @@ fn exactly_one(q: &Term) -> bool {
 
 /// An aggregate call in this expression, outside any subquery.
 fn aggregates(t: &Term) -> bool {
-    if t.is("q") {
+    // An aggregate OVER () keeps every row.
+    if t.is("q") || t.is("win") {
         return false;
     }
     // MIN and MAX of one argument; a string's comparison is the dialect's.

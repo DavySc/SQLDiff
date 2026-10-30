@@ -451,6 +451,10 @@ pub struct Parser<'a> {
     /// target, `FOR JSON` options). The evaluator compares the statement's
     /// tokens as well; [`parse_stmt_exact`] refuses any of these.
     pub dropped: Vec<&'static str>,
+    /// Constructs only readers that lower them take (`parse_stmt_lowered`,
+    /// [`parse_stmt_output`], [`Parser::lowering`]):
+    /// UNION, EXCEPT and INTERSECT, and aggregates `OVER ()`.
+    pub lowered: bool,
     /// Read OUTPUT / RETURNING into [`Parser::output`] instead of refusing
     /// them ([`parse_stmt_output`]).
     pub keep_output: bool,
@@ -465,8 +469,17 @@ impl<'a> Parser<'a> {
             d,
             ext: false,
             dropped: Vec::new(),
+            lowered: false,
             keep_output: false,
             output: None,
+        }
+    }
+
+    /// A parser for the equivalence lowering (see [`Parser::lowered`]).
+    pub fn lowering(t: &'a [Tok], d: Dialect) -> Self {
+        Parser {
+            lowered: true,
+            ..Parser::new(t, d)
         }
     }
 
@@ -477,6 +490,7 @@ impl<'a> Parser<'a> {
             d,
             ext: true,
             dropped: Vec::new(),
+            lowered: true,
             keep_output: false,
             output: None,
         }
@@ -1195,6 +1209,17 @@ impl<'a> Parser<'a> {
             self.expect_kind(K::RParen)?;
             c.within_group = true;
         }
+        // An aggregate over all rows of the query: `OVER ()` only.
+        if self.lowered
+            && self.is_kw("OVER")
+            && self.is_kind_at(1, K::LParen)
+            && self.is_kind_at(2, K::RParen)
+            && !c.distinct
+            && c.order.is_empty()
+        {
+            self.i += 3;
+            c.over = true;
+        }
         if self.is_kw("OVER") || self.is_kw("FILTER") {
             return Err("window functions and FILTER are not supported".into());
         }
@@ -1423,7 +1448,7 @@ impl<'a> Parser<'a> {
             s.having = Some(self.expr()?);
         }
         if self.is_kw("UNION") || self.is_kw("EXCEPT") || self.is_kw("INTERSECT") {
-            if !self.ext {
+            if !self.lowered {
                 return Err("set operations are not supported".into());
             }
             let mut op = self.peek().unwrap().up.clone();
@@ -2629,7 +2654,7 @@ pub fn parse_stmt_exact(toks: &[Tok], d: Dialect) -> PResult<Stmt> {
 /// [`parse_stmt`], also reading the rows the statement returns (see
 /// [`Output`]); `None` when it returns none.
 pub fn parse_stmt_output(toks: &[Tok], d: Dialect) -> PResult<(Stmt, Option<Output>)> {
-    let mut p = Parser::new(toks, d);
+    let mut p = Parser::lowering(toks, d);
     p.keep_output = true;
     let s = p.stmt()?;
     if !p.at_end() {
@@ -2648,6 +2673,18 @@ pub fn parse_stmt_output(toks: &[Tok], d: Dialect) -> PResult<(Stmt, Option<Outp
 
 pub fn parse_stmt(toks: &[Tok], d: Dialect) -> PResult<Stmt> {
     let mut p = Parser::new(toks, d);
+    let s = p.stmt()?;
+    if !p.at_end() {
+        return Err(p.err("unexpected trailing tokens"));
+    }
+    Ok(s)
+}
+
+/// [`parse_stmt`] reading UNION, EXCEPT and INTERSECT and aggregates
+/// `OVER ()` too, for the equivalence lowering, which compares them
+/// (`equiv::canon`).
+pub fn parse_stmt_lowered(toks: &[Tok], d: Dialect) -> PResult<Stmt> {
+    let mut p = Parser::lowering(toks, d);
     let s = p.stmt()?;
     if !p.at_end() {
         return Err(p.err("unexpected trailing tokens"));
