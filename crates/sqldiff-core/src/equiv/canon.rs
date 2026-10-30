@@ -737,6 +737,18 @@ impl<'a> Canon<'a> {
         self.rows = false;
     }
 
+    /// The geography point a constant is: `0x…` in T-SQL, `'…'` (hex EWKB)
+    /// in PostgreSQL.
+    fn geog_point(&self, t: &Term) -> Option<super::geography::Point> {
+        use super::geography as g;
+        let text = t.kid(0).and_then(Term::atom)?;
+        match (self.d, t.head()) {
+            (Dialect::Tsql, "bytes") => g::from_sqlserver(&g::unhex(text)?),
+            (Dialect::Postgres, "str") => g::from_ewkb(&g::unhex(text)?),
+            _ => None,
+        }
+    }
+
     /// SQL Server cannot compare geography, text, ntext, image or xml values
     /// (GROUP BY, DISTINCT, IN, set operations, = all fail); PostGIS
     /// compares geography bounding boxes, PostgreSQL has no xml equality.
@@ -1998,6 +2010,25 @@ impl<'a> Canon<'a> {
         // ("Invalid endian flag value", checked on PostGIS 3.6), and the
         // two parse text differently.
         if dst.fam == Fam::Geography && v.1.map_or(true, |t| t.fam != Fam::Geography) {
+            // A point constant both read alike: SQL Server's binary form,
+            // PostGIS's hex EWKB text (super::geography has the runs).
+            if let Some(p) = self.geog_point(&v.0) {
+                let bits =
+                    |f: Option<f64>| a(f.map_or("-".into(), |f| format!("{:016x}", f.to_bits())));
+                return (
+                    n(
+                        "geog",
+                        vec![
+                            a(p.srid.to_string()),
+                            bits(Some(p.x)),
+                            bits(Some(p.y)),
+                            bits(p.z),
+                            bits(p.m),
+                        ],
+                    ),
+                    to,
+                );
+            }
             return (
                 n(
                     "dcast",

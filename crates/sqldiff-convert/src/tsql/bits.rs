@@ -57,7 +57,7 @@ impl BitEdits {
 }
 
 /// `(` matching the `)` at `close`.
-fn opening(ts: &[T], close: usize) -> Option<usize> {
+pub(super) fn opening(ts: &[T], close: usize) -> Option<usize> {
     let mut depth = 0i32;
     for j in (0..=close).rev() {
         match ts[j].k {
@@ -76,7 +76,7 @@ fn opening(ts: &[T], close: usize) -> Option<usize> {
 
 /// First token of the simple operand that ends at `j`: a variable, a
 /// literal, a dotted name, a call or a parenthesized group.
-fn operand_start(ts: &[T], j: usize) -> Option<usize> {
+pub(super) fn operand_start(ts: &[T], j: usize) -> Option<usize> {
     match ts[j].k {
         VARIABLE | NUMBER | STRING => Some(j),
         IDENT | QUOTED_IDENT => {

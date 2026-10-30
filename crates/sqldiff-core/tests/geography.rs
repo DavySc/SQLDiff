@@ -90,3 +90,26 @@ fn geography_built_compared_or_ordered_is_not_shown_equal() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+#[test]
+fn point_constants_read_to_the_same_point() {
+    // geography::Point(36.5822667, -87.0655564, 4326) and its EWKB.
+    let t = "UPDATE dbo.C SET L1 = 0xE6100000010C610619B7874A4240C982781332C455C0 WHERE Id = 1;";
+    assert!(equal(
+        t,
+        "UPDATE C SET L1 = '0101000020E6100000C982781332C455C0610619B7874A4240'::geography WHERE Id = 1;"
+    ));
+    // The latitude's last mantissa bit, latitude and longitude swapped,
+    // another SRID, Z dropped.
+    for b in [
+        "UPDATE C SET L1 = '0101000020E6100000C982781332C455C0600619B7874A4240'::geography WHERE Id = 1;",
+        "UPDATE C SET L1 = '0101000020E6100000610619B7874A4240C982781332C455C0'::geography WHERE Id = 1;",
+        "UPDATE C SET L1 = '0101000020AD100000C982781332C455C0610619B7874A4240'::geography WHERE Id = 1;",
+    ] {
+        assert!(!equal(t, b), "{b}");
+    }
+    assert!(!equal(
+        "UPDATE dbo.C SET L1 = 0xE6100000010D00000000000042400000000000C055C00000000000001440 WHERE Id = 1;",
+        "UPDATE C SET L1 = '0101000020E61000000000000000C055C00000000000004240'::geography WHERE Id = 1;"
+    ));
+}

@@ -210,3 +210,56 @@ fn parameters_passed_with_a_conversion_are_not_converted() {
     assert_eq!(u.status, Status::NotConverted);
     assert!(reason(u).contains("not a variable"), "{}", reason(u));
 }
+
+#[test]
+fn only_text_that_reaches_a_refused_exec_stays_t_sql() {
+    // The first text runs converted; the second has no rule. The variable
+    // runs both, but only the second assignment's value reaches the refused
+    // EXEC.
+    let src = proc(
+        "    SET @SQL = N'DELETE FROM dbo.t WHERE id = 3;';\n    EXECUTE (@SQL);\n    SET @SQL = N'CREATE TYPE dbo.l AS TABLE (id int);';\n    EXECUTE (@SQL);",
+    );
+    let c = pg(&src);
+    let first = unit(&c, &src, "SET @SQL = N'DELETE");
+    assert!(!has_rule(first, "dynamic-sql.text"), "{:?}", first.notes);
+    let second = unit(&c, &src, "SET @SQL = N'CREATE TYPE");
+    assert!(has_rule(second, "dynamic-sql.text"), "{:?}", second.notes);
+    // The converted EXEC pairs with its T-SQL statement past the refused one.
+    let exec = unit(&c, &src, "EXECUTE (@SQL);\n    SET");
+    assert_eq!(
+        exec.status,
+        Status::Assumptions,
+        "{:?}\n{}",
+        exec.notes,
+        c.output
+    );
+}
+
+#[test]
+fn text_read_through_unknown_assignments_keeps_every_one_t_sql() {
+    // The refused EXEC's text is not known (a parameter), so any assignment
+    // may reach it.
+    let src = proc(
+        "    SET @SQL = N'DELETE FROM dbo.t WHERE id = 3;';\n    EXECUTE (@SQL);\n    SET @SQL = N'DROP TABLE ' + QUOTENAME(@n);\n    EXECUTE (@SQL);",
+    );
+    let c = pg(&src);
+    let first = unit(&c, &src, "SET @SQL = N'DELETE");
+    assert!(has_rule(first, "dynamic-sql.text"), "{:?}", first.notes);
+}
+
+#[test]
+fn a_multi_line_string_keeps_its_value() {
+    // The lines inside the literal are neither indented nor dedented.
+    let src = proc(
+        "    SET @SQL = N'\nDELETE FROM dbo.t\n  WHERE id = 3\n          ';\n    EXECUTE (@SQL);",
+    );
+    let c = pg(&src);
+    assert!(
+        c.output
+            .contains("v_sql := '\nDELETE FROM dbo.t\n  WHERE id = 3\n          ';\n"),
+        "{}",
+        c.output
+    );
+    let set = unit(&c, &src, "SET @SQL");
+    assert_eq!(set.status, Status::Assumptions, "{:?}", set.notes);
+}
