@@ -92,7 +92,7 @@ pub mod asm {
     );
     pub const DATEADD_RANGE: (&str, &str) = (
         "ASM-DATEADD-RANGE",
-        "DATEADD results stay within the range of their type: T-SQL raises an error past 9999-12-31 (or before 0001-01-01), where PostgreSQL returns the date",
+        "DATEADD results stay within the range of their type: T-SQL raises an error outside it (date and datetime2 0001-01-01 to 9999-12-31, datetime 1753-01-01 to 9999-12-31, smalldatetime 1900-01-01 to 2079-06-06), where PostgreSQL returns the date",
     );
     pub const DATEADD_YEAR_END: (&str, &str) = (
         "ASM-DATEADD-YEAR-END",
@@ -2713,7 +2713,17 @@ impl<'a> Canon<'a> {
             ));
         }
         let mut args = Vec::new();
-        for x in &c.args {
+        for (k, x) in c.args.iter().enumerate() {
+            // A date part is a word, never a column, even where the FROM
+            // table has a column named `minute`.
+            if let (0, Dialect::Tsql, Expr::Name(p)) = (k, d, x) {
+                if p.len() == 1 && DATEPART_FNS.contains(&name.as_str()) {
+                    // Synonyms (`mi`, `n`) read as the part's name.
+                    let part = tsql_datepart(&p[0]).map_or_else(|| lc(&p[0]), str::to_string);
+                    args.push((n("dpart", vec![a(part)]), None));
+                    continue;
+                }
+            }
             args.push(self.expr(x)?);
         }
         // SQL Server refuses text and ntext in most built-ins (Msg 8116,
@@ -3217,8 +3227,8 @@ impl<'a> Canon<'a> {
             }
             (Dialect::Tsql, "datediff", 3) => {
                 let part = args[0].0.clone();
-                let unit = part.kid(1).and_then(Term::atom).unwrap_or("");
-                if part.is("col") && matches!(unit, "day" | "dd" | "d") {
+                let unit = part.kid(0).and_then(Term::atom).unwrap_or("");
+                if part.is("dpart") && matches!(unit, "day" | "dd" | "d") {
                     (
                         n("daydiff", vec![args[1].0.clone(), args[2].0.clone()]),
                         Some(Ty {
@@ -3347,7 +3357,9 @@ impl<'a> Canon<'a> {
     /// value: `k` an integer of at most 32 bits (T-SQL converts other
     /// numbers to int, truncating; PostgreSQL's secs keeps a fraction), and
     /// `d` a date (whole days or longer; T-SQL rejects smaller parts) or a
-    /// timestamp without T-SQL's datetime/smalldatetime ticks, which round.
+    /// timestamp. On T-SQL datetime every whole unit keeps its 1/300 s
+    /// ticks; smalldatetime keeps whole minutes for every unit but seconds,
+    /// which it rounds to the minute, so seconds are not proven there.
     /// Both add months by moving a day the month lacks to its last day,
     /// and add hours, minutes and seconds exactly. The result has `d`'s
     /// type, as in T-SQL.
@@ -3366,7 +3378,14 @@ impl<'a> Canon<'a> {
         let dty = dty?;
         let ok = match dty.fam {
             Fam::Date => matches!(field, "years" | "months" | "weeks" | "days"),
-            Fam::Timestamp => dty.scale.is_none(),
+            // Whole units keep datetime on its 1/300 s ticks and
+            // smalldatetime on whole minutes, except seconds, which
+            // smalldatetime rounds to the minute (SQL Server 2022, PG 18).
+            Fam::Timestamp => match dty.scale {
+                None | Some(300) => true,
+                Some(60) => field != "secs",
+                Some(_) => false,
+            },
             _ => false,
         };
         if !ok {
@@ -8499,6 +8518,17 @@ fn is_make_interval(c: &Call) -> bool {
 fn is_zero_literal(e: &Expr) -> bool {
     matches!(e, Expr::Num(s) if s.parse::<f64>().is_ok_and(|v| v == 0.0))
 }
+
+/// T-SQL functions whose first argument is a date part keyword.
+const DATEPART_FNS: [&str; 7] = [
+    "dateadd",
+    "datediff",
+    "datediff_big",
+    "datepart",
+    "datename",
+    "datetrunc",
+    "date_bucket",
+];
 
 /// The make_interval field a T-SQL DATEADD datepart adds; the parts whose
 /// amounts round (milliseconds and smaller) and quarters have none.
