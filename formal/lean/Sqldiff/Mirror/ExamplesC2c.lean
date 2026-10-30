@@ -666,4 +666,151 @@ def wP (b : Ast.Routine) : List String := whyP Γv b
   [("T", .Bin "+" (pv "p_t") (mkInterval "days" (num 1)))] (some (.Bin "=" (pv "Id") (num 1)))]) ==
   ["stmt:update:value", "type:timestamptz"]
 
+/-! ## Review of C2c: regressions
+
+Each refused pair below was confirmed before the fix (the reviewers'
+repros, review-c2c/cx). -/
+
+/- B1. PostgreSQL `date + make_interval(...)` is a `timestamp` (`pg_typeof`,
+probed), not a `date`: `+ 1` and `- date` on it are no date arithmetic. -/
+#guard tP (.Bin "+" (pv "v_d") (mkInterval "months" (pv "p_id"))) ==
+  some (.dateAdd .month (.var "p_id") (.toTs (.var "v_d")), .ts 6)
+#guard (tP (.Bin "+" (.Bin "+" (pv "v_d") (mkInterval "months" (pv "p_id"))) (num 1))).isNone
+#guard (tP (.Bin "-" (.Bin "+" (pv "v_d") (mkInterval "months" (pv "p_id"))) (pv "v_d"))).isNone
+-- Only an explicit `::date` makes it a date again.
+#guard tP (castDate (.Bin "+" (pv "v_d") (mkInterval "months" (pv "p_id")))) ==
+  some (.dateAdd .month (.var "p_id") (.var "v_d"), .date)
+-- `d - 2147483648` is `date - bigint`: no date arithmetic either.
+#guard (tP (.Bin "-" (pv "v_d") (.Num "2147483648"))).isNone
+#guard tP (.Bin "-" (pv "v_d") (num 5)) == some (.dateAdd .day (.int (-5)) (.var "v_d"), .date)
+-- The fold is the same value on a date (the timestamp at midnight, moved,
+-- then its date).
+#guard evl (.toDate (.dateAdd .month (.int 1) (.toTs (.var "a")))) (D 2024 1 31) N ==
+  evl (.dateAdd .month (.int 1) (.var "a")) (D 2024 1 31) N
+#guard evl (.toDate (.dateAdd .year (.int (-1)) (.toTs (.var "a")))) (D 2024 2 29) N ==
+  evl (.dateAdd .year (.int (-1)) (.var "a")) (D 2024 2 29) N
+def f1T (e : Ast.Expr) : Ast.Routine :=
+  tsqlProc ["dbo", "f1"] [inT "@id", inT "@d" date, inT "@w" date, ioT "@r" date] [xactAbort, nocount,
+    set (tv "@r") e]
+def f1P (e : Ast.Expr) : Ast.Routine :=
+  pgProc ["f1"] [inP "p_id", inP "p_d" date, inP "p_w" date, ioP "p_r" date] [] [set (pv "p_r") e]
+def f1Cert : Cert := ⟨[("@id", "p_id"), ("@d", "p_d"), ("@w", "p_w"), ("@r", "p_r"), (statusVar, statusVar)]⟩
+#guard !isConfirmed (check depv Γv f1Cert
+  (f1T (dateadd "day" (num 1) (dateadd "month" (tv "@id") (tv "@d"))))
+  (f1P (.Bin "+" (.Bin "+" (pv "p_d") (mkInterval "months" (pv "p_id"))) (num 1))))
+#guard isC2a (check depv Γv f1Cert
+  (f1T (dateadd "day" (num 1) (dateadd "month" (tv "@id") (tv "@d"))))
+  (f1P (.Bin "+" (castDate (.Bin "+" (pv "p_d") (mkInterval "months" (pv "p_id")))) (num 1))))
+def f2T : Ast.Routine :=
+  tsqlProc ["dbo", "f2"] [inT "@id", inT "@d" date, inT "@w" date, ioT "@i"] [xactAbort, nocount,
+    set (tv "@i") (datediff "day" (tv "@w") (dateadd "month" (tv "@id") (tv "@d")))]
+def f2P (e : Ast.Expr) : Ast.Routine :=
+  pgProc ["f2"] [inP "p_id", inP "p_d" date, inP "p_w" date, ioP "p_i"] [] [set (pv "p_i") e]
+def f2Cert : Cert := ⟨[("@id", "p_id"), ("@d", "p_d"), ("@w", "p_w"), ("@i", "p_i"), (statusVar, statusVar)]⟩
+#guard !isConfirmed (check depv Γv f2Cert f2T
+  (f2P (.Bin "-" (.Bin "+" (pv "p_d") (mkInterval "months" (pv "p_id"))) (pv "p_w"))))
+#guard isC2a (check depv Γv f2Cert f2T
+  (f2P (.Bin "-" (castDate (.Bin "+" (pv "p_d") (mkInterval "months" (pv "p_id")))) (castDate (pv "p_w")))))
+
+/- B2. A call's arguments must have exactly the callee's parameter types
+(`Catalog.routineTys`): PostgreSQL finds no `cs(integer)` for `cs(p_x
+smallint)` (42883), and a `smallint` variable in the `INOUT` position of
+`cal(INOUT p_x integer)` is not writable. -/
+def callDep (callee : String) : Deployment :=
+  { rowCounts := false, routines := [("dbo." ++ callee, callee)] }
+def callΓ (callee : String) (m : Ast.Mode) (ty : Ast.Ty) : Catalog :=
+  { routines := [(callee, [m])], routineTys := [(callee, [ty])] }
+def callT (decls : List Ast.Node) (callee : String) (a : Ast.Expr) (out : Bool) : Ast.Routine :=
+  tsqlProc ["dbo", "f"] [inT "@i"] ([xactAbort, nocount] ++ decls ++
+    [.Call ["dbo", callee] [arg a out] none])
+def callP (decls : List Ast.Stmt) (callee : String) (a : Ast.Expr) : Ast.Routine :=
+  pgProc ["f"] [inP "p_i"] decls [.Call [callee] [arg a false] none]
+def callCert : Cert := ⟨[("@i", "p_i"), ("@s", "v_s"), ("@b", "v_b"), (statusVar, statusVar)]⟩
+-- `EXEC dbo.cs @i` / `CALL cs(p_i)` into `cs(p_x smallint)`; `5` the same.
+#guard reasonOf (check (callDep "cs") (callΓ "cs" .In smallint) callCert
+  (callT [] "cs" (tv "@i") false) (callP [] "cs" (pv "p_i"))) == reasonOutsideT
+#guard reasonOf (check (callDep "cs") (callΓ "cs" .In smallint) callCert
+  (callT [] "cs" (num 5) false) (callP [] "cs" (num 5))) == reasonOutsideT
+-- Into `cs(p_x integer)` it is confirmed, as before C2c.
+#guard isC2a (check (callDep "cs") (callΓ "cs" .In integer) callCert
+  (callT [] "cs" (tv "@i") false) (callP [] "cs" (pv "p_i")))
+-- `EXEC dbo.cal @s OUTPUT` with `@s smallint` into `cal(INOUT p_x integer)`.
+#guard reasonOf (check (callDep "cal") (callΓ "cal" .InOut integer) callCert
+  (callT [declT "@s" smallint none] "cal" (tv "@s") true)
+  (callP [.Declare "v_s" (some smallint) none] "cal" (pv "v_s"))) == reasonOutsideT
+#guard isC2a (check (callDep "cal") (callΓ "cal" .InOut smallint) callCert
+  (callT [declT "@s" smallint none] "cal" (tv "@s") true)
+  (callP [.Declare "v_s" (some smallint) none] "cal" (pv "v_s")))
+-- An `int` into `cb(p_x boolean)`; the literal `1` against `TRUE` is a bit.
+#guard reasonOf (check (callDep "cb") (callΓ "cb" .In boolean) callCert
+  (callT [] "cb" (tv "@i") false) (callP [] "cb" (pv "p_i"))) == reasonOutsideT
+#guard isC2a (check (callDep "cb") (callΓ "cb" .In boolean) callCert
+  (callT [] "cb" (num 1) false) (callP [] "cb" tru))
+-- A callee whose parameter types the request does not give takes no argument.
+#guard reasonOf (check (callDep "cs") { routines := [("cs", [.In])] } callCert
+  (callT [] "cs" (tv "@i") false) (callP [] "cs" (pv "p_i"))) == reasonOutsideT
+#guard whyT (callDep "cs") (callΓ "cs" .In smallint) (callT [] "cs" (tv "@i") false) ==
+  ["node:call:type"]
+
+/- B3. `@b <> 1` against `b <> TRUE` names `ASM-TSQL-ANSI-NULLS`: under
+`ANSI_NULLS OFF` a NULL bit `<> 1` is TRUE in T-SQL (SQL Server 1,
+PostgreSQL 0). -/
+def anT : Ast.Routine :=
+  tsqlProc ["dbo", "an"] [inT "@b" bit, ioT "@r"] [xactAbort, nocount, set (tv "@r") (num 0),
+    ifT (.Bin "<>" (tv "@b") (num 1)) [set (tv "@r") (num 1)]]
+def anP : Ast.Routine :=
+  pgProc ["an"] [inP "p_b" boolean, ioP "p_r"] [] [set (pv "p_r") (num 0),
+    ifT (.Bin "<>" (pv "p_b") tru) [set (pv "p_r") (num 1)]]
+#guard isC2a (check depv Γv ⟨[("@b", "p_b"), ("@r", "p_r"), (statusVar, statusVar)]⟩ anT anP)
+#guard residualOf depv Γv anT == some ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"]
+
+/- M1. A `datetime2(6)` value into a T-SQL `datetime` local against a
+PL/pgSQL `timestamp` one: SQL Server keeps `.123333`, PostgreSQL
+`.123456`. Refused twice over: a slice value into a type outside the
+slice is no store of the spec, and the two locals' declared types differ. -/
+def m1T : Ast.Routine :=
+  tsqlProc ["dbo", "f3"] [inT "@t" (dt2 6), ioT "@r" (dt2 6)] [xactAbort, nocount,
+    declT "@x" (.Ty "DATETIME" []) none, set (tv "@x") (tv "@t"), set (tv "@r") (tv "@x")]
+def m1P (x : Ast.Ty) : Ast.Routine :=
+  pgProc ["f3"] [inP "p_t" (.Ty "TIMESTAMP" []), ioP "p_r" (.Ty "TIMESTAMP" [])]
+    [.Declare "v_x" (some x) none] [set (pv "v_x") (pv "p_t"), set (pv "p_r") (pv "v_x")]
+def m1Cert : Cert := ⟨[("@t", "p_t"), ("@r", "p_r"), ("@x", "v_x"), (statusVar, statusVar)]⟩
+#guard reasonOf (check depv Γv m1Cert m1T (m1P (.Ty "TIMESTAMP" []))) == reasonOutsideT
+#guard wT m1T == ["store:assign:datetime"]
+#guard (lowerP Γv (m1P (.Ty "TIMESTAMP" []))).isSome
+-- The declared types compared on their own (a value outside the slice).
+#guard !localTyCorr (.Ty "DATETIME" []) (.Ty "TIMESTAMP" [])
+#guard !localTyCorr (dt2 7) (ts 6) && localTyCorr (dt2 6) (.Ty "TIMESTAMP" []) &&
+  localTyCorr (dt2 3) (ts 3) && !localTyCorr (dt2 3) (ts 6)
+#guard localTyCorr bit boolean && localTyCorr smallint (.Ty "INT2" []) && !localTyCorr int bigint
+#guard localTyCorr (.Ty "VARCHAR" ["10"]) (.Ty "TEXT" []) && localTyCorr (.Ty "XML" []) (.Ty "xml" [])
+#guard !localTyCorr (.Ty "DECIMAL" ["18", "2"]) (.Ty "NUMERIC" ["18", "2"])
+#guard reasonOf (check depv Γv ⟨[("@x", "v_x"), (statusVar, statusVar)]⟩
+  (tsqlProc ["dbo", "s"] [] [xactAbort, declT "@x" (.Ty "DATETIME" []) none,
+    set (tv "@x") (fn "GETDATE" [])])
+  (pgProc ["s"] [] [.Declare "v_x" (some (.Ty "TIMESTAMP" ["3"])) none] [set (pv "v_x") (fn "getdate" [])]))
+  == "the declared types of the variables do not correspond"
+
+/- N1 (the review's claim, probed and not confirmed). SQL Server 2022
+types the constant `-2147483648` as `int`, as PostgreSQL does, and
+`(-2147483648 + @y) - @z` with `@y = @z = -1` raises 8115 in a procedure,
+against PostgreSQL's 22003 (eval/values V2): the literal is the 32-bit
+integer on both sides. `-9223372036854775808` is `numeric` in T-SQL and
+`bigint` in PostgreSQL: only a `bigint`'s stored or compared value. -/
+#guard intLit? "-2147483648" == some (-2147483648)
+#guard tT (.Num "-2147483648") == some (.int (-2147483648), .int .i32)
+#guard tP (.Num "-2147483648") == some (.int (-2147483648), .int .i32)
+#guard (tT (.Num "-9223372036854775808")).isNone
+#guard tP (.Num "-9223372036854775808") == some (.int (-9223372036854775808), .int .i64)
+#guard isC2a (checkS "@big" (.Num "-9223372036854775808") "p_big" (.Num "-9223372036854775808"))
+#guard (tT (.Bin "+" (tv "@big") (.Num "-9223372036854775808"))).isNone
+
+/- N2. A T-SQL routine with a `smallint`, `bit`, `date` or `datetime2`
+parameter names `ASM-TSQL-STRING-ARGS` (now: every argument a caller
+passes is a value of the parameter's declared type). -/
+#guard tsqlStringParams (tsqlProc ["p"] [inT "@d" date] []) &&
+  tsqlStringParams (tsqlProc ["p"] [inT "@s" smallint] []) &&
+  tsqlStringParams (tsqlProc ["p"] [inT "@t" (dt2 6)] []) &&
+  !tsqlStringParams (tsqlProc ["p"] [inT "@i", inT "@b" bigint] [])
+
 end Sqldiff.Mirror.ExamplesC2c

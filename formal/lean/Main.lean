@@ -118,6 +118,17 @@ still names `ASM-NO-CALLER-TXN`. Request format unchanged.
 answer changes: the codes are computed after the check, from the
 untrusted diagnostic, and no theorem depends on them. Every reason text,
 every other field and the request format are unchanged.
+
+0.14.0 (C2c) reads typed values (integer widths, `bit` against `boolean`,
+`date` and `datetime2(p)` against `timestamp(p)`) and typed catalog
+columns (SPEC `j`, `h`, `b`, `d`, `t<p>`). A ROUTINE entry may carry its
+parameters' types (`NAME:MODES:TYPES`); a call's arguments must have
+exactly those types, so a request that names a callee without them has
+no call in the spec (an older client's calls are refused, never
+confirmed). A pair whose variables' declared types differ is answered
+"the declared types of the variables do not correspond". New reason
+codes `type:<name>`, `expr:date-literal`, `expr:bit-literal`,
+`expr:dateadd:part`, `expr:datediff:part`, `node:call:type`.
 -/
 import Sqldiff.Gate
 import Sqldiff.Mirror.Request

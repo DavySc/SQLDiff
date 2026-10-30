@@ -794,6 +794,98 @@ fn the_real_checker_confirms_typed_values() {
     assert_eq!(r["answer"], "unconfirmed", "{r}");
 }
 
+/// C2c review: the converter's calls are confirmed only when each argument
+/// has exactly its callee's parameter type (an `int` into a `smallint`
+/// parameter finds no procedure in PostgreSQL, 42883); `@b <> 1` against
+/// `b <> TRUE` names `ASM-TSQL-ANSI-NULLS`; a nested `DATEADD`, which the
+/// converter writes with `::date`, is confirmed.
+#[test]
+fn the_real_checker_holds_call_arguments_and_bit_comparisons() {
+    let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
+        return;
+    };
+    let _turn = turn();
+    let d = scratch("c2c-review");
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let callee = |name: &str, ty: &str| {
+        format!(
+            "CREATE PROCEDURE dbo.{name} @x {ty} AS\nBEGIN\n  SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  \
+             DECLARE @y {ty};\n  SET @y = @x;\nEND\nGO\n"
+        )
+    };
+    write(
+        &src,
+        "c.sql",
+        &format!(
+            "{}{}{}CREATE PROCEDURE dbo.callers @i int, @b bit, @r int OUTPUT AS\nBEGIN\n  \
+             SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  EXEC dbo.ci @i;\n  EXEC dbo.cb @b;\n  \
+             EXEC dbo.cb 1;\n  SET @r = 0;\n  IF @b <> 1 SET @r = 1;\nEND\nGO\n\
+             CREATE PROCEDURE dbo.narrow @i int AS\nBEGIN\n  SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  \
+             EXEC dbo.cs @i;\nEND\nGO\n\
+             CREATE PROCEDURE dbo.nd @id int, @d date, @w date, @r date OUTPUT, @i int OUTPUT AS\nBEGIN\n  \
+             SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  SET @r = DATEADD(day, 1, DATEADD(month, @id, @d));\n  \
+             SET @i = DATEDIFF(day, @w, DATEADD(month, @id, @d));\nEND\nGO\n",
+            callee("cs", "smallint"),
+            callee("cb", "bit"),
+            callee("ci", "int")
+        ),
+    );
+    Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+        .args([
+            "convert",
+            &src.display().to_string(),
+            "--to",
+            "postgres",
+            "--out",
+        ])
+        .arg(d.join("out"))
+        .args(["--overwrite", "--isolated", "--proof", "report"])
+        .env("SQLDIFF_CHECK", &real)
+        .output()
+        .unwrap();
+    let out = std::fs::read_to_string(d.join("out/c.sql")).unwrap();
+    for shape in [
+        "CALL cs(p_i);",
+        "CALL cb(TRUE);",
+        "IF p_b <> TRUE THEN",
+        "(p_d + make_interval(months => p_id))::date + 1",
+    ] {
+        assert!(out.contains(shape), "{shape}:\n{out}");
+    }
+    let c: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(d.join("out/certificates.json")).unwrap())
+            .unwrap();
+    let routine = |name: &str| {
+        c["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|f| f["routines"].as_array().unwrap().clone())
+            .find(|r| r["routine"] == name)
+            .unwrap()
+    };
+    let r = routine("dbo.narrow");
+    assert_eq!(r["answer"], "unconfirmed", "{r}");
+    assert_eq!(r["why"][0], "node:call:type", "{r}");
+    let r = routine("dbo.callers");
+    assert_eq!(r["answer"], "confirmed", "{r}");
+    assert_eq!(r["theorems"][0], "Sqldiff.Mirror.check_sound_c2a", "{r}");
+    let asm: Vec<&str> = r["assumptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    for a in ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"] {
+        assert!(asm.contains(&a), "{a}: {r}");
+    }
+    for name in ["dbo.cs", "dbo.cb", "dbo.ci", "dbo.nd"] {
+        let r = routine(name);
+        assert_eq!(r["answer"], "confirmed", "{r}");
+    }
+}
+
 /// C2b end to end: concatenation and ISNULL over bounded string variables
 /// are confirmed in the slice, and the leading SET CONCAT_NULL_YIELDS_NULL
 /// ON discharges ASM-CONCAT-NULL in the release gate. A string `=` is

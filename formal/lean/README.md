@@ -222,7 +222,9 @@ convert --to postgres` writes (`tsql.bit.compare`, `tsql.bit.store`,
 | `DATEADD` | `day \| month \| year` (and their abbreviations) with an `int` number on a date or `datetime2(p)` against the converter's `(d + n)`, `(d - m)`, `(d + make_interval(months \| years => n))::date` and `(t + make_interval(days \| months \| years => n))`: days added, months and years moved with the day clamped to the result month's last day, the time kept; the result is not held to a range (T-SQL raises 517 past 9999-12-31 where PostgreSQL returns the value: `ASM-DATEADD-RANGE`); years name `ASM-DATEADD-YEAR-END` (Microsoft's page states the clamp for months); other dateparts, a `bigint` number, a string date are outside | V6 |
 | `DATEDIFF` | `day` only, against `((b)::date - (a)::date)`: the day number of `b`'s date minus `a`'s, an `int`; other dateparts outside | V7 |
 | Columns | `bigint`, `smallint`, `bit`/`boolean`, `date`, `datetime2(p)`/`timestamp(p)` columns with constant defaults in the forms above (SPEC `j`, `h`, `b`, `d`, `t<p>`; defaults `b0`/`b1`, `d<hex>`, `t<hex>`); a date or timestamp key column; the Rust side sends them when both DDLs show them (`plain_table::ColType`, `cert.rs::pair_type`) | V8 |
-| Signatures | `bigint` and `smallint` with themselves, `bit` with `boolean`, `date`, `datetime2(6)` with `timestamp(6)` or `timestamp` (PostgreSQL drops a parameter's and a result's precision, so a `datetime2(p < 6)` parameter is outside); a `bigint` argument to a call is outside the slice (the callee's type is not known, and PostgreSQL has no implicit `bigint` to `integer` conversion) | not probed |
+| Signatures | `bigint` and `smallint` with themselves, `bit` with `boolean`, `date`, `datetime2(6)` with `timestamp(6)` or `timestamp` (PostgreSQL drops a parameter's and a result's precision, so a `datetime2(p < 6)` parameter is outside) | not probed |
+| Calls | every argument has exactly its callee's parameter type, which the request names (ROUTINE `NAME:MODES:TYPES`, `Catalog.routineTys`, from the PostgreSQL DDL): a value of that slice type (or NULL; the T-SQL literals a `bit` or date parameter reads), an `OUTPUT`/`INOUT` variable declared with it; a string for a string parameter (C1 path only); a callee whose types the request does not give takes no argument. Before C2c an argument was not compared with the callee, which was sound only while confirmed callees were `int` routines: an `int` into a `smallint` or `boolean` parameter finds no procedure in PostgreSQL (42883), a `smallint` variable in an `INOUT integer` position is not writable, where T-SQL converts | review of C2c, on PostgreSQL 18 |
+| Variable types | the declared types of the variables the certificate pairs correspond (`localTyCorr`: the same slice type, any string lengths, or the same type outside the slice), and a slice value other than a string is not stored into a variable of a type outside the slice: a `datetime2(6)` value through T-SQL `datetime` and PostgreSQL `timestamp` locals is `.123333` against `.123456` (review of C2c); refused on the C1 path too | review of C2c |
 
 Outside, by decision: `datetime2(7)` and `datetime2` without a precision
 (no PostgreSQL mirror), `datetime`, `smalldatetime`, `datetimeoffset`,
@@ -240,9 +242,15 @@ texts quoted from memory in `Lower.lean`; `ASM-DATEADD-RANGE` and
 `ASM-DATEADD-YEAR-END` in `residual` (`Check.lean`); values a caller
 passes that both engines can hold (a T-SQL caller's dates are within
 0001-01-01 and 9999-12-31, a PostgreSQL caller's timestamps have at most
-six digits), which is the argument correspondence of decision 1; for
-columns, `ASM-TABLES-AS-DECLARED` as in C3c. No new residual id and no
-new answer field; `check_sound` and `check_sound_c2a` keep their
+six digits), which is the argument correspondence of decision 1, and
+`ASM-TSQL-STRING-ARGS`, whose statement now says that every argument is
+a value of its parameter's declared type and which a routine with a
+`smallint`, `bit`, `date` or `datetime2` parameter names too (a
+`datetime2(7)` value is rounded on entry, an `int` narrowed or made
+0/1); for columns, `ASM-TABLES-AS-DECLARED` as in C3c. A pair whose
+variables' declared types differ is answered "the declared types of the
+variables do not correspond". No new residual id and no new answer
+field; the request's ROUTINE entries gain the callees' parameter types; `check_sound` and `check_sound_c2a` keep their
 statements, the core lemmas (the renaming simulation, "cannot fail")
 gained the new cases, and `Axioms.lean` is unchanged (standard axioms
 only). `ExamplesC2c` has the confirmed pair (eval/values' procedure as

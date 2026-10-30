@@ -809,7 +809,59 @@ cases += [
     ("111", req3v(111, cat=V_CAT.replace(".t6.", ".t.")), "unconfirmed"),
     ("112", req3v(112, cat=V_CAT.replace(".bn.", ".bnk.")), "unconfirmed"),
 ]
+# Review of C2c: each pair below was confirmed before the fix.
+# B1: PostgreSQL `date + make_interval(...)` is a timestamp; `+ 1` on it is
+# no date arithmetic (PostgreSQL: no operator timestamp + integer).
+def f1_t():
+    return proc(["dbo", "f1"], [param("@id", "In"), sparam("@d", "In", DATE), sparam("@r", "InOut", DATE)], [],
+                [ABORT, assign(tv("@r"), dateadd("day", num(1), dateadd("month", tv("@id"), tv("@d"))))])
+
+
+def f1_p(cast_date):
+    inner = bin_("+", pv("p_d"), make_interval("months", pv("p_id")))
+    return proc(["f1"], [param("p_id", "In"), sparam("p_d", "In", DATE), sparam("p_r", "InOut", DATE)], [],
+                [assign(pv("p_r"), bin_("+", cast(inner, DATE) if cast_date else inner, num(1)))])
+
+
+F1_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@id", "p_id"), ("@d", "p_d"), ("@r", "p_r"), ("%status", "%status")])
+# B2: an int argument into a smallint callee (PostgreSQL 42883).
+CS_DEP = f"0,{hx('dbo.cs')}:{hx('cs')}"
+
+
+def cs_cat(t):
+    return f"{hx('cs')}:i:{hx(t)}"
+
+
+CS_T = proc(["dbo", "f5"], [param("@i", "In")], [], [ABORT, call(["dbo", "cs"], (tv("@i"), "f"))])
+CS_P = proc(["f5"], [param("p_i", "In")], [], [call(["cs"], (pv("p_i"), "f"))])
+CS_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@i", "p_i"), ("%status", "%status")])
+# B3: `@b <> 1` against `b <> TRUE` names ASM-TSQL-ANSI-NULLS.
+AN_T = proc(["dbo", "an"], [sparam("@b", "In", BIT), param("@r", "InOut")], [],
+            [ABORT, assign(tv("@r"), num(0)), if_(bin_("<>", tv("@b"), num(1)), [assign(tv("@r"), num(1))])])
+AN_P = proc(["an"], [sparam("p_b", "In", BOOL), param("p_r", "InOut")], [],
+            [assign(pv("p_r"), num(0)), if_(bin_("<>", pv("p_b"), TRUE), [assign(pv("p_r"), num(1))])])
+AN_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@b", "p_b"), ("@r", "p_r"), ("%status", "%status")])
+# M1: a datetime2(6) value through a T-SQL datetime local and a PL/pgSQL
+# timestamp local (SQL Server .123333, PostgreSQL .123456).
+M1_T = proc(["dbo", "f3"], [sparam("@t", "In", DT2_6), sparam("@r", "InOut", DT2_6)], [],
+            [ABORT, decl("@x", ty("DATETIME")), assign(tv("@x"), tv("@t")), assign(tv("@r"), tv("@x"))])
+M1_P = proc(["f3"], [sparam("p_t", "In", ty("TIMESTAMP")), sparam("p_r", "InOut", ty("TIMESTAMP"))],
+            [C("Declare", S("v_x"), ty("TIMESTAMP"), NONE)],
+            [assign(pv("v_x"), pv("p_t")), assign(pv("p_r"), pv("v_x"))])
+M1_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@t", "p_t"), ("@r", "p_r"), ("@x", "v_x"), ("%status", "%status")])
+cases += [
+    ("113", req3(113, a=f1_t(), b=f1_p(False), dep="0", cat="-", cert=F1_CERT), "unconfirmed"),
+    ("114", req3(114, a=f1_t(), b=f1_p(True), dep="0", cat="-", cert=F1_CERT), "confirmed"),
+    ("115", req3(115, a=CS_T, b=CS_P, dep=CS_DEP, cat=cs_cat("SMALLINT"), cert=CS_CERT), "unconfirmed"),
+    ("116", req3(116, a=CS_T, b=CS_P, dep=CS_DEP, cat=cs_cat("INTEGER"), cert=CS_CERT), "confirmed"),
+    ("117", req3(117, a=CS_T, b=CS_P, dep=CS_DEP, cat=f"{hx('cs')}:i", cert=CS_CERT), "unconfirmed"),
+    ("118", req3(118, a=AN_T, b=AN_P, dep="0", cat="-", cert=AN_CERT), "confirmed"),
+    ("119", req3(119, a=M1_T, b=M1_P, dep="0", cat="-", cert=M1_CERT), "unconfirmed"),
+]
 THEOREMS = {
+    "114": "Sqldiff.Mirror.check_sound_c2a",
+    "116": "Sqldiff.Mirror.check_sound_c2a",
+    "118": "Sqldiff.Mirror.check_sound_c2a",
     "104": "Sqldiff.Mirror.check_sound_c2a",
     "91": "Sqldiff.Mirror.check_sound_c2a",
     "83": "Sqldiff.Mirror.check_sound_c2a",
@@ -879,10 +931,19 @@ EXTRA = {
            "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS"],
            "statements": "c3b"},
     "104": {"scalars": "c2a",
-            "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-DATEADD-RANGE",
-                         "ASM-DATEADD-YEAR-END", "ASM-NO-CALLER-TXN"],
+            "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS",
+                         "ASM-DATEADD-RANGE", "ASM-DATEADD-YEAR-END", "ASM-NO-CALLER-TXN"],
             "statements": "c3b", "errors": "c4"},
     "105": {"why": ["type:datetime2_7", "stmt:insert:value"]},
+    "114": {"scalars": "c2a",
+            "residual": ["ASM-TSQL-STRING-ARGS", "ASM-DATEADD-RANGE"],
+            "statements": "c1"},
+    "115": {"why": ["node:call:type"]},
+    "116": {"scalars": "c2a", "residual": ["ASM-STATE-AFTER-ERROR"], "statements": "c1"},
+    "117": {"why": ["node:call:type"]},
+    "118": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"],
+            "statements": "c1"},
+    "119": {"why": ["store:assign:datetime"]},
     "106": {"why": ["store:declare:smallint"]},
     "107": {"why": ["store:assign:bit", "expr:bit-literal"]},
     "108": {"why": ["store:assign:date", "expr:date-literal"]},
