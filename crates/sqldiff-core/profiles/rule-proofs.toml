@@ -1,0 +1,1329 @@
+# The rule proof registry: every conversion rule id the converter's notes
+# and trace steps can carry, and every rule-file id, with what backs it
+# (docs/verified-conversion.md, C0.9).
+#
+# Read by `sqldiff_core::rule_proofs`; `docs/proof-coverage.md` is generated
+# from it. `crates/sqldiff-core/tests/rule_proofs.rs` scans the converter's
+# sources and the rule files and fails when an id is used but not listed
+# here, listed but never used, or its `sites` are not the files that use it.
+#
+# The Lean checker (formal/lean/Sqldiff/Mirror/Lower.lean) does not read
+# rule ids: it re-lowers the output on disk. A rule is lemma-backed when the
+# construct it rewrites, in the form the converter writes it, is inside the
+# lowering's spec; the proof then cites the section of Lower.lean whose
+# rule reads that form. Everything else rests on the Rust engine comparison,
+# the tests and the probes, or on a vendor fact that is not a lemma.
+#
+# Fields:
+#   id      The id. A converter id is `tsql.<area>.<name>`, `pg.<name>`,
+#           `idiom.<name>` or `db2.<name>`; a rule-file id is the head of a
+#           `(translate ...)`, `(idiom ...)` or `(lint ...)` form. An id
+#           ending in `*` is a family whose rest the code builds
+#           (`tsql.func.<function>`, `tsql.type.<type>`, `tsql.<global>`).
+#   kind    `converter` for an id a Rust rule writes; `translate`, `idiom`
+#           or `lint` for a rule-file head.
+#   proof   What backs the rule:
+#             lemma:<Lower.lean section[/rule]>   the construct is mirrored
+#                      by the Lean lowering (the output on disk is re-lowered
+#                      and `Sqldiff.Mirror.check_sound` or `check_sound_c2a`
+#                      applies); the citation names the section of
+#                      formal/lean/Sqldiff/Mirror/Lower.lean and, after a
+#                      slash, the rule within it;
+#             axiom:V<n>   rests on vendor fact V<n> of
+#                      docs/vendor-facts-verification.md, with no lemma;
+#             engine   backed only by the Rust engine comparison, the tests
+#                      and the probes.
+#           A lemma covers a rule only within the slice: the note says
+#           where the coverage is partial.
+#   family  Optional: the family (`tsql.func.*`) a member registered on its
+#           own belongs to, so that it can carry its own proof. The member's
+#           name must be a string literal (upper-cased) in the family's
+#           sites, and its sites are the family's.
+#   note    Optional: where a lemma is partial, or what the status rests on.
+#   sites   The files that use the id (relative to `crates/`).
+
+[[rule]]
+id = "advisory-lock/applock"
+kind = "idiom"
+proof = "axiom:V21"
+note = "sp_getapplock against pg_advisory_xact_lock (ASM-APPLOCK-CHECK-RAISES)"
+sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+
+[[rule]]
+id = "cardinality/correlated-update-unrestricted"
+kind = "lint"
+proof = "engine"
+note = "a lint changes no output"
+sites = ["sqldiff-core/profiles/rules/lints.rules"]
+
+[[rule]]
+id = "charindex/strpos"
+kind = "translate"
+proof = "engine"
+sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+
+[[rule]]
+id = "concurrency/insert-if-absent-race"
+kind = "lint"
+proof = "engine"
+note = "a lint changes no output"
+sites = ["sqldiff-core/profiles/rules/lints.rules"]
+
+[[rule]]
+id = "concurrency/upsert-race"
+kind = "lint"
+proof = "engine"
+note = "a lint changes no output"
+sites = ["sqldiff-core/profiles/rules/lints.rules"]
+
+[[rule]]
+id = "datediff-day/date-minus"
+kind = "translate"
+proof = "engine"
+sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+
+[[rule]]
+id = "db2.lob"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "db2.merge"
+kind = "converter"
+proof = "axiom:V2"
+note = "MERGE kept in a procedure compiled with *CS; in a script ASM-FACT-V2"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "db2.print"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "db2.proc-transaction"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "db2.sqlcode"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "db2.xact-abort"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "dbo-schema"
+kind = "translate"
+proof = "engine"
+note = "C3a maps a table's `dbo.t` through the deployment under ASM-DBO-SCHEMA"
+sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+
+[[rule]]
+id = "delete-orphans/anti-join"
+kind = "idiom"
+proof = "engine"
+sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+
+[[rule]]
+id = "idiom.rollback-rethrow"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C4 errors and transactions/The rollback-and-rethrow idiom"
+note = "PostgreSQL target, at the routine's top level around one transaction bracket (ASM-NO-CALLER-TXN); the Db2 for i `ROLLBACK; RESIGNAL` form engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "iif/case"
+kind = "translate"
+proof = "engine"
+note = "T-SQL IIF is outside the slice; the searched CASE it becomes is in it"
+sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+
+[[rule]]
+id = "insert-identity/lastval"
+kind = "idiom"
+proof = "engine"
+note = "ASM-LASTVAL-SAME-INSERT"
+sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+
+[[rule]]
+id = "insert-identity/returning"
+kind = "idiom"
+proof = "engine"
+sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+
+[[rule]]
+id = "insert-if-absent/if-not-exists"
+kind = "idiom"
+proof = "engine"
+sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+
+[[rule]]
+id = "insert-if-absent/on-conflict"
+kind = "idiom"
+proof = "engine"
+sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+
+[[rule]]
+id = "isnull/coalesce"
+kind = "translate"
+proof = "lemma:Sqldiff.Mirror/C2a operators/ISNULL"
+note = "int arguments (C2a), or a string variable or parameter with a fallback that fits it (C2b strings/ISNULL); other types engine (ASM-ISNULL-TYPE)"
+sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+
+[[rule]]
+id = "len/length"
+kind = "translate"
+proof = "lemma:Sqldiff.Mirror/C2b strings/LEN"
+note = "`LEN(x)` against `length(rtrim(x))` on a string of the slice (ASM-TSQL-LEN-BMP)"
+sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+
+[[rule]]
+id = "newid/gen-random-uuid"
+kind = "translate"
+proof = "engine"
+sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+
+[[rule]]
+id = "nolock/plain-read"
+kind = "translate"
+proof = "engine"
+sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+
+[[rule]]
+id = "pg.bit-number"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "pg.lastval"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "pg.name-collision"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/instances.rs"]
+
+[[rule]]
+id = "pg.param-default-order"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "pg.reserved-name"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/names.rs"]
+
+[[rule]]
+id = "pg.security-definer-transaction"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "pg.sqlstate"
+kind = "converter"
+proof = "engine"
+note = "ERROR_NUMBER() and SQLSTATE are outside the C4 spec wherever they stand ('Error functions')"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "pg.table-variable-rollback"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "pg.trigger-per-event"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/trigger.rs"]
+
+[[rule]]
+id = "plus/concat"
+kind = "translate"
+proof = "lemma:Sqldiff.Mirror/C2b strings/Concatenation"
+note = "both operands strings of the slice (ASM-TSQL-PLUS-IS-CONCAT)"
+sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+
+[[rule]]
+id = "select-assign/into"
+kind = "translate"
+proof = "engine"
+note = "`SELECT e INTO v FROM ...` is outside C3b except `COUNT(*)` into an int variable (ASM-EXACTLY-ONE-ROW)"
+sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+
+[[rule]]
+id = "select-assign2/into"
+kind = "translate"
+proof = "engine"
+note = "as select-assign/into"
+sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+
+[[rule]]
+id = "semantic/top-without-order"
+kind = "lint"
+proof = "engine"
+note = "a lint changes no output"
+sites = ["sqldiff-core/profiles/rules/lints.rules"]
+
+[[rule]]
+id = "string-agg/within-group"
+kind = "translate"
+proof = "engine"
+sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+
+[[rule]]
+id = "sysdatetime/statement-timestamp"
+kind = "translate"
+proof = "axiom:V20"
+note = "once per statement on both sides (ASM-TSQL-SYSDATETIME-PER-STATEMENT); the T-SQL part of V20 is partial"
+sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+
+[[rule]]
+id = "top-distinct/limit"
+kind = "translate"
+proof = "engine"
+sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+
+[[rule]]
+id = "top/limit"
+kind = "translate"
+proof = "engine"
+sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+
+[[rule]]
+id = "tsql.*"
+kind = "converter"
+proof = "engine"
+note = "T-SQL global variables (`@@ROWCOUNT` is `tsql.rowcount`) and built-ins without a rule (`OBJECT_ID()` is `tsql.object_id`), both refused with the reason"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.bit.arithmetic"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/bits.rs"]
+
+[[rule]]
+id = "tsql.bit.between"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/bits.rs"]
+
+[[rule]]
+id = "tsql.bit.bitwise"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/bits.rs"]
+
+[[rule]]
+id = "tsql.bit.boolean-default"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.bit.case-result"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/bits.rs"]
+
+[[rule]]
+id = "tsql.bit.coalesce"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/bits.rs"]
+
+[[rule]]
+id = "tsql.bit.compare"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/bits.rs"]
+
+[[rule]]
+id = "tsql.bit.concat"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/bits.rs"]
+
+[[rule]]
+id = "tsql.bit.in"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/bits.rs"]
+
+[[rule]]
+id = "tsql.bit.not"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/bits.rs"]
+
+[[rule]]
+id = "tsql.bit.store"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/bits.rs"]
+
+[[rule]]
+id = "tsql.builtin"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.catalog.exists"
+kind = "converter"
+proof = "engine"
+note = "a catalog existence test; `IF EXISTS (SELECT 1 FROM t ...)` on a plain table is C3b rule 3 and leaves no step"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.charindex"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.convert-style"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.cte.recursive"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.ctl.if"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C2a operators/IF and WHILE"
+note = "a condition of the slice; `IF [NOT] EXISTS (...)` as the whole condition is C3b rule 3; other conditions are C1"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.ctl.try-catch"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C4 errors and transactions/TRY-CATCH against EXCEPTION WHEN OTHERS"
+note = "the `exception-block` form in a procedure, under ASM-TRY-SUBTRANSACTION and ASM-CATCH-CORE-ERRORS; the Db2 for i handler forms engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.ctl.while"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C2a operators/IF and WHILE"
+note = "a condition of the slice; other conditions are C1"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.cursor.close"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.cursor.deallocate"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.cursor.declare"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.cursor.fetch"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.cursor.open"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.cursor.while"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.database.filegroup"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.datalength"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.dateadd"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.datediff"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.decl.hoist"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/Blocks/declTys"
+note = "the lowering gathers T-SQL DECLAREs where they stand and PL/pgSQL ones from the block header, so the move changes nothing it reads"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.decl.init"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/Statements"
+note = "`DECLARE @x t = e` as the assignment `x := e` after the declaration, `e` in the slice"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.decl.table-variable"
+kind = "converter"
+proof = "engine"
+note = "PostgreSQL TEMP table engine; the Db2 for i NOT LOGGED table rests on V16 (ASM-TABLE-VARIABLE)"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.decl.variable"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/Blocks/declTys"
+note = "locals of a slice type (int, varchar(n), nvarchar(n)); other types are C1 (uninterpreted values)"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.dml.delete-from"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C3a data statements/DELETE"
+note = "`DELETE t [WHERE p]` on a plain table (the step is the added FROM); joins (tsql.dml.delete-join) engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.dml.delete-join"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.dml.insert-into"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C3a data statements/INSERT"
+note = "`INSERT t (cols) VALUES (...)` on a plain table (the step is the added INTO); INSERT ... SELECT, OUTPUT and other forms engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.dml.output-into"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.dml.update-from"
+kind = "converter"
+proof = "engine"
+note = "UPDATE ... FROM with a join; a plain `UPDATE t SET` leaves no step and is C3a"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.end-of-time-literal"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.exec.named-argument"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.expr.binary-concat"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.expr.binary-literal"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.expr.concat"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C2b strings/Concatenation"
+note = "both operands strings of the slice, `+` against `||` (ASM-CONCAT-NULL); a string literal next to a number engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.expr.datetime-literal"
+kind = "converter"
+proof = "axiom:V33"
+note = "Db2 for i only (ASM-FACT-V33)"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.expr.dbo-schema"
+kind = "converter"
+proof = "engine"
+note = "C3a maps a table's `dbo.t` through the deployment under ASM-DBO-SCHEMA; the step itself is not read"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.expr.end-of-time-literal"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.expr.like-pattern"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.expr.literal-fraction"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.expr.module-setting"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.expr.next-value"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.expr.plus-numeric"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.expr.quoted-ident"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.expr.string-compare"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.expr.table-variable"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.expr.temp-table"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.expr.undeclared-variable"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.expr.unicode-literal"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C2b strings/Literals"
+note = "`N'...'` of printable ASCII without a backslash reads as the same literal as `'...'`"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.expr.variable"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/Expressions"
+note = "a variable read; the rename (`p_`/`v_` prefix) is the certificate's renaming, checked injective"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.from.table-function"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.from.table-hint"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.func.*"
+kind = "converter"
+proof = "engine"
+note = "Every rewritten built-in call, named after the function (`tsql.func.getdate`); the members with a lemma are listed on their own"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.func.current_timestamp"
+kind = "converter"
+proof = "engine"
+note = "a time source; Db2 for i rests on V20 (ASM-TIME-SOURCE)"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.func.isnull"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C2a operators/ISNULL"
+family = "tsql.func.*"
+note = "int arguments (C2a), or a string variable or parameter with a fallback that fits it (C2b strings/ISNULL); other types engine (ASM-ISNULL-TYPE)"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.func.len"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C2b strings/LEN"
+family = "tsql.func.*"
+note = "`LEN(x)` against `length(rtrim(x))` on a string variable, parameter or literal of the slice (ASM-TSQL-LEN-BMP)"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.func.string_agg"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.global-temp"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.index.clustered"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.index.nulls-not-distinct"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.index.qualify"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.key-order"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.lock-hint"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.merge"
+kind = "converter"
+proof = "engine"
+note = "PostgreSQL MERGE needs 15 or later (V12); Db2 for i has no WHEN NOT MATCHED BY SOURCE (V1)"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.merge.by-target"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.merge.into"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.nchar"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.order.nulls"
+kind = "converter"
+proof = "axiom:V19"
+note = "NULLS FIRST/LAST after T-SQL's placement (ASM-FACT-V19); the Db2 for i part of V19 is unverified"
+sites = ["sqldiff-convert/src/tsql/paging.rs"]
+
+[[rule]]
+id = "tsql.partition-scheme"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.plan-hint"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.query-hints"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.routine-options"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-convert/src/tsql/trigger.rs"]
+
+[[rule]]
+id = "tsql.routine-options-dropped"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-convert/src/tsql/trigger.rs"]
+
+[[rule]]
+id = "tsql.routine.alter"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.routine.execute-as"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.routine.function"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/Routines"
+note = "scalar functions; TRY/CATCH, THROW, transactions, data statements and queries are procedure-only in the spec"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.routine.param"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/Routines/lowerParam"
+note = "name, mode and a NULL or slice default; the types under 'Parameter and return types'"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.routine.procedure"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/Routines"
+note = "CREATE [OR ALTER] PROCEDURE against CREATE OR REPLACE PROCEDURE ... LANGUAGE plpgsql; the body is checked statement by statement"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.routine.return-code"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/T-SQL return status"
+note = "`INOUT return_code integer DEFAULT NULL` as the last parameter, the status set to 0 first"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.routine.returns"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/Parameter and return types"
+note = "int and slice string return types; others engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.routine.view"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.schema.authorization-dbo"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.select.assign"
+kind = "converter"
+proof = "engine"
+note = "`SELECT @x = e` without FROM as `x := e`; not read as an assignment by the Lean lowering"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.select.assign-into"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C3b queries/rule 4"
+note = "`SELECT @x = COUNT(*) FROM t [WHERE c]` into an int variable only (`SELECT COUNT(*) INTO x`); every other SELECT ... INTO engine (ASM-SELECT-ASSIGN-CARDINALITY)"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.select.assign-loop"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C3b queries/rule 1"
+note = "one plain table, a WHERE that fixes every primary-key column, int or fitting string targets, procedures only; other queries engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.select.dummy-from"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.select.top"
+kind = "converter"
+proof = "engine"
+note = "PostgreSQL LIMIT engine; Db2 for i FETCH FIRST below the outer query rests on V32 (ASM-FACT-V32)"
+sites = ["sqldiff-convert/src/tsql/paging.rs"]
+
+[[rule]]
+id = "tsql.sequence"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.sequence-cache"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.server-metadata"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.sqlcmd-include"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/lib.rs", "sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.stmt.break"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.stmt.continue"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.stmt.dynamic-known-text"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.stmt.dynamic-parameters"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.stmt.exec"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.stmt.extended-property"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.stmt.grant"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.stmt.print"
+kind = "converter"
+proof = "engine"
+note = "a message is outside the spec (`Message`)"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.stmt.raiserror"
+kind = "converter"
+proof = "engine"
+note = "RAISERROR is outside the C4 spec (V10: it does not honour XACT_ABORT)"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.stmt.result-set"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.stmt.return"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/T-SQL return status"
+note = "the `return-code` form in a procedure (`return_code := COALESCE(e, 0); RETURN;`); the trigger form (`RETURN NULL`) engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.stmt.set-option"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.stmt.set-variable"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/Statements"
+note = "`SET @x = e` with `e` in the slice (`x := e`), and `SET @x = (SELECT e FROM t WHERE c)` (C3b rule 2); compound operators (`+=`) engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.stmt.sqlcmd-include"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.stmt.throw"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C4 errors and transactions/THROW and RAISE EXCEPTION"
+note = "a literal number from 50000, a literal message and state (`raise`), and `THROW;` directly in a handler (`rethrow`, 'Re-raising'); variables as arguments engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.stmt.truncate"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.storage-options"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.table-builtin"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.table.add-column"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.table.add-default"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.table.check-constraint"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.table.column-default"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.table.column-option-dropped"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.table.columnstore"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.table.computed-column"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.table.computed-concat"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.table.identity"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.table.inline-index"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.table.primary-key-not-null"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.table.sequence-default-trigger"
+kind = "converter"
+proof = "axiom:V34"
+note = "Db2 for i only (ASM-FACT-V34); the fact is unverified"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.table.temp"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.table.with-check"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.temporal-history-created"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/temporal.rs"]
+
+[[rule]]
+id = "tsql.temporal.period"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/temporal.rs"]
+
+[[rule]]
+id = "tsql.temporal.period-column"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/temporal.rs"]
+
+[[rule]]
+id = "tsql.temporal.switch"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/temporal.rs"]
+
+[[rule]]
+id = "tsql.temporal.table"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/temporal.rs"]
+
+[[rule]]
+id = "tsql.temporal.versioning-option"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/temporal.rs"]
+
+[[rule]]
+id = "tsql.trigger"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/trigger.rs"]
+
+[[rule]]
+id = "tsql.trigger.missing-image"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.trigger.rowcount-guard"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/trigger.rs"]
+
+[[rule]]
+id = "tsql.txn.autocommit"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C4 errors and transactions/Transactions, PL/pgSQL"
+note = "the COMMIT added after a statement T-SQL commits on its own (ASM-NO-CALLER-TXN); the Lean rule names this id"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.txn.begin"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C4 errors and transactions/Transactions, T-SQL"
+note = "as a bracket with its COMMIT in a procedure under SET XACT_ABORT ON, outside TRY, IF, WHILE and nested blocks (ASM-NO-CALLER-TXN, ASM-TSQL-DOOMED-TXN); elsewhere engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.txn.commit"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C4 errors and transactions/Transactions, T-SQL"
+note = "as the end of a bracket (see tsql.txn.begin), the PL/pgSQL COMMIT under 'Transactions, PL/pgSQL'; elsewhere engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.txn.rollback"
+kind = "converter"
+proof = "engine"
+note = "a ROLLBACK is outside the C4 spec except inside idiom.rollback-rethrow"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.txn.rollback-savepoint"
+kind = "converter"
+proof = "axiom:V14"
+note = "the note names V14 (ASM-FACT-V14) on every target; the fact is about Db2 for i commitment control"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.txn.save"
+kind = "converter"
+proof = "axiom:V14"
+note = "the note names V14 (ASM-FACT-V14) on every target; the fact is about Db2 for i commitment control"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.txn.trancount-guard"
+kind = "converter"
+proof = "engine"
+note = "the `IF @@TRANCOUNT > 0` guard outside idiom.rollback-rethrow"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.txn.wrapper"
+kind = "converter"
+proof = "engine"
+note = "the call is one transaction: outside the C4 bracket shape"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.type.*"
+kind = "converter"
+proof = "engine"
+note = "The type mapping, named after the T-SQL type (`tsql.type.bigint`); the members with a lemma are listed on their own"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.type.int"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C2a types"
+family = "tsql.type.*"
+note = "`int` against PostgreSQL `integer` (also 'Parameter and return types')"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.type.integer"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C2a types"
+family = "tsql.type.*"
+note = "`integer` against PostgreSQL `integer` (also 'Parameter and return types')"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.type.nvarchar"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C2b strings/Types"
+family = "tsql.type.*"
+note = "`nvarchar(n)` with 1 <= n <= 4000 against `varchar(n)` (read with the `wide` bound); `max` and `nchar(n)` engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.type.user-defined"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.type.varchar"
+kind = "converter"
+proof = "lemma:Sqldiff.Mirror/C2b strings/Types"
+family = "tsql.type.*"
+note = "`varchar(n)` with 1 <= n <= 4000 against `varchar(n)`; `max`, no length and `char(n)` engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.unique-nulls"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.view-options"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "upsert/if-exists"
+kind = "idiom"
+proof = "engine"
+sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+
+[[rule]]
+id = "upsert/if-exists-locked"
+kind = "idiom"
+proof = "engine"
+sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+
+[[rule]]
+id = "upsert/merge"
+kind = "idiom"
+proof = "engine"
+sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+
+[[rule]]
+id = "upsert/on-conflict"
+kind = "idiom"
+proof = "engine"
+sites = ["sqldiff-core/profiles/rules/idioms.rules"]

@@ -229,6 +229,43 @@ pub struct UnitReport {
     /// still under assumptions; see [`Report::deployment`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted: Vec<String>,
+    /// What the proof checker said about the routine this unit lies in
+    /// (`--proof report|require`): additive, it changes no status. Absent
+    /// without a proof mode, and for a unit outside every routine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<UnitProof>,
+}
+
+/// The certificate of the routine a unit lies in, as it bears on the unit
+/// (`cert::Certificate`, without the hashes and the renaming).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitProof {
+    /// `confirmed` or `unconfirmed`.
+    pub answer: String,
+    /// The theorem(s) a confirmation names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theorem: Option<String>,
+    /// Why the routine is not confirmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The refusal's codes (`cert::reason_code`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub why: Vec<String>,
+}
+
+/// The proof checker's answers over the tree, when a proof mode is on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofTotals {
+    /// Routines with a certificate, and those the checker confirmed.
+    pub routines: usize,
+    pub routines_confirmed: usize,
+    /// Units inside a routine with a certificate, and those inside a
+    /// confirmed one.
+    pub units_in_routines: usize,
+    pub units_confirmed: usize,
+    /// Refusal codes with the number of unconfirmed routines carrying
+    /// each (a routine counts once per code).
+    pub reasons: std::collections::BTreeMap<String, usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -360,6 +397,9 @@ pub struct Totals {
     pub seconds: f64,
     /// Most frequent reasons a unit is not converted, with counts.
     pub top_reasons: Vec<(String, usize)>,
+    /// The proof checker's answers, when a proof mode is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<ProofTotals>,
 }
 
 /// A converted tree: the report, and every file as it is written (the
@@ -1501,6 +1541,7 @@ fn file_report(rel: &str, input: &str, c: &Conversion, lines: &[usize], secs: f6
             trace: u.trace.clone(),
             review: None,
             accepted: Vec::new(),
+            proof: None,
         };
         if u.status == Status::Converted {
             converted_units.push(r);
@@ -1882,6 +1923,113 @@ fn totals(files: &[FileReport], seconds: f64) -> Totals {
     t
 }
 
+/// Puts the certificates on the report: every unit inside a certified
+/// routine (by byte-span containment in the source) gets the routine's
+/// answer as its `proof`, and the totals get the counts and the refusal
+/// histogram, which is also returned for `certificates.json`. Statuses do
+/// not change. `inputs` are the texts the tree was converted from.
+pub fn annotate_proof(
+    t: &mut Tree,
+    inputs: &[Input],
+    certs: &[crate::job::FileCertificates],
+) -> ProofTotals {
+    let mut p = ProofTotals::default();
+    for c in certs.iter().flat_map(|f| &f.routines) {
+        p.routines += 1;
+        match &c.answer {
+            crate::cert::Answer::Confirmed { .. } => p.routines_confirmed += 1,
+            crate::cert::Answer::Unconfirmed { .. } => {
+                let mut codes: Vec<&str> = c.why.iter().map(String::as_str).collect();
+                codes.sort_unstable();
+                codes.dedup();
+                if codes.is_empty() {
+                    codes.push("check:other");
+                }
+                for code in codes {
+                    *p.reasons.entry(code.to_string()).or_default() += 1;
+                }
+            }
+        }
+    }
+    for (f, c) in t.report.files.iter_mut().zip(&t.conversions) {
+        let Some(input) = inputs.iter().find(|i| i.rel == f.path) else {
+            continue;
+        };
+        let routines: Vec<&crate::cert::Certificate> = certs
+            .iter()
+            .filter(|x| x.path == f.path)
+            .flat_map(|x| &x.routines)
+            .collect();
+        // The units' spans, by the ids the report keys them with.
+        let spans: std::collections::HashMap<String, (usize, usize)> =
+            crate::review::unit_ids(&f.path, &input.text, c)
+                .into_iter()
+                .zip(c.units.iter().map(|u| (u.src.start, u.src.end)))
+                .collect();
+        for u in f.units.iter_mut().chain(f.converted_units.iter_mut()) {
+            let Some(&(start, end)) = spans.get(&u.id) else {
+                continue;
+            };
+            let Some(r) = routines
+                .iter()
+                .find(|r| r.span.0 <= start && end <= r.span.1)
+            else {
+                continue;
+            };
+            p.units_in_routines += 1;
+            u.proof = Some(match &r.answer {
+                crate::cert::Answer::Confirmed { theorems } => {
+                    p.units_confirmed += 1;
+                    UnitProof {
+                        answer: "confirmed".into(),
+                        theorem: Some(theorems.join(", ")),
+                        reason: None,
+                        why: Vec::new(),
+                    }
+                }
+                crate::cert::Answer::Unconfirmed { reason } => UnitProof {
+                    answer: "unconfirmed".into(),
+                    theorem: None,
+                    reason: Some(reason.clone()),
+                    why: r.why.clone(),
+                },
+            });
+        }
+    }
+    t.report.totals.proof = Some(p.clone());
+    p
+}
+
+/// The refusal codes of a proof histogram, most frequent first (ties by
+/// code).
+pub fn proof_blockers(p: &ProofTotals) -> Vec<(&str, usize)> {
+    let mut v: Vec<(&str, usize)> = p.reasons.iter().map(|(k, n)| (k.as_str(), *n)).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    v
+}
+
+/// The summary's two proof lines, when a proof mode was on.
+fn proof_lines(r: &Report) -> Option<(String, Option<String>)> {
+    let p = r.totals.proof.as_ref()?;
+    let first = format!(
+        "proof: {} of {} routines confirmed ({} of {} units)",
+        p.routines_confirmed, p.routines, p.units_confirmed, p.units_in_routines
+    );
+    let blockers = proof_blockers(p);
+    let second = (!blockers.is_empty()).then(|| {
+        format!(
+            "proof blockers: {}",
+            blockers
+                .iter()
+                .take(8)
+                .map(|(k, n)| format!("{k} ({n})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    });
+    Some((first, second))
+}
+
 pub fn summary(r: &Report) -> String {
     let mut s = String::new();
     let _ = writeln!(
@@ -1958,6 +2106,12 @@ pub fn summary(r: &Report) -> String {
             }
         );
     }
+    if let Some((first, second)) = proof_lines(r) {
+        let _ = writeln!(s, "{first}");
+        if let Some(second) = second {
+            let _ = writeln!(s, "{second}");
+        }
+    }
     s
 }
 
@@ -1989,6 +2143,9 @@ pub fn markdown(r: &Report) -> String {
         "A file counts as converted only when every unit in it is: no assumption, no decision, nothing found by the engine's diff or by checking the output on its own (binding, leftover source syntax, target limits).\n"
     );
     let _ = writeln!(s, "```\n{}```\n", summary(r));
+    if let Some(p) = &r.totals.proof {
+        proof_markdown(&mut s, r, p);
+    }
     if let Some(d) = &r.deployment {
         deployment_markdown(&mut s, d);
     }
@@ -2050,6 +2207,30 @@ pub fn markdown(r: &Report) -> String {
         s.push('\n');
     }
     s
+}
+
+/// The proof checker's answers over the tree: what the summary says, and
+/// every refusal code with its count. No status changes with it.
+fn proof_markdown(s: &mut String, r: &Report, p: &ProofTotals) {
+    let _ = writeln!(s, "## Proof\n");
+    if let Some((first, second)) = proof_lines(r) {
+        let _ = writeln!(s, "{first}  ");
+        if let Some(second) = second {
+            let _ = writeln!(s, "{second}");
+        }
+    }
+    let _ = writeln!(
+        s,
+        "\nA confirmation is the checker's answer about the routine a unit lies in (`certificates.json`), evidence within the checker's slice; it changes no status. Each unconfirmed routine counts once per code.\n"
+    );
+    let blockers = proof_blockers(p);
+    if !blockers.is_empty() {
+        let _ = writeln!(s, "| code | count |\n|---|---:|");
+        for (k, n) in blockers {
+            let _ = writeln!(s, "| `{k}` | {n} |");
+        }
+        s.push('\n');
+    }
 }
 
 fn deployment_markdown(s: &mut String, d: &DeploymentReport) {
