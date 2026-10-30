@@ -614,6 +614,32 @@ fn words(n: &SyntaxNode, d: Dialect, out: &mut Vec<String>) {
     }
 }
 
+/// (C3d part 2) The words of a `CREATE` statement's head, before its first
+/// `ON`, `AS` or `(`: the name of the index, view or trigger it defines
+/// (and a few keywords). An index or a view is a relation of that name,
+/// which may hide a table of the same name in another schema on
+/// PostgreSQL's `search_path`, so it counts for that name.
+fn head_words(n: &SyntaxNode, d: Dialect, out: &mut Vec<String>) {
+    let t = tokens(n);
+    if t.first().map(|x| x.up.as_str()) != Some("CREATE") {
+        return;
+    }
+    for t in t {
+        if t.kind == K::LParen || (t.kind == K::Word && (t.up == "ON" || t.up == "AS")) {
+            break;
+        }
+        match t.kind {
+            K::Word => out.push(t.text.to_lowercase()),
+            K::Quoted => out.push(
+                sqldiff_syntax::abstract_syntax::quoted_name(&t.text, d)
+                    .trim_start_matches('"')
+                    .to_lowercase(),
+            ),
+            _ => {}
+        }
+    }
+}
+
 fn is_ddl(n: &SyntaxNode) -> bool {
     tokens(n).first().is_some_and(|t| {
         matches!(
@@ -765,8 +791,9 @@ fn definitions(texts: &[&str], d: Dialect) -> Ddl {
                         // its body may run when it fires counts as for a
                         // procedure, dynamic SQL for every table.
                         match (d, kind.as_deref()) {
-                            (Dialect::Tsql, Some("VIEW")) => {}
+                            (Dialect::Tsql, Some("VIEW")) => head_words(&n, d, &mut named_ro),
                             (Dialect::Tsql, Some("TRIGGER")) => {
+                                head_words(&n, d, &mut named_ro);
                                 body_words(&mut named_ro);
                                 ro_blocked |= dynamic_sql(&n, d);
                             }
@@ -794,7 +821,9 @@ fn definitions(texts: &[&str], d: Dialect) -> Ddl {
                     // read-only table out; anything else naming it does.
                     match plain_table::read_only(&n, d) {
                         Ok(t) => ro_defs.push(t),
-                        Err(_) if plain_table::leaves_reads(&n, d) => {}
+                        Err(_) if plain_table::leaves_reads(&n, d) => {
+                            head_words(&n, d, &mut named_ro)
+                        }
                         // Another table (`LIKE t`, `AS SELECT ... FROM t`, a
                         // temporary one): only the name it defines counts.
                         Err(_) => match plain_table::creates_other_table(&n, d) {
@@ -2226,8 +2255,11 @@ END
             }
         }
         // What can, or what the reader cannot show harmless, keeps the table
-        // out (and only that table).
+        // out (and only that table). An index or a view named like the table
+        // may hide it on PostgreSQL's search_path.
         for (extra, out) in [
+            ("CREATE INDEX Item ON dbo.Line (Qty);\n", "item"),
+            ("GO\nCREATE VIEW rpt.Item AS SELECT Id FROM dbo.Item;\nGO\n", "item"),
             ("GO\nCREATE FUNCTION dbo.f (@n varchar(20)) RETURNS TABLE WITH SCHEMABINDING AS \
               RETURN SELECT 1 AS ok WHERE @n = USER_NAME();\nGO\n\
               CREATE SECURITY POLICY dbo.P ADD FILTER PREDICATE dbo.f(Name) ON dbo.Item;\n", "item"),
