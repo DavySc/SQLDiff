@@ -423,9 +423,9 @@ page; **nothing is probed**: `eval/` has no run of any of it):
 | `THROW;` and `RAISE;` re-raise the handled error, only directly in a handler | same pages (from memory) | no |
 | `RAISERROR`, `RAISE NOTICE`, other `ERRCODE`s, `ERROR_NUMBER()` and the other error functions, `XACT_STATE()`, `@@ERROR`, `SQLSTATE`, `SQLERRM`, condition-specific handlers: outside | V10 (RAISERROR ignores XACT_ABORT) | n/a |
 | No call inside a handled body (a callee's errors are not in the core, its writes would differ) | n/a | n/a |
-| T-SQL `BEGIN TRAN ... COMMIT` as a bracket in the routine's own list (or in the idiom's body), under `SET XACT_ABORT ON`, nothing between them that returns, calls, handles or controls transactions; lowers to nothing and `commit` | "BEGIN/COMMIT TRANSACTION" (from memory), V10 | no |
+| T-SQL `BEGIN TRAN ... COMMIT` as a bracket in the routine's own list (or in the idiom's body), under `SET XACT_ABORT ON`, nothing between them that returns, calls, handles or controls transactions; lowers to nothing (checker 0.12.0; before, `COMMIT` lowered to `commit`) | "BEGIN/COMMIT TRANSACTION" (from memory), V10 | no |
 | The rollback-and-rethrow idiom (`IF @@TRANCOUNT > 0 ROLLBACK; THROW;`, or `ROLLBACK; THROW;` around a body that is exactly one bracket), outside other handlers and outside `IF`/`WHILE`/nested blocks, lowers to its body (0.8.0: with two brackets an error between them finds no transaction, the `ROLLBACK` raises 3903, probed) | "ROLLBACK TRANSACTION", "THROW" (from memory) | no |
-| PL/pgSQL `COMMIT` only in a procedure without `SECURITY DEFINER`, outside exception blocks | V17 | no |
+| PL/pgSQL `COMMIT` only in a procedure without `SECURITY DEFINER`, outside exception blocks; lowers to nothing (checker 0.12.0), wherever it stands there: after a transaction or after each statement T-SQL commits on its own (`tsql.txn.autocommit`); a confirmation names `ASM-NO-CALLER-TXN` from the `COMMIT`s (`pgTxn`) | V17 | no |
 | `TRY`, `THROW`, transactions only in T-SQL procedures | "CREATE FUNCTION (Transact-SQL)" (from memory) | n/a |
 
 **Residuals** added to a C2a answer: `ASM-CATCH-CORE-ERRORS` (the routine

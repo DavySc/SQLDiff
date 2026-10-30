@@ -256,10 +256,11 @@ Phase C4 adds error handling and transaction control:
   it runs (`Stmt.bindErr`); one that is never bound fails with
   `other "reraise"` (the lowerings put `reraise` only directly in a
   handler).
-* `commit`: T-SQL `COMMIT` and PL/pgSQL `COMMIT`, where the lowerings
-  admit them (`Sqldiff.Mirror`, "The C4 rules"): it changes nothing a
-  finished call shows, so it does nothing. A statement of its own, not
-  `skip`, so that a confirmation names it (`ASM-NO-CALLER-TXN`).
+* `commit`: a `COMMIT`: it changes nothing a finished call shows, so it
+  does nothing. The mirror lowerings no longer write it: T-SQL and
+  PL/pgSQL `COMMIT` lower to nothing, and a confirmation names
+  `ASM-NO-CALLER-TXN` from the transaction statements of the source
+  (`Sqldiff.Mirror`, "The C4 rules").
 
 Phase C3b adds a read:
 
