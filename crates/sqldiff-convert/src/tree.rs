@@ -410,6 +410,9 @@ pub struct Tree {
     pub outputs: Vec<String>,
     /// Each file's conversion as the engine returned it, in report order.
     pub conversions: Vec<Conversion>,
+    /// (C3d part 2) The base catalogs' DDL, source side and target side
+    /// (`base::Base::ddl`); empty without base catalogs.
+    pub base_ddl: (Vec<String>, Vec<String>),
 }
 
 /// Reads the source tree (`collect`) for `a`. Fails when the pair has no
@@ -548,6 +551,7 @@ pub fn convert_with(
         report,
         outputs,
         conversions,
+        base_ddl: base.map(|b| b.ddl).unwrap_or_default(),
     })
 }
 

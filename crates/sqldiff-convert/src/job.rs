@@ -244,11 +244,22 @@ pub fn convert_into(job: &Job, hooks: &Hooks) -> Result<Written, String> {
         let checker = job.proof.checker.as_deref();
         // Tables are read from the whole tree, source and output as written;
         // a file that could not be read may change any of them, so then none.
+        // (C3d part 2) With the base catalogs' DDL on each side, as each side
+        // binds against it (`base::Base::ddl`).
         let texts: Vec<&str> = inputs.iter().map(|i| i.text.as_str()).collect();
         let tables = if t.report.unreadable.is_empty() {
+            let (base_a, base_b) = &t.base_ddl;
             crate::cert::Tables::read(
-                &texts,
-                &t.outputs.iter().map(String::as_str).collect::<Vec<_>>(),
+                &texts
+                    .iter()
+                    .copied()
+                    .chain(base_a.iter().map(String::as_str))
+                    .collect::<Vec<_>>(),
+                &t.outputs
+                    .iter()
+                    .chain(base_b)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
                 job.tree.from,
                 job.tree.to,
             )

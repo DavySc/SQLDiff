@@ -958,7 +958,7 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 id = "tsql.select.assign-loop"
 kind = "converter"
 proof = "lemma:Sqldiff.Mirror/C3b queries/rule 1"
-note = "one plain table or (C3d) a block of them (inner and cross joins, comma lists, aliases, qualified names) whose every table the key closure determines, int or fitting string targets, procedures only; other queries engine"
+note = "one catalog table, plain or (C3d part 2) read-only (constraints, identity, defaults, computed and opaque columns the query does not name; a key only when wholly visible), or (C3d) a block of them (inner and cross joins, comma lists, aliases, qualified names) whose every table the key closure determines, int or fitting string targets, procedures only; other queries engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
