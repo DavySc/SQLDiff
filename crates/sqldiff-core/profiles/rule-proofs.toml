@@ -198,12 +198,6 @@ proof = "engine"
 sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
 
 [[rule]]
-id = "pg.bit-boolean"
-kind = "converter"
-proof = "engine"
-sites = ["sqldiff-convert/src/tsql.rs"]
-
-[[rule]]
 id = "pg.bit-number"
 kind = "converter"
 proof = "engine"
