@@ -207,3 +207,37 @@ fn routine_ddl_not_compared() {
     ));
     unknown(&t, &p, "inside an IF");
 }
+
+#[test]
+fn constraint_names_reused_where_one_side_refuses_them_are_not_compared() {
+    // One FK name on two tables: SQL Server refuses the second (names are
+    // unique per schema), PostgreSQL takes it (unique per table).
+    let (t, p) = script(
+        "ALTER TABLE dbo.Customer ADD CONSTRAINT PK_Customer PRIMARY KEY (id);\nGO\nALTER TABLE dbo.Sale ADD CONSTRAINT FK_X FOREIGN KEY (customer_id) REFERENCES dbo.Customer (id);\nGO\nALTER TABLE dbo.Customer ADD CONSTRAINT FK_X FOREIGN KEY (id) REFERENCES dbo.Customer (id);",
+        "ALTER TABLE Customer ADD CONSTRAINT PK_Customer PRIMARY KEY (id);\nALTER TABLE Sale ADD CONSTRAINT FK_X FOREIGN KEY (customer_id) REFERENCES Customer (id);\nALTER TABLE Customer ADD CONSTRAINT FK_X FOREIGN KEY (id) REFERENCES Customer (id);",
+    );
+    unknown(&t, &p, "Msg 2714");
+    // A UNIQUE named like an index of another table: PostgreSQL refuses it.
+    let (t, p) = script(
+        "CREATE INDEX IX_S ON dbo.Customer (code);\nGO\nALTER TABLE dbo.Sale ADD CONSTRAINT IX_S UNIQUE (id);",
+        "CREATE INDEX IX_S ON Customer (code);\nALTER TABLE Sale ADD CONSTRAINT IX_S UNIQUE (id);",
+    );
+    unknown(&t, &p, "index's name");
+    // The same in a procedure.
+    let t = LOAD_T.replace(
+        "    CREATE INDEX IX_Sale_Customer ON dbo.Sale (customer_id);\n",
+        "    CREATE INDEX IX_Sale_Customer ON dbo.Sale (customer_id);\n    ALTER TABLE dbo.Customer ADD CONSTRAINT IX_Sale_Customer UNIQUE (code);\n",
+    );
+    let p = load_p(&format!(
+        "{LOAD_P}\n  ALTER TABLE Customer ADD CONSTRAINT IX_Sale_Customer UNIQUE (code);"
+    ));
+    unknown(&t, &p, "index's name");
+    // A name declared inside a CREATE TABLE, used again by an ALTER.
+    let t = "CREATE TABLE dbo.A (id int NOT NULL CONSTRAINT PK_A PRIMARY KEY);\nGO\nCREATE TABLE dbo.B (id int NOT NULL);\nGO\nALTER TABLE dbo.B ADD CONSTRAINT PK_A UNIQUE (id);\n";
+    let p = "CREATE TABLE A (id integer NOT NULL CONSTRAINT PK_A PRIMARY KEY);\nCREATE TABLE B (id integer NOT NULL);\nALTER TABLE B ADD CONSTRAINT PK_A UNIQUE (id);\n";
+    unknown(t, p, "used again");
+    // Two CREATE TABLEs declaring one FK name.
+    let t = "CREATE TABLE dbo.A (id int NOT NULL PRIMARY KEY);\nGO\nCREATE TABLE dbo.B (id int NOT NULL, CONSTRAINT FK_X FOREIGN KEY (id) REFERENCES dbo.A (id));\nGO\nCREATE TABLE dbo.C (id int NOT NULL, CONSTRAINT FK_X FOREIGN KEY (id) REFERENCES dbo.A (id));\n";
+    let p = "CREATE TABLE A (id integer NOT NULL PRIMARY KEY);\nCREATE TABLE B (id integer NOT NULL, CONSTRAINT FK_X FOREIGN KEY (id) REFERENCES A (id));\nCREATE TABLE C (id integer NOT NULL, CONSTRAINT FK_X FOREIGN KEY (id) REFERENCES A (id));\n";
+    unknown(t, p, "Msg 2714");
+}

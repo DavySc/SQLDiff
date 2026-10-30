@@ -1254,6 +1254,94 @@ fn same_stmt(
 }
 
 /// The rest of the line from byte `off`, white space trimmed.
+/// Constraint names are scoped differently: T-SQL keeps every constraint
+/// name in `sys.objects`, unique per schema (Msg 2714); PostgreSQL wants a
+/// constraint name unique per table, and a PRIMARY KEY or UNIQUE name, which
+/// is also its index's name, unique among the schema's tables and indexes.
+/// A file that reuses a name where either side refuses it is not compared:
+/// the other side may well accept it.
+fn constraint_name_clashes(side: &Analyzed, u: &Unit, name: &str, out: &mut Outcome) {
+    let d = side.dialect();
+    let pg = d == sqldiff_syntax::Dialect::Postgres;
+    let norm = |n: &table::Name| {
+        if pg {
+            Some(table::stored(n))
+        } else {
+            table::key(n, d).ok()
+        }
+    };
+    // (schema, table, constraint name, names an index, offset)
+    let mut named: Vec<(Option<String>, String, String, bool, usize)> = Vec::new();
+    // Tables and indexes: relations of the schema.
+    let mut relations: Vec<(Option<String>, String)> = Vec::new();
+    for (n, _) in &u.tables {
+        let toks = ast::tokens(n);
+        let Ok(t) = table::parse(&toks, d) else {
+            continue;
+        };
+        let Ok((schema, tname)) = ddl::stored_key(&t.name, d) else {
+            continue;
+        };
+        relations.push((schema.clone(), tname.clone()));
+        let keys = t.keys.iter().map(|k| (&k.name, true, k.off));
+        let fks = t.fks.iter().map(|f| (&f.name, false, f.off));
+        let checks = t.checks.iter().map(|c| (&c.name, false, c.off));
+        for (cn, ix, off) in keys.chain(fks).chain(checks) {
+            if let Some(cn) = cn.as_ref().and_then(&norm) {
+                named.push((schema.clone(), tname.clone(), cn, ix, off));
+            }
+        }
+    }
+    for (node, _) in &u.ddl {
+        match ddl::parse(&ast::tokens(node), d) {
+            Ok(ddl::Ddl::Constraint(c)) => {
+                let (Ok((schema, tname)), Some(cn)) = (ddl::stored_key(&c.table, d), norm(&c.name))
+                else {
+                    continue;
+                };
+                let ix = matches!(c.added, ddl::Added::Key(_));
+                named.push((schema, tname, cn, ix, c.off));
+            }
+            Ok(ddl::Ddl::Index(ix)) => {
+                if let (Ok((schema, _)), Some(n)) = (ddl::stored_key(&ix.table, d), norm(&ix.name))
+                {
+                    relations.push((schema, n));
+                }
+            }
+            _ => {}
+        }
+    }
+    for (i, (schema, tname, cn, ix, off)) in named.iter().enumerate() {
+        let others = || {
+            named
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != i)
+                .map(|(_, o)| o)
+        };
+        let why = if !pg {
+            others()
+                .any(|o| o.0 == *schema && o.2 == *cn)
+                .then_some("T-SQL constraint names are unique per schema, so SQL Server refuses one of them (Msg 2714)")
+        } else if others().any(|o| o.0 == *schema && o.1 == *tname && o.2 == *cn) {
+            Some("PostgreSQL refuses a second constraint of that name on the table")
+        } else if *ix
+            && (relations.contains(&(schema.clone(), cn.clone()))
+                || others().any(|o| o.3 && o.0 == *schema && o.2 == *cn))
+        {
+            Some("a PRIMARY KEY or UNIQUE constraint's name is also its index's name, which PostgreSQL wants unique among the schema's tables and indexes")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            out.unknown_reasons.push(format!(
+                "{name} line {}: the constraint name {cn} is used again in this schema and is not compared: {why}",
+                line_at(side, *off).start_line
+            ));
+        }
+    }
+}
+
 fn line_at(side: &Analyzed, off: usize) -> crate::model::Location {
     let text = &side.artifact.text;
     let off = off.min(text.len());
@@ -2318,10 +2406,12 @@ fn ddl_stmts(
     out: &mut Outcome,
 ) {
     use ast::K;
+    let (na, nb) = (side_name(a), side_name(b));
+    constraint_name_clashes(a, ua, &na, out);
+    constraint_name_clashes(b, ub, &nb, out);
     if ua.ddl.is_empty() && ub.ddl.is_empty() {
         return;
     }
-    let (na, nb) = (side_name(a), side_name(b));
     struct Stmt<'n> {
         node: &'n SyntaxNode,
         pos: usize,
