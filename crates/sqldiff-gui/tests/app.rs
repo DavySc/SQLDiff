@@ -1668,3 +1668,61 @@ fn a_format_run_never_reads_a_private_pack_as_the_folders_config() {
         pack
     );
 }
+
+#[test]
+fn the_review_list_endpoints_page_and_walk_over_http() {
+    let d = Dir::new("review-list");
+    d.write(
+        "src/a.sql",
+        "CREATE PROCEDURE dbo.p AS\nBEGIN\n  UPDATE dbo.t SET a = 1;\nEND\n",
+    );
+    d.write(
+        "src/b.sql",
+        "CREATE PROCEDURE dbo.p2 AS\nBEGIN\n  UPDATE dbo.t SET a = 2;\nEND\n",
+    );
+    d.write(
+        "src/r.sql",
+        "CREATE PROCEDURE dbo.r AS\nBEGIN\n  SELECT @@ERROR;\nEND\n",
+    );
+    let r = review(&d);
+    let addr = start(app(None, Some(r)));
+    let q = "tiers=1,2,3,4,5&group=tier&q=";
+    let json = |path: &str| {
+        let (status, body) = get(addr, path);
+        assert_eq!(status, "HTTP/1.1 200 OK", "{path}: {body}");
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()
+    };
+    let list = json(&format!("/review/api/list?{q}"));
+    let groups = list["groups"].as_array().unwrap();
+    assert!(groups.len() >= 2, "{list}");
+    let g0 = groups[0]["key"].as_str().unwrap();
+    let rows = json(&format!("/review/api/rows?{q}&key={g0}&count=1"));
+    assert_eq!(rows["rows"].as_array().unwrap().len(), 1, "{rows}");
+    let first = rows["rows"][0]["key"].as_str().unwrap().to_string();
+    // Where it is, the next group's first, the next item, by index.
+    let at = json(&format!("/review/api/near?{q}&from={first}"));
+    assert_eq!(
+        (at["key"].as_str(), at["group"].as_u64()),
+        (Some(first.as_str()), Some(0))
+    );
+    let jump = json(&format!("/review/api/near?{q}&from={first}&jump=1"));
+    assert_eq!(
+        (jump["group"].as_u64(), jump["offset"].as_u64()),
+        (Some(1), Some(0)),
+        "{jump}"
+    );
+    let step = json(&format!("/review/api/near?{q}&from={first}&step=1"));
+    assert_eq!(step["index"].as_u64(), Some(1), "{step}");
+    assert_eq!(
+        json(&format!("/review/api/near?{q}&index=0"))["key"],
+        first.as_str()
+    );
+    // Nothing shown: null.
+    assert!(json("/review/api/near?tiers=&group=tier&index=0").is_null());
+    assert!(json(&format!("/review/api/accept?{q}&key={g0}")).is_array());
+    assert!(json("/review/api/reviewed?from=0").is_array());
+    // The state counts what the list lists, and lists no items itself.
+    let st = json("/review/api/state");
+    assert!(st.get("items").is_none());
+    assert_eq!(st["open"], list["total"]);
+}

@@ -24,10 +24,20 @@
 //! the same options gives the same conversion.
 //!
 //! - `GET /`: the page
-//! - `GET /api/state[?all=1]`: queue, ledger summary, warnings, the done
-//!   gate (`all` adds tier 6; the gate lists its first
-//!   [`GATE_BLOCKERS_SHOWN`] blockers, and `blockers_total` counts them all)
+//! - `GET /api/state[?all=1]`: counts per tier, ledger summary, warnings,
+//!   the first reviewed units, the done gate (`all` adds tier 6; the gate
+//!   lists its first [`GATE_BLOCKERS_SHOWN`] blockers, and `blockers_total`
+//!   counts them all). The queue's items come from the list endpoints.
 //! - `GET /api/gate`: the done gate alone, as `/api/state` gives it
+//! - `GET /api/list?tiers=..&group=cause|file|tier&q=..[&from=N&count=N]`: a
+//!   lens's groups (see [`crate::review_list`]); the same `tiers`, `group`
+//!   and `q` (and `all`) go with the next four
+//! - `GET /api/rows?..&key=G[&from=N&count=N]`: rows of the group `G`
+//! - `GET /api/accept?..&key=G`: its units with `G` as an open assumption
+//! - `GET /api/near?..&from=K[&step=N|&jump=N]` or `?..&index=N`: where an
+//!   item is listed, the item `N` on, the first of the group `N` on, or the
+//!   item at `N` of the walk order (`null` when nothing is shown)
+//! - `GET /api/reviewed[?from=N&count=N]`: reviewed units, a page
 //! - `GET /api/item?key=K[&all=1]`: one queue item in detail
 //! - `GET /api/unit?path=P&unit=U`: one unit in detail (also reviewed ones)
 //! - `GET /api/file?path=P&side=in|out`: a whole input, or its conversion
@@ -38,7 +48,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -49,6 +59,7 @@ use sqldiff_convert::tree::{self, Input, Tree, UnitReviewReport};
 use sqldiff_convert::{Status, Unit};
 
 use crate::packs::LoadedPack;
+use crate::review_list::{self, Listing, Place, Query};
 use crate::server::{
     allowed_hosts, bad, json, not_found, read_request, respond, Request, Response,
 };
@@ -97,6 +108,11 @@ struct Loaded {
     gate: Result<ShownGate, String>,
     judged: String,
     stamp: Stamp,
+    /// The queue as the page lists it, tier 6 included and without the
+    /// hashes (rows get those): built on first use, once per read.
+    listed: OnceLock<Vec<ListedItem>>,
+    /// The last listing asked for, which the page pages through.
+    listing: Mutex<Option<Listing>>,
 }
 
 /// Every file under the source, OUT, the instance report and the base
@@ -186,11 +202,16 @@ pub struct StateView {
     pub templates: bool,
     pub files: usize,
     pub units: usize,
-    pub items: Vec<ListedItem>,
+    /// Items in tiers 1 to 5. The items themselves come a page at a time
+    /// (`/api/list`, `/api/rows`).
+    pub open: usize,
     pub tiers: BTreeMap<u8, usize>,
     pub tier_labels: BTreeMap<u8, &'static str>,
-    /// Units reviewed by people (not in the queue).
+    /// Units reviewed by people (not in the queue): the first
+    /// [`REVIEWED_SHOWN`] (`/api/reviewed` pages through the rest), and
+    /// how many there are.
     pub reviewed: Vec<ReviewedUnit>,
+    pub reviewed_total: usize,
     /// Whether an instance report was read.
     pub instances: bool,
     /// Whether tier 6 (plainly converted units nobody approved) is listed.
@@ -226,6 +247,13 @@ pub struct GateState {
 /// (`blockers_total`). A large tree has tens of thousands, which made the
 /// page's payload several times larger than everything else on it.
 pub const GATE_BLOCKERS_SHOWN: usize = 100;
+
+/// Reviewed units the state carries; the page asks for more.
+pub const REVIEWED_SHOWN: usize = 200;
+
+/// Most rows one `/api/rows` or `/api/reviewed` answer carries, and most
+/// groups one `/api/list` answer does.
+pub const PAGE_MAX: usize = 1000;
 
 /// The done gate as the review keeps and shows it: its first
 /// [`GATE_BLOCKERS_SHOWN`] blockers and how many there are, the rest as
@@ -318,6 +346,42 @@ pub struct UnitView {
     /// Instances woven from this file's template, and those not converted.
     pub instances: usize,
     pub failing_instances: Vec<(String, String)>,
+}
+
+/// `/api/list`: a lens's groups, a page of them.
+#[derive(Debug, Clone, Serialize)]
+pub struct ListView {
+    /// Items in the lens's tiers, and those the filter shows.
+    pub total: usize,
+    pub shown: usize,
+    pub groups_total: usize,
+    pub groups: Vec<GroupView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupView {
+    pub key: String,
+    /// Items in the group.
+    pub n: usize,
+    pub desc: String,
+    /// Units with the group's cause as an open assumption.
+    pub accept: usize,
+}
+
+/// `/api/rows`: a page of a group's items.
+#[derive(Debug, Clone, Serialize)]
+pub struct RowsView {
+    pub n: usize,
+    pub rows: Vec<ListedItem>,
+}
+
+/// What `/api/near` looks for.
+#[derive(Debug, Clone, Copy)]
+pub enum Near<'a> {
+    At(&'a str),
+    Step(&'a str, i64),
+    Group(&'a str, i64),
+    Index(usize),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -528,48 +592,11 @@ impl Review {
         }
     }
 
-    pub fn state(&self, all: bool) -> StateView {
-        let gate = self.gate_state();
+    /// Units people reviewed, in path order, and decisions on units that
+    /// no longer exist, units with an outdated decision, and all units.
+    fn tally(&self) -> (Vec<ReviewedUnit>, usize, usize, usize) {
         let l = &self.loaded;
         let r = &l.tree.report;
-        let q = self.queue(all);
-        // Per file: the hashes of its input and output, taken once.
-        let mut hashes: BTreeMap<usize, (String, String)> = BTreeMap::new();
-        let items = q
-            .items
-            .into_iter()
-            .map(|item| {
-                let found = match (&item.kind, &item.unit) {
-                    (Kind::Unit, Some(id)) => self.find(&item.path, id),
-                    _ => None,
-                };
-                let Some((f, k)) = found else {
-                    return ListedItem {
-                        item,
-                        open_assumptions: Vec::new(),
-                        blocking: Vec::new(),
-                        hashes: None,
-                    };
-                };
-                let u = &l.tree.conversions[f].units[k];
-                let rv = self.unit_review(f, &l.ids[f][k]);
-                let h = hashes.entry(f).or_insert_with(|| {
-                    (
-                        review::file_hash(&l.inputs[f].text),
-                        review::file_hash(&l.tree.conversions[f].output),
-                    )
-                });
-                ListedItem {
-                    open_assumptions: open_assumptions(u, rv),
-                    blocking: rv.map_or_else(
-                        || review::undischargeable(u),
-                        |rv| rv.undischargeable.clone(),
-                    ),
-                    hashes: Some(h.clone()),
-                    item,
-                }
-            })
-            .collect();
         let mut reviewed = Vec::new();
         let (mut orphaned, mut outdated, mut units) = (0, 0, 0);
         for f in &r.files {
@@ -606,6 +633,22 @@ impl Review {
             }
         }
         reviewed.sort_by(|a, b| a.path.cmp(&b.path).then(a.src_line.cmp(&b.src_line)));
+        (reviewed, orphaned, outdated, units)
+    }
+
+    pub fn state(&self, all: bool) -> StateView {
+        let gate = self.gate_state();
+        let l = &self.loaded;
+        let r = &l.tree.report;
+        let mut tiers: BTreeMap<u8, usize> = (1..=6u8).map(|t| (t, 0)).collect();
+        for it in self.listed_all() {
+            if it.item.tier != 6 || all {
+                *tiers.entry(it.item.tier).or_default() += 1;
+            }
+        }
+        let (mut reviewed, orphaned, outdated, units) = self.tally();
+        let reviewed_total = reviewed.len();
+        reviewed.truncate(REVIEWED_SHOWN);
         StateView {
             from: r.from.clone(),
             to: r.to.clone(),
@@ -615,11 +658,12 @@ impl Review {
             templates: r.templates,
             files: r.files.len(),
             units,
-            items,
-            tiers: q.tiers,
+            open: (1..=5u8).map(|t| tiers[&t]).sum(),
+            tiers,
             tier_labels: (1..=6u8).map(|t| (t, queue::tier_label(t))).collect(),
             reviewed,
-            instances: q.instances,
+            reviewed_total,
+            instances: l.instances.is_some(),
             all,
             records: r.ledger.as_ref().map_or(0, |x| x.records),
             not_applied: l.not_applied.clone(),
@@ -633,6 +677,165 @@ impl Review {
             gate_judged: gate.gate_judged,
             packs: self.setup.packs.clone(),
         }
+    }
+
+    /// The queue as the page lists it, tier 6 included, without hashes.
+    fn listed_all(&self) -> &[ListedItem] {
+        self.loaded.listed.get_or_init(|| {
+            let l = &self.loaded;
+            self.queue(true)
+                .items
+                .into_iter()
+                .map(|item| {
+                    let found = match (&item.kind, &item.unit) {
+                        (Kind::Unit, Some(id)) => self.find(&item.path, id),
+                        _ => None,
+                    };
+                    let Some((f, k)) = found else {
+                        return ListedItem {
+                            item,
+                            open_assumptions: Vec::new(),
+                            blocking: Vec::new(),
+                            hashes: None,
+                        };
+                    };
+                    let u = &l.tree.conversions[f].units[k];
+                    let rv = self.unit_review(f, &l.ids[f][k]);
+                    ListedItem {
+                        open_assumptions: open_assumptions(u, rv),
+                        blocking: rv.map_or_else(
+                            || review::undischargeable(u),
+                            |rv| rv.undischargeable.clone(),
+                        ),
+                        hashes: None,
+                        item,
+                    }
+                })
+                .collect()
+        })
+    }
+
+    /// Items as a page row shows them: with the hashes an action on a
+    /// unit sends back (those of its files as of this read).
+    fn rows_of<'a>(&self, items: impl Iterator<Item = &'a ListedItem>) -> Vec<ListedItem> {
+        let l = &self.loaded;
+        let mut hashes: BTreeMap<usize, (String, String)> = BTreeMap::new();
+        items
+            .map(|it| {
+                let mut it = it.clone();
+                if it.item.kind == Kind::Unit && it.item.unit.is_some() {
+                    if let Some(f) = self.file_index(&it.item.path) {
+                        let h = hashes.entry(f).or_insert_with(|| {
+                            (
+                                review::file_hash(&l.inputs[f].text),
+                                review::file_hash(&l.tree.conversions[f].output),
+                            )
+                        });
+                        it.hashes = Some(h.clone());
+                    }
+                }
+                it
+            })
+            .collect()
+    }
+
+    /// Every item of the queue as the page lists it (tier 6 with `all`).
+    pub fn items(&self, all: bool) -> Vec<ListedItem> {
+        self.rows_of(self.listed_all().iter().filter(|i| all || i.item.tier != 6))
+    }
+
+    /// Runs `f` on the listing of `q`, made once per query and read.
+    fn with_listing<R>(&self, q: &Query, f: impl FnOnce(&Listing, &[ListedItem]) -> R) -> R {
+        let items = self.listed_all();
+        let mut cached = self
+            .loaded
+            .listing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if cached.as_ref().map_or(true, |l| l.query != *q) {
+            *cached = Some(review_list::list(items, q));
+        }
+        f(cached.as_ref().expect("listed"), items)
+    }
+
+    /// `/api/list`: the groups of a lens, `count` from `from`.
+    pub fn list(&self, q: &Query, from: usize, count: usize) -> ListView {
+        let total = self
+            .listed_all()
+            .iter()
+            .filter(|i| q.tiers.contains(&i.item.tier))
+            .count();
+        self.with_listing(q, |l, _| ListView {
+            total,
+            shown: l.shown,
+            groups_total: l.groups.len(),
+            groups: l
+                .groups
+                .iter()
+                .skip(from)
+                .take(count.min(PAGE_MAX))
+                .map(|g| GroupView {
+                    key: g.key.clone(),
+                    n: g.items.len(),
+                    desc: g.desc.clone(),
+                    accept: g.accept,
+                })
+                .collect(),
+        })
+    }
+
+    /// `/api/rows`: `count` items of the group `key` from `from`.
+    pub fn rows(&self, q: &Query, key: &str, from: usize, count: usize) -> Option<RowsView> {
+        self.with_listing(q, |l, items| {
+            let g = l.group(key)?;
+            Some(RowsView {
+                n: g.items.len(),
+                rows: self.rows_of(
+                    g.items
+                        .iter()
+                        .skip(from)
+                        .take(count.min(PAGE_MAX))
+                        .map(|&i| &items[i as usize]),
+                ),
+            })
+        })
+    }
+
+    /// `/api/accept`: the units of the group `key` with `key` as an open
+    /// assumption, which "accept for all" selects.
+    pub fn acceptable(&self, q: &Query, key: &str) -> Vec<ListedItem> {
+        self.with_listing(q, |l, items| {
+            let Some(g) = l.group(key) else {
+                return Vec::new();
+            };
+            self.rows_of(
+                g.items
+                    .iter()
+                    .map(|&i| &items[i as usize])
+                    .filter(|i| i.open_assumptions.iter().any(|r| r == key)),
+            )
+        })
+    }
+
+    /// `/api/near`: where an item is listed (`at`), the one `step` on
+    /// from it, the first of the group `group` on from its, or the one at
+    /// `index` of the walk order.
+    pub fn near(&self, q: &Query, how: Near<'_>) -> Option<Place> {
+        self.with_listing(q, |l, items| match how {
+            Near::At(key) => l.find(items, key),
+            Near::Step(key, d) => l.step(items, key, d),
+            Near::Group(key, d) => l.step_group(items, key, d),
+            Near::Index(i) => l.at(items, i),
+        })
+    }
+
+    /// `/api/reviewed`: `count` reviewed units from `from`, as the state
+    /// lists them.
+    pub fn reviewed(&self, from: usize, count: usize) -> Vec<ReviewedUnit> {
+        let mut v = self.tally().0;
+        v.drain(..from.min(v.len()));
+        v.truncate(count.min(PAGE_MAX));
+        v
     }
 
     /// File index and unit index of a unit, by path and id.
@@ -760,7 +963,12 @@ impl Review {
     }
 
     pub fn item(&self, key: &str, all: bool) -> Option<ItemView> {
-        let item = self.queue(all).items.into_iter().find(|i| i.key == key)?;
+        let item = self
+            .listed_all()
+            .iter()
+            .find(|i| i.item.key == key && (all || i.item.tier != 6))?
+            .item
+            .clone();
         let units = match (&item.kind, &item.unit) {
             (Kind::Unit, Some(id)) => self.unit(&item.path, id).into_iter().collect(),
             (Kind::MissingObject, _) => item
@@ -1042,6 +1250,8 @@ fn empty() -> Loaded {
         ids: Vec::new(),
         by_path: Vec::new(),
         by_id: Vec::new(),
+        listed: OnceLock::new(),
+        listing: Mutex::new(None),
         instances: None,
         not_applied: Vec::new(),
         out_differs: Vec::new(),
@@ -1137,6 +1347,8 @@ fn load(s: &Setup, prev: Option<Loaded>, hooks: &tree::Hooks) -> Result<Loaded, 
         gate,
         judged: sqldiff_review::time::now(),
         stamp,
+        listed: OnceLock::new(),
+        listing: Mutex::new(None),
     })
 }
 
@@ -1275,6 +1487,12 @@ fn lexer() -> &'static str {
     &page[start..end]
 }
 
+fn num(req: &Request, key: &str, or: usize) -> usize {
+    param(&req.query, key)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(or)
+}
+
 fn param(query: &str, key: &str) -> Option<String> {
     crate::server::param(query, key)
 }
@@ -1286,6 +1504,37 @@ pub(crate) fn route(r: &Mutex<Review>, req: &Request) -> Response {
         ("GET", "/") => ("200 OK", "text/html; charset=utf-8", page(&s.state(all))),
         ("GET", "/api/state") => json(&s.state(all)),
         ("GET", "/api/gate") => json(&s.gate_state()),
+        ("GET", "/api/list") => {
+            let q = Query::parse(&req.query, all);
+            json(&s.list(&q, num(req, "from", 0), num(req, "count", 200)))
+        }
+        ("GET", "/api/rows") => {
+            let q = Query::parse(&req.query, all);
+            let key = param(&req.query, "key").unwrap_or_default();
+            match s.rows(&q, &key, num(req, "from", 0), num(req, "count", 200)) {
+                Some(v) => json(&v),
+                None => not_found(),
+            }
+        }
+        ("GET", "/api/accept") => {
+            let q = Query::parse(&req.query, all);
+            json(&s.acceptable(&q, &param(&req.query, "key").unwrap_or_default()))
+        }
+        ("GET", "/api/near") => {
+            let q = Query::parse(&req.query, all);
+            let from = param(&req.query, "from").unwrap_or_default();
+            let d = |k| param(&req.query, k).and_then(|v| v.parse::<i64>().ok());
+            // `jump`: `group` names the grouping.
+            let how = match (d("step"), d("jump"), d("index")) {
+                (Some(n), _, _) => Near::Step(&from, n),
+                (_, Some(n), _) => Near::Group(&from, n),
+                (_, _, Some(i)) => Near::Index(i.max(0) as usize),
+                _ => Near::At(&from),
+            };
+            // Nothing shown: `null`.
+            json(&s.near(&q, how))
+        }
+        ("GET", "/api/reviewed") => json(&s.reviewed(num(req, "from", 0), num(req, "count", 200))),
         ("GET", "/api/item") => match param(&req.query, "key").and_then(|k| s.item(&k, all)) {
             Some(v) => json(&v),
             None => not_found(),
