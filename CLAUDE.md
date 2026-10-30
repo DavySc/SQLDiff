@@ -48,14 +48,23 @@ coordinate through GitHub, which every session can read:
 - **Never loosen the gate.** A statement the engine never compared does not
   count as converted, and a wrong "equal" is worse than "not proven". Do not
   trade correctness for speed or coverage without the owner's explicit OK.
-- **No new assumption without the owner's OK.** A new `ASM-*` id, or a wider
-  reading of an existing one, needs the owner's explicit approval before it
-  merges. Register it in `crates/sqldiff-core/profiles/assumptions.toml` and
+- **No new assumption without the owner's OK.** A new `ASM-*` id needs the
+  owner's explicit approval before it merges. Register it in `crates/sqldiff-core/profiles/assumptions.toml` and
   regenerate `docs/assumptions.md` with
   `SQLDIFF_BLESS=1 cargo test -p sqldiff-core --test assumptions`. An
   assumption the owner withdrew is not proposed again without new evidence.
-- **Rule ids are registered.** Adding or renaming a converter rule id means
-  updating `crates/sqldiff-core/profiles/rule-proofs.toml` and regenerating
+- **An assumption says everything it covers.** When a change makes an
+  existing `ASM-*` id cover more cases (more types, units or statements),
+  update its text in the code and its statement and fact in
+  `assumptions.toml` so a reviewer who accepts it sees the new bounds; for
+  example ASM-DATEADD-RANGE names the datetime and smalldatetime ranges
+  since #225.
+- **Doc comments follow the code.** When a change alters what a function
+  proves or refuses, update its doc comment in the same commit, and keep a
+  `///` comment directly on the item it documents.
+- **Rule ids are registered.** Adding, renaming, removing or moving a
+  converter rule id means updating
+  `crates/sqldiff-core/profiles/rule-proofs.toml` and regenerating
   `docs/proof-coverage.md` with
   `SQLDIFF_BLESS=1 cargo test -p sqldiff-core --test rule_proofs`.
 - **Db2 means Db2 for i.** Nothing for Db2 for z/OS or Db2 LUW enters the
