@@ -18,9 +18,9 @@ pub fn run(a: Args) -> Result<ExitCode, String> {
     }
     print!("{}", tree::summary(&w.tree.report));
     print!("{}", sqldiff_convert::queue::summary(&w.queue));
-    if let Some((c, path)) = &w.certificates {
-        let (confirmed, all) = c.counts();
-        println!("certificates: {confirmed} of {all} routines confirmed by the proof checker");
+    // The proof counts are in the summary above (`proof: R of S routines
+    // confirmed`), printed once.
+    if let Some((_, path)) = &w.certificates {
         eprintln!("wrote {}", path.display());
     }
     let [json, md, qjson, qmd] = &w.reports;

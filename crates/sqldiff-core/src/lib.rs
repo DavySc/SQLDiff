@@ -25,6 +25,7 @@ pub mod observer;
 pub mod phrase;
 pub mod proof;
 pub mod render;
+pub mod rule_proofs;
 pub mod rules;
 pub mod session;
 pub mod target;

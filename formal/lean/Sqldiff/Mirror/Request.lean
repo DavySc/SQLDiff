@@ -72,8 +72,9 @@ answers a request with a `v`/`w` column or a DEFAULT "the catalog does
 not decode"; a C3c checker reads every older request as before.
 
 The answer: `check`, plus the fields `extra` adds to a confirmed answer
-(`"scalars"`, `"residual"` for a C2a answer, and `"statements"`; see
-`Main.lean`).
+(`"scalars"`, `"residual"` for a C2a answer, `"statements"` and
+`"errors"`; see `Main.lean`), and (0.13.0) the `"why"` codes it adds to
+an unconfirmed answer whose routine is outside the spec.
 -/
 import Sqldiff.Ast
 import Sqldiff.Mirror.Check
@@ -252,10 +253,29 @@ answer (the slice grew; the theorem is the same), and its `"residual"`
 names the string facts it rests on (`ASM-CONCAT-NULL`,
 `ASM-BINARY-COLLATION`, `ASM-TSQL-LEN-BMP`, `ASM-TSQL-STRING-ARGS`;
 `Sqldiff.Mirror.residual`). A reader that does not know one of them must
-not treat the answer as a C2a one. -/
+not treat the answer as a C2a one.
+
+* `"why"` (0.13.0), on an **unconfirmed** answer whose reason is "the
+  T-SQL routine is outside the C1 spec" or "the PL/pgSQL routine is
+  outside the C1 spec" only: the reason codes of that routine
+  (`Sqldiff.Mirror.why`, `Sqldiff/Mirror/Diagnose.lean`; the table is in
+  `README.md`, "Refusal diagnostics"), an array of at most 24 distinct
+  ASCII strings `family:detail`, never empty. Untrusted and
+  informational: it names the constructs the lowering refused, it is
+  computed only after the answer is decided, and a reader may ignore it.
+  Other unconfirmed answers carry no `"why"`. -/
+def whyField (codes : List String) : String :=
+  ",\"why\":[" ++ ",".intercalate (codes.map fun c => "\"" ++ c ++ "\"") ++ "]"
+
 def extra (dep cat ra rb : String) (ans : Answer) : String :=
   match ans with
-  | .unconfirmed _ => ""
+  | .unconfirmed r =>
+    -- 0.13.0: the reason codes of the routine that does not lower.
+    if r == reasonOutsideT || r == reasonOutsideP then
+      match deployment? dep, catalog? cat, Ast.decodeRoutineLine ra, Ast.decodeRoutineLine rb with
+      | some d, some g, some a, some b => whyField (why d g a b)
+      | _, _, _, _ => ""
+    else ""
   | .confirmed t =>
     let a := Ast.decodeRoutineLine ra
     -- The conversion's own `COMMIT`s, which lower to nothing.
