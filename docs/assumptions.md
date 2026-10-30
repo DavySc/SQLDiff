@@ -12,9 +12,9 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 |---|---|---|
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 55 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 21 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 103 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 104 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 29 |
-| | Total | 208 |
+| | Total | 209 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -128,6 +128,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-IDENTITY-VALUES` | Identity columns hand out the same values on both sides: nobody relies on gaps, and explicit values go in the same way. | `deployment` | How callers write identity columns and read their values. | `sqldiff-core/src/equiv/table.rs` |
 | `ASM-INDEX-NAME-SCHEMA` | No other index, table, view or sequence in the schema has the index's name on the target. | `catalog` | The target schema's object names. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/ddl.rs` |
 | `ASM-ISNULL-TYPE` | The ISNULL fallback fits the type of the first argument (ISNULL converts to it, COALESCE takes the wider type). | `catalog` | The types of both arguments. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/profiles/rules/tsql-pg.rules` |
+| `ASM-JSON-PATH-VALUES` | The JSON documents read with JSON_QUERY or JSON_VALUE of a top-level key are valid JSON objects or arrays (nothing after the value) with no duplicate keys, no key written with escapes, no \u0000 or unpaired surrogate escapes, and each string JSON_VALUE reads is at most 4,000 characters. | `deployment` | The application writes such documents: on these, JSON_QUERY and JSON_VALUE in lax mode and PostgreSQL's json operators (->, ->> and json_typeof) read the same values, fragments and numbers as written (checked on SQL Server 2022 and PostgreSQL 18). | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-LASTVAL-SAME-INSERT` | No trigger on the target table inserts into another table with a sequence, so lastval() is the key of this INSERT. | `catalog` | The triggers on the table in the catalog. | `sqldiff-core/profiles/rules/idioms.rules` |
 | `ASM-LISTAGG` | The aggregated list fits LISTAGG's maximum length (STRING_AGG over MAX types has none). | `deployment` | The data never aggregates a longer list. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-LITERAL-FRACTION` | No stored value lies within half a microsecond of a 7-digit time literal without being equal to it. | `deployment` | The data was moved with the same rounding. | `sqldiff-convert/src/tsql.rs` |

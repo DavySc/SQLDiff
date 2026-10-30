@@ -5895,6 +5895,19 @@ impl<'a> Cx<'a> {
                 if not_null { " NOT NULL" } else { "" }
             ));
         }
+        if let Some((ty, expr)) = self.computed_json(e, it[as_at].pos.0)? {
+            self.step_ts("tsql.table.computed-json", &it[as_at..]);
+            self.note(Status::Assumptions, "ASM-JSON-PATH-VALUES", &format!(
+                "The computed column {0} becomes a STORED generated column that reads the key with PostgreSQL's json operators: json_typeof tells a value (JSON_VALUE) from an object or array (JSON_QUERY), and the other kind gives NULL, as SQL Server's lax mode does. The json type keeps the text as written, so fragments and numbers read the same. The same value only for documents that are valid JSON objects or arrays without duplicate keys, keys written with escapes, \\u0000 or unpaired surrogate escapes, and for JSON_VALUE strings of at most 4,000 characters (ASM-JSON-PATH-VALUES). {1} Both refuse a value written into the column. Not the same: an INSERT without a column list skips {0} in T-SQL but not in PostgreSQL (the engine compares no such INSERT), and PostgreSQL accepts the keyword DEFAULT for it.",
+                name.trim(),
+                if persisted { "T-SQL stores it too (PERSISTED)." } else { "T-SQL computes it when the row is read, PostgreSQL when the row is written." }
+            ));
+            return Ok(format!(
+                "{} {ty} GENERATED ALWAYS AS ({expr}) STORED{}",
+                name.trim(),
+                if not_null { " NOT NULL" } else { "" }
+            ));
+        }
         let es = sig(e);
         if es.len() < 2 || !e[es[0]].is("CASE") || !e[*es.last().unwrap()].is("END") {
             return no(format!(
@@ -6020,35 +6033,7 @@ impl<'a> Cx<'a> {
                     parts.push(self.expr(a).trim().to_string());
                 }
                 [t] if matches!(t.k, IDENT | QUOTED_IDENT) && !t.s.starts_with('@') => {
-                    let key = tsql_unquote(&t.s).to_ascii_lowercase();
-                    let ty: Vec<T> = self
-                        .table_items
-                        .iter()
-                        .find_map(|item| {
-                            let s = sig(item);
-                            let f = *s.first()?;
-                            (tsql_unquote(&item[f].s).to_ascii_lowercase() == key
-                                && !constraint_item(&item[f]))
-                            .then(|| s[1..].iter().map(|&k| item[k].clone()).collect())
-                        })
-                        .ok_or_else(|| No(REASON.into()))?;
-                    // `nvarchar(n)`, `varchar(n)` or `… (max)`, then column options.
-                    let word = ty.first().map(|t| tsql_unquote(&t.s).to_ascii_lowercase());
-                    let n = match word.as_deref() {
-                        Some("nvarchar") => true,
-                        Some("varchar") => false,
-                        _ => return no(REASON),
-                    };
-                    let l = match ty.get(1..4) {
-                        Some([o, v, c]) if o.k == L_PAREN && c.k == R_PAREN => {
-                            if v.is("MAX") {
-                                None
-                            } else {
-                                Some(v.s.parse::<u32>().map_err(|_| No(REASON.into()))?)
-                            }
-                        }
-                        _ => return no(REASON),
-                    };
+                    let (n, l) = self.string_column(t).ok_or_else(|| No(REASON.into()))?;
                     national |= n;
                     len = len.zip(l).map(|(x, y)| x + y);
                     parts.push(format!("COALESCE({}, '')", self.expr(a).trim()));
@@ -6071,6 +6056,102 @@ impl<'a> Cx<'a> {
         ];
         let (ty, _, _) = self.ty(&ty)?;
         Ok(Some((ty, parts.join(" || "))))
+    }
+
+    /// A varying-string column of the table being created:
+    /// `(national, length)`, the length `None` for `max`.
+    fn string_column(&self, t: &T) -> Option<(bool, Option<u32>)> {
+        let key = tsql_unquote(&t.s).to_ascii_lowercase();
+        let ty: Vec<T> = self.table_items.iter().find_map(|item| {
+            let s = sig(item);
+            let f = *s.first()?;
+            (tsql_unquote(&item[f].s).to_ascii_lowercase() == key && !constraint_item(&item[f]))
+                .then(|| s[1..].iter().map(|&k| item[k].clone()).collect())
+        })?;
+        // `nvarchar(n)`, `varchar(n)` or `… (max)`, then column options.
+        let national = match tsql_unquote(&ty.first()?.s).to_ascii_lowercase().as_str() {
+            "nvarchar" => true,
+            "varchar" => false,
+            _ => return None,
+        };
+        match ty.get(1..4) {
+            Some([o, v, c]) if o.k == L_PAREN && c.k == R_PAREN => {
+                if v.is("MAX") {
+                    Some((national, None))
+                } else {
+                    Some((national, Some(v.s.parse::<u32>().ok()?)))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `JSON_QUERY(col, '$.key')` or `JSON_VALUE(col, '$.key')` of a
+    /// varying-string column of the table, in lax mode: the PostgreSQL type
+    /// SQL Server gives the result (`nvarchar(max)`, `nvarchar(4000)`) and
+    /// the plain `json` expression that reads the same value
+    /// (ASM-JSON-PATH-VALUES). `json`, not `jsonb`, keeps a fragment's text
+    /// and a number's digits as written, as SQL Server returns them. `None`
+    /// when `e` is neither call; refused for other paths and sources.
+    fn computed_json(&mut self, e: &[T], at: usize) -> R<Option<(String, String)>> {
+        let es = sig(e);
+        let query = match es.first().map(|&k| &e[k]) {
+            Some(t) if t.is("JSON_QUERY") => true,
+            Some(t) if t.is("JSON_VALUE") => false,
+            _ => return Ok(None),
+        };
+        if !(es.len() >= 3
+            && e[es[1]].k == L_PAREN
+            && matching(e, es[1]) == Some(*es.last().unwrap()))
+        {
+            return Ok(None);
+        }
+        const REASON: &str = "computed column: JSON_QUERY and JSON_VALUE are converted only for a string column of the table and a lax path '$.key' to a top-level key of letters, digits and underscores";
+        let args = split_commas(&e[es[1] + 1..*es.last().unwrap()]);
+        let [src, path] = args.as_slice() else {
+            return no(REASON);
+        };
+        let ([c], [p]) = (trimmed(src), trimmed(path)) else {
+            return no(REASON);
+        };
+        if !matches!(c.k, IDENT | QUOTED_IDENT) || c.s.starts_with('@') || p.k != STRING {
+            return no(REASON);
+        }
+        self.string_column(c).ok_or_else(|| No(REASON.into()))?;
+        let body = p.s[usize::from(p.s.starts_with(['N', 'n']))..]
+            .trim_matches('\'')
+            .replace("''", "'");
+        let key = body
+            .strip_prefix("lax ")
+            .unwrap_or(&body)
+            .strip_prefix("$.")
+            .filter(|k| {
+                let mut c = k.chars();
+                c.next()
+                    .is_some_and(|f| f.is_ascii_alphabetic() || f == '_')
+                    && c.all(|x| x.is_ascii_alphanumeric() || x == '_')
+            })
+            .ok_or_else(|| No(REASON.into()))?
+            .to_string();
+        let x = format!("CAST({} AS json)", self.expr(trimmed(src)).trim());
+        let expr = if query {
+            format!("CASE WHEN json_typeof({x} -> '{key}') IN ('object', 'array') THEN CAST({x} -> '{key}' AS text) END")
+        } else {
+            format!("CASE WHEN json_typeof({x} -> '{key}') NOT IN ('object', 'array') THEN {x} ->> '{key}' END")
+        };
+        let made = |k, s: &str| T::made(k, s, at, "tsql.table.computed-json");
+        let ty = [
+            made(IDENT, "nvarchar"),
+            made(L_PAREN, "("),
+            if query {
+                made(IDENT, "max")
+            } else {
+                made(NUMBER, "4000")
+            },
+            made(R_PAREN, ")"),
+        ];
+        let (ty, _, _) = self.ty(&ty)?;
+        Ok(Some((ty, expr)))
     }
 
     fn alter_table(&mut self, ts: &[T]) -> R<String> {

@@ -225,6 +225,12 @@ pub mod asm {
         "ASM-OPENJSON-VALUES",
         "The JSON documents read with OPENJSON are valid JSON (nothing after the value), an object or an array of objects, with no duplicate keys, no \\u0000 escape and no unpaired surrogate escape; each value a WITH column reads is null or a scalar in its type's plain form: a string of Basic Multilingual Plane characters for nvarchar, an integer number in range for int and bigint, a number without exponent for decimal, a 'yyyy-mm-dd' string for date, true, false, 0 or 1 for bit",
     );
+    /// T-SQL JSON_QUERY/JSON_VALUE of a top-level key and its PostgreSQL
+    /// `json` form (`json_path`).
+    pub const JSON_PATH_VALUES: (&str, &str) = (
+        "ASM-JSON-PATH-VALUES",
+        "The JSON documents read with JSON_QUERY or JSON_VALUE are valid JSON objects or arrays (nothing after the value) with no duplicate keys, no key written with escapes, no \\u0000 escape and no unpaired surrogate escape, and each string JSON_VALUE reads is at most 4,000 characters",
+    );
     /// An OPENJSON source of UPDATE … FROM reads one row per target row.
     pub const OPENJSON_ONE_ROW: (&str, &str) = (
         "ASM-OPENJSON-ONE-ROW",
@@ -1576,6 +1582,13 @@ impl<'a> Canon<'a> {
                 let v = self.expr(x)?;
                 self.cast(dst, v)
             }
+            // The converter's JSON_QUERY/JSON_VALUE of a top-level key.
+            Expr::Case(None, whens, None)
+                if self.d == Dialect::Postgres && pg_json_path(whens).is_some() =>
+            {
+                let (query, src, key) = pg_json_path(whens).unwrap();
+                self.json_path(query, src, &key)?
+            }
             Expr::Case(op, whens, els) => {
                 let mut kids = Vec::new();
                 match op {
@@ -2165,6 +2178,11 @@ impl<'a> Canon<'a> {
         if let Some(part) = own_name(self.unit, c) {
             self.assume(asm::PROCID_NAME);
             return self.expr(&Expr::Str(part));
+        }
+        if d == Dialect::Tsql && plain && !c.within_group {
+            if let Some((query, src, key)) = tsql_json_path(&name, &c.args) {
+                return self.json_path(query, src, &key);
+            }
         }
         // Aggregates and functions with special forms first.
         match (d, name.as_str()) {
@@ -3638,6 +3656,32 @@ impl<'a> Canon<'a> {
     /// see [`pg_json_rows`]), under `alias` or `openjson`. Both sides lower
     /// to `(openjson table src (cols (jc name key mode type)...))`; a column reads
     /// as `(col table name)` with its own side's type.
+    /// T-SQL `JSON_QUERY(x, '$.key')` / `JSON_VALUE(x, '$.key')` (lax) and
+    /// the converter's PostgreSQL `json` form (`pg_json_path`): one term
+    /// under ASM-JSON-PATH-VALUES. The source must be a string on both
+    /// sides (a `jsonb` source would have lost the text as written). The
+    /// type is SQL Server's: `nvarchar(max)` for JSON_QUERY,
+    /// `nvarchar(4000)` for JSON_VALUE.
+    fn json_path(&mut self, query: bool, src: &Expr, key: &str) -> R<(Term, Option<Ty>)> {
+        let (x, ty) = self.expr(src)?;
+        let what = if query { "json_query" } else { "json_value" };
+        if !ty.is_some_and(|t| t.is_string()) {
+            return Ok((n("dfn", vec![self.dtag(), a(what), x]), None));
+        }
+        self.assume(asm::JSON_PATH_VALUES);
+        // The key in hex: JSON keys are case-sensitive.
+        let key: String = key.bytes().map(|b| format!("{b:02x}")).collect();
+        let len = (!query).then_some(4000);
+        Ok((
+            n("jsonpath", vec![a(what), x, a(format!("key:{key}"))]),
+            Some(Ty {
+                fam: Fam::VarChar,
+                len,
+                scale: None,
+            }),
+        ))
+    }
+
     fn json_rows(&mut self, src: &Expr, fields: &[JsonField], alias: &Option<String>) -> R<Term> {
         let (st, _) = self.expr(src)?;
         if !st.is("sym") {
@@ -6990,6 +7034,72 @@ fn openjson_fields<'e>(
 }
 
 /// `name(args)`: a plain call of the function `name`.
+/// T-SQL `JSON_QUERY(x, '[lax ]$.key')` or `JSON_VALUE(…)` of a plain
+/// top-level key: (whether JSON_QUERY, x, key).
+fn tsql_json_path<'e>(name: &str, args: &'e [Expr]) -> Option<(bool, &'e Expr, String)> {
+    let query = match name {
+        "json_query" => true,
+        "json_value" => false,
+        _ => return None,
+    };
+    let [x, Expr::Str(path)] = args else {
+        return None;
+    };
+    let key = path
+        .strip_prefix("lax ")
+        .unwrap_or(path)
+        .strip_prefix("$.")?;
+    plain_key(key).then(|| (query, x, key.to_string()))
+}
+
+/// The converter's PostgreSQL form of a T-SQL JSON_QUERY or JSON_VALUE of
+/// a top-level key (`computed_json`), `x` a string:
+/// `CASE WHEN json_typeof(CAST(x AS json) -> 'key') IN ('object', 'array')
+/// THEN CAST(CAST(x AS json) -> 'key' AS text) END` (JSON_QUERY) and
+/// `CASE WHEN json_typeof(CAST(x AS json) -> 'key') NOT IN ('object',
+/// 'array') THEN CAST(x AS json) ->> 'key' END` (JSON_VALUE): (whether
+/// JSON_QUERY, x, key). Exactly this shape; anything else is `None`.
+fn pg_json_path(whens: &[(Expr, Expr)]) -> Option<(bool, &Expr, String)> {
+    let [(Expr::InList(t, kinds, not), v)] = whens else {
+        return None;
+    };
+    let [Expr::Str(o), Expr::Str(r)] = kinds.as_slice() else {
+        return None;
+    };
+    if o != "object" || r != "array" {
+        return None;
+    }
+    let Expr::Call(c) = &**t else {
+        return None;
+    };
+    let [arrow] = c.args.as_slice() else {
+        return None;
+    };
+    if !is_call(t, "json_typeof", &[arrow]) {
+        return None;
+    }
+    let Expr::Bin(op, j, k) = arrow else {
+        return None;
+    };
+    let (Expr::Cast(x, jt), Expr::Str(key)) = (&**j, &**k) else {
+        return None;
+    };
+    if op != "->" || !jt.name.eq_ignore_ascii_case("JSON") || !jt.args.is_empty() || !plain_key(key)
+    {
+        return None;
+    }
+    let same = match (*not, v) {
+        // JSON_VALUE: the value as text.
+        (true, Expr::Bin(op, j2, k2)) => op == "->>" && j2 == j && k2 == k,
+        // JSON_QUERY: the fragment as written.
+        (false, Expr::Cast(f, tt)) => {
+            tt.name.eq_ignore_ascii_case("TEXT") && tt.args.is_empty() && **f == *arrow
+        }
+        _ => false,
+    };
+    same.then(|| (!*not, &**x, key.clone()))
+}
+
 fn is_call(e: &Expr, name: &str, args: &[&Expr]) -> bool {
     matches!(e, Expr::Call(c)
         if matches!(c.name.as_slice(), [f] if f.eq_ignore_ascii_case(name))
