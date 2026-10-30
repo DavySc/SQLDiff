@@ -124,7 +124,7 @@ def addP : Ast.Routine := procP addBodyP addDeclsP
 -- `NOT NULL` column can fail (`XACT_ABORT ON`), after a write; the T-SQL
 -- parameter `@c` is a string. No string comparison: no collation fact.
 #guard residualOf depc Γc addT ==
-  some ["ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN"]
+  some ["ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN", "ASM-TSQL-ROWCOUNT-0"]
 #guard (lowerT depc Γc addT).map Core.Routine.hasQuery == some true
 
 /- The lowered `INSERT`: the left-out columns with a default, `City` and
@@ -258,7 +258,7 @@ def plainEq : Ast.Expr := .Bin "=" (pv "Name") (pv "v_n")
 def trimEq : Ast.Expr := .Bin "=" (fn "rtrim" [pv "Name"]) (fn "rtrim" [pv "v_n"])
 #guard isC2a (checkC delT (delP trimEq) Γcb)
 #guard residualOf depc Γcb delT ==
-  some ["ASM-TSQL-ANSI-NULLS", "ASM-BINARY-COLLATION", "ASM-TSQL-STRING-ARGS"]
+  some ["ASM-TSQL-ANSI-NULLS", "ASM-BINARY-COLLATION", "ASM-TSQL-STRING-ARGS", "ASM-TSQL-ROWCOUNT-0"]
 #guard reasonOf (checkC delT (delP plainEq) Γcb) == "the lowered routines differ beyond the renaming"
 #guard isC1 (checkC delT (delP plainEq))
 -- Why: `'ab '` is deleted by T-SQL `Name = 'ab'`, not by PostgreSQL's `=`.

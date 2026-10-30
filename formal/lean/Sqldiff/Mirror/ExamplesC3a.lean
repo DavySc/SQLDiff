@@ -131,7 +131,8 @@ def bumpP (body : List Ast.Node := bumpBodyP) (params : List Ast.Param := [inP "
 -- What the answer carries: the session facts, and that the routine can
 -- fail (the `INSERT` on a duplicate key, an overflow) after writing.
 #guard (residualOf depd Γd bumpT) ==
-  some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN"]
+  some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS",
+    "ASM-NO-CALLER-TXN", "ASM-TSQL-ROWCOUNT-0"]
 #guard ((lowerT depd Γd bumpT).map Core.Routine.hasData) == some true
 
 /-- The lowered T-SQL procedure, as the core sees it: column names are the
@@ -156,7 +157,7 @@ def safeP : Ast.Routine :=
     upd ["acct"] [("qty", .Null)] (some (.IsNull (pv "p_id") true)),
     del ["acct"] (some (.IsNull (pv "qty") false))]
 #guard isC2a (checkD safeT safeP ⟨[("@id", "p_id"), (statusVar, statusVar)]⟩)
-#guard (residualOf depd Γd safeT) == some ["ASM-TSQL-STRING-ARGS"]
+#guard (residualOf depd Γd safeT) == some ["ASM-TSQL-STRING-ARGS", "ASM-TSQL-ROWCOUNT-0"]
 
 -- `DELETE` without `WHERE` and `UPDATE` without `WHERE`.
 #guard isC2a (checkD

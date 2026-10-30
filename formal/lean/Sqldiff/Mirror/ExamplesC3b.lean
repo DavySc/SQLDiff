@@ -140,7 +140,8 @@ def lookP (body : List Ast.Node := lookBodyP) (ps : List Ast.Param :=
 
 #guard isC2a (checkQ lookT lookP)
 -- `COUNT(*)` can overflow (2^31 rows); `Id = @id` compares with `=`.
-#guard residualOf depq Γq lookT == some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN"]
+#guard residualOf depq Γq lookT ==
+  some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN", "ASM-TSQL-ROWCOUNT-0"]
 #guard (lowerT depq Γq lookT).map Core.Routine.hasQuery == some true
 -- The `EXISTS` variable is a local of both lowered routines.
 #guard (lowerT depq Γq lookT).map (·.locals) == some [existsVar]
@@ -168,7 +169,8 @@ def readP : Ast.Routine :=
     .If (existsT ["acct"] none) [] [set (pv "p_q") .Null]]
 def readCert : Cert := ⟨[("@id", "p_id"), ("@q", "p_q"), (statusVar, statusVar)]⟩
 #guard isC2a (checkQ readT readP readCert)
-#guard residualOf depq Γq readT == some ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"]
+#guard residualOf depq Γq readT ==
+  some ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS", "ASM-TSQL-ROWCOUNT-0"]
 -- `SELECT *` in `EXISTS`, `e = k` the other way round, and `@x` in the
 -- `WHERE` of a read with the key fixed by a literal.
 #guard isC2a (checkQ

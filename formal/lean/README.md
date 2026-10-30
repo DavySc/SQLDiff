@@ -326,7 +326,21 @@ corrects C2a, which observed the world after a failed call.)
   read (the deployment's choice, as before);
 - the residuals of the answer: `ASM-TSQL-ARITH-ERRORS`,
   `ASM-TSQL-ANSI-NULLS` (it also decides which rows a `WHERE` with `=`
-  matches), and `ASM-STATE-AFTER-ERROR`;
+  matches), `ASM-STATE-AFTER-ERROR`, and (checker 0.15.0)
+  `ASM-TSQL-ROWCOUNT-0`: callers run the routine with `SET ROWCOUNT 0`,
+  the default. A caller's `SET ROWCOUNT n` is inherited by the routine
+  and limits the rows its `INSERT`, `UPDATE`, `DELETE` and `SELECT`
+  statements touch or read, and PostgreSQL has no such setting
+  (`eval/session`, R1 to R4, SQL Server 2022 and PostgreSQL 18.6: under a
+  caller's `SET ROWCOUNT 1` an `UPDATE` and a `DELETE` of three rows
+  touch one and a three-row `INSERT ... VALUES` inserts one; the
+  converted procedure touches all three). Every routine with a data
+  statement or a query names it (`Sqldiff.Mirror.residual`), and the
+  Rust side adds it to every confirmation whose `statements` is `c3a` or
+  `c3b` (also on the C1 path and from an older checker). It is not
+  discharged by the routine's text: the reader keeps only `ON`/`OFF`
+  options as `Setting`s, so a routine that begins with `SET ROWCOUNT 0`
+  is outside the spec;
 - the parser: `sqldiff_syntax` reads routines with the extended parser,
   which drops a T-SQL `OUTPUT` clause on `INSERT`/`UPDATE` and the
   qualifier of `SET t.c = e`; the Lean side cannot see either, so the Rust
@@ -403,7 +417,12 @@ quoted from memory in `Lower.lean`; `ASM-TABLES-AS-DECLARED` for the read
 tables too (the Rust side now sends a plain table a routine only reads,
 `cert.rs`, `read_tables`); `ASM-TSQL-ANSI-NULLS` when a `WHERE` uses `=`;
 `ASM-TSQL-ARITH-ERRORS` when the routine counts rows; decision 1's serial
-execution (other sessions' writes are not modelled). No new residual id.
+execution (other sessions' writes are not modelled). No new residual id
+in C3b; since checker 0.15.0 a routine that reads names
+`ASM-TSQL-ROWCOUNT-0` (see C3a). The read shapes return at most one row
+each and showed no change under a caller's `SET ROWCOUNT 1`
+(`eval/session` R3), where a pick over several rows did; they name it all
+the same, since the setting applies to every `SELECT`.
 A confirmed answer whose routines read a table carries `"statements":
 "c3b"`.
 

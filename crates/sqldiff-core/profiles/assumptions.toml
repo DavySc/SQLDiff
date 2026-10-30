@@ -1291,6 +1291,13 @@ fact = "The session settings of the callers."
 sites = ["sqldiff-convert/src/cert.rs"]
 
 [[assumption]]
+id = "ASM-TSQL-ROWCOUNT-0"
+statement = "Callers run the routine with SET ROWCOUNT 0 (the default): a caller's SET ROWCOUNT n is inherited by the routine and limits the rows its INSERT, UPDATE, DELETE and SELECT statements touch or read; PostgreSQL has no such setting (probed on SQL Server 2022, eval/session)."
+discharge = "deployment"
+fact = "The session settings of the callers: no SET ROWCOUNT other than 0 before a call."
+sites = ["sqldiff-convert/src/cert.rs"]
+
+[[assumption]]
 id = "ASM-TSQL-RETURN-NULL-WARNING"
 statement = "Callers do not read the warning T-SQL sends when a procedure returns NULL (the status is 0 on both sides)."
 discharge = "deployment"

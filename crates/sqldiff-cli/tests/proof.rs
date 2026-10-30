@@ -476,11 +476,13 @@ fn the_real_checker_confirms_data_statements_on_a_plain_table() {
         .iter()
         .map(|a| a.as_str().unwrap())
         .collect();
-    // The UPDATE can overflow after the INSERT wrote.
+    // The UPDATE can overflow after the INSERT wrote; a caller's SET
+    // ROWCOUNT would limit the rows the statements touch (eval/session).
     for a in [
         "ASM-STATE-AFTER-ERROR",
         "ASM-TABLES-AS-DECLARED",
         "ASM-OBSERVER-ROWCOUNT",
+        "ASM-TSQL-ROWCOUNT-0",
     ] {
         assert!(asm.contains(&a), "{a}: {r}");
     }
@@ -568,11 +570,13 @@ fn the_real_checker_confirms_reads_of_a_plain_table() {
         .map(|a| a.as_str().unwrap())
         .collect();
     // COUNT(*) can overflow; `Id = @id` compares with `=`; the table is
-    // taken as declared. Reads send no rows-affected count.
+    // taken as declared; the reads run under the caller's SET ROWCOUNT.
+    // Reads send no rows-affected count.
     for a in [
         "ASM-TSQL-ARITH-ERRORS",
         "ASM-TSQL-ANSI-NULLS",
         "ASM-TABLES-AS-DECLARED",
+        "ASM-TSQL-ROWCOUNT-0",
     ] {
         assert!(asm.contains(&a), "{a}: {r}");
     }
@@ -782,6 +786,7 @@ fn the_real_checker_confirms_a_table_with_strings_defaults_and_an_index() {
         "ASM-TSQL-ANSI-PADDING",
         "ASM-STATE-AFTER-ERROR",
         "ASM-TSQL-STRING-ARGS",
+        "ASM-TSQL-ROWCOUNT-0",
     ] {
         assert!(asm.contains(&a), "{a}: {r}");
     }
@@ -890,6 +895,7 @@ fn the_real_checker_confirms_typed_values() {
         "ASM-TSQL-ANSI-NULLS",
         "ASM-DATEADD-RANGE",
         "ASM-TABLES-AS-DECLARED",
+        "ASM-TSQL-ROWCOUNT-0",
     ] {
         assert!(asm.contains(&a), "{a}: {r}");
     }
@@ -1194,6 +1200,7 @@ fn the_real_checker_discharges_the_try_subtransaction_note() {
         "ASM-CATCH-CORE-ERRORS",
         "ASM-STATE-AFTER-ERROR",
         "ASM-NO-CALLER-TXN",
+        "ASM-TSQL-ROWCOUNT-0",
     ] {
         assert!(stdout.contains(open), "{open}: {stdout}");
     }

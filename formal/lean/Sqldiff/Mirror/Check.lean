@@ -171,6 +171,27 @@ And, for errors and transactions (C4, `Sqldiff.Mirror`, "The C4 rules"):
   callers do not tell such errors apart by the T-SQL error number (the
   PostgreSQL caller sees SQLSTATE P0001).
 
+And, for data statements and queries (C3a, C3b), one more fact about the
+caller's session:
+
+* `ASM-TSQL-ROWCOUNT-0`, when the routine has a data statement or a query
+  (`Core.Routine.hasData`, `Core.Routine.hasQuery`): callers run the
+  routine with `SET ROWCOUNT 0` (the default). A caller's `SET ROWCOUNT n`
+  is inherited by the routine and limits the rows its `INSERT`, `UPDATE`,
+  `DELETE` and `SELECT` statements touch or read ("SET ROWCOUNT
+  (Transact-SQL)", quoted from memory: it applies to those four
+  statements, and a `SET` inside a procedure lasts until it returns);
+  PostgreSQL has no such setting (`SET rowcount` raises 42704). Probed on
+  SQL Server 2022 and PostgreSQL 18.6 (eval/session R1 to R4): under a
+  caller's `SET ROWCOUNT 1` the routine's `UPDATE` and `DELETE` of three
+  rows touch one, a three-row `INSERT ... VALUES` inserts one, while the
+  converted procedure touches all three. The C3b shapes read at most one
+  row each and showed no change under `ROWCOUNT 1` (R3); a query names
+  the id all the same, since the setting applies to every `SELECT` and
+  the core does not model it. Not discharged by the routine's own text:
+  the reader keeps `SET ROWCOUNT 0` as no `Setting` (only the `ON`/`OFF`
+  options), so a routine that starts with it is outside the spec.
+
 `ASM-STATE-AFTER-ERROR` is decided on the settled routine
 (`Core.Routine.settle`): a handled body that cannot fail after a write
 leaves nothing behind when it fails, which is what `undo` says. -/
@@ -187,7 +208,8 @@ def residual (a : Ast.Routine) (ca : Core.Routine) (bTxn : Bool := false) : List
     (if ca.hasCatch then ["ASM-CATCH-CORE-ERRORS"] else []) ++
     (if ca.catches || ca.hasCommit || tsqlTxn a || bTxn || ca.mayFail then ["ASM-NO-CALLER-TXN"]
       else []) ++
-    (if ca.raisesUser then ["ASM-THROW-ERRCODE"] else [])
+    (if ca.raisesUser then ["ASM-THROW-ERRCODE"] else []) ++
+    (if ca.hasData || ca.hasQuery then ["ASM-TSQL-ROWCOUNT-0"] else [])
 
 /-- The routines use C4: a handler, a raised error or transaction
 control (the `"errors"` field of an answer). -/

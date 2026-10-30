@@ -224,7 +224,9 @@ pub const C1_NO_ERRORS: &str = "ASM-C1-NO-ERRORS";
 /// binary (only sent when the deployment accepts it), `LEN` sees no
 /// character outside the BMP, and string arguments fit their parameters.
 /// With dates (C2c): the two DATEADD facts the converter notes too.
-pub const C2A_RESIDUALS: [&str; 12] = [
+/// With data statements or queries (C3a, C3b): callers run the routine
+/// with `SET ROWCOUNT 0`.
+pub const C2A_RESIDUALS: [&str; 13] = [
     "ASM-TSQL-ARITH-ERRORS",
     "ASM-TSQL-ANSI-NULLS",
     "ASM-STATE-AFTER-ERROR",
@@ -243,7 +245,17 @@ pub const C2A_RESIDUALS: [&str; 12] = [
     "ASM-CATCH-CORE-ERRORS",
     "ASM-NO-CALLER-TXN",
     "ASM-THROW-ERRCODE",
+    // C3a, C3b: a caller's SET ROWCOUNT n limits the rows the routine's
+    // INSERT, UPDATE, DELETE and SELECT statements touch (eval/session).
+    ROWCOUNT_0,
 ];
+
+/// A routine with a data statement or a query (`statements` `c3a` or
+/// `c3b`) runs as converted only under `SET ROWCOUNT 0`, the default: a
+/// caller's `SET ROWCOUNT n` is inherited by the T-SQL routine and limits
+/// the rows its INSERT, UPDATE, DELETE and SELECT statements touch or read,
+/// and PostgreSQL has no such setting (eval/session, R1 to R4).
+pub const ROWCOUNT_0: &str = "ASM-TSQL-ROWCOUNT-0";
 
 /// Residual ids the checker names whenever a routine needs them, so a
 /// `c2a` confirmation without one proves the converter's note of it.
@@ -1295,6 +1307,7 @@ pub fn certify(
                                     proof::Answer::Confirmed { theorem } => {
                                         c.assumptions = confirmed_rests_on(
                                             m.scalars.as_deref(),
+                                            m.statements.as_deref(),
                                             &m.residual,
                                             assumptions,
                                         );
@@ -1506,8 +1519,16 @@ fn has_double_quoted_name(text: &str, d: Dialect) -> bool {
 
 /// What a confirmation rests on: the C2a slice's residual assumptions
 /// when every expression was in it, else the C1 caveats (operators taken
-/// to mean the same, runs without errors); then the routine's own.
-fn confirmed_rests_on(scalars: Option<&str>, residual: &[String], own: Vec<String>) -> Vec<String> {
+/// to mean the same, runs without errors); then the routine's own. A
+/// routine with data statements or queries also rests on `ROWCOUNT_0`,
+/// which the C1 caveats do not cover and a checker before 0.15.0 does not
+/// name.
+fn confirmed_rests_on(
+    scalars: Option<&str>,
+    statements: Option<&str>,
+    residual: &[String],
+    own: Vec<String>,
+) -> Vec<String> {
     // A residual the registry does not know (a checker newer than this
     // build) is not trusted to mean anything: fall back to the C1 caveats.
     let known = residual
@@ -1518,6 +1539,9 @@ fn confirmed_rests_on(scalars: Option<&str>, residual: &[String], own: Vec<Strin
     } else {
         vec![C1_OPERATORS.to_string(), C1_NO_ERRORS.to_string()]
     };
+    if matches!(statements, Some("c3a" | "c3b")) && !out.iter().any(|a| a == ROWCOUNT_0) {
+        out.push(ROWCOUNT_0.to_string());
+    }
     for a in own {
         if !out.contains(&a) {
             out.push(a);
@@ -2183,6 +2207,41 @@ END
         assert_eq!(certs[0].why, ["check:differ:assign", "check:differ:if"]);
         let json = serde_json::to_value(&certs[0]).unwrap();
         assert_eq!(json["why"].as_array().unwrap().len(), 2);
+    }
+
+    /// A confirmation with data statements or queries rests on the
+    /// caller's `SET ROWCOUNT 0` whichever path it took: the checker's
+    /// residual names it from 0.15.0, the C1 caveats do not cover it, and
+    /// an older checker's residual lacks it.
+    #[test]
+    fn data_statements_and_queries_rest_on_rowcount_0() {
+        let own = vec!["ASM-TABLES-AS-DECLARED".to_string()];
+        let named = vec![STRING_ARGS.to_string(), ROWCOUNT_0.to_string()];
+        assert_eq!(
+            confirmed_rests_on(Some("c2a"), Some("c3a"), &named, own.clone()),
+            [STRING_ARGS, ROWCOUNT_0, "ASM-TABLES-AS-DECLARED"]
+        );
+        // A checker before 0.15.0.
+        let old = vec![STRING_ARGS.to_string()];
+        assert_eq!(
+            confirmed_rests_on(Some("c2a"), Some("c3b"), &old, own.clone()),
+            [STRING_ARGS, ROWCOUNT_0, "ASM-TABLES-AS-DECLARED"]
+        );
+        assert_eq!(
+            confirmed_rests_on(Some("uninterpreted"), Some("c3a"), &[], own),
+            [
+                C1_OPERATORS,
+                C1_NO_ERRORS,
+                ROWCOUNT_0,
+                "ASM-TABLES-AS-DECLARED"
+            ]
+        );
+        // No table, no ROWCOUNT.
+        assert_eq!(
+            confirmed_rests_on(Some("c2a"), Some("c1"), &old, Vec::new()),
+            [STRING_ARGS]
+        );
+        assert!(C2A_RESIDUALS.contains(&ROWCOUNT_0));
     }
 
     /// A checker that answers every mirror request with `answer` and

@@ -130,6 +130,15 @@ confirmed). A pair whose variables' declared types differ is answered
 codes `type:<name>`, `expr:date-literal`, `expr:bit-literal`,
 `expr:dateadd:part`, `expr:datediff:part`, `node:call:type`.
 
+0.15.0 names one more residual, `ASM-TSQL-ROWCOUNT-0`, in a `"c2a"`
+answer whose T-SQL routine has a data statement or a query (`"statements"`
+`"c3a"` or `"c3b"`): callers run the routine with `SET ROWCOUNT 0`, the
+default. A caller's `SET ROWCOUNT n` is inherited by the routine and
+limits the rows its `INSERT`, `UPDATE`, `DELETE` and `SELECT` statements
+touch or read, and PostgreSQL has no such setting (eval/session). No
+other answer changes; a reader that does not know the id must not treat
+the answer as a C2a one. Request format unchanged.
+
 0.16.0 (C3d part 1) reads query blocks in the C3b statement shapes:
 several catalog tables, `[INNER] JOIN ... ON` and `CROSS JOIN`, comma
 lists, aliases (self-joins too) and qualified names ("The C3d blocks" in
@@ -142,7 +151,11 @@ tables still carries `"statements":"c3b"`. New reason codes
 `stmt:select:from:join:<kind>` (in place of `stmt:select:from:join`),
 `stmt:select:from:qualifier`, `stmt:select:from:ref`, `name:ambiguous`,
 `name:column-variable`; `stmt:select:from:alias` and
-`stmt:select:from:multi` are gone. Request format unchanged.
+`stmt:select:from:multi` are gone. Review of C3d: `ASM-NO-CALLER-TXN` is
+also named in a `"c2a"` answer whose routine can fail (an error under
+`XACT_ABORT ON` dooms a caller's T-SQL transaction, eval/queries Q15),
+and a table is sent only when spelt as its DDL declares it. Request
+format unchanged.
 -/
 import Sqldiff.Gate
 import Sqldiff.Mirror.Request
