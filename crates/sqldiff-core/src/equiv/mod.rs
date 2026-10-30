@@ -124,7 +124,10 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Ite
                     None => c.stmt(&ast::Stmt::Return(None)),
                 }
             }
-            (None, Ok(st)) => c.stmt(st),
+            (None, Ok(st)) => match &s.output {
+                Some(o) => c.output_stmt(st, o),
+                None => c.stmt(st),
+            },
         };
         let (term, err) = match res {
             Ok(t) => (t, None),
@@ -1155,10 +1158,13 @@ fn same_stmt(
                    s: &Schema,
                    other: &Unit|
      -> Result<(Term, Vec<Assumption>), String> {
-        let st = ast::parse_stmt(toks, u.dialect)?;
+        let (st, out) = ast::parse_stmt_output(toks, u.dialect)?;
         let mut c = Canon::new(u, s);
         c.fold_quoted = other.dialect == Dialect::Tsql;
-        let t = c.stmt(&st)?;
+        let t = match &out {
+            Some(o) => c.output_stmt(&st, o)?,
+            None => c.stmt(&st)?,
+        };
         Ok((t, std::mem::take(&mut c.asm)))
     };
     let (tx, mut asms) = match lowered(x, ua, sa, ub) {

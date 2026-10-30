@@ -4,7 +4,7 @@
 
 use sqldiff_syntax::{ast as cst, Dialect, SyntaxKind, SyntaxNode};
 
-use super::ast::{parse_stmt, tokens, Expr, Parser, Stmt, Tok, Type, K};
+use super::ast::{parse_stmt, parse_stmt_output, tokens, Expr, Output, Parser, Stmt, Tok, Type, K};
 use super::cursor::{CursorLoop, CursorOp};
 use super::schema::Ty;
 use crate::artifact::Analyzed;
@@ -93,6 +93,9 @@ pub struct LStmt {
     /// A message or error built from a format (`ast` then says why it is
     /// not a plain statement): compared as its text (`Canon::message`).
     pub msg: Option<Msg>,
+    /// The rows the statement returns (T-SQL OUTPUT, PostgreSQL RETURNING
+    /// that is not INTO variables), which `ast` leaves out.
+    pub output: Option<Output>,
     /// A statement of a cursor loop (`cursor.rs`; `ast` then says why it is
     /// not a plain statement): compared as `Canon::cursor_op` says.
     pub cursor: Option<CursorOp>,
@@ -594,6 +597,7 @@ fn assign_loop(c: &SyntaxNode, u: &mut Unit) -> bool {
         ast: Ok(Stmt::Select(sel)),
         from_declare: false,
         msg: None,
+        output: None,
         cursor: None,
     });
     true
@@ -1429,6 +1433,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
             ast,
             from_declare: false,
             msg,
+            output: None,
             cursor: None,
         });
         return;
@@ -1487,7 +1492,10 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         | StmtKind::Return
         | StmtKind::Declare => {
             let toks = tokens(c);
-            let mut ast = parse_stmt(&toks, d);
+            let (mut ast, output) = match parse_stmt_output(&toks, d) {
+                Ok((s, o)) => (Ok(s), o),
+                Err(e) => (Err(e), None),
+            };
             let mut from_declare = false;
             if let Ok(Stmt::Declare { name, ty, default }) = &ast {
                 u.locals.push(Local {
@@ -1512,6 +1520,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                 ast,
                 from_declare,
                 msg: None,
+                output,
                 cursor: None,
             });
         }
@@ -1558,6 +1567,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                         ast,
                         from_declare: false,
                         msg: None,
+                        output: None,
                         cursor: None,
                     });
                 }
@@ -1682,6 +1692,7 @@ fn cursor_stmt(c: &SyntaxNode, u: &mut Unit) -> bool {
         ast: Err("a cursor statement".into()),
         from_declare: false,
         msg: None,
+        output: None,
         cursor: Some(op),
     });
     true
@@ -2220,6 +2231,7 @@ fn pg_declaration(s: &SyntaxNode, u: &mut Unit) {
         ast,
         from_declare: true,
         msg: None,
+        output: None,
         cursor: None,
     });
 }

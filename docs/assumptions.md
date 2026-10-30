@@ -10,11 +10,11 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 
 | Discharge | Meaning | Ids |
 |---|---|---|
-| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 52 |
+| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 53 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 19 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 95 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 96 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 29 |
-| | Total | 195 |
+| | Total | 197 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -139,6 +139,8 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-NOLOCK` | Results read without NOLOCK are the same: no other transaction writes while the query runs (concurrency is not observed). | `deployment` | Callers do not depend on reading uncommitted rows. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-OBSERVER-ROWCOUNT` | The caller does not read rows-affected counts. | `deployment` | The callers' drivers ignore rows-affected counts (decision 1, observer profile). | `sqldiff-convert/src/cert.rs`<br>`sqldiff-core/src/observer.rs` |
 | `ASM-ORDER-TOTAL` | The ORDER BY keys are unique, so both sides return the same rows in the same order. | `catalog` | A unique key over the ORDER BY columns. | `sqldiff-core/src/equiv/canon.rs` |
+| `ASM-OUTPUT-INTO-TARGET` | The table an OUTPUT … INTO writes has no enabled trigger, CHECK constraint or rule and is on neither side of a foreign key (SQL Server rejects the statement otherwise, Msg 331 to 333; the PostgreSQL insert runs). | `catalog` | The SQL Server catalog of the OUTPUT table: no enabled triggers, CHECK constraints or rules, no foreign key referencing it or referenced by it. | `sqldiff-core/src/equiv/canon.rs` |
+| `ASM-OUTPUT-ROW-ORDER` | Rows OUTPUT … INTO or RETURNING writes get the values their table generates (identity, sequence defaults) in the same order on both sides; neither engine specifies the order. | `deployment` | Nothing relies on which generated value each written row gets. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-OWNER-PRIVILEGES` | The routine owner holds every privilege its statements need on both sides. | `deployment` | The owner's grants on the target. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-PAGE-COUNT-NOT-NULL` | The row count and offset of TOP, LIMIT, FETCH and OFFSET are never NULL: T-SQL raises an error for NULL, PostgreSQL reads it as no limit (OFFSET NULL as 0). | `deployment` | Callers never pass a NULL row count or offset, and the routine never computes one. | `sqldiff-convert/src/tsql/paging.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-PAGE-UNORDERED` | A row limit or offset without ORDER BY keeps rows that each engine picks: any such rows will do. | `nothing` | A reading of the statement: its callers accept any rows (an ORDER BY would make it deterministic). | `sqldiff-core/src/equiv/canon.rs` |
