@@ -160,6 +160,11 @@ pub enum CtlKind {
     If(Result<Expr, String>),
     /// WHILE: the body runs while the condition is true.
     While(Result<Expr, String>),
+    /// An IF that tests whether the statement right before it touched or
+    /// returned a row: T-SQL `@@ROWCOUNT = 0` / `<> 0`, PostgreSQL `NOT
+    /// FOUND` / `FOUND` (`rows_test`). Whether a row was found, and the
+    /// kind of that statement.
+    RowsIf(bool, &'static str),
     /// The WHILE of a cursor loop (`cursor.rs`): T-SQL `@@FETCH_STATUS = 0`,
     /// PostgreSQL `FOUND`, both right after a FETCH of the cursor (its key).
     FetchWhile(String),
@@ -1857,7 +1862,15 @@ fn if_stmt(c: &SyntaxNode, u: &mut Unit) {
             mark_at(u, CtlKind::Else, k, last);
         }
         if let Some(cn) = cond.take() {
-            mark(u, CtlKind::If(condition(cn, u.dialect)), cn);
+            let kind = match opened
+                .is_empty()
+                .then(|| rows_test(cn, c, u.dialect))
+                .flatten()
+            {
+                Some((found, stmt)) => CtlKind::RowsIf(found, stmt),
+                None => CtlKind::If(condition(cn, u.dialect)),
+            };
+            mark(u, kind, cn);
             opened.push(cn);
         }
         u.depth += 1;
@@ -1869,6 +1882,129 @@ fn if_stmt(c: &SyntaxNode, u: &mut Unit) {
     for cn in opened.into_iter().rev() {
         mark_at(u, CtlKind::End, c, cn);
     }
+}
+
+/// `IF @@ROWCOUNT = 0` (`<> 0`, `!= 0`, `> 0`, `>= 1`; `= 1` after a
+/// `SELECT TOP 1`) in T-SQL, `IF NOT FOUND` (`FOUND`) in PostgreSQL, whose
+/// IF statement `stmt` comes right after the statement it reads, in the
+/// same block: whether the test asks for a row, and that statement's kind
+/// (`insert`, `update`, `delete`, `select`). Both tell whether the
+/// statement touched or returned at least one row (checked on SQL Server
+/// 2022 and PostgreSQL 18, also with an AFTER trigger writing other rows);
+/// any statement in between resets them, so none may be there (but a
+/// PostgreSQL COMMIT, which keeps FOUND).
+fn rows_test(cond: &SyntaxNode, stmt: &SyntaxNode, d: Dialect) -> Option<(bool, &'static str)> {
+    let toks = tokens(cond);
+    let mut w: Vec<&str> = toks.iter().map(|t| t.up.as_str()).collect();
+    if w.first() == Some(&"(") && w.last() == Some(&")") {
+        w = w[1..w.len() - 1].to_vec();
+    }
+    // PL/pgSQL's COMMIT leaves FOUND as it was (checked on PostgreSQL 18):
+    // the converter writes one after each statement of a T-SQL autocommit
+    // routine. T-SQL's COMMIT resets @@ROWCOUNT, so only PostgreSQL skips it.
+    let commit = |p: &SyntaxNode| {
+        d == Dialect::Postgres
+            && p.kind() == SyntaxKind::STATEMENT
+            && tokens(p)
+                .iter()
+                .filter(|t| t.kind != K::Semi)
+                .map(|t| t.up.as_str())
+                .eq(["COMMIT"])
+    };
+    let mut prev = stmt.prev_sibling();
+    while prev
+        .as_ref()
+        .is_some_and(|p| !p.kind().is_unit() || commit(p))
+    {
+        prev = prev.and_then(|p| p.prev_sibling());
+    }
+    let prev = prev?;
+    let kind = rows_stmt(&prev, d)?;
+    let found = match (d, w.as_slice()) {
+        (Dialect::Tsql, ["@@ROWCOUNT", "=", "0"]) => false,
+        (Dialect::Tsql, ["@@ROWCOUNT", "<>" | "!=" | ">", "0"] | ["@@ROWCOUNT", ">=", "1"]) => true,
+        // At most one row: a count of 1 is a row found.
+        (Dialect::Tsql, ["@@ROWCOUNT", "=", "1"]) => {
+            // Not WITH TIES or PERCENT, which may return more rows.
+            let p: Vec<String> = tokens(&prev).iter().take(6).map(|t| t.up.clone()).collect();
+            let p: Vec<&str> = p.iter().map(String::as_str).collect();
+            let rest = match p.as_slice() {
+                ["SELECT", "TOP", "(", "1", ")", rest @ ..] => rest,
+                ["SELECT", "TOP", "1", rest @ ..] => rest,
+                _ => return None,
+            };
+            if matches!(rest.first(), Some(&"WITH" | &"PERCENT")) {
+                return None;
+            }
+            true
+        }
+        (Dialect::Postgres, ["FOUND"]) => true,
+        (Dialect::Postgres, ["NOT", "FOUND"]) => false,
+        _ => return None,
+    };
+    Some((found, kind))
+}
+
+/// The kind of a statement that sets T-SQL's @@ROWCOUNT or PostgreSQL's
+/// FOUND to whether it touched or returned a row: INSERT, UPDATE or DELETE
+/// (T-SQL without OUTPUT or EXEC, PostgreSQL without RETURNING); a T-SQL
+/// SELECT that assigns variables from a table; PostgreSQL's SELECT … INTO …
+/// FROM, or the converter's block `DECLARE r record; BEGIN FOR r IN SELECT
+/// … LOOP … END LOOP; END` (a FOR loop sets FOUND to whether it ran once).
+fn rows_stmt(n: &SyntaxNode, d: Dialect) -> Option<&'static str> {
+    if d == Dialect::Postgres && n.kind() == SyntaxKind::BLOCK {
+        let units: Vec<SyntaxNode> = cst::structural_children(n)
+            .into_iter()
+            .filter(|c| c.kind().is_unit())
+            .collect();
+        let [lp] = units.as_slice() else {
+            return None;
+        };
+        let t = tokens(lp);
+        let words: Vec<&str> = t.iter().take(4).map(|t| t.up.as_str()).collect();
+        return (lp.kind() == SyntaxKind::LOOP_STMT
+            && matches!(words.as_slice(), ["FOR", _, "IN", "SELECT"]))
+        .then_some("select");
+    }
+    if n.kind() != SyntaxKind::STATEMENT {
+        return None;
+    }
+    let t = tokens(n);
+    let mut depth = 0i32;
+    let mut top: Vec<&Tok> = Vec::new();
+    for x in &t {
+        match x.kind {
+            K::LParen => depth += 1,
+            K::RParen => depth -= 1,
+            _ if depth == 0 => top.push(x),
+            _ => {}
+        }
+    }
+    let has = |w: &str| top.iter().any(|x| x.kind == K::Word && x.up == w);
+    let kind = match top.first().map(|x| x.up.as_str()) {
+        Some("INSERT") => "insert",
+        Some("UPDATE") => "update",
+        Some("DELETE") => "delete",
+        Some("SELECT") => "select",
+        _ => return None,
+    };
+    let ok = match (d, kind) {
+        // An assignment in the select list, before FROM (`WHERE @id = id`
+        // is a comparison).
+        (Dialect::Tsql, "select") => {
+            let from = top.iter().position(|x| x.kind == K::Word && x.up == "FROM");
+            from.is_some_and(|f| {
+                top[..f]
+                    .windows(2)
+                    .any(|w| w[0].kind == K::Var && w[1].kind == K::Op && w[1].text == "=")
+            })
+        }
+        (Dialect::Tsql, _) => !has("OUTPUT") && !has("EXEC") && !has("EXECUTE"),
+        (Dialect::Postgres, "select") => has("INTO") && has("FROM"),
+        (Dialect::Postgres, _) => !has("RETURNING"),
+        _ => false,
+    };
+    ok.then_some(kind)
 }
 
 /// WHILE c (T-SQL `WHILE c stmt`, PostgreSQL `WHILE c LOOP … END LOOP`,

@@ -29,6 +29,10 @@ type Parts = (Vec<Term>, Vec<(Term, Option<Ty>)>);
 
 /// Assumption identifiers and texts used by the equivalence rules.
 pub mod asm {
+    pub const ROWCOUNT_FOUND: (&str, &str) = (
+        "ASM-ROWCOUNT-FOUND",
+        "No INSTEAD OF trigger, no PostgreSQL BEFORE ROW trigger that returns NULL and no PostgreSQL rule (CREATE RULE … DO INSTEAD) acts on a table or view whose write @@ROWCOUNT is tested: T-SQL counts the statement's rows even when an INSTEAD OF trigger writes others, PostgreSQL's FOUND counts only the rows its triggers let through",
+    );
     pub const LEN_BMP: (&str, &str) = (
         "ASM-TSQL-LEN-BMP",
         "Strings a T-SQL LEN counts, or a LIKE `_` steps over, have no character outside the Basic Multilingual Plane, or the collation is supplementary-character aware (_SC)",
@@ -656,7 +660,7 @@ impl<'a> Canon<'a> {
         n("geog-cmp", vec![self.dtag()])
     }
 
-    fn assume(&mut self, x: (&str, &str)) {
+    pub(super) fn assume(&mut self, x: (&str, &str)) {
         if !self.asm.iter().any(|y| y.id == x.0) {
             self.asm.push(asm::make(x));
         }
@@ -1348,6 +1352,29 @@ impl<'a> Canon<'a> {
                     return Ok((n("strpos", vec![a(ci), h, x]), Some(INT32)));
                 }
                 (n("dfn", vec![self.dtag(), a("charindex-sub"), h, x]), None)
+            }
+            // The converter's CHARINDEX with a start position (see
+            // `charindex_from`).
+            Expr::Bin(op, l, r)
+                if self.d == Dialect::Postgres && op == "*" && charindex_from(l, r).is_some() =>
+            {
+                let (hay, needle, start) = charindex_from(l, r).unwrap();
+                let (h, hty) = self.expr(hay)?;
+                let (x, xty) = self.expr(needle)?;
+                let (st, sty) = self.expr(start)?;
+                if [hty, xty]
+                    .iter()
+                    .all(|t| t.is_some_and(|t| t.fam == Fam::VarChar))
+                    && is_int32(&sty)
+                {
+                    let ci = self.collation_marker();
+                    self.assume(asm::LEN_BMP);
+                    return Ok((n("strpos", vec![a(ci), h, x, st]), Some(INT32)));
+                }
+                (
+                    n("dfn", vec![self.dtag(), a("charindex-from"), h, x, st]),
+                    None,
+                )
             }
             Expr::Bin(op, l, r) => self.binary(op, l, r)?,
             Expr::Unary(op, x) => {
@@ -2544,6 +2571,26 @@ impl<'a> Canon<'a> {
                 self.assume(asm::LEN_BMP);
                 let (needle, hay) = (args[0].0.clone(), args[1].0.clone());
                 (n("strpos", vec![a(ci), hay, needle]), Some(INT32))
+            }
+            // CHARINDEX(needle, s, start), against the converter's
+            // `(strpos(substr(s, start), x) - 1 + greatest(start, 1)) *
+            // (strpos(substr(s, start), x) > 0 AND length(x) > 0)::int`
+            // (lowered in `expr`): equal for every needle, string and start,
+            // NULL, empty, start < 1 or past the end included (SQL Server
+            // 2022 against PostgreSQL 18 under a case-sensitive collation,
+            // eval/builtins/2026-10-30-am). A 32-bit start only: substr
+            // takes an integer.
+            (Dialect::Tsql, "charindex", 3)
+                if args[..2]
+                    .iter()
+                    .all(|x| x.1.is_some_and(|t| t.fam == Fam::VarChar))
+                    && is_int32(&args[2].1) =>
+            {
+                let ci = self.collation_marker();
+                self.assume(asm::LEN_BMP);
+                let (needle, hay, start) =
+                    (args[0].0.clone(), args[1].0.clone(), args[2].0.clone());
+                (n("strpos", vec![a(ci), hay, needle, start]), Some(INT32))
             }
             (Dialect::Postgres, "strpos", 2)
                 if args
@@ -6546,6 +6593,58 @@ fn charindex_sub<'e>(l: &'e Expr, r: &'e Expr) -> Option<(&'e Expr, &'e Expr)> {
     let pos = call(l, "strpos", 2)?;
     (op == "=" && matches!(zero.as_ref(), Expr::Num(z) if z == "0") && &pos[1] == x)
         .then_some((&pos[0], x))
+}
+
+/// An integer of at most 32 bits that is not a T-SQL bit.
+fn is_int32(t: &Option<Ty>) -> bool {
+    t.is_some_and(|t| t.fam == Fam::Int && t.len.is_some_and(|l| (2..=32).contains(&l)))
+}
+
+/// `(strpos(substr(s, st), x) - 1 + greatest(st, 1)) * (strpos(substr(s,
+/// st), x) > 0 AND length(x) > 0)::int`: (s, x, st). The converter's
+/// CHARINDEX(x, s, st), exactly this shape: each part reads the same s, x
+/// and st.
+fn charindex_from<'e>(l: &'e Expr, r: &'e Expr) -> Option<(&'e Expr, &'e Expr, &'e Expr)> {
+    let call = |e: &'e Expr, name: &str, argc: usize| match e {
+        Expr::Call(c)
+            if c.name.len() == 1
+                && c.name[0].eq_ignore_ascii_case(name)
+                && c.args.len() == argc
+                && !c.distinct
+                && !c.star
+                && c.order.is_empty() =>
+        {
+            Some(&c.args)
+        }
+        _ => None,
+    };
+    let num = |e: &Expr, v: &str| matches!(e, Expr::Num(z) if z == v);
+    let bin = |e: &'e Expr, want: &str| match e {
+        Expr::Bin(op, x, y) if op.eq_ignore_ascii_case(want) => Some((x.as_ref(), y.as_ref())),
+        _ => None,
+    };
+    // l: (P - 1) + greatest(st, 1), P = strpos(substr(s, st), x)
+    let (pm, g) = bin(l, "+")?;
+    let (p, one) = bin(pm, "-")?;
+    let g = call(g, "greatest", 2)?;
+    let pos = call(p, "strpos", 2)?;
+    let sub = call(&pos[0], "substr", 2)?;
+    let (hay, start, needle) = (&sub[0], &sub[1], &pos[1]);
+    if !num(one, "1") || g[0] != *start || !num(&g[1], "1") {
+        return None;
+    }
+    // r: (P > 0 AND length(x) > 0)::int
+    let Expr::Cast(cond, ty) = r else {
+        return None;
+    };
+    if !matches!(ty.name.as_str(), "INT" | "INTEGER" | "INT4") || !ty.args.is_empty() {
+        return None;
+    }
+    let (found, nonempty) = bin(cond, "AND")?;
+    let (p2, z1) = bin(found, ">")?;
+    let (len, z2) = bin(nonempty, ">")?;
+    let len = call(len, "length", 1)?;
+    (p2 == p && num(z1, "0") && num(z2, "0") && len[0] == *needle).then_some((hay, needle, start))
 }
 
 /// Whether REPLACE(s, from, to) cannot outgrow what T-SQL returns uncut:

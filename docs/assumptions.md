@@ -10,11 +10,11 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 
 | Discharge | Meaning | Ids |
 |---|---|---|
-| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 56 |
+| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 57 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 21 |
 | `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 106 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 29 |
-| | Total | 212 |
+| | Total | 213 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -176,6 +176,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-ROUTINE-LABEL` | A routine's STABLE, IMMUTABLE or DETERMINISTIC label is truthful. | `catalog` | The routine's body in the catalog. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-ROUTINE-REPLACE` | CREATE OR REPLACE replaces the existing routine (its parameter list is unchanged); otherwise the old one stays beside it. | `catalog` | The existing routine's signature on the target. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-ROW-*` | A row of the dialect's semantic profile holds as tabled (the rest of the id is the row). | `nothing` | The profile row checked against the engine (eval/ probes). | `sqldiff-core/src/ir/interp.rs` |
+| `ASM-ROWCOUNT-FOUND` | No INSTEAD OF trigger, no PostgreSQL BEFORE ROW trigger that returns NULL and no PostgreSQL rule (CREATE RULE … DO INSTEAD) acts on a table or view whose write @@ROWCOUNT is tested: T-SQL counts the statement's rows even when an INSTEAD OF trigger writes others, PostgreSQL's FOUND counts only the rows its triggers let through. | `catalog` | The triggers on the written tables and views in the catalog. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-SAME-DATABASE-NAME` | The PostgreSQL database has the same name, letter for letter, as the SQL Server database (DB_NAME() becomes current_database()). | `deployment` | The database names on both sides. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-SCHEMA-OWNER` | The schema's owner on the target holds the privileges its owner holds on the source. | `deployment` | The roles and grants of the target. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/ddl.rs` |
 | `ASM-SELECT-ASSIGN-CARDINALITY` | A query that assigns variables returns at most one row. | `catalog` | A unique key over the query's predicate. | `sqldiff-convert/src/tsql.rs` |

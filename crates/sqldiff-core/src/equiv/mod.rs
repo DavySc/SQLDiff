@@ -185,6 +185,18 @@ fn ctl_item(c: &mut Canon, unit: &Unit, m: &lower::Ctl) -> Item {
             "ctl-while",
             e.clone().and_then(|e| c.condition(&e)).map(|t| vec![t]),
         ),
+        // Both dialects' tests of whether the statement just before touched
+        // or returned a row (`lower::rows_test`).
+        C::RowsIf(found, stmt) => {
+            c.assume(canon::asm::ROWCOUNT_FOUND);
+            (
+                "ctl-if",
+                Ok(vec![n(
+                    "rows-found",
+                    vec![a(*stmt), a(if *found { "true" } else { "false" })],
+                )]),
+            )
+        }
         // Both dialects' tests of the FETCH just before (`cursor.rs`).
         C::FetchWhile(key) => (
             "ctl-while",
