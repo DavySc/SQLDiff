@@ -1,0 +1,11 @@
+CREATE TABLE
+insert select of an integer into a boolean column:
+insert values of an integer literal:
+ERROR:  column "selected" is of type boolean but expression is of type integer
+LINE 1: ...ND AS Selected) INSERT INTO sel (Selected) SELECT Selected F...
+                                                             ^
+HINT:  You will need to rewrite or cast the expression.
+ERROR:  column "selected" is of type boolean but expression is of type integer
+LINE 1: INSERT INTO sel (Selected) VALUES (1);
+                                           ^
+HINT:  You will need to rewrite or cast the expression.

@@ -1,0 +1,46 @@
+1 default recursion limit (expect Msg 530):
+Msg 530, Level 16, State 1, Server 1db4dfcf32f0, Line 2
+The statement terminated. The maximum recursion 100 has been exhausted before statement completion.
+2 MAXRECURSION 0:
+ 
+-
+200
+Msg 240, Level 16, State 1, Server 1db4dfcf32f0, Line 2
+Types don't match between the anchor and the recursive part in column "s" of recursive query "N".
+Msg 240, Level 16, State 1, Server 1db4dfcf32f0, Line 2
+Types don't match between the anchor and the recursive part in column "i" of recursive query "N".
+4 a query naming a later CTE (table b holds 5):
+x
+-
+5
+5 CTE name in other letter case:
+x
+-
+1
+6 CTE named like table t (holds 7), one-part and dbo.t:
+cte tab
+--- ---
+2 7
+Msg 252, Level 16, State 1, Server 1db4dfcf32f0, Line 2
+Recursive common table expression 't' does not contain a top-level UNION ALL operator.
+8 NEWID() CTE read twice (0 = computed per read):
+ 
+-
+0
+9 recursive member with ROW_NUMBER:
+i r
+- -
+1 1
+2 1
+3 1
+10 rows of a split, any order (StartPosition, item):
+StartPosition EndPosition  
+------------- ----------- -
+1 2 [a]
+3 4 [b]
+5 5 []
+6 7 [c]
+11 types of the split columns:
+charindex_max len_max charindex_lit
+------------- ------- -------------
+bigint bigint int

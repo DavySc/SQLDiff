@@ -1,0 +1,37 @@
+CREATE TABLE
+INSERT 0 1
+CREATE TABLE
+INSERT 0 1
+1 no recursion limit:
+200
+3 anchor varchar(10) vs recursive text:
+ERROR:  recursive query "n" column 1 has type character varying(10) in non-recursive term but type character varying overall
+LINE 1: WITH RECURSIVE N(s) AS (SELECT CAST('a' AS varchar(10)) UNIO...
+                                       ^
+HINT:  Cast the output of the non-recursive term to the correct type.
+ERROR:  recursive query "n" column 1 has type integer in non-recursive term but type bigint overall
+LINE 1: WITH RECURSIVE N(i) AS (SELECT CAST(1 AS int) UNION ALL SELE...
+                                            ^
+HINT:  Cast the output of the non-recursive term to the correct type.
+3b anchor int vs recursive bigint:
+4 RECURSIVE list, a query naming a later CTE (table b holds 5):
+1
+4b without RECURSIVE:
+5
+7 non-recursive CTE naming itself (table t holds 7):
+8
+7b RECURSIVE CTE naming itself without UNION:
+ERROR:  recursive query "t" does not have the form non-recursive-term UNION [ALL] recursive-term
+LINE 1: WITH RECURSIVE t AS (SELECT x FROM t) SELECT x FROM t;
+                       ^
+8 random() CTE read twice (1 = computed once):
+1
+9 recursive member with row_number:
+1|1
+2|1
+3|1
+10 rows of a split:
+1|2|[a]
+3|4|[b]
+5|5|[]
+6|7|[c]
