@@ -61,6 +61,9 @@ pub enum Ty {
     TimestampTz(u32),
     DateTimeOffset(u32),
     Uuid,
+    /// T-SQL geography, PostGIS geography without a type modifier
+    /// (ASM-POSTGIS-GEOGRAPHY: a value is carried as it is).
+    Geography,
     /// Byte string: zero-padded (`fixed`), length limit (`None`: max or
     /// unbounded).
     Binary {
@@ -1174,6 +1177,7 @@ pub(crate) fn tsql_type(ty: &ast::Type) -> R<Ty> {
         "DATETIME2" => Ok(Ty::DateTime2(arg(ty, 0)?.unwrap_or(7))),
         "DATETIMEOFFSET" => Ok(Ty::DateTimeOffset(arg(ty, 0)?.unwrap_or(7))),
         "UNIQUEIDENTIFIER" => none(Ty::Uuid),
+        "GEOGRAPHY" | "SYS.GEOGRAPHY" => none(Ty::Geography),
         "BINARY" => Ok(Ty::Binary {
             fixed: true,
             len: Some(arg(ty, 0)?.unwrap_or(1)),
@@ -1232,6 +1236,7 @@ pub(crate) fn pg_type(ty: &ast::Type) -> R<Ty> {
         "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => Ok(Ty::Timestamp(arg(ty, 0)?.unwrap_or(6))),
         "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => Ok(Ty::TimestampTz(arg(ty, 0)?.unwrap_or(6))),
         "UUID" => none(Ty::Uuid),
+        "GEOGRAPHY" => none(Ty::Geography),
         "BYTEA" => none(Ty::Binary {
             fixed: false,
             len: None,
@@ -1431,7 +1436,7 @@ pub fn types(t: &Ty, p: &Ty) -> TyCmp {
             &mut c,
             "{T} keeps the offset of 2024-01-01 10:00 +02:00, {P} stores the instant only and reads it back in the session's time zone".into(),
         ),
-        (Ty::Uuid, Ty::Uuid) => {}
+        (Ty::Uuid, Ty::Uuid) | (Ty::Geography, Ty::Geography) => {}
         (Ty::Binary { fixed: true, .. }, Ty::Binary { fixed: false, .. }) => diff(
             &mut c,
             "{T} pads 0x01 with zero bytes to the column's length, {P} stores 0x01".into(),

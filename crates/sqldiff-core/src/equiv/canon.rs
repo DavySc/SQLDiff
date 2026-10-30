@@ -973,7 +973,7 @@ impl<'a> Canon<'a> {
             // IMAGE, MONEY, an alias type, …): the store may pad, cut off,
             // round or fail.
             Fam::Other => false,
-            Fam::Date | Fam::Interval | Fam::Bool | Fam::Uuid => true,
+            Fam::Date | Fam::Interval | Fam::Bool | Fam::Uuid | Fam::Geography => true,
         }
     }
 
@@ -1360,7 +1360,9 @@ impl<'a> Canon<'a> {
                 let mut kids = vec![t, lo, hi, a(neg.to_string())];
                 // Strings by collation, uuids by each dialect's byte order.
                 if ty.map_or(true, |t| t.is_string())
-                    || tys.iter().any(|t| t.is_some_and(|t| t.fam == Fam::Uuid))
+                    || tys
+                        .iter()
+                        .any(|t| t.is_some_and(|t| t.orders_per_dialect()))
                 {
                     kids.push(self.dtag());
                 }
@@ -1779,6 +1781,25 @@ impl<'a> Canon<'a> {
         if matches!(v.0.head(), "null") {
             return (n(head, vec![Self::ty_term(&to), v.0]), to);
         }
+        // Only a geography value is one on both sides: SQL Server reads
+        // 0xE6100000010C… in its own serialization, which PostGIS rejects
+        // ("Invalid endian flag value", checked on PostGIS 3.6), and the
+        // two parse text differently.
+        if dst.fam == Fam::Geography && v.1.map_or(true, |t| t.fam != Fam::Geography) {
+            return (
+                n(
+                    "dcast",
+                    vec![
+                        self.dtag(),
+                        a(how.name()),
+                        Self::ty_term(&to),
+                        Self::ty_term(&v.1),
+                        v.0,
+                    ],
+                ),
+                to,
+            );
+        }
         if v.1.is_none() {
             let castable = matches!(
                 dst.fam,
@@ -1899,7 +1920,7 @@ impl<'a> Canon<'a> {
             // numeric half away from zero and float half to even.
             (Exact | Float, Int) if self.d == Dialect::Tsql => Rule::Trunc,
             (Float, Float) => Rule::Same,
-            (Uuid, Uuid) => Rule::Same,
+            (Uuid, Uuid) | (Geography, Geography) => Rule::Same,
             // Explicit casts truncate silently on both sides, and storing too
             // long a string fails on both; a T-SQL variable truncates where a
             // PL/pgSQL one fails. CHAR pads on both; what differs is how
@@ -2566,7 +2587,7 @@ impl<'a> Canon<'a> {
             (_, "lower" | "lcase", 1) => portable("lower", args, first_ty),
             (_, "abs", 1) => portable("abs", args, first_ty),
             (_, "min" | "max", 1) => match first_ty {
-                Some(t) if t.is_string() || t.fam == Fam::Uuid => (
+                Some(t) if t.orders_per_dialect() => (
                     n("dfn", vec![self.dtag(), a(name.clone()), args[0].0.clone()]),
                     first_ty,
                 ),
@@ -2938,11 +2959,14 @@ impl<'a> Canon<'a> {
                     ));
                 }
                 // SQL Server orders uniqueidentifier by its byte groups, last
-                // group first; PostgreSQL orders uuid byte by byte.
-                if any(&|t| t.fam == Fam::Uuid) && !matches!(op, "=" | "<>") {
+                // group first; PostgreSQL orders uuid byte by byte. SQL Server
+                // has no comparison of geography at all.
+                if any(&|t| t.fam == Fam::Geography)
+                    || (any(&|t| t.fam == Fam::Uuid) && !matches!(op, "=" | "<>"))
+                {
                     let (x, y, op) = order_operands(op, lt, rt);
                     return Ok((
-                        n("cmp-uuid", vec![self.dtag(), a(op), x, y]),
+                        n("cmp-dialect", vec![self.dtag(), a(op), x, y]),
                         Some(Ty::of(Fam::Bool)),
                     ));
                 }
@@ -3373,7 +3397,7 @@ impl<'a> Canon<'a> {
             match ty {
                 // Character ordering depends on the collation of each dialect,
                 // uuid ordering on its byte order (last group first in T-SQL).
-                Some(t) if t.is_string() || t.fam == Fam::Uuid => kids.push(self.dtag()),
+                Some(t) if t.orders_per_dialect() => kids.push(self.dtag()),
                 None => self.assume(asm::UNTYPED),
                 _ => {}
             }
@@ -3665,7 +3689,7 @@ impl<'a> Canon<'a> {
                 a(if o.desc { "desc" } else { "asc" }),
                 a(nulls),
             ];
-            if col_tys[k].is_some_and(|t| t.is_string() || t.fam == Fam::Uuid) {
+            if col_tys[k].is_some_and(|t| t.orders_per_dialect()) {
                 kids.push(self.dtag());
             }
             order.push(n("ord", kids));
