@@ -1010,18 +1010,20 @@ fn tables_by_rules(
                 continue;
             }
             if n.rule == "ASM-DBO-SCHEMA" {
-                if !engine.contains(&n.rule) {
-                    engine.push(n.rule.clone());
+                if !engine.iter().any(|e| *e == n.rule) {
+                    engine.push(n.rule.to_string());
                 }
-            } else if !accepted.contains(&n.rule) && !items.iter().any(|i| i.rule == n.rule) {
+            } else if !accepted.iter().any(|a| *a == n.rule)
+                && !items.iter().any(|i| i.rule == n.rule)
+            {
                 // A file-level assumption of the conversion is on every
                 // table's unit: once is enough.
                 items.push(Item {
                     status: Outcome::Assumptions,
-                    rule: n.rule.clone(),
+                    rule: n.rule.to_string(),
                     side: "target",
                     line,
-                    text: n.text.clone(),
+                    text: n.text.to_string(),
                 });
             }
         }

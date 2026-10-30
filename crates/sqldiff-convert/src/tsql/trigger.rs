@@ -181,7 +181,7 @@ impl Cx<'_> {
                 if n.status == Status::NotConverted {
                     // A partly converted trigger would fail every statement on
                     // the table: refuse the whole trigger.
-                    return Err(No(n.text.clone()));
+                    return Err(No(n.text.to_string()));
                 }
                 if !notes.iter().any(|x| x.rule == n.rule) {
                     notes.push(n.clone());

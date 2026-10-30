@@ -927,7 +927,7 @@ impl Review {
                 .notes
                 .iter()
                 .filter(|n| n.status == s)
-                .map(|n| n.rule.clone())
+                .map(|n| n.rule.to_string())
                 .collect();
             v.dedup();
             v
@@ -946,8 +946,8 @@ impl Review {
                 .iter()
                 .map(|n| NoteView {
                     status: n.status,
-                    rule: n.rule.clone(),
-                    text: n.text.clone(),
+                    rule: n.rule.to_string(),
+                    text: n.text.to_string(),
                 })
                 .collect(),
             findings,
@@ -1134,7 +1134,7 @@ fn open_assumptions(u: &Unit, rv: Option<&UnitReviewReport>) -> Vec<String> {
         .notes
         .iter()
         .filter(|n| n.status == Status::Assumptions)
-        .map(|n| n.rule.clone())
+        .map(|n| n.rule.to_string())
         .filter(|r| rv.map_or(true, |rv| rv.open.contains(r)))
         .collect();
     v.dedup();
@@ -1299,7 +1299,13 @@ fn load(s: &Setup, prev: Option<Loaded>, hooks: &tree::Hooks) -> Result<Loaded, 
         }
         _ => {
             let started = Instant::now();
-            let t = tree::convert_with(&s.tree, &inputs, unreadable.clone(), Some(&s.out), hooks)?;
+            let t = tree::convert_for_review(
+                &s.tree,
+                &inputs,
+                unreadable.clone(),
+                Some(&s.out),
+                hooks,
+            )?;
             (t, started.elapsed().as_secs_f64() * 1000.0, true)
         }
     };
@@ -1361,17 +1367,12 @@ fn load(s: &Setup, prev: Option<Loaded>, hooks: &tree::Hooks) -> Result<Loaded, 
 /// conversion is stored trimmed: reopening it reads what this one does.
 fn trim(t: &mut Tree) {
     for c in &mut t.conversions {
-        for r in [&mut c.report, &mut c.output_check] {
-            r.witnesses = Vec::new();
-            r.diagnostics = Vec::new();
-            r.normalizations = Vec::new();
-            r.assumptions = Vec::new();
-            r.unknown_reasons = Vec::new();
-            r.discharged = Vec::new();
-            r.suppressed = Vec::new();
-            r.refinements = Vec::new();
-            r.proof = None;
-        }
+        // Mostly done per file while converting (`tree::convert_for_review`);
+        // a conversion handed over comes whole. The assumptions served the
+        // report's deployment section, built by now.
+        sqldiff_convert::trim_reports(c);
+        c.report.assumptions = Vec::new();
+        c.output_check.assumptions = Vec::new();
     }
 }
 

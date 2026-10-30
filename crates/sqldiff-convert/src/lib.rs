@@ -12,6 +12,7 @@
 //! once expression trees and the semantic IR land.
 
 use serde::{Deserialize, Serialize};
+pub use shared::Shared;
 use sqldiff_core::{Artifact, Dialect, Options, Report};
 use sqldiff_syntax::{parse, LineIndex};
 
@@ -27,6 +28,7 @@ mod out;
 pub mod queue;
 mod refused;
 pub mod review;
+pub mod shared;
 mod table_vars;
 mod template;
 mod tok;
@@ -71,13 +73,31 @@ impl Status {
     }
 }
 
+/// Drops what is read of neither engine report of `c` once its file is
+/// checked and its units have their statuses: of each report only the
+/// findings (units point into them) and the assumptions (the deployment
+/// report reads them) stay. For a review (`tree::convert_for_review`).
+pub fn trim_reports(c: &mut Conversion) {
+    for r in [&mut c.report, &mut c.output_check] {
+        r.witnesses = Vec::new();
+        r.diagnostics = Vec::new();
+        r.normalizations = Vec::new();
+        r.unknown_reasons = Vec::new();
+        r.discharged = Vec::new();
+        r.suppressed = Vec::new();
+        r.refinements = Vec::new();
+        r.proof = None;
+    }
+}
+
 /// Why a unit has the status it has.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Note {
     pub status: Status,
-    /// Stable rule id, e.g. `ASM-CI-COLLATION` or `tsql.merge`.
-    pub rule: String,
-    pub text: String,
+    /// Stable rule id, e.g. `ASM-CI-COLLATION` or `tsql.merge`. Both are
+    /// shared with every equal note of the tree (`shared::Pool`).
+    pub rule: Shared,
+    pub text: Shared,
 }
 
 /// One rewrite the rules made: which rule, on which input bytes. Unlike a
@@ -258,7 +278,7 @@ impl Draft {
             .flat_map(|u| &u.notes)
             .filter(|n| n.status >= at_least)
             .max_by_key(|n| n.status)
-            .map(|n| n.text.clone())
+            .map(|n| n.text.to_string())
     }
 
     /// Adds a note to unit `i` (a hand-written text that could not be applied).
@@ -496,11 +516,12 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
                         at,
                         Note {
                             status: Status::Unproven,
-                            rule: f.rule.clone(),
+                            rule: f.rule.clone().into(),
                             text: format!(
                                 "The engine could not show the output equivalent to the input: {}",
                                 f.witness
-                            ),
+                            )
+                            .into(),
                         },
                     );
                 }
@@ -575,7 +596,7 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
                     Note {
                         status: Status::Unproven,
                         rule: NOT_COMPARED.into(),
-                        text: text.clone(),
+                        text: text.clone().into(),
                     },
                 );
             }
@@ -608,12 +629,13 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
                 0,
                 Note {
                     status: Status::Differs,
-                    rule: f.rule.clone(),
+                    rule: f.rule.clone().into(),
                     text: format!(
                         "The output does not check as {}: {}",
                         to.display_name(),
                         without_side(&f.witness)
-                    ),
+                    )
+                    .into(),
                 },
             );
         }
@@ -635,7 +657,8 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
                         "The output does not parse as {}: {}",
                         to.display_name(),
                         d.message
-                    ),
+                    )
+                    .into(),
                 },
             );
         }
@@ -660,8 +683,8 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
                 at,
                 Note {
                     status: Status::Assumptions,
-                    rule: x.id.clone(),
-                    text: x.text.clone(),
+                    rule: x.id.clone().into(),
+                    text: x.text.clone().into(),
                 },
             );
         }
@@ -835,7 +858,7 @@ fn refuse_all(root: &sqldiff_syntax::SyntaxNode, text: &str, reason: &str, rule:
             vec![Note {
                 status: Status::NotConverted,
                 rule: rule.into(),
-                text: reason.to_string(),
+                text: reason.to_string().into(),
             }],
             vec![Step {
                 rule: rule.into(),
