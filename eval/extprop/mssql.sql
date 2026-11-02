@@ -1,10 +1,13 @@
 -- Probe for SQL Server 2022 (not run in the sandbox: no SQL Server there).
--- Question: is a bracketed identifier in an EXEC argument the unbracketed
--- name string? The converter and engine read `[Person]` as 'Person' for
--- @level0name/@level1name/@level2name of sp_addextendedproperty
--- (AdventureWorks' own install script writes it this way).
--- Expected: three rows whose objname is 'Address' / 'AddressID' and whose
--- value matches; the brackets are NOT part of any stored name.
+-- Question: does SQL Server resolve a bracketed identifier in an EXEC
+-- argument to the object with the unbracketed name? The converter and engine
+-- read `[Person]` as 'Person' for @level0name/@level1name/@level2name of
+-- sp_addextendedproperty (AdventureWorks' own install script writes it so).
+-- What decides it: the EXECs below succeed (a wrong name raises error 15135)
+-- and the properties show on the table and column in SSMS. The SELECTs only
+-- list the properties by their catalog names (sys.extended_properties stores
+-- object ids, not the typed text), so they cannot show whether brackets were
+-- kept; they confirm the properties landed on the intended objects.
 CREATE SCHEMA [Person Probe];
 GO
 CREATE TABLE [Person Probe].[Address Lines]([Address ID] int NOT NULL);
