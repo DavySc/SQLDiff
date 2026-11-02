@@ -736,6 +736,27 @@ proof = "engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.geography.from-wkb"
+kind = "converter"
+proof = "engine"
+note = "geography::STGeomFromWKB(wkb, 4326) to ST_GeomFromWKB(wkb, 4326)::geography; the engine shows it equal for a constant WKB both engines read alike (equiv/geography.rs, eval/geography/2026-11-02)"
+sites = ["sqldiff-convert/src/tsql/geography.rs"]
+
+[[rule]]
+id = "tsql.geography.point"
+kind = "converter"
+proof = "engine"
+note = "geography::Point(lat, lon, 4326) to ST_SetSRID(ST_MakePoint(lon, lat), 4326)::geography for decimal literal coordinates inside ±90 / ±180"
+sites = ["sqldiff-convert/src/tsql/geography.rs"]
+
+[[rule]]
+id = "tsql.geography.static-method"
+kind = "converter"
+proof = "engine"
+note = "a CLR static method with no checked rule (and any on Db2 for i) is refused with the method named; no type::Method text reaches the output"
+sites = ["sqldiff-convert/src/tsql/geography.rs"]
+
+[[rule]]
 id = "tsql.geography.point-constant"
 kind = "converter"
 proof = "engine"

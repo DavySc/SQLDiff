@@ -741,6 +741,38 @@ pub(super) fn cannot_fail(u: &Unit, node: &SyntaxNode) -> bool {
     };
     let string = matches!(ty, Some(table::Ty::Str { .. }));
     let binary = matches!(ty, Some(table::Ty::Binary { .. }));
+    // A geography built from a constant both engines read: the call cannot
+    // raise (`geography::wkb`).
+    if let (Dialect::Tsql, Expr::Call(c)) = (u.dialect, v) {
+        if decl.name.eq_ignore_ascii_case("GEOGRAPHY") && c.name.len() == 1 {
+            let known = |x: &Expr| -> Option<String> {
+                let name = match x {
+                    Expr::Var(v) => v.trim_start_matches('@').to_string(),
+                    _ => return None,
+                };
+                super::known_bytes::before(node, &name, u.dialect).ok()
+            };
+            return super::geography::tsql_constant(&c.name[0].to_lowercase(), &c.args, &known)
+                .is_some();
+        }
+    }
+    // `SET @b += 0x…` on a `varbinary(max)`: a max operand keeps the whole
+    // result, so nothing is cut off and no error is raised.
+    if let (
+        Some(table::Ty::Binary {
+            fixed: false,
+            len: None,
+        }),
+        Expr::Bin(op, l, r),
+    ) = (&ty, v)
+    {
+        if op == "+"
+            && l.as_ref() == target.as_ref()
+            && matches!(r.as_ref(), Expr::Num(x) if x.len() >= 2 && x[..2].eq_ignore_ascii_case("0x"))
+        {
+            return true;
+        }
+    }
     match super::canon::own_name_literal(u, v).as_ref() {
         Expr::Null => true,
         Expr::Str(_) if string => true,

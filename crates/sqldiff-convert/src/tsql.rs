@@ -6850,6 +6850,10 @@ impl<'a> Cx<'a> {
             // A token a rule added (Db2's FROM SYSIBM.SYSDUMMY1, ...).
             self.step(rule, t.pos);
         }
+        if let Some((text, end)) = self.geography_static(ts, i) {
+            o.push_str(&text);
+            return end;
+        }
         if self.db2() && matches!(t.k, IDENT | QUOTED_IDENT) && from_item_start(ts, i) {
             if let Some((text, end)) = self.table_function_db2(ts, i) {
                 self.step_ts("tsql.from.table-function", &ts[i..end]);

@@ -1,0 +1,31 @@
+import struct
+from cases import *
+D={}
+D['line_same2']=b'\x01'+struct.pack('<I',2)+ring([(1,1),(1,1)])
+D['line0']=b'\x01'+struct.pack('<I',2)+struct.pack('<I',0)
+D['ring0']=b'\x01'+struct.pack('<I',3)+struct.pack('<II',1,0)
+D['ring4same']=poly([[(1,1)]*4])
+D['lon180']=poly([[(179,0),(180,0),(180,1),(179,1),(179,0)]])
+D['lat90']=poly([[(0,89),(10,89),(10,90),(0,89)]])
+D['negzero']=b'\x01'+struct.pack('<I',1)+struct.pack('<dd',-0.0,-0.0)
+D['pt180_90']=b'\x01'+struct.pack('<I',1)+pt(180,90)
+D['pt-180']=b'\x01'+struct.pack('<I',1)+pt(-180,-90)
+D['sub']=b'\x01'+struct.pack('<I',1)+pt(5e-324,1e-310)
+D['gc_nested']=b'\x01'+struct.pack('<I',7)+struct.pack('<I',1)+b'\x01'+struct.pack('<I',7)+struct.pack('<I',1)+b'\x01'+struct.pack('<I',1)+pt(1,2)
+D['gc0']=b'\x01'+struct.pack('<I',7)+struct.pack('<I',0)
+D['mp_wrongchild']=b'\x01'+struct.pack('<I',4)+struct.pack('<I',1)+b'\x01'+struct.pack('<I',2)+ring([(0,0),(1,1)])
+D['mline0']=b'\x01'+struct.pack('<I',5)+struct.pack('<I',0)
+D['mpt0']=b'\x01'+struct.pack('<I',4)+struct.pack('<I',0)
+D['ring_cw_hole_cw']=poly([[(0,0),(0,10),(10,10),(10,0),(0,0)],[(2,2),(2,4),(4,4),(4,2),(2,2)]])
+D['poly_two_shells_touch']=poly([[(0,0),(1,0),(1,1),(0,1),(0,0)],[(0,0),(1,0),(1,1),(0,1),(0,0)]])
+D['inf']=b'\x01'+struct.pack('<I',1)+struct.pack('<dd',float('inf'),1)
+D['count_huge']=b'\x01'+struct.pack('<I',2)+struct.pack('<I',0x7fffffff)
+D['empty_pt_nan']=b'\x01'+struct.pack('<I',1)+struct.pack('<dd',float('nan'),float('nan'))
+D['empty_input']=b''
+D['one_byte']=b'\x01'
+D['type0']=b'\x01'+struct.pack('<I',0)
+D['type8']=b'\x01'+struct.pack('<I',8)+struct.pack('<I',0)
+D['curve_ct']=b'\x01'+struct.pack('<I',8)
+D['ewkb_srid']=b'\x01'+struct.pack('<I',0x20000001)+struct.pack('<I',4326)+pt(1,2)
+D['mpoly_inner_wrong_order']=b'\x01'+struct.pack('<I',6)+struct.pack('<I',1)+b'\x00'+struct.pack('>I',3)+struct.pack('>I',0)
+for k,v in D.items(): print(k,v.hex())
