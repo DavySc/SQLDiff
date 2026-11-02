@@ -123,6 +123,11 @@ pub struct Item {
     pub status: String,
     pub rules: Vec<String>,
     pub reason: String,
+    /// The SQL Server-only feature a not converted unit names
+    /// ([`crate::impossible`]): impossible to convert automatically. The
+    /// status stays `not converted`; the item is not work left to do.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub impossible: Option<String>,
     /// Units this item stands for (a missing object), by id.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub units: Vec<String>,
@@ -243,6 +248,7 @@ pub fn build(r: &Report, inst: Option<&Instances>, all: bool) -> Queue {
                     "{} output finding(s) outside any unit: the file cannot count as converted",
                     f.unplaced.len()
                 ),
+                impossible: None,
                 units: Vec::new(),
                 instances: blast(&f.path),
                 failing_instances: Vec::new(),
@@ -267,6 +273,7 @@ pub fn build(r: &Report, inst: Option<&Instances>, all: bool) -> Queue {
                     f.unproven.len(),
                     f.unproven.join("; ")
                 ),
+                impossible: None,
                 units: Vec::new(),
                 instances: blast(&f.path),
                 failing_instances: Vec::new(),
@@ -301,6 +308,7 @@ pub fn build(r: &Report, inst: Option<&Instances>, all: bool) -> Queue {
                     .collect::<std::collections::BTreeSet<_>>()
                     .len()
             ),
+            impossible: None,
             units: us.iter().map(|(_, u)| u.id.clone()).collect(),
             instances: us.iter().map(|(f, _)| blast(&f.path)).sum(),
             failing_instances: Vec::new(),
@@ -347,6 +355,7 @@ pub fn build(r: &Report, inst: Option<&Instances>, all: bool) -> Queue {
                         t.instances
                     )
                 },
+                impossible: None,
                 units: Vec::new(),
                 instances: t.instances,
                 failing_instances: per_template
@@ -390,6 +399,7 @@ pub fn build(r: &Report, inst: Option<&Instances>, all: bool) -> Queue {
                     status: "unknown".into(),
                     rules: Vec::new(),
                     reason: reason.into(),
+                    impossible: None,
                     units: Vec::new(),
                     instances: 0,
                     failing_instances: Vec::new(),
@@ -412,6 +422,7 @@ pub fn build(r: &Report, inst: Option<&Instances>, all: bool) -> Queue {
             status: Status::NotConverted.label().to_string(),
             rules: Vec::new(),
             reason: "the source file could not be read as text: it was not converted".into(),
+            impossible: None,
             units: Vec::new(),
             instances: blast(p),
             failing_instances: Vec::new(),
@@ -521,6 +532,7 @@ fn unit_item(f: &FileReport, u: &UnitReport, tier: u8, per_template: &PerTemplat
         status: u.status.label().to_string(),
         rules: u.rules.clone(),
         reason: u.reason.clone(),
+        impossible: u.impossible.clone(),
         units: Vec::new(),
         instances: per_template.get(f.path.as_str()).map_or(0, |e| e.0),
         failing_instances: Vec::new(),

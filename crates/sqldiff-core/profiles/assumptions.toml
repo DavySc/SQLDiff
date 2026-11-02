@@ -539,7 +539,7 @@ sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/table.rs"]
 
 [[assumption]]
 id = "ASM-CLOCK-FRACTION-6"
-statement = "The 7th fraction digit of the clock is not used: SYSDATETIME() (7 digits in T-SQL) and the PostgreSQL statement clock (6 digits), stored in or cast to a 6-digit timestamp, are the same value; SQL Server rounds the 7th digit away and PostgreSQL never has one."
+statement = "Storing the statement clock in, or casting it to, a 6-digit timestamp changes nothing the code reads: SYSDATETIME() has 7 fraction digits in T-SQL and the cast rounds the 7th away, the PostgreSQL statement clock has only 6. Only the precision: whether the two clocks are the same instant is a separate question this assumption does not cover."
 discharge = "deployment"
 fact = "No code reads the 7th fraction digit of a clock value."
 sites = ["sqldiff-core/src/equiv/canon.rs"]
@@ -902,6 +902,13 @@ statement = "A statement with RAND() produces a single value (T-SQL evaluates it
 discharge = "generated"
 fact = "The converted statement draws the value once (a variable)."
 sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[assumption]]
+id = "ASM-RANDOM-FRESH"
+statement = "NEWID() and gen_random_uuid() are the same, and RAND() and random() (both without a seed) are the same: each evaluation draws a fresh value from the same range, and a RAND() is compared only in a statement that evaluates it once."
+discharge = "nothing"
+fact = "The vendor documentation of NEWID() and RAND() (SQL Server 2022) and of gen_random_uuid() and random() (PostgreSQL 18): each call returns a new random value of the same type and range."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-READ-COMMITTED"

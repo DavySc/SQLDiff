@@ -1671,6 +1671,8 @@ impl Ctx<'_> {
             Expr::Null => Ok(V::Null),
             Expr::Num(n) => parse_num(n),
             Expr::Str(s) => Ok(V::Str(s.clone())),
+            // The witness evaluator has no binary values: refuse, never invent one.
+            Expr::Bytes(_) | Expr::Duration(..) => rej(),
             Expr::Var(v) => self.var(v),
             Expr::Name(parts) => self.resolve(parts, scopes),
             Expr::Special(s) => match s.as_str() {

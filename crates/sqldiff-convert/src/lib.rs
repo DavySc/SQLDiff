@@ -21,6 +21,7 @@ pub mod callees;
 pub mod cert;
 pub mod drift;
 pub mod gate;
+pub mod impossible;
 pub mod instances;
 pub mod job;
 pub mod names;
@@ -170,6 +171,18 @@ pub struct Unit {
     pub written: Option<Written>,
 }
 
+impl Unit {
+    /// The SQL Server-only feature the unit's refusal names, if it is one:
+    /// the unit is still not converted ([`impossible`]).
+    pub fn impossible(&self) -> Option<impossible::Feature> {
+        if self.status == Status::NotConverted {
+            impossible::of_note(&self.notes)
+        } else {
+            None
+        }
+    }
+}
+
 /// Who wrote a unit's output by hand.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Written {
@@ -186,7 +199,13 @@ pub struct Counts {
     pub decision: usize,
     pub unproven: usize,
     pub differs: usize,
+    /// Every not converted unit. Of them, `impossible` are marked as
+    /// impossible to convert automatically (`impossible`): a count within
+    /// `not_converted`, never beside it, so no file or total reads
+    /// cleaner for it.
     pub not_converted: usize,
+    #[serde(default)]
+    pub impossible: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -813,6 +832,9 @@ pub(crate) fn recount(c: &mut Conversion) {
             Status::Differs => &mut counts.differs,
             Status::NotConverted => &mut counts.not_converted,
         } += 1;
+        if u.status == Status::NotConverted && u.impossible().is_some() {
+            counts.impossible += 1;
+        }
     }
     c.counts = counts;
 }

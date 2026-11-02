@@ -114,13 +114,17 @@ pub mod asm {
         "ASM-TSQL-PLUS-IS-CONCAT",
         "Operands of T-SQL `+` next to a string literal are character strings, so `+` concatenates",
     );
+    pub const RANDOM_FRESH: (&str, &str) = (
+        "ASM-RANDOM-FRESH",
+        "NEWID() and gen_random_uuid() are the same, and RAND() and random() (both without a seed) are the same: each evaluation draws a fresh value from the same range (a uniqueidentifier or uuid, a float in [0, 1)), and a RAND() is compared only in a statement that evaluates it once (T-SQL draws it once per statement, PostgreSQL's random() once per row)",
+    );
     pub const SYSDATETIME: (&str, &str) = (
         "ASM-TSQL-SYSDATETIME-PER-STATEMENT",
         "SYSDATETIME() is evaluated once per statement (observed SQL Server behaviour, not documented; fact V20)",
     );
     pub const CLOCK_FRACTION_6: (&str, &str) = (
         "ASM-CLOCK-FRACTION-6",
-        "The 7th fraction digit of the clock is not used: SYSDATETIME() (7 digits in T-SQL) and the PostgreSQL statement clock (6 digits), stored in or cast to a 6-digit timestamp, are the same value; SQL Server rounds the 7th digit away and PostgreSQL never has one",
+        "Storing the statement clock in, or casting it to, a 6-digit timestamp changes nothing the code reads: SYSDATETIME() has 7 fraction digits in T-SQL and the cast rounds the 7th away, the PostgreSQL statement clock has only 6. Only the precision: whether the two clocks are the same instant is a separate question this assumption does not cover",
     );
     pub const STRING_AGG_8000: (&str, &str) = (
         "ASM-TSQL-STRING-AGG-8000",
@@ -354,6 +358,12 @@ pub struct Canon<'a> {
     pub discharged: Vec<String>,
     /// The statement being lowered evaluates its expressions for one row.
     single_row: bool,
+    /// Random draws (`RAND()`, `random()`) lowered in the statement so far.
+    rand_seen: usize,
+    /// Queries (`query_inner`) the lowering is inside of, at this point.
+    query_depth: usize,
+    /// Random draws lowered in the unit so far, numbered (see `fresh`).
+    fresh_seq: usize,
     seen_tables: HashMap<String, usize>,
     /// PostgreSQL `EXCLUDED.c` while lowering ON CONFLICT DO UPDATE.
     excluded: Option<Vec<(String, Term, Option<Ty>)>>,
@@ -728,6 +738,9 @@ impl<'a> Canon<'a> {
             asm: Vec::new(),
             discharged: Vec::new(),
             single_row: false,
+            rand_seen: 0,
+            query_depth: 0,
+            fresh_seq: 0,
             seen_tables: HashMap::new(),
             excluded: None,
             sub_bits: HashMap::new(),
@@ -751,6 +764,9 @@ impl<'a> Canon<'a> {
         self.asm.clear();
         self.discharged.clear();
         self.single_row = false;
+        self.rand_seen = 0;
+        self.query_depth = 0;
+        self.fresh_seq = 0;
         self.seen_tables.clear();
         self.excluded = None;
         self.names.clear();
@@ -1554,6 +1570,10 @@ impl<'a> Canon<'a> {
                 )
             }
             Expr::Num(s) => self.num_lit(s),
+            // Db2 for i `BX'…'` is the same bytes as T-SQL `0x…` above.
+            Expr::Bytes(h) => (n("bytes", vec![a(h.clone())]), None),
+            // Not modelled: a duration is refused, never read as the number.
+            Expr::Duration(..) => return Err("a labeled duration is not modelled".into()),
             Expr::Str(s) => (
                 n("str", vec![a(s.clone())]),
                 Some(Ty {
@@ -1982,6 +2002,27 @@ impl<'a> Canon<'a> {
                 )
             }
         })
+    }
+
+    /// Whether a random draw may be compared here. A procedure or a script
+    /// is lowered once, and each loop body once on each side, so the draw's
+    /// numbering holds. A function, a view or a trigger may run the same
+    /// draw in another statement or for another caller, which the numbering
+    /// does not show, so it stays not compared.
+    fn fresh_allowed(&self) -> bool {
+        matches!(self.unit.kind, UnitKind::Proc | UnitKind::Script)
+    }
+
+    /// A fresh random value (`ASM-RANDOM-FRESH`). Each draw is numbered in
+    /// the order the unit lowers it, so a draw never equals another draw of
+    /// the same side, and the two sides' draws pair in source order.
+    fn fresh(&mut self, fam: Fam, kind: &str) -> (Term, Option<Ty>) {
+        self.fresh_seq += 1;
+        self.assume(asm::RANDOM_FRESH);
+        (
+            n("fresh", vec![a(kind), a(self.fresh_seq.to_string())]),
+            Some(Ty::of(fam)),
+        )
     }
 
     fn time(&mut self, kind: &str) -> (Term, Option<Ty>) {
@@ -3268,6 +3309,22 @@ impl<'a> Canon<'a> {
                 }
                 _ => portable(&name, args, first_ty),
             },
+            (Dialect::Tsql, "newid", 0) | (Dialect::Postgres, "gen_random_uuid", 0)
+                if self.fresh_allowed() =>
+            {
+                self.fresh(Fam::Uuid, "uuid")
+            }
+            // RAND() draws once per statement in T-SQL and random() once per
+            // row: only a statement that evaluates it once, and holds one draw.
+            (Dialect::Tsql, "rand", 0) | (Dialect::Postgres, "random", 0)
+                if self.fresh_allowed()
+                    && self.single_row
+                    && self.query_depth == 0
+                    && self.rand_seen == 0 =>
+            {
+                self.rand_seen += 1;
+                self.fresh(Fam::Float, "float")
+            }
             (Dialect::Tsql, "sysdatetime", 0) => self.time("stmt"),
             (Dialect::Tsql, "getdate", 0) => self.time("stmt-datetime"),
             (Dialect::Postgres, "statement_timestamp", 0) => self.time("stmt"),
@@ -4901,6 +4958,15 @@ impl<'a> Canon<'a> {
     }
 
     fn query_inner(&mut self, s: &Select, ctx: QCtx) -> R<Parts> {
+        // A draw inside a query runs once per row the query reads (see
+        // `fresh`), so a RAND() under any query is not compared.
+        self.query_depth += 1;
+        let r = self.query_body(s, ctx);
+        self.query_depth -= 1;
+        r
+    }
+
+    fn query_body(&mut self, s: &Select, ctx: QCtx) -> R<Parts> {
         let from = self.push_from(&s.from)?;
         let mut items = Vec::new();
         for it in &s.items {
@@ -5193,6 +5259,8 @@ impl<'a> Canon<'a> {
     /// tested.
     pub fn condition(&mut self, e: &Expr) -> R<Term> {
         self.seen_tables.clear();
+        self.rand_seen = 0;
+        self.query_depth = 0;
         self.single_row = true;
         Ok(self.cond(e)?.0)
     }
@@ -5460,6 +5528,8 @@ impl<'a> Canon<'a> {
             return self.output_unfolded(s, &o);
         }
         self.seen_tables.clear();
+        self.rand_seen = 0;
+        self.query_depth = 0;
         self.single_row = false;
         match s {
             Stmt::Select(sel) if !sel.ctes.is_empty() => {
