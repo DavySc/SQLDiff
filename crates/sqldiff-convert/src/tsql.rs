@@ -98,6 +98,7 @@ pub(crate) fn convert(
         bit_outer: None,
         bit_aliases: Vec::new(),
         ret_bit: false,
+        ret_dt: Dt::Other,
         view_query: false,
         trigger: None,
         seq_defaults: Vec::new(),
@@ -287,6 +288,9 @@ struct Cx<'a> {
     bit_aliases: Vec<String>,
     /// The function being converted returns BIT.
     ret_bit: bool,
+    /// The type of the function being converted, when it is an integer
+    /// (`Dt::Other` otherwise): a RETURNed fraction is truncated.
+    ret_dt: Dt,
     /// The query of a view is being converted: its ORDER BY does not order
     /// the view's rows.
     view_query: bool,
@@ -683,6 +687,7 @@ impl<'a> Cx<'a> {
         self.routine_parts = sqldiff_syntax::ast::routine_name_parts(r);
         self.rolls_back = pg_rolls_back(r);
         self.ret_bit = false;
+        self.ret_dt = Dt::Other;
         self.return_code = false;
         self.rows_fn = false;
         self.results.clear();
@@ -826,6 +831,7 @@ impl<'a> Cx<'a> {
             }
             let (ty, _, _) = self.ty(rt)?;
             self.ret_bit = Dt::of_tokens(rt) == Dt::Bit;
+            self.ret_dt = Dt::of_tokens(rt);
             returns = format!(" RETURNS {ty}");
             self.step_ts_with("tsql.routine.returns", &ts[ret..rend], ty);
         }
@@ -3779,6 +3785,42 @@ impl<'a> Cx<'a> {
         Some(Dt::of(&c.data_type.base, &c.data_type.args))
     }
 
+    /// The type of column `col` of the UPDATE target `table` when the
+    /// statement has a FROM: the target is an alias of a FROM item (the
+    /// alias wins, as in T-SQL) or the table itself. `None` unless the
+    /// statement's scope names exactly one table for it and knows its columns.
+    fn scope_col_dt(&self, table: &[T], col: &str) -> Option<Dt> {
+        use sqldiff_core::catalog::Ident;
+        let names: Vec<String> = table
+            .iter()
+            .filter(|t| matches!(t.k, IDENT | QUOTED_IDENT))
+            .map(|t| tsql_unquote(&t.s).to_ascii_lowercase())
+            .collect();
+        let [n] = names.as_slice() else {
+            return self.target_col_dt(table, col);
+        };
+        let scope = self.scope.as_ref()?;
+        let aliased: Vec<&ScopeEntry> = scope
+            .entries
+            .iter()
+            .filter(|e| e.alias.as_deref() == Some(n.as_str()))
+            .collect();
+        if aliased.is_empty() {
+            return self.target_col_dt(table, col);
+        }
+        let mut found: Option<(&str, Dt)> = None;
+        for e in aliased {
+            let t = self.entry_table(e)?;
+            let c = t.column(Dialect::Tsql, &Ident::plain(col.to_string()))?;
+            let dt = Dt::of(&c.data_type.base, &c.data_type.args);
+            if found.is_some_and(|(name, d)| name != t.name || d != dt) {
+                return None;
+            }
+            found = Some((t.name.as_str(), dt));
+        }
+        found.map(|(_, d)| d)
+    }
+
     /// Wraps `value` (tokens) as `trunc(value)` tokens.
     fn wrap_trunc(value: &[T]) -> Vec<T> {
         let at = value.iter().find(|t| t.sig()).map_or(0, |t| t.pos.0);
@@ -3810,14 +3852,21 @@ impl<'a> Cx<'a> {
                 .map_or(ts[first].pos.0, |t| t.pos.0)
         };
         if ts[first].is("UPDATE") {
-            let (Some(set), None) = (top(&ts, "SET", 0), top(&ts, "FROM", 0)) else {
+            let Some(set) = top(&ts, "SET", 0) else {
                 return ts;
             };
             if top(&ts, "OUTPUT", 0).is_some() {
                 return ts;
             }
             let table = &ts[first + 1..set];
-            let end = top(&ts, "WHERE", set).unwrap_or(ts.len());
+            // `UPDATE x SET … FROM t x JOIN u …`: the SET list ends at the
+            // FROM, and the target `x` may be an alias (`scope_col_dt`).
+            let joined = top(&ts, "FROM", set);
+            let end = [joined, top(&ts, "WHERE", set)]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(ts.len());
             let mut out = ts[..=set].to_vec();
             let mut changed = false;
             for (k, item) in split_commas(&ts[set + 1..end]).into_iter().enumerate() {
@@ -3837,7 +3886,14 @@ impl<'a> Cx<'a> {
                         let dt = (it[..e]
                             .iter()
                             .all(|&j| matches!(item[j].k, IDENT | QUOTED_IDENT | DOT)))
-                        .then(|| self.target_col_dt(table, &tsql_unquote(&col.s)))
+                        .then(|| {
+                            let c = tsql_unquote(&col.s);
+                            if joined.is_some() {
+                                self.scope_col_dt(table, &c)
+                            } else {
+                                self.target_col_dt(table, &c)
+                            }
+                        })
                         .flatten();
                         let value = &item[it[e] + 1..];
                         match dt {
@@ -3885,10 +3941,13 @@ impl<'a> Cx<'a> {
             let Some(close) = matching(&ts, open) else {
                 return ts;
             };
+            let table = &ts[name_at..open];
+            if let Some(sel) = next_sig(&ts, close).filter(|&j| ts[j].is("SELECT")) {
+                return self.int_stores_select(ts, name_at, open, close, sel);
+            }
             let Some(values) = next_sig(&ts, close).filter(|&j| ts[j].is("VALUES")) else {
                 return ts;
             };
-            let table = &ts[name_at..open];
             if table
                 .iter()
                 .any(|t| t.sig() && !matches!(t.k, IDENT | QUOTED_IDENT | DOT))
@@ -3956,6 +4015,122 @@ impl<'a> Cx<'a> {
             return if changed { out } else { ts };
         }
         ts
+    }
+
+    /// `INSERT INTO t (a, b) SELECT x, y FROM …`: the select-list item for a
+    /// column of integer type that has a fraction is truncated, as in
+    /// `int_stores`. T-SQL converts each row's value when it stores it, so
+    /// the rewrite must not change what the SELECT does with the unconverted
+    /// value: any DISTINCT, TOP, set operator, ORDER BY, INTO or OFFSET at the
+    /// top level of the SELECT, or an item with a top-level `AS` alias that
+    /// ORDER BY or GROUP BY could name, leaves the statement as it is.
+    fn int_stores_select(
+        &mut self,
+        ts: Vec<T>,
+        name_at: usize,
+        open: usize,
+        close: usize,
+        sel: usize,
+    ) -> Vec<T> {
+        let table = &ts[name_at..open];
+        if table
+            .iter()
+            .any(|t| t.sig() && !matches!(t.k, IDENT | QUOTED_IDENT | DOT))
+        {
+            return ts;
+        }
+        let ds = crate::tok::depths(&ts);
+        let top_words = |from: usize, ws: &[&str]| {
+            (from..ts.len()).any(|j| ds[j] == 0 && ws.iter().any(|w| ts[j].is(w)))
+        };
+        if top_words(
+            sel,
+            &[
+                "DISTINCT",
+                "TOP",
+                "UNION",
+                "EXCEPT",
+                "INTERSECT",
+                "ORDER",
+                "INTO",
+                "OFFSET",
+                "FOR",
+            ],
+        ) {
+            return ts;
+        }
+        let cols: Vec<Option<Dt>> = split_commas(&ts[open + 1..close])
+            .iter()
+            .map(|c| match trimmed(c) {
+                [t] if matches!(t.k, IDENT | QUOTED_IDENT) => {
+                    self.target_col_dt(table, &tsql_unquote(&t.s))
+                }
+                _ => None,
+            })
+            .collect();
+        if !cols.iter().any(|d| matches!(d, Some(Dt::Int | Dt::BigInt))) {
+            return ts;
+        }
+        let end = (sel + 1..ts.len())
+            .find(|&j| {
+                ds[j] == 0
+                    && ["FROM", "WHERE", "GROUP", "HAVING", "OPTION"]
+                        .iter()
+                        .any(|w| ts[j].is(w))
+            })
+            .unwrap_or(ts.len());
+        let items = split_commas(&ts[sel + 1..end]);
+        if items.len() != cols.len() {
+            return ts;
+        }
+        let mut out = ts[..=sel].to_vec();
+        let mut changed = false;
+        for (k, item) in items.iter().enumerate() {
+            if k > 0 {
+                out.push(T::made(
+                    COMMA,
+                    ",",
+                    item.first().map_or(0, |t| t.pos.0),
+                    "tsql.assign.int-trunc",
+                ));
+            }
+            let v = trimmed(item);
+            let aliased = crate::tok::find_word(v, 0, "AS");
+            let (expr, alias) = match aliased {
+                Some(a) => (trimmed(&v[..a]), &v[a..]),
+                None => (v, &v[v.len()..]),
+            };
+            if matches!(cols[k], Some(Dt::Int | Dt::BigInt))
+                && !expr.is_empty()
+                && self.expr_dt(expr) == Some(Dt::Fraction)
+            {
+                self.step_ts("tsql.assign.int-trunc", expr);
+                // The leading space of the item, then trunc(expr) and the alias.
+                let lead = item.len() - item.iter().skip_while(|t| !t.sig()).count();
+                out.extend(item[..lead].iter().cloned());
+                out.extend(Self::wrap_trunc(expr));
+                if !alias.is_empty() {
+                    out.push(T::made(
+                        WHITESPACE,
+                        " ",
+                        expr.iter().find(|t| t.sig()).map_or(0, |t| t.pos.0),
+                        "tsql.assign.int-trunc",
+                    ));
+                    out.extend(alias.iter().cloned());
+                }
+                let tail = item.iter().rposition(|t| t.sig()).map_or(0, |p| p + 1);
+                out.extend(item[tail..].iter().cloned());
+                changed = true;
+            } else {
+                out.extend(item.iter().cloned());
+            }
+        }
+        out.extend(ts[end..].iter().cloned());
+        if changed {
+            out
+        } else {
+            ts
+        }
     }
 
     fn set(&mut self, ts: &[T]) -> R<String> {
@@ -4336,7 +4511,12 @@ impl<'a> Cx<'a> {
             if self.mode == Mode::Func && self.ret_bit {
                 self.bit_store_text(&ts[j..])
             } else {
-                self.expr(&ts[j..]).trim().to_string()
+                let v = self.expr(&ts[j..]).trim().to_string();
+                if self.mode == Mode::Func && self.trigger.is_none() {
+                    self.store_int(self.ret_dt, &ts[j..], v)
+                } else {
+                    v
+                }
             }
         });
         match (self.mode, val) {
@@ -5212,6 +5392,7 @@ impl<'a> Cx<'a> {
             };
             // The parameter this argument binds to, when the callee is known.
             let mut bit_param = false;
+            let mut param_dt = Dt::Other;
             if let Some(ps) = params {
                 let at = if named {
                     ps.iter().position(|p| p.name.eq_ignore_ascii_case(&a[0].s))
@@ -5226,6 +5407,9 @@ impl<'a> Cx<'a> {
                 };
                 passed.push(at);
                 bit_param = ps[at].data_type.base == "BIT" && !marked;
+                if !marked {
+                    param_dt = Dt::of(&ps[at].data_type.base, &ps[at].data_type.args);
+                }
                 let out_param = matches!(ps[at].mode, ParamMode::Out | ParamMode::InOut);
                 if out_param != marked {
                     return no(if out_param {
@@ -5252,7 +5436,8 @@ impl<'a> Cx<'a> {
                 let v = if bit_param {
                     self.bit_store_text(value)
                 } else {
-                    self.expr(value).trim().to_string()
+                    let v = self.expr(value).trim().to_string();
+                    self.store_int(param_dt, value, v)
                 };
                 let arg = format!("p_{}", snake(&a[0].s[1..]));
                 self.step_ts_with("tsql.exec.named-argument", a, arg.clone());
@@ -5260,7 +5445,8 @@ impl<'a> Cx<'a> {
             } else if bit_param {
                 args.push(self.bit_store_text(value));
             } else {
-                args.push(self.expr(value).trim().to_string());
+                let v = self.expr(value).trim().to_string();
+                args.push(self.store_int(param_dt, value, v));
             }
         }
         if let Some(ps) = params {
