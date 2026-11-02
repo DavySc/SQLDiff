@@ -11117,6 +11117,25 @@ impl Cx<'_> {
         };
         let ty = trimmed(a[0]);
         let words: Vec<String> = sig(ty).iter().map(|&i| ty[i].up()).collect();
+        // A compact date literal read with style 112 is the CAST of the
+        // same literal (the engine proves it the same way).
+        if let (Some(name), [lit], [num]) = (
+            words.first(),
+            sig(trimmed(a[1])).as_slice(),
+            sig(trimmed(a[2])).as_slice(),
+        ) {
+            let (lit, num) = (&trimmed(a[1])[*lit], &trimmed(a[2])[*num]);
+            if lit.k == STRING
+                && num.k == NUMBER
+                && sqldiff_core::equiv::canon::compact_date_convert(
+                    name,
+                    &string_value(&lit.s),
+                    &num.s,
+                )
+            {
+                return self.cast_pg(a[1], a[0]);
+            }
+        }
         let len = match words
             .iter()
             .map(String::as_str)
