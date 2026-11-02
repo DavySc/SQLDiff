@@ -460,3 +460,31 @@ fn bulk_insert_is_refused_without_a_leftover_statement() {
         );
     }
 }
+
+#[test]
+fn bulk_insert_as_an_if_or_while_body_is_never_live_sql() {
+    for src in [
+        "IF 1 = 1 BULK INSERT t FROM 'f'\nGO\n",
+        "IF 1 = 1 BULK INSERT t FROM 'f' ELSE PRINT 'x'\nGO\n",
+        "WHILE 1 = 1 BULK INSERT t FROM 'f'\nGO\n",
+    ] {
+        for c in [pg(src), db2(src)] {
+            let live: Vec<&str> = c
+                .output
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("--"))
+                .collect();
+            assert!(
+                !live
+                    .iter()
+                    .any(|l| l.to_ascii_uppercase().contains("INSERT")),
+                "{src}: {live:?}"
+            );
+            assert!(
+                c.units.iter().any(|u| u.status == Status::NotConverted),
+                "{src}: {:?}",
+                c.units.iter().map(|u| u.status).collect::<Vec<_>>()
+            );
+        }
+    }
+}

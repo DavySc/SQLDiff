@@ -669,7 +669,10 @@ impl<'a> Parser<'a> {
             }
             if !first && depth == 0 && case == 0 && k == IDENT {
                 let w = self.upper_word();
-                let starter = TSQL_STARTERS.contains(&w.as_str()) || w == "ELSE" || w == "END";
+                let starter = TSQL_STARTERS.contains(&w.as_str())
+                    || w == "ELSE"
+                    || w == "END"
+                    || w == "BULK" && self.nth_kw(1, "INSERT");
                 let continues = matches!(prev_word.as_str(), "AND" | "OR" | "NOT")
                     || matches!(prev_kind, Some(COMMA | L_PAREN));
                 if starter && !continues {
@@ -1219,6 +1222,29 @@ mod tests {
                 "INSERT INTO"
             ]
         );
+    }
+
+    #[test]
+    fn bulk_insert_as_the_body_of_if_and_while() {
+        for text in [
+            "IF 1 = 1 BULK INSERT t FROM 'f'\nSELECT 1",
+            "IF 1 = 1 BULK INSERT t FROM 'f' ELSE BULK INSERT t FROM 'g'\nSELECT 1",
+            "WHILE 1 = 1 BULK INSERT t FROM 'f'\nSELECT 1",
+            "IF 1 = 1\n    BULK INSERT t FROM 'f' WITH (TABLOCK);\nSELECT 1",
+        ] {
+            let words: Vec<String> = units(text, Dialect::Tsql)
+                .into_iter()
+                .map(|(_, w)| w)
+                .collect();
+            assert!(
+                !words.iter().any(|w| w.starts_with("INSERT")),
+                "{text}: {words:?}"
+            );
+            assert!(
+                words.iter().any(|w| w == "BULK INSERT"),
+                "{text}: {words:?}"
+            );
+        }
     }
 
     #[test]
