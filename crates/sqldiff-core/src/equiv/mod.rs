@@ -17,6 +17,7 @@ pub mod dynamic;
 pub mod edit;
 pub mod eval;
 pub mod geography;
+mod geography_area;
 mod known_bytes;
 pub mod like;
 pub mod literal;

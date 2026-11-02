@@ -164,9 +164,13 @@ pub enum Wkb {
 /// A geometry collection nested in a collection is accepted by both but not
 /// read here.
 pub fn wkb(b: &[u8]) -> Option<Wkb> {
-    let mut r = Reader { b, at: 0 };
+    let mut r = Reader {
+        b,
+        at: 0,
+        polygons: Vec::new(),
+    };
     r.geometry(true)?;
-    if r.at != b.len() {
+    if r.at != b.len() || !super::geography_area::same_region(&r.polygons) {
         return None;
     }
     if b.len() == 21 && b[1..5] == [1, 0, 0, 0] {
@@ -185,7 +189,7 @@ pub fn wkb(b: &[u8]) -> Option<Wkb> {
 /// A plain decimal literal (digits, one optional point, optional minus) read
 /// as the double both engines convert it to. SQL Server's decimal-to-float
 /// and PostgreSQL's numeric-to-float8 both give the nearest double (606
-/// literals of up to 27 digits checked equal on both engines,
+/// literals checked equal on both engines,
 /// `eval/geography/2026-11-02/pointprobe.py`); `-0.0` is a zero without a
 /// sign in both. Exponents, other bases and longer literals are not read.
 pub fn literal_double(e: &super::ast::Expr) -> Option<f64> {
@@ -198,7 +202,7 @@ pub fn literal_double(e: &super::ast::Expr) -> Option<f64> {
         && body.bytes().filter(|&b| b == b'.').count() <= 1
         && body.bytes().next().is_some_and(|b| b.is_ascii_digit())
         && !body.ends_with('.')
-        && (1..=27).contains(&digits);
+        && (1..=15).contains(&digits);
     let v: f64 = shape.then(|| s.parse().ok()).flatten()?;
     Some(if v == 0.0 { 0.0 } else { v })
 }
@@ -248,6 +252,8 @@ pub fn tsql_constant(
 struct Reader<'a> {
     b: &'a [u8],
     at: usize,
+    /// Every polygon read, for the side check (`geography_area`).
+    polygons: Vec<super::geography_area::Polygon>,
 }
 
 impl Reader<'_> {
@@ -297,6 +303,7 @@ impl Reader<'_> {
             }
             3 => {
                 let rings = self.count(4)?;
+                let mut polygon = Vec::new();
                 for _ in 0..rings {
                     let n = self.count(16)?;
                     let p = self.points(n)?;
@@ -308,7 +315,9 @@ impl Reader<'_> {
                     if !closed {
                         return None;
                     }
+                    polygon.push(p);
                 }
+                self.polygons.push(polygon);
             }
             4..=6 => {
                 let n = self.count(9)?;
@@ -405,10 +414,18 @@ mod tests {
             let [name, hex, both] = l.split_whitespace().collect::<Vec<_>>()[..] else {
                 panic!("bad case line {l}");
             };
-            // Both engines read a collection inside a collection alike; it
-            // is left out on purpose.
-            let read = both == "same" && name != "gc_nested";
-            assert_eq!(wk(hex).is_some(), read, "{name}");
+            // Accepted means the same bytes on both engines. A collection
+            // inside a collection is left out on purpose, and a polygon is
+            // accepted only when both engines also take the same side of its
+            // rings (`geography_area`; `regions.py` replays that probe).
+            let read = wk(hex).is_some();
+            if read {
+                assert!(both == "same" && name != "gc_nested", "{name}");
+            }
+            // Wrong ring direction: SQL Server takes the other side.
+            let wrong_side = ["cw_small", "cw_big", "hole_ccw", "ring_cw_hole_cw"];
+            assert_eq!(wrong_side.contains(&name) && read, false, "{name}");
+            assert!(name != "ccw" || read, "{name}");
             n += 1;
         }
         assert!(n > 50);

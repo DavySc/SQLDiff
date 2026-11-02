@@ -55,6 +55,27 @@ fn poly(ring: &[(f64, f64)]) -> String {
     format!("0103000000{}{}{pts}", le32(1), le32(ring.len() as u32))
 }
 
+/// A polygon of several rings, the first one the exterior.
+fn poly_rings(rings: &[Vec<(f64, f64)>]) -> String {
+    let body: String = rings
+        .iter()
+        .map(|r| {
+            let pts: String = r.iter().map(|&(x, y)| d(x) + &d(y)).collect();
+            format!("{}{pts}", le32(r.len() as u32))
+        })
+        .collect();
+    format!("0103000000{}{body}", le32(rings.len() as u32))
+}
+
+/// A square of side `s` at (`x`, `y`), counter-clockwise or clockwise.
+fn square(x: f64, y: f64, s: f64, ccw: bool) -> Vec<(f64, f64)> {
+    let mut r = vec![(x, y), (x + s, y), (x + s, y + s), (x, y + s), (x, y)];
+    if !ccw {
+        r.reverse();
+    }
+    r
+}
+
 const SQUARE: [(f64, f64); 5] = [
     (-88.5, 30.2),
     (-87.5, 30.2),
@@ -110,8 +131,11 @@ fn other_shapes_and_a_point_in_wkb() {
         d(3.0),
         d(4.0)
     );
-    let multi = format!("0106000000{}{}{}", le32(2), poly(&SQUARE), poly(&SQUARE));
-    for h in [point, line, multi, format!("0107000000{}", le32(0))] {
+    let apart = poly(&square(10.0, 10.0, 1.0, true));
+    let multi = format!("0106000000{}{}{}", le32(2), poly(&SQUARE), apart);
+    // A counter-clockwise shell with a clockwise hole.
+    let holed = poly_rings(&[square(0.0, 0.0, 10.0, true), square(2.0, 2.0, 2.0, false)]);
+    for h in [point, line, multi, holed, format!("0107000000{}", le32(0))] {
         let src = format!(
             "SET XACT_ABORT ON;\nUPDATE dbo.Cities SET Location = geography::STGeomFromWKB(0x{h}, 4326) WHERE CityID = 1;\n"
         );
@@ -143,6 +167,17 @@ fn point_from_decimal_coordinates() {
 }
 
 #[test]
+fn coordinates_beyond_what_a_double_keeps_are_not_proven() {
+    // 15 significant digits are read back exactly; 16 or more may not be.
+    let src = |lat: &str| {
+        format!("SET XACT_ABORT ON;\nUPDATE dbo.Cities SET Location = geography::Point({lat}, 1, 4326) WHERE CityID = 1;\n")
+    };
+    ok(&pg(&src("37.7657860000000")));
+    not_proven(&pg(&src("37.76578600000001")));
+    not_proven(&pg(&src("37.765786000000012345678")));
+}
+
+#[test]
 fn input_the_engines_treat_differently_is_not_proven() {
     let mut bad: Vec<(&str, String)> = Vec::new();
     // Latitude 91: SQL Server raises, PostGIS moves it into range.
@@ -164,6 +199,29 @@ fn input_the_engines_treat_differently_is_not_proven() {
     ));
     // NaN longitude.
     bad.push(("nan", format!("0x0101000000{}{}", d(f64::NAN), d(1.0))));
+    // Ring direction: SQL Server takes the area on the left of the ring (a
+    // clockwise exterior is the rest of the globe), PostGIS the smaller side.
+    // Each shape has a counter-clockwise control that is proven below.
+    let cw: Vec<_> = SQUARE.iter().rev().copied().collect();
+    bad.push(("clockwise exterior", format!("0x{}", poly(&cw))));
+    let shell = square(0.0, 0.0, 10.0, true);
+    bad.push((
+        "counter-clockwise hole",
+        format!("0x{}", poly_rings(&[shell.clone(), square(2.0, 2.0, 2.0, true)])),
+    ));
+    bad.push((
+        "clockwise shell with a clockwise hole",
+        format!("0x{}", poly_rings(&[square(0.0, 0.0, 10.0, false), square(2.0, 2.0, 2.0, false)])),
+    ));
+    bad.push((
+        "hole outside the shell",
+        format!("0x{}", poly_rings(&[shell.clone(), square(20.0, 2.0, 2.0, false)])),
+    ));
+    let bow = vec![(0.0, 0.0), (1.0, 1.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)];
+    bad.push(("bow tie", format!("0x{}", poly(&bow))));
+    // A hemisphere and a pole: too large for the smaller-side reading.
+    bad.push(("180 degrees wide", format!("0x{}", poly(&square(-90.0, 0.0, 180.0, true)))));
+    bad.push(("around the pole", format!("0x{}", poly(&square(0.0, 80.0, 20.0, true)))));
     // A variable the code never gives a value: NULL, or a parameter's value.
     bad.push(("no value", "@p".into()));
     for (what, arg) in bad {
