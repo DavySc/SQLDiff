@@ -4718,7 +4718,12 @@ impl<'a> Canon<'a> {
             return Err("SELECT INTO here is not supported".into());
         }
         self.scopes.push(Vec::new());
+        // The derived tables this query binds (their column types) end with
+        // it: a subquery's `(SELECT …) x` must not leave its types under the
+        // alias of an outer `x`.
+        let derived_types = self.sub_bits.clone();
         let r = self.query_inner(s, ctx);
+        self.sub_bits = derived_types;
         self.scopes.pop();
         r
     }
