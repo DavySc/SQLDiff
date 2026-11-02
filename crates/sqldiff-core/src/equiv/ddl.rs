@@ -88,6 +88,16 @@ pub struct SchemaDef {
     pub off: usize,
 }
 
+/// `CREATE ROLE name`: a T-SQL database role, or a PostgreSQL role made
+/// `NOLOGIN` (the form the converter writes, `ASM-ROLE-NOLOGIN`).
+#[derive(Debug, Clone)]
+pub struct RoleDef {
+    pub dialect: Dialect,
+    pub name: Name,
+    pub nologin: bool,
+    pub off: usize,
+}
+
 /// `GRANT privileges ON table TO principals [WITH GRANT OPTION]` (T-SQL
 /// `ON [OBJECT::]name`): the object privileges both dialects grant one to
 /// one on a table or view.
@@ -188,6 +198,7 @@ pub enum Ddl {
     Index(Index),
     Sequence(Sequence),
     Schema(SchemaDef),
+    Role(RoleDef),
     Grant(Grant),
     Drop(DropDef),
     Default(SetDefault),
@@ -201,6 +212,7 @@ impl Ddl {
             Ddl::Index(_) => "CREATE INDEX",
             Ddl::Sequence(_) => "CREATE SEQUENCE",
             Ddl::Schema(_) => "CREATE SCHEMA",
+            Ddl::Role(_) => "CREATE ROLE",
             Ddl::Grant(_) => "GRANT",
             Ddl::Drop(d) => match d.kind {
                 "TABLE" => "DROP TABLE",
@@ -237,7 +249,8 @@ pub fn is_ddl(words: &[String]) -> bool {
     if w(1) == "OR" && w(2) == "REPLACE" {
         i = 3;
     }
-    matches!(w(i), "SEQUENCE" | "SCHEMA") || (i..words.len().min(i + 4)).any(|j| w(j) == "INDEX")
+    matches!(w(i), "SEQUENCE" | "SCHEMA" | "ROLE")
+        || (i..words.len().min(i + 4)).any(|j| w(j) == "INDEX")
 }
 
 /// Whether a statement's first words make it a `DROP` or `ALTER TABLE`
@@ -346,6 +359,9 @@ pub fn case_check(x: &Ddl, schema: &super::schema::Schema) -> R<()> {
         Ddl::Schema(c) if c.dialect == Dialect::Postgres => {
             schema.case_check(&stored(&c.name), false)?;
         }
+        Ddl::Role(r) if r.dialect == Dialect::Postgres => {
+            schema.case_check(&stored(&r.name), false)?;
+        }
         Ddl::Grant(g) if g.dialect == Dialect::Postgres => {
             for n in &g.object {
                 schema.case_check(&stored(n), true)?;
@@ -409,6 +425,7 @@ pub fn pair_key(x: &Ddl) -> R<String> {
             format!("sequence {}.{n}", s.unwrap_or_default())
         }
         Ddl::Schema(s) => format!("schema {}", fold(&s.name, s.dialect)?),
+        Ddl::Role(r) => format!("role {}", fold(&r.name, r.dialect)?),
         Ddl::Grant(g) => {
             let (s, o) = object_key(&g.object, g.dialect)?;
             let to = g
@@ -551,6 +568,9 @@ pub fn parse(ts: &[Tok], d: Dialect) -> R<Ddl> {
     }
     if word(ts.get(1), "SCHEMA") {
         return schema(ts, d).map(Ddl::Schema);
+    }
+    if word(ts.get(1), "ROLE") {
+        return role(ts, d).map(Ddl::Role);
     }
     index(ts, d).map(Ddl::Index)
 }
@@ -1304,6 +1324,27 @@ fn set_default(ts: &[Tok], d: Dialect) -> R<SetDefault> {
     }
 }
 
+/// `CREATE ROLE name` (T-SQL) or `CREATE ROLE name NOLOGIN` (PostgreSQL).
+/// Any other option (LOGIN, PASSWORD, AUTHORIZATION, …) is refused.
+fn role(ts: &[Tok], d: Dialect) -> R<RoleDef> {
+    let name = ts
+        .get(2)
+        .filter(|t| matches!(t.kind, K::Word | K::Quoted))
+        .and_then(name_of)
+        .ok_or("CREATE ROLE without a name")?;
+    let nologin = match &ts[3.min(ts.len())..] {
+        [] => false,
+        [t] if word(Some(t), "NOLOGIN") => true,
+        rest => return Err(format!("CREATE ROLE with `{}` (options)", text(rest))),
+    };
+    Ok(RoleDef {
+        dialect: d,
+        name,
+        nologin,
+        off: ts[0].off,
+    })
+}
+
 fn schema(ts: &[Tok], d: Dialect) -> R<SchemaDef> {
     let mut i = 2;
     if word(ts.get(i), "IF") {
@@ -1552,6 +1593,10 @@ pub mod asm {
         "ASM-TRUNCATE",
         "TRUNCATE behaves alike on both: no indexed view or other schema-bound object refers to the table (SQL Server refuses the TRUNCATE then), no ON TRUNCATE trigger is on the target table (T-SQL has none to fire), no sequence other than an identity column's belongs to it (RESTART IDENTITY restarts every sequence the table owns), the identity starts where the T-SQL seed does, and no other session reads the table across it (PostgreSQL's TRUNCATE is not MVCC-safe)",
     );
+    pub const ROLE_NOLOGIN: (&str, &str) = (
+        "ASM-ROLE-NOLOGIN",
+        "A T-SQL database role is the PostgreSQL role of the same name created NOLOGIN: the role has no login of its own, and no other PostgreSQL role of that name exists on the target cluster (PostgreSQL roles are cluster-wide)",
+    );
     pub const SCHEMA_OWNER: (&str, &str) = (
         "ASM-SCHEMA-OWNER",
         "The schema's owner on the target holds the privileges its owner holds on the source: the role it names, or the user running the script, which stands for T-SQL dbo (the database owner)",
@@ -1577,6 +1622,7 @@ pub fn compare(
         (Ddl::Index(a), Ddl::Index(b)) => indexes(a, b, na, nb, cols, &mut ev),
         (Ddl::Sequence(a), Ddl::Sequence(b)) => sequences(a, b, na, nb, &mut ev),
         (Ddl::Schema(a), Ddl::Schema(b)) => schemas(a, b, na, nb, &mut ev),
+        (Ddl::Role(a), Ddl::Role(b)) => roles(a, b, na, nb, &mut ev),
         (Ddl::Grant(a), Ddl::Grant(b)) => grants(a, b, na, nb, &mut ev),
         (Ddl::Drop(a), Ddl::Drop(b)) => drops(a, b, na, nb, &mut ev),
         (Ddl::Default(a), Ddl::Default(b)) => defaults(a, b, na, nb, &mut ev),
@@ -2121,6 +2167,43 @@ fn sequences(x: &Sequence, y: &Sequence, na: &str, nb: &str, ev: &mut Vec<Event>
             )));
         }
     }
+    Ok(())
+}
+
+/// A T-SQL `CREATE ROLE` (no options) against a PostgreSQL `CREATE ROLE …
+/// NOLOGIN` of the same name: equal under `ASM-ROLE-NOLOGIN`.
+fn roles(x: &RoleDef, y: &RoleDef, na: &str, nb: &str, ev: &mut Vec<Event>) -> R<()> {
+    let (da, db) = (x.dialect, y.dialect);
+    let tsql_a = tsql_side(da, db)?;
+    let (t, p) = if tsql_a { (x, y) } else { (y, x) };
+    let (pn, tn) = if tsql_a { (nb, na) } else { (na, nb) };
+    let at = (x.off, y.off);
+    ev.push(Event::Asm(super::canon::asm::IDENT_FOLD));
+    if fold(&x.name, da)? != fold(&y.name, db)? {
+        ev.push(Event::Diff {
+            rule: "equiv.role-name",
+            witness: format!(
+                "{na} creates the role {} and {nb} {}, so statements naming one find the other missing",
+                x.name.text, y.name.text
+            ),
+            at,
+        });
+        return Ok(());
+    }
+    // ASM-ROLE-NOLOGIN speaks of PostgreSQL roles only: Db2 for i has none.
+    if p.dialect != Dialect::Postgres {
+        ev.push(Event::Unknown(format!(
+            "{pn} is not PostgreSQL, which is the only target with roles this rule converts to"
+        )));
+        return Ok(());
+    }
+    if t.nologin || !p.nologin {
+        ev.push(Event::Unknown(format!(
+            "{tn} creates the role with no options, and {pn} must create it NOLOGIN to compare"
+        )));
+        return Ok(());
+    }
+    ev.push(Event::Asm(asm::ROLE_NOLOGIN));
     Ok(())
 }
 
