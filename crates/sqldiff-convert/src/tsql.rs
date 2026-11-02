@@ -5891,6 +5891,19 @@ impl<'a> Cx<'a> {
             .position(|t| t.k == L_PAREN)
             .ok_or(No("CREATE TABLE without columns".into()))?;
         let close = matching(&ts, open).ok_or(No("unbalanced parentheses".into()))?;
+        // SQL Server takes one trailing comma after an item of the column
+        // list (a script generator may write it); it is not an item itself.
+        // After `(` or another comma there is no item, and the empty items
+        // are refused below.
+        let list_end = match (open + 1..close).rev().find(|&j| ts[j].sig()) {
+            Some(j)
+                if ts[j].k == COMMA
+                    && prev_sig(&ts, j).is_some_and(|p| p > open && ts[p].k != COMMA) =>
+            {
+                j
+            }
+            _ => close,
+        };
         let name_t: Vec<T> = ts[..open]
             .iter()
             .skip_while(|t| !t.is("TABLE"))
@@ -5901,11 +5914,11 @@ impl<'a> Cx<'a> {
         let name = self.expr(&name_t).trim().to_string();
         let mut cols = Vec::new();
         let pk = if self.db2() {
-            primary_key_columns(&ts[open + 1..close])
+            primary_key_columns(&ts[open + 1..list_end])
         } else {
             Vec::new()
         };
-        self.table_cols = split_commas(&ts[open + 1..close])
+        self.table_cols = split_commas(&ts[open + 1..list_end])
             .iter()
             .filter_map(|item| {
                 let &f = sig(item).first()?;
@@ -5913,13 +5926,13 @@ impl<'a> Cx<'a> {
                     .then(|| tsql_unquote(&item[f].s).to_ascii_lowercase())
             })
             .collect();
-        self.table_items = split_commas(&ts[open + 1..close])
+        self.table_items = split_commas(&ts[open + 1..list_end])
             .into_iter()
             .map(<[T]>::to_vec)
             .collect();
         let mut names = Vec::new();
         let mut indexes = Vec::new();
-        for item in split_commas(&ts[open + 1..close]) {
+        for item in split_commas(&ts[open + 1..list_end]) {
             if sig(item).first().is_some_and(|&f| item[f].is("INDEX")) && !temp {
                 // `INDEX name CLUSTERED COLUMNSTORE` only stores the rows
                 // column by column: no key, no order, nothing enforced.
@@ -5951,7 +5964,7 @@ impl<'a> Cx<'a> {
         }
         if temp {
             if let Some(&n) = sig(&name_t).first() {
-                self.own_table(&name_t[n].s.clone(), &ts[open + 1..close]);
+                self.own_table(&name_t[n].s.clone(), &ts[open + 1..list_end]);
             }
         }
         let tail = self.expr(&ts[close + 1..]);
@@ -6104,9 +6117,10 @@ impl<'a> Cx<'a> {
         };
         let it = trimmed(item);
         let Some(first) = it.first() else {
-            // `(a INT, b INT,)`: SQL Server takes the trailing comma; refuse
-            // rather than guess what the targets make of an empty item.
-            return no("empty item in the column list (a trailing comma)");
+            // `(a INT,, b INT)`, `(,)`: one trailing comma after an item is
+            // dropped by `create_table`; any other empty item is refused
+            // rather than guessing what the targets make of it.
+            return no("empty item in the column list (a stray comma)");
         };
         if constraint_item(first) {
             return Ok(format!("{lead}{}", self.constraint_def(it)?));

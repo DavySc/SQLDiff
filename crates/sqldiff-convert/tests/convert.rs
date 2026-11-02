@@ -1217,19 +1217,51 @@ fn fragments_convert_for_db2i_too() {
 }
 
 #[test]
-fn trailing_comma_in_a_column_list_is_refused_not_a_crash() {
-    // sakila's SQL Server schema has `PRIMARY KEY NONCLUSTERED (film_id),\n)`.
+fn one_trailing_comma_in_a_column_list_is_dropped() {
+    // sakila's SQL Server schema has `PRIMARY KEY NONCLUSTERED (film_id),\n)`,
+    // and so has AdventureWorks' install script: SQL Server takes it.
     let src = "CREATE TABLE film_text (\n  film_id SMALLINT NOT NULL,\n  title VARCHAR(255) NOT NULL,\n  PRIMARY KEY NONCLUSTERED (film_id),\n);\n";
     for to in [Dialect::Postgres, Dialect::Db2i] {
         let c = convert(src, Dialect::Tsql, to).unwrap();
         let u = unit(&c, src, "CREATE TABLE");
-        assert_eq!(u.status, Status::NotConverted, "{}", c.output);
+        assert_ne!(u.status, Status::NotConverted, "{:?}", u.notes);
+        assert!(!c.output.contains(",\n)"), "{}", c.output);
+    }
+    // A comma with no item before it is no trailing comma: refused cleanly,
+    // and the other statements of the file still convert.
+    for bad in [
+        "CREATE TABLE t1 (,);",
+        "CREATE TABLE t1 (a INT,,);",
+        "CREATE TABLE t1 (, a INT);",
+    ] {
+        let src = format!("{bad}\nGO\nCREATE TABLE t2 (a INT);\n");
+        let c = convert(&src, Dialect::Tsql, Dialect::Postgres).unwrap();
+        assert_eq!(
+            unit(&c, &src, bad).status,
+            Status::NotConverted,
+            "{bad}\n{}",
+            c.output
+        );
         assert!(
-            u.notes.iter().any(|n| n.text.contains("trailing comma")),
-            "{:?}",
-            u.notes
+            unit(&c, &src, "CREATE TABLE t2").status <= Status::Assumptions,
+            "{bad}\n{}",
+            c.output
+        );
+        assert!(
+            !c.output.contains("without a trace step"),
+            "{bad}\n{}",
+            c.output
         );
     }
+    // More than one is still refused, not a crash.
+    let two = src.replace("(film_id),\n)", "(film_id),,\n)");
+    let c = convert(&two, Dialect::Tsql, Dialect::Postgres).unwrap();
+    assert_eq!(
+        unit(&c, &two, "CREATE TABLE").status,
+        Status::NotConverted,
+        "{}",
+        c.output
+    );
 }
 
 /// Incomplete statements (a file cut short, or typed half-way in the GUI)

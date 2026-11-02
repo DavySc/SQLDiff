@@ -462,3 +462,23 @@ fn fractions_stored_in_integers_are_truncated() {
         db2("CREATE TABLE T(Pop bigint NULL);\nGO\nUPDATE T SET Pop = Pop * 1.04;\nGO\n").output;
     assert!(!d.to_ascii_lowercase().contains("trunc"), "{d}");
 }
+
+/// SQL Server takes one trailing comma in a CREATE TABLE column list; the
+/// conversion has none, and the engine reads both sides alike.
+#[test]
+fn a_trailing_comma_in_the_column_list_is_dropped() {
+    let src = "CREATE TABLE [dbo].[A](\n    [ID] int NOT NULL,\n    [Name] nvarchar(50) NOT NULL, -- last\n);\nGO\nCREATE TABLE [dbo].[B](\n    [ID] int NOT NULL,\n    CONSTRAINT [PK_B] PRIMARY KEY CLUSTERED ([ID]),\n) ON [PRIMARY];\nGO\n";
+    for c in [pg(src), db2(src)] {
+        assert_eq!(c.units.len(), 2);
+        for u in &c.units {
+            assert_ne!(u.status, Status::NotConverted, "{:?}", u.notes);
+        }
+        assert!(!c.output.contains(",\n)"), "{}", c.output);
+        assert!(!c.output.contains(", )"), "{}", c.output);
+    }
+    // Two commas are still an empty item.
+    assert_eq!(
+        pg("CREATE TABLE [dbo].[C](\n    [ID] int NOT NULL,,\n);\nGO\n").units[0].status,
+        Status::NotConverted
+    );
+}
