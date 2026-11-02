@@ -87,6 +87,7 @@ pub(crate) fn convert(
         wrapper: None,
         autocommit: Vec::new(),
         decls: Vec::new(),
+        rc_scratch: false,
         context: false,
         dynamic: Vec::new(),
         dynamic_from: Vec::new(),
@@ -168,6 +169,9 @@ struct Var {
     /// The T-SQL type, for DATEADD.
     dt: Dt,
 }
+
+/// The variable a CALL passes for a callee's `return_code` it does not read.
+const RC_SCRATCH: &str = "rc_scratch";
 
 /// A hoisted declaration: the DECLARE statement's span and the lines it adds.
 struct Decl {
@@ -257,6 +261,8 @@ struct Cx<'a> {
     /// a COMMIT follows each of them.
     autocommit: Vec<usize>,
     decls: Vec<Decl>,
+    /// A CALL passed `RC_SCRATCH`: the DECLARE section declares it.
+    rc_scratch: bool,
     /// The unit being converted was refused because of where it stands, not
     /// for want of a rule: the idiom rules, which see statements out of
     /// context, must not take it either.
@@ -516,6 +522,7 @@ impl<'a> Cx<'a> {
     fn reset(&mut self) {
         self.vars.clear();
         self.decls.clear();
+        self.rc_scratch = false;
         self.cursors.clear();
         self.loops.clear();
         self.labels = 0;
@@ -585,12 +592,15 @@ impl<'a> Cx<'a> {
             }
             return;
         }
-        if self.decls.is_empty() {
+        if self.decls.is_empty() && !self.rc_scratch {
             return;
         }
         out.push("DECLARE\n");
         for d in std::mem::take(&mut self.decls) {
             out.unit(d.src, INDENT, &d.lines.join("\n"), d.notes, d.trace);
+        }
+        if std::mem::take(&mut self.rc_scratch) {
+            out.lines(INDENT, &format!("{RC_SCRATCH} integer;"));
         }
     }
 
@@ -5273,6 +5283,18 @@ impl<'a> Cx<'a> {
                 ));
             }
         }
+        // A callee that returns a status got a last INOUT return_code (a
+        // PL/pgSQL CALL cannot leave it out: "argument is not writable"), so
+        // pass a variable nobody reads; a top-level CALL takes NULL.
+        if !self.db2() && self.callee_returns_status(&raw_name) {
+            let target = if matches!(self.mode, Mode::Proc | Mode::Do) {
+                self.rc_scratch = true;
+                RC_SCRATCH
+            } else {
+                "NULL"
+            };
+            args.push(format!("return_code => {target}"));
+        }
         self.step_ts("tsql.stmt.exec", &ts);
         Ok(format!("CALL {name}({})", args.join(", ")))
     }
@@ -5280,7 +5302,21 @@ impl<'a> Cx<'a> {
     /// The procedure `name` (as written, possibly qualified) in the source
     /// catalog, when exactly one matches. `dbo` and no schema are the same.
     fn callee(&self, name: &str) -> Option<&'a sqldiff_core::catalog::Routine> {
-        let cat = self.catalog?;
+        Self::routine_in(self.catalog?, name)
+    }
+
+    /// Whether the procedure `name` returns a status: it gets a `return_code`.
+    /// Known from the tree's catalog, or else from this input's own routines.
+    fn callee_returns_status(&self, name: &str) -> bool {
+        self.type_catalog()
+            .and_then(|c| Self::routine_in(c, name))
+            .is_some_and(|r| r.returns_status)
+    }
+
+    fn routine_in<'c>(
+        cat: &'c sqldiff_core::catalog::Catalog,
+        name: &str,
+    ) -> Option<&'c sqldiff_core::catalog::Routine> {
         let parts: Vec<String> = name.split('.').map(tsql_unquote).collect();
         let (schema, proc) = match parts.as_slice() {
             [p] => (None, p.clone()),
