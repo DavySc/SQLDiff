@@ -293,18 +293,74 @@ pub fn compare(
         }
         return out;
     }
-    let pairs = script::segment_pairs(a, b, anchors, &mut out).unwrap_or_else(|| {
+    if let Some(e) = trigger::embedded(a, b, sa, sb, &mut out) {
+        for (mut ua, mut ub, sa, sb) in e.pairs {
+            tv_names(a, b, &mut ua, &mut ub);
+            compare_units(a, b, &ua, &ub, &sa, &sb, anchors, &mut out);
+        }
+        // The rest of the artifacts, with the triggers and what was written
+        // for them blanked out (same offsets and lines).
+        let (xa, xb) = (
+            blanked(a.artifact, &e.blank_a),
+            blanked(b.artifact, &e.blank_b),
+        );
+        let (ra, rb) = (
+            Analyzed::new(&xa, a.side, a.excerpt_lines),
+            Analyzed::new(&xb, b.side, b.excerpt_lines),
+        );
+        compare_rest(&ra, &rb, sa, sb, anchors, &mut out);
+        return out;
+    }
+    compare_rest(a, b, sa, sb, anchors, &mut out);
+    out
+}
+
+/// The artifact with the given byte ranges overwritten by spaces (line
+/// breaks kept), so offsets and line numbers stay those of the original.
+fn blanked(
+    art: &crate::artifact::Artifact,
+    ranges: &[(usize, usize)],
+) -> crate::artifact::Artifact {
+    let mut bytes = art.text.clone().into_bytes();
+    for &(s, e) in ranges {
+        for c in bytes.iter_mut().take(e).skip(s) {
+            if !matches!(*c, b'\n' | b'\r') {
+                *c = b' ';
+            }
+        }
+    }
+    let mut x = art.clone();
+    x.text = String::from_utf8(bytes).unwrap_or_else(|e| e.to_string());
+    x
+}
+
+fn compare_rest(
+    a: &Analyzed,
+    b: &Analyzed,
+    sa: &Schema,
+    sb: &Schema,
+    anchors: &[Anchor],
+    out: &mut Outcome,
+) {
+    let mut pairs = script::segment_pairs(a, b, anchors, out).unwrap_or_else(|| {
         vec![(
             lower::lower_against(a, b.dialect()),
             lower::lower_against(b, a.dialect()),
         )]
     });
+    // Each segment may name the tables the earlier ones create.
+    let (mut seen_a, mut seen_b): (Vec<SyntaxNode>, Vec<SyntaxNode>) = (Vec::new(), Vec::new());
+    for (ua, ub) in pairs.iter_mut() {
+        ua.earlier_tables = seen_a.clone();
+        ub.earlier_tables = seen_b.clone();
+        seen_a.extend(ua.tables.iter().map(|(n, _)| n.clone()));
+        seen_b.extend(ub.tables.iter().map(|(n, _)| n.clone()));
+    }
     for (mut ua, mut ub) in pairs {
         script::name_locals(&mut ua, &mut ub);
         tv_names(a, b, &mut ua, &mut ub);
-        compare_units(a, b, &ua, &ub, sa, sb, anchors, &mut out);
+        compare_units(a, b, &ua, &ub, sa, sb, anchors, out);
     }
-    out
 }
 
 /// T-SQL against PostgreSQL or Db2 for i: the other side's temporary
@@ -2629,6 +2685,25 @@ fn col_facts(
             },
         });
     }
+    // A table an earlier segment of the script creates: used when exactly
+    // one of them has the name (a name created twice has no one column list).
+    let mut earlier = u.earlier_tables.iter().filter_map(|node| {
+        let t = table::parse(&ast::tokens(node), d).ok()?;
+        (ddl::stored_key(&t.name, d).ok().as_ref() == Some(&want)).then_some(t)
+    });
+    if let Some(t) = earlier.next() {
+        if earlier.next().is_some() {
+            return None;
+        }
+        let c = table::column_by_key(&t, col)?;
+        return Some(ddl::ColFacts {
+            nullable: table::nullable(&t, c).ok()?,
+            string: match c.ty {
+                table::Ty::Str { fixed, .. } => Some(fixed),
+                _ => None,
+            },
+        });
+    }
     let t = schema.table_exact(want.0.as_deref(), &want.1)?;
     let c = t.column(col)?;
     if c.collation.is_some() || matches!(c.ty.fam, schema::Fam::Other | schema::Fam::Binary) {
@@ -3048,13 +3123,18 @@ fn ddl_stmts(
             let Ok(want) = ddl::stored_key(&g.object, d) else {
                 return false;
             };
-            u.tables.iter().any(|(n, _)| {
-                table::parse(&ast::tokens(n), d)
-                    .ok()
-                    .and_then(|t| ddl::stored_key(&t.name, d).ok())
-                    .as_ref()
-                    == Some(&want)
-            }) || s.table_exact(want.0.as_deref(), &want.1).is_some()
+            u.tables
+                .iter()
+                .map(|(n, _)| n)
+                .chain(&u.earlier_tables)
+                .any(|n| {
+                    table::parse(&ast::tokens(n), d)
+                        .ok()
+                        .and_then(|t| ddl::stored_key(&t.name, d).ok())
+                        .as_ref()
+                        == Some(&want)
+                })
+                || s.table_exact(want.0.as_deref(), &want.1).is_some()
         };
         if !grant_table(a, ua, sa, dx) || !grant_table(b, ub, sb, dy) {
             unknown(
