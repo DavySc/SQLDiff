@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 187 | 35 (19%) | 6 (3%) | 146 (78%) |
+| `converter` | 191 | 35 (18%) | 6 (3%) | 150 (79%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 216 | 38 (18%) | 8 (4%) | 170 (79%) |
+| **All** | 220 | 38 (17%) | 8 (4%) | 174 (79%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -159,6 +159,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.routine.param` | `converter` | lemma: `Sqldiff.Mirror/Routines/lowerParam` | name, mode and a NULL or slice default; the types under 'Parameter and return types' | `sqldiff-convert/src/tsql.rs` |
 | `tsql.routine.procedure` | `converter` | lemma: `Sqldiff.Mirror/Routines` | CREATE [OR ALTER] PROCEDURE against CREATE OR REPLACE PROCEDURE ... LANGUAGE plpgsql; the body is checked statement by statement | `sqldiff-convert/src/tsql.rs` |
 | `tsql.routine.result-set` | `converter` | engine | the casts of a result set's columns to their declared types (RETURN QUERY needs exact types, checked on PostgreSQL 18.6) | `sqldiff-convert/src/tsql.rs` |
+| `tsql.routine.result-set-cursors` | `converter` | engine | a procedure's result sets as INOUT refcursor parameters (result_set_1, …) under ASM-RESULTSET-REFCURSOR | `sqldiff-convert/src/tsql.rs` |
 | `tsql.routine.result-set-function` | `converter` | engine | a procedure's one result set as a function RETURNS TABLE under ASM-RESULT-SET-FUNCTION | `sqldiff-convert/src/tsql.rs` |
 | `tsql.routine.return-code` | `converter` | lemma: `Sqldiff.Mirror/T-SQL return status` | `INOUT return_code integer DEFAULT NULL` as the last parameter, the status set to 0 first | `sqldiff-convert/src/tsql.rs` |
 | `tsql.routine.returns` | `converter` | lemma: `Sqldiff.Mirror/Parameter and return types` | int and slice string return types; others engine | `sqldiff-convert/src/tsql.rs` |
@@ -186,6 +187,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.stmt.print` | `converter` | engine | a message is outside the spec (`Message`) | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.raiserror` | `converter` | engine | RAISERROR is outside the C4 spec (V10: it does not honour XACT_ABORT) | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.result-set` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.stmt.result-set-cursor` | `converter` | engine | a result set's SELECT opened as OPEN result_set_N FOR …, its name = expr items written expr AS name | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.return` | `converter` | lemma: `Sqldiff.Mirror/T-SQL return status` | the `return-code` form in a procedure (`return_code := COALESCE(e, 0); RETURN;`); the trigger form (`RETURN NULL`) engine | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.set-option` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.set-variable` | `converter` | lemma: `Sqldiff.Mirror/Statements` | `SET @x = e` with `e` in the slice (`x := e`), and `SET @x = (SELECT e FROM ...)` over a table or (C3d) a block of tables, more than one row the cardinality error (C3b rule 2); compound operators (`+=`) engine | `sqldiff-convert/src/tsql.rs` |
@@ -196,6 +198,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.table-builtin` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.add-column` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.add-default` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.table.alias-not-null` | `converter` | engine | A column of an alias type that spells no nullability gets the type's NOT NULL; not compared by the engine yet | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.check-constraint` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.column-default` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.column-option-dropped` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
@@ -229,6 +232,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.txn.trancount-guard` | `converter` | engine | the `IF @@TRANCOUNT > 0` guard outside idiom.rollback-rethrow | `sqldiff-convert/src/tsql.rs` |
 | `tsql.txn.wrapper` | `converter` | engine | the call is one transaction: outside the C4 bracket shape | `sqldiff-convert/src/tsql.rs` |
 | `tsql.type.*` | `converter` | engine | The type mapping, named after the T-SQL type (`tsql.type.bigint`); the members with a lemma are listed on their own | `sqldiff-convert/src/tsql.rs` |
+| `tsql.type.alias-domain` | `converter` | engine | `CREATE TYPE n FROM base` becomes `CREATE DOMAIN n AS base`; the engine does not compare the pair yet (a unit stays not proven) | `sqldiff-convert/src/tsql.rs` |
 | `tsql.type.int` | `converter` | lemma: `Sqldiff.Mirror/C2a types` | `int` against PostgreSQL `integer` (also 'Parameter and return types') | `sqldiff-convert/src/tsql.rs` |
 | `tsql.type.integer` | `converter` | lemma: `Sqldiff.Mirror/C2a types` | `integer` against PostgreSQL `integer` (also 'Parameter and return types') | `sqldiff-convert/src/tsql.rs` |
 | `tsql.type.nvarchar` | `converter` | lemma: `Sqldiff.Mirror/C2b strings/Types` | `nvarchar(n)` with 1 <= n <= 4000 against `varchar(n)` (read with the `wide` bound); `max` and `nchar(n)` engine | `sqldiff-convert/src/tsql.rs` |

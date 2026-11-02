@@ -888,6 +888,13 @@ note = "the casts of a result set's columns to their declared types (RETURN QUER
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.routine.result-set-cursors"
+kind = "converter"
+proof = "engine"
+note = "a procedure's result sets as INOUT refcursor parameters (result_set_1, …) under ASM-RESULTSET-REFCURSOR"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
 id = "tsql.routine.result-set-function"
 kind = "converter"
 proof = "engine"
@@ -1067,6 +1074,13 @@ proof = "engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.stmt.result-set-cursor"
+kind = "converter"
+proof = "engine"
+note = "a result set's SELECT opened as OPEN result_set_N FOR …, its name = expr items written expr AS name"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
 id = "tsql.stmt.return"
 kind = "converter"
 proof = "lemma:Sqldiff.Mirror/T-SQL return status"
@@ -1199,6 +1213,13 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 id = "tsql.table.inline-index"
 kind = "converter"
 proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.table.alias-not-null"
+kind = "converter"
+proof = "engine"
+note = "A column of an alias type that spells no nullability gets the type's NOT NULL; not compared by the engine yet"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
@@ -1371,6 +1392,13 @@ kind = "converter"
 proof = "lemma:Sqldiff.Mirror/C2b strings/Types"
 family = "tsql.type.*"
 note = "`nvarchar(n)` with 1 <= n <= 4000 against `varchar(n)` (read with the `wide` bound); `max` and `nchar(n)` engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.type.alias-domain"
+kind = "converter"
+proof = "engine"
+note = "`CREATE TYPE n FROM base` becomes `CREATE DOMAIN n AS base`; the engine does not compare the pair yet (a unit stays not proven)"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]

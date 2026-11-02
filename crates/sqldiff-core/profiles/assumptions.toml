@@ -264,9 +264,9 @@ sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/ddl.rs"]
 
 [[assumption]]
 id = "ASM-COLUMN-RANGE"
-statement = "Stored values stay within what both sides' column types accept."
+statement = "Stored values, and the money intermediates that compute them, stay within what both sides' column types accept."
 discharge = "generated"
-fact = "CHECK constraints on the converted columns that reject what the original type rejects."
+fact = "CHECK constraints on the converted columns that reject what the original type rejects; and the operands of a money computed column (a sum, difference or product of money columns and integers of at most 32 bits, possibly several operations) never take an intermediate result outside the money range (+/-922,337,203,685,477.5808), where SQL Server raises an error and numeric(19, 4) does not."
 sites = ["sqldiff-core/src/equiv/table.rs"]
 
 [[assumption]]
@@ -704,6 +704,13 @@ id = "ASM-RESULT-SET-FUNCTION"
 statement = "Callers of the procedure that became a PostgreSQL function RETURNS TABLE read its rows with SELECT … FROM the function (in the order it returns them) where they ran EXEC, and accept that the columns have the PostgreSQL types and that a failing statement returns no rows (SQL Server may have sent some before the error)."
 discharge = "deployment"
 fact = "How the application calls the procedure and reads its result set."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-RESULTSET-REFCURSOR"
+statement = "Callers of the procedure that returns its result sets through INOUT refcursor parameters (result_set_1, …) call it inside a transaction block, FETCH ALL from each cursor in the order of the parameters before they commit, treat a cursor left NULL as a result set T-SQL did not send, and accept the PostgreSQL column types and that a failure while the rows are read surfaces on FETCH, after the procedure returned. Rows T-SQL had already sent are lost when a later statement of the procedure fails (the failed CALL returns no cursors), as under ASM-RESULT-SET-FUNCTION."
+discharge = "deployment"
+fact = "How the application calls the procedure and reads its result sets."
 sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
