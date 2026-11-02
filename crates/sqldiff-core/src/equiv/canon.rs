@@ -118,6 +118,10 @@ pub mod asm {
         "ASM-TSQL-SYSDATETIME-PER-STATEMENT",
         "SYSDATETIME() is evaluated once per statement (observed SQL Server behaviour, not documented; fact V20)",
     );
+    pub const CLOCK_FRACTION_6: (&str, &str) = (
+        "ASM-CLOCK-FRACTION-6",
+        "The 7th fraction digit of the clock is not used: SYSDATETIME() (7 digits in T-SQL) and the PostgreSQL statement clock (6 digits), stored in or cast to a 6-digit timestamp, are the same value; SQL Server rounds the 7th digit away and PostgreSQL never has one",
+    );
     pub const STRING_AGG_8000: (&str, &str) = (
         "ASM-TSQL-STRING-AGG-8000",
         "The aggregated list stays under 8000 bytes (T-SQL STRING_AGG of a non-MAX input errors past that)",
@@ -2085,6 +2089,19 @@ impl<'a> Canon<'a> {
                 }
             }
         }
+        // The statement clock cast to a 6-digit timestamp: PostgreSQL's
+        // clock has 6 digits, so the cast changes nothing; SYSDATETIME()'s
+        // 7th digit is dropped (ASM-CLOCK-FRACTION-6). Not for datetime
+        // (1/300 s ticks) or fewer than 6 digits, which round differently.
+        if v.0 == n("time", vec![a("stmt")])
+            && dst.fam == Fam::Timestamp
+            && dst.scale.is_none()
+            && dst.len == Some(6)
+            && matches!(self.d, Dialect::Tsql | Dialect::Postgres)
+        {
+            self.assume(asm::CLOCK_FRACTION_6);
+            return v;
+        }
         if let Some(src) = v.1 {
             if src == dst && src.fam != Fam::Other {
                 return v;
@@ -2181,6 +2198,27 @@ impl<'a> Canon<'a> {
     /// `v` converted to `dst`: by CAST, by storing it in a column, or by
     /// assigning it to a variable, parameter or return value.
     fn convert(&mut self, dst: Ty, v: (Term, Option<Ty>), how: How) -> (Term, Option<Ty>) {
+        // A value with at most 6 fraction digits (a date, or a timestamp of
+        // up to 6 digits) is stored exactly by datetime2(7) and by
+        // PostgreSQL's timestamp(6): the target's 7th digit is never used,
+        // so both are the same destination.
+        let dst = match v.1 {
+            Some(src)
+                if dst.fam == Fam::Timestamp
+                    && dst.scale.is_none()
+                    && dst.len == Some(7)
+                    && (src.fam == Fam::Date
+                        || (src.fam == Fam::Timestamp
+                            && src.scale.is_none()
+                            && src.len.is_some_and(|l| l <= 6))) =>
+            {
+                Ty {
+                    len: Some(6),
+                    ..dst
+                }
+            }
+            _ => dst,
+        };
         let to = Some(dst);
         let head = if how == How::Cast { "cast" } else { "conv" };
         // A decimal literal without a fraction (2.0) converts to an integer
@@ -2619,6 +2657,20 @@ impl<'a> Canon<'a> {
                 if let Some(field) = dateadd_field(&c.args[0]) {
                     let k = self.expr(&c.args[1])?;
                     let d = self.expr(&c.args[2])?;
+                    // DATEADD converts a non-integer number to int by
+                    // truncating (SQL Server 2022, decimal and float, both
+                    // signs: eval/builtins/2026-11-02-dateadd), the cast the
+                    // PostgreSQL side spells trunc(x)::integer.
+                    let k = match k.1 {
+                        Some(t) if matches!(t.fam, Fam::Exact | Fam::Float) => {
+                            let ty = super::ast::Type {
+                                name: "INT".to_string(),
+                                args: Vec::new(),
+                            };
+                            self.expr(&Expr::Cast(Box::new(c.args[1].clone()), ty))?
+                        }
+                        _ => k,
+                    };
                     if let Some(t) = self.date_add(field, k, d) {
                         return Ok(t);
                     }
@@ -3265,6 +3317,11 @@ impl<'a> Canon<'a> {
                         scale: Some(0),
                     },
                 };
+                // ceil and floor give a whole number, which trunc leaves as
+                // it is: trunc(ceil(x)) is ceil(x).
+                if args[0].0.is("ceil") || args[0].0.is("floor") {
+                    return Ok((args.swap_remove(0).0, Some(ty)));
+                }
                 portable("trunc", args, Some(ty))
             }
             (Dialect::Db2i, "days", 1) => {
@@ -3354,8 +3411,9 @@ impl<'a> Canon<'a> {
 
     /// DATEADD of `k` `field`s (`years` … `secs`, PostgreSQL's
     /// make_interval names) to `d`, where both engines give the same
-    /// value: `k` an integer of at most 32 bits (T-SQL converts other
-    /// numbers to int, truncating; PostgreSQL's secs keeps a fraction), and
+    /// value: `k` an integer of at most 32 bits (T-SQL converts a decimal or
+    /// float amount to int, truncating, which the caller lowers as that cast;
+    /// PostgreSQL's secs keeps a fraction), and
     /// `d` a date (whole days or longer; T-SQL rejects smaller parts) or a
     /// timestamp. On T-SQL datetime every whole unit keeps its 1/300 s
     /// ticks; smalldatetime keeps whole minutes for every unit but seconds,
