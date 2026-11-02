@@ -6668,6 +6668,19 @@ impl<'a> Cx<'a> {
     fn arith_type(&self, e: &[T], persisted: bool) -> Option<Arith> {
         let s = sig(e);
         let (ty, used) = self.arith_sum(e, &s, 0)?;
+        // A chain of operations over money is left unread (the engine does
+        // not prove it either): an intermediate money value may leave the
+        // money range where the result does not. `MONEY_CHAINS`.
+        let ops = s
+            .iter()
+            .filter(|&&k| e[k].k == OP && matches!(e[k].s.as_str(), "+" | "-" | "*"))
+            .count();
+        let money = s.iter().any(|&k| {
+            matches!(e[k].k, IDENT | QUOTED_IDENT) && self.column_arith(&e[k]) == Some(Arith::Money)
+        });
+        if money && ops > 1 && !sqldiff_core::equiv::canon::MONEY_CHAINS {
+            return None;
+        }
         // Integer arithmetic raises its overflow error when SQL Server
         // reads a column that is not PERSISTED, but when PostgreSQL's
         // STORED column is written: only a PERSISTED column converts
@@ -10516,7 +10529,11 @@ impl Arith {
         match (a, b) {
             (Lit(_), Lit(_)) => Some(Int(32)),
             (Money, Money) => (!mul).then_some(Money),
-            (Money, Int(_) | Lit(_)) | (Int(_) | Lit(_), Money) => Some(Money),
+            // SQL Server converts the integer to money first: a bigint may be
+            // outside the money range (10^15 * money 0 fails, numeric stores
+            // 0), so only integers of at most 32 bits.
+            (Money, Int(w)) | (Int(w), Money) => (w <= 32).then_some(Money),
+            (Money, Lit(_)) | (Lit(_), Money) => Some(Money),
             (Lit(_), Int(w)) | (Int(w), Lit(_)) => Some(Int(w.max(32))),
             (Int(x), Int(y)) => Some(Int(x.max(y))),
             _ => {
@@ -10553,7 +10570,11 @@ impl Arith {
             }
             Arith::Dec(p, s) => frac.len() as u32 <= s && int.len() as u32 <= p - s,
             Arith::Lit(_) => false,
-            Arith::Money => frac.len() <= 4 && int.len() <= 15,
+            Arith::Money => {
+                frac.len() <= 4
+                    && int.len() <= 15
+                    && int.parse::<u64>().unwrap_or(0) < 922_337_203_685_477
+            }
         }
     }
 }

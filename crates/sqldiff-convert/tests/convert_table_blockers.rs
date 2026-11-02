@@ -590,7 +590,7 @@ fn pg_computed_arithmetic_refusals() {
 }
 
 fn money_table(col: &str) -> String {
-    format!("CREATE TABLE dbo.P (\n    A money NOT NULL,\n    B money NOT NULL,\n    Q int NOT NULL,\n    Sm smallint NOT NULL,\n    R decimal(9,2) NOT NULL,\n    Sx smallmoney NOT NULL,\n    {col}\n);\n")
+    format!("CREATE TABLE dbo.P (\n    A money NOT NULL,\n    B money NOT NULL,\n    Q int NOT NULL,\n    Sm smallint NOT NULL,\n    R decimal(9,2) NOT NULL,\n    Sx smallmoney NOT NULL,\n    Big bigint NOT NULL,\n    {col}\n);\n")
 }
 
 /// Money columns: a sum, a difference or a product with an integer is money
@@ -655,6 +655,14 @@ fn pg_computed_money_arithmetic() {
 fn pg_computed_money_refusals() {
     for col in [
         "C AS A + B",
+        // A bigint is converted to money first and may not fit.
+        "C AS A + Big PERSISTED",
+        "C AS Big * A PERSISTED",
+        // An intermediate money value may leave the money range
+        // (MONEY_CHAINS): only one operation over money is read.
+        "C AS A + B - A PERSISTED",
+        "C AS A + B + Q PERSISTED",
+        "C AS (A + B) * Q PERSISTED",
         "C AS A * B PERSISTED",
         "C AS A / Q PERSISTED",
         "C AS A / B PERSISTED",

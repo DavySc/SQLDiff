@@ -321,6 +321,18 @@ impl How {
     }
 }
 
+/// Whether a chain of money operations is read (`a + b - c`). SQL Server
+/// raises an error when an intermediate money value leaves its range where
+/// the final value is inside it, and numeric(19, 4) does not, which
+/// ASM-COLUMN-RANGE as worded (the stored value) does not cover. Off until
+/// the owner decides on its wording; `sqldiff-convert` follows this switch.
+pub const MONEY_CHAINS: bool = false;
+
+/// A term made by arithmetic (an intermediate result, not a column).
+fn chained(t: &Term) -> bool {
+    matches!(t.head(), "add" | "sub" | "mul" | "arith")
+}
+
 /// Whether a conversion means the same in every dialect.
 enum Rule {
     Same,
@@ -1677,6 +1689,11 @@ impl<'a> Canon<'a> {
                     } else {
                         (n("not", vec![self.bare_bool(t, ty)]), None)
                     }
+                } else if ty.is_some_and(|t| t.fam == Fam::Money) {
+                    // SQL Server raises an error for the negative of the
+                    // smallest money value (-922,337,203,685,477.5808),
+                    // numeric(19, 4) negates it: per dialect.
+                    (n("dneg", vec![self.dtag(), t]), ty)
                 } else {
                     (n("neg", vec![t]), ty)
                 }
@@ -3266,6 +3283,12 @@ impl<'a> Canon<'a> {
             }
             (_, "upper" | "ucase", 1) => portable("upper", args, first_ty),
             (_, "lower" | "lcase", 1) => portable("lower", args, first_ty),
+            // ABS of the smallest money value raises an error in SQL Server
+            // where numeric(19, 4) returns it: per dialect.
+            (_, "abs", 1) if first_ty.is_some_and(|t| t.fam == Fam::Money) => (
+                n("dfn", vec![self.dtag(), a(name.clone()), args[0].0.clone()]),
+                first_ty,
+            ),
             (_, "abs", 1) => portable("abs", args, first_ty),
             (_, "min" | "max", 1) => match first_ty {
                 Some(t) if t.orders_per_dialect() => (
@@ -3961,6 +3984,10 @@ impl<'a> Canon<'a> {
         if !money(&lty) && !money(&rty) {
             return Ok((lty, rty));
         }
+        // An intermediate money value may leave the money range.
+        if !MONEY_CHAINS && ((money(&lty) && chained(_lt)) || (money(&rty) && chained(_rt))) {
+            return Err(());
+        }
         let known_dec = |t: &Option<Ty>| {
             t.is_some_and(|t| t.fam == Fam::Exact && t.len.is_some() && t.scale.is_some())
         };
@@ -4001,9 +4028,16 @@ impl<'a> Canon<'a> {
         rty: Option<Ty>,
     ) -> (Term, Option<Ty>) {
         let is = |t: &Option<Ty>, f: Fam| t.is_some_and(|t| t.fam == f);
-        let int = |t: &Option<Ty>| t.is_some_and(|t| t.fam == Fam::Int && t.len != Some(1));
+        // SQL Server converts an integer to money before it computes, and a
+        // bigint may be outside the money range where the sum or product of
+        // it is not (bigint 10^15 * money 0 fails, numeric stores 0): only
+        // integers of at most 32 bits.
+        let int = |t: &Option<Ty>| {
+            t.is_some_and(|t| t.fam == Fam::Int && t.len.is_some_and(|l| l > 1 && l <= 32))
+        };
         let (lm, rm) = (is(&lty, Fam::Money), is(&rty, Fam::Money));
         let ok = self.stored_values
+            && (MONEY_CHAINS || !(chained(&lt) || chained(&rt)))
             && self.d == Dialect::Tsql
             && match op {
                 "+" | "-" => (lm || int(&lty)) && (rm || int(&rty)),

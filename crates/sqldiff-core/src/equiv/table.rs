@@ -1247,9 +1247,11 @@ impl Ar {
         match (a, b) {
             (Ar::Lit(_), Ar::Lit(_)) => Some(Ar::Int(32)),
             (Ar::Money, Ar::Money) => (!mul).then_some(Ar::Money),
-            (Ar::Money, Ar::Int(_) | Ar::Lit(_)) | (Ar::Int(_) | Ar::Lit(_), Ar::Money) => {
-                Some(Ar::Money)
-            }
+            // SQL Server converts the integer to money first: a bigint may
+            // be outside the money range (10^15 * money 0 fails, numeric
+            // stores 0), so only integers of at most 32 bits.
+            (Ar::Money, Ar::Int(w)) | (Ar::Int(w), Ar::Money) => (w <= 32).then_some(Ar::Money),
+            (Ar::Money, Ar::Lit(_)) | (Ar::Lit(_), Ar::Money) => Some(Ar::Money),
             (Ar::Lit(_), Ar::Int(w)) | (Ar::Int(w), Ar::Lit(_)) => Some(Ar::Int(w.max(32))),
             (Ar::Int(x), Ar::Int(y)) => Some(Ar::Int(x.max(y))),
             _ => {
@@ -1344,7 +1346,19 @@ fn arith_computed(t: &Table, e: &[Tok], persisted: bool) -> Option<(Ty, String, 
     // left unread (decimal arithmetic within 38 digits cannot overflow).
     let whole = |e: &[Tok]| -> Option<Ar> {
         let (ty, n) = sum(e, 0, &col)?;
+        // An intermediate money value may leave the money range where the
+        // stored result does not (ASM-COLUMN-RANGE says nothing about it):
+        // a chain of operations over money is left unread, see
+        // `MONEY_CHAINS`.
+        let ops = e
+            .iter()
+            .filter(|t| t.kind == K::Op && matches!(t.text.as_str(), "+" | "-" | "*"))
+            .count();
+        let money = e
+            .iter()
+            .any(|t| matches!(t.kind, K::Word | K::Quoted) && col(t) == Some(Ar::Money));
         (n == e.len()
+            && (super::canon::MONEY_CHAINS || !money || ops <= 1)
             && !matches!(ty, Ar::Lit(_))
             && (persisted || !matches!(ty, Ar::Int(_) | Ar::Money)))
         .then_some(ty)

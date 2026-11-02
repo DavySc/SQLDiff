@@ -39,12 +39,12 @@ fn table_equal(col_a: &str, col_b: &str) -> bool {
         &Artifact::new(
             "a.sql",
             Dialect::Tsql,
-            format!("CREATE TABLE dbo.T (A money NOT NULL, B money NOT NULL, Q int NOT NULL, R decimal(9,2) NOT NULL, {col_a});"),
+            format!("CREATE TABLE dbo.T (A money NOT NULL, B money NOT NULL, Big bigint NOT NULL, Q int NOT NULL, R decimal(9,2) NOT NULL, {col_a});"),
         ),
         &Artifact::new(
             "b.sql",
             Dialect::Postgres,
-            format!("CREATE TABLE T (A numeric(19,4) NOT NULL, B numeric(19,4) NOT NULL, Q integer NOT NULL, R numeric(9,2) NOT NULL, {col_b});"),
+            format!("CREATE TABLE T (A numeric(19,4) NOT NULL, B numeric(19,4) NOT NULL, Big bigint NOT NULL, Q integer NOT NULL, R numeric(9,2) NOT NULL, {col_b});"),
         ),
         &Options::default(),
     );
@@ -86,6 +86,9 @@ fn money_uses_that_differ_stay_unproven() {
         ("Price + F", "Price + F"),
         ("Price < F", "Price < F"),
         ("ROUND(Price, 2)", "ROUND(Price, 2)"),
+        // The smallest money value has no negative or absolute value in T-SQL.
+        ("-Price", "-Price"),
+        ("ABS(Price)", "ABS(Price)"),
         // A different cast target or a wrong operation is never equal.
         ("CAST(Price AS int)", "CAST(Price AS bigint)"),
         ("Price + Fee", "Price - Fee"),
@@ -120,6 +123,11 @@ fn money_computed_columns_with_exact_arithmetic() {
         ("C AS A - B PERSISTED", "B - A"),
         ("C AS A * Q PERSISTED", "A * Q + 1"),
         ("C AS A * B PERSISTED", "A * B"),
+        // A bigint is converted to money first and may not fit.
+        ("C AS A + Big PERSISTED", "A + Big"),
+        // A chain: an intermediate may leave the money range.
+        ("C AS A + B - Q PERSISTED", "A + B - Q"),
+        ("C AS A + B + A PERSISTED", "A + B + A"),
         ("C AS A / Q PERSISTED", "A / Q"),
     ] {
         assert!(!table_equal(a, &g(b)), "{a} vs {b}");
