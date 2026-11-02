@@ -432,3 +432,30 @@ fn exec_with_output_in_a_script_becomes_a_call_in_a_do_block() {
         c.output
     );
 }
+
+/// A computed bit column whose CASE results are `CONVERT([bit], …)` is a bit
+/// for the statements that compare it with 0 or 1 (the bracketed type name
+/// used to keep it from being read as BIT).
+#[test]
+fn a_computed_bit_column_is_compared_as_boolean() {
+    for ty in ["[bit]", "bit", "CAST(1 AS [bit])"] {
+        let result = |v: &str| {
+            if ty.starts_with("CAST") {
+                format!("CAST({v} AS [bit])")
+            } else {
+                format!("CONVERT({ty}, {v})")
+            }
+        };
+        let src = format!(
+            "CREATE TABLE [dbo].[T]([ID] int NOT NULL, [Done] date NULL, [IsDone] AS (case when [Done] IS NULL then {} else {} end) PERSISTED);\nGO\nCREATE PROCEDURE dbo.P\nAS\nBEGIN\n    DECLARE @n int;\n    SELECT @n = COUNT(*) FROM dbo.T WHERE IsDone = 0 OR 1 <> IsDone;\n    UPDATE dbo.T SET Done = NULL WHERE IsDone = 1;\nEND;\nGO\n",
+            result("(0)"),
+            result("(1)")
+        );
+        let o = pg(&src).output;
+        assert!(
+            o.contains("WHERE IsDone = FALSE OR TRUE <> IsDone"),
+            "{ty}\n{o}"
+        );
+        assert!(o.contains("WHERE IsDone = TRUE;"), "{ty}\n{o}");
+    }
+}

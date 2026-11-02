@@ -361,7 +361,19 @@ pub fn column_defs(tb: &mut Table, inner: &[Tok], dialect: Dialect) {
                     col.has_default = true;
                     col.generated = true;
                     if let Some(ty) = computed_case_type(&opts[1..]) {
-                        col.data_type = DataType::parse(&tokens::texts(ty));
+                        // `CONVERT([bit], 0)`: the type name unbracketed.
+                        let words: Vec<String> = ty
+                            .iter()
+                            .map(|x| {
+                                if x.kind == SyntaxKind::QUOTED_IDENT {
+                                    x.ident().text
+                                } else {
+                                    x.text.clone()
+                                }
+                            })
+                            .collect();
+                        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                        col.data_type = DataType::parse(&words);
                     } else if let Some(ty) = computed_call_type(&opts[1..], tb, dialect) {
                         col.data_type = ty;
                     }
