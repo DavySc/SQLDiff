@@ -339,6 +339,29 @@ pub(super) fn created_name(ts: &[Tok]) -> R<Vec<Name>> {
     Ok(name)
 }
 
+/// The name a `CREATE TABLE` or `CREATE EXTERNAL TABLE` creates, also when
+/// the statement is not a plain table (`CREATE TABLE t WITH (…) AS SELECT`,
+/// `CREATE EXTERNAL TABLE t (…) WITH (…)`). Only for pairing statements by
+/// name: those are never compared, but their name is taken in the schema all
+/// the same, so a script holding one still pairs its other tables.
+pub(super) fn created_name_any(ts: &[Tok]) -> R<Vec<Name>> {
+    if !word(ts.first(), "CREATE") {
+        return Err("not a CREATE TABLE".into());
+    }
+    let at = if word(ts.get(1), "EXTERNAL") { 3 } else { 2 };
+    if !word(ts.get(at - 1), "TABLE") {
+        return Err("not a CREATE TABLE".into());
+    }
+    let (name, i) = dotted(ts, at)?;
+    if ts
+        .get(i)
+        .is_some_and(|t| t.kind == K::LParen || word(Some(t), "WITH") || word(Some(t), "AS"))
+    {
+        return Ok(name);
+    }
+    created_name(ts)
+}
+
 pub fn parse(ts: &[Tok], d: Dialect) -> R<Table> {
     if !word(ts.first(), "CREATE") {
         return Err("not a CREATE TABLE".into());
@@ -752,7 +775,17 @@ fn column(ts: &[Tok], d: Dialect, t: &mut Table) -> R<()> {
         i += 3;
     }
     let ty_text = text(&ts[1..i]);
+    // `sysname` is `nvarchar(128)` whose own nullability is NOT NULL
+    // ("functionally the same as nvarchar(128) except that, by default,
+    // sysname is NOT NULL", Microsoft Learn, "System Data Types": sysname);
+    // a column that does not say which it is has a nullability this
+    // comparison does not rely on.
+    let sysname = d == Dialect::Tsql && ty.name == "SYSNAME" && ty.args.is_empty();
     let parsed = match d {
+        Dialect::Tsql if sysname => tsql_type(&ast::Type {
+            name: "NVARCHAR".into(),
+            args: vec!["128".into()],
+        }),
         Dialect::Tsql => tsql_type(&ty),
         Dialect::Postgres => pg_type(&ty),
         Dialect::Db2i => Err("Db2 for i column types are not compared".into()),
@@ -960,6 +993,11 @@ fn column(ts: &[Tok], d: Dialect, t: &mut Table) -> R<()> {
     }
     if cname.is_some() {
         return Err(what("CONSTRAINT with nothing after it"));
+    }
+    if sysname && c.null.is_none() {
+        return Err(what(
+            "a sysname column without NULL or NOT NULL: its nullability is not compared",
+        ));
     }
     t.columns.push(c);
     Ok(())
