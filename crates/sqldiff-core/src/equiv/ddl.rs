@@ -470,6 +470,72 @@ pub fn pair_key(x: &Ddl) -> R<String> {
     })
 }
 
+/// An `ALTER TABLE t ADD CONSTRAINT a …, CONSTRAINT b …` (T-SQL) or
+/// `ALTER TABLE t ADD CONSTRAINT a …, ADD CONSTRAINT b …` (PostgreSQL) that
+/// adds several constraints at once, as one `ALTER TABLE` statement for each
+/// constraint (the prefix up to ADD, then the constraint). `None` unless it
+/// has at least two items and every item starts as a constraint does. Both
+/// dialects run the actions of one statement as a unit (all or none), so
+/// the constraints compare one by one; the caller compares how many each
+/// statement holds, so a statement split on one side only is not paired.
+pub(super) fn split_adds(ts: &[Tok], d: Dialect) -> Option<Vec<Vec<Tok>>> {
+    let ts = match ts.last() {
+        Some(t) if t.kind == K::Semi => &ts[..ts.len() - 1],
+        _ => ts,
+    };
+    if d == Dialect::Db2i || !word(ts.first(), "ALTER") || !word(ts.get(1), "TABLE") {
+        return None;
+    }
+    // Commas outside parentheses, and the first ADD outside them.
+    let (mut depth, mut commas, mut add) = (0usize, Vec::new(), None);
+    for (i, t) in ts.iter().enumerate() {
+        match t.kind {
+            K::LParen => depth += 1,
+            K::RParen => depth = depth.checked_sub(1)?,
+            K::Comma if depth == 0 => commas.push(i),
+            K::Word if depth == 0 && t.up == "ADD" && add.is_none() => add = Some(i),
+            _ => {}
+        }
+    }
+    let add = add?;
+    if commas.is_empty() || commas[0] < add || depth != 0 {
+        return None;
+    }
+    let mut bounds = vec![add];
+    bounds.extend(commas.iter().map(|c| c + 1));
+    bounds.push(ts.len() + 1);
+    let mut out = Vec::new();
+    for (k, w) in bounds.windows(2).enumerate() {
+        let item = &ts[w[0]..(w[1] - 1).min(ts.len())];
+        let mut one = ts[..add].to_vec();
+        match (d, k) {
+            (_, 0) => {}
+            // PostgreSQL repeats ADD; T-SQL lists the next constraint.
+            (Dialect::Postgres, _) if word(item.first(), "ADD") => {}
+            (Dialect::Tsql, _) if word(item.first(), "CONSTRAINT") => one.push(ts[add].clone()),
+            _ => return None,
+        }
+        if !word(item.first(), "ADD") && k == 0 {
+            return None;
+        }
+        one.extend_from_slice(item);
+        if !word(one.get(add), "ADD") || !word(one.get(add + 1), "CONSTRAINT") {
+            return None;
+        }
+        out.push(one);
+    }
+    Some(out)
+}
+
+/// `parse`, one result for each constraint of a statement that adds several
+/// (`split_adds`).
+pub(super) fn parse_all(ts: &[Tok], d: Dialect) -> Vec<R<Ddl>> {
+    match split_adds(ts, d) {
+        Some(parts) => parts.iter().map(|p| parse(p, d)).collect(),
+        None => vec![parse(ts, d)],
+    }
+}
+
 /// Reads a whole statement (terminator dropped).
 pub fn parse(ts: &[Tok], d: Dialect) -> R<Ddl> {
     let ts = match ts.last() {

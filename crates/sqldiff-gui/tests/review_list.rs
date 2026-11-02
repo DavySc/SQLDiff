@@ -18,6 +18,7 @@ fn unit(key: &str, tier: u8, path: &str, open: &[&str]) -> ListedItem {
             status: "under assumptions".into(),
             rules: open.iter().map(|s| s.to_string()).collect(),
             reason: format!("reason of {key}"),
+            impossible: None,
             units: Vec::new(),
             instances: 0,
             failing_instances: Vec::new(),

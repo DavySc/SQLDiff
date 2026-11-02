@@ -66,6 +66,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `top-distinct/limit` | `translate` | engine |  | `sqldiff-core/profiles/rules/tsql-pg.rules` |
 | `top/limit` | `translate` | engine |  | `sqldiff-core/profiles/rules/tsql-pg.rules` |
 | `tsql.*` | `converter` | engine | T-SQL global variables (`@@ROWCOUNT` is `tsql.rowcount`) and built-ins without a rule (`OBJECT_ID()` is `tsql.object_id`), both refused with the reason | `sqldiff-convert/src/tsql.rs` |
+| `tsql.assign.int-trunc` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.bit.arithmetic` | `converter` | engine |  | `sqldiff-convert/src/tsql/bits.rs` |
 | `tsql.bit.between` | `converter` | engine |  | `sqldiff-convert/src/tsql/bits.rs` |
 | `tsql.bit.bitwise` | `converter` | engine |  | `sqldiff-convert/src/tsql/bits.rs` |
@@ -199,6 +200,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.table.column-default` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.column-option-dropped` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.columnstore` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.table.computed-arith` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.computed-column` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.computed-concat` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.computed-iso126` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |

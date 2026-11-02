@@ -283,3 +283,39 @@ fn own_name_from_procid_needs_a_named_module() {
     );
     assert_eq!(u.status, Status::NotConverted, "{out}");
 }
+
+/// `CONVERT(type, 'YYYYMMDD', 112)` of a literal is the CAST of the same
+/// literal for every date type (eval/builtins/2026-11-02-o/convert112-tsql.out);
+/// any other literal shape or style keeps the refusal.
+#[test]
+fn compact_date_literal_with_style_112() {
+    for (ty, pg) in [
+        ("date", "date"),
+        ("datetime", "timestamp(3)"),
+        ("datetime2(3)", "timestamp(3)"),
+        ("smalldatetime", "timestamp(0)"),
+    ] {
+        let src = format!(
+            "CREATE FUNCTION dbo.f() RETURNS {ty}\nAS\nBEGIN\n    RETURN CONVERT({ty}, '20030701', 112);\nEND\n"
+        );
+        let c = convert(&src, Dialect::Tsql, Dialect::Postgres).unwrap();
+        assert!(
+            c.output
+                .contains(&format!("RETURN CAST('20030701' AS {pg});")),
+            "{ty}: {}",
+            c.output
+        );
+        let u = c.units.iter().find(|u| u.src.line == 4).unwrap();
+        assert_eq!(u.checked, Status::Converted, "{ty}: {:?}", u.notes);
+    }
+    for stmt in [
+        "RETURN CONVERT(datetime, '2003-07-01', 112);",
+        "RETURN CONVERT(datetime, '20030701', 101);",
+        "RETURN CONVERT(datetime, '2003070', 112);",
+    ] {
+        let src = format!("CREATE FUNCTION dbo.f() RETURNS datetime\nAS\nBEGIN\n    {stmt}\nEND\n");
+        let c = convert(&src, Dialect::Tsql, Dialect::Postgres).unwrap();
+        let u = c.units.iter().find(|u| u.src.line == 4).unwrap();
+        assert_eq!(u.status, Status::NotConverted, "{stmt}\n{}", c.output);
+    }
+}
