@@ -1745,6 +1745,24 @@ impl<'a> Parser<'a> {
                 });
             }
         }
+        // T-SQL `alias = expr`: a column alias (a comparison needs more than
+        // the name in front of the `=`; checked on SQL Server 2022).
+        if self.d == Dialect::Tsql
+            && self
+                .peek()
+                .is_some_and(|t| t.kind == K::Quoted || t.kind == K::Word && !is_reserved(&t.up))
+            && self.is_kind_at(1, K::Op)
+            && self.peek_at(1).unwrap().text == "="
+        {
+            let alias = self.ident()?;
+            self.i += 1;
+            let expr = self.expr()?;
+            return Ok(SelItem {
+                expr,
+                alias: Some(alias),
+                assign: None,
+            });
+        }
         let expr = self.expr()?;
         let alias = self.alias()?;
         Ok(SelItem {
