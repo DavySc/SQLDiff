@@ -3,7 +3,7 @@
 //! only when given one. Options and Db2 for i stay refused with the reason.
 
 use sqldiff_convert::{check, rewrite_in, Conversion};
-use sqldiff_core::{Artifact, Dialect, Options};
+use sqldiff_core::{Dialect, Options};
 
 fn pg(src: &str) -> Conversion {
     let opts = Options {
