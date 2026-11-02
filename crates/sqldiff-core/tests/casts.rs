@@ -180,6 +180,30 @@ fn implicit_conversion_to_integer() {
             "!UPDATE M SET D = D0 WHERE Id = 1;",
             Eq,
         ),
+        // The same value read through a derived table keeps its type: a
+        // decimal stored in an integer column still loses its fraction in
+        // T-SQL and is rounded in PostgreSQL (no ASM-UNTYPED-STORE).
+        (
+            "!UPDATE dbo.M SET Q = (SELECT MAX(x.D) FROM (SELECT D FROM dbo.M) x) WHERE Id = 1;",
+            "!UPDATE M SET Q = (SELECT MAX(x.D) FROM (SELECT D FROM M) x) WHERE Id = 1;",
+            Diff("equiv.cast-rounding"),
+        ),
+        (
+            "!UPDATE dbo.M SET Q = (SELECT MAX(x.d2) FROM (SELECT D AS d2 FROM dbo.M) x) WHERE Id = 1;",
+            "!UPDATE M SET Q = (SELECT MAX(x.d2) FROM (SELECT D AS d2 FROM M) x) WHERE Id = 1;",
+            Diff("equiv.cast-rounding"),
+        ),
+        (
+            "!UPDATE dbo.M SET Q = (SELECT MAX(x.D) FROM (SELECT D FROM dbo.M) x) WHERE Id = 1;",
+            "!UPDATE M SET Q = (SELECT MAX(x.D) FROM (SELECT trunc(D) AS D FROM M) x) WHERE Id = 1;",
+            Unknown,
+        ),
+        // An integer read through a derived table is still an integer.
+        (
+            "!UPDATE dbo.M SET Q = (SELECT MAX(x.Q) FROM (SELECT Q FROM dbo.M) x) WHERE Id = 1;",
+            "!UPDATE M SET Q = (SELECT MAX(x.Q) FROM (SELECT Q FROM M) x) WHERE Id = 1;",
+            Eq,
+        ),
         // char(5) 'a' stored in varchar(20): SQL Server keeps 'a    ',
         // PostgreSQL drops the trailing blanks ('a').
         (
