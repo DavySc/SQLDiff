@@ -85,6 +85,17 @@ const ORDERS_P: &str = "CREATE TABLE Orders (
     CONSTRAINT CK_Orders_Amount CHECK (Amount >= 0)
 );";
 
+/// SQL Server takes one trailing comma in the column list; PostgreSQL's
+/// table has none. Two commas stay an empty item.
+#[test]
+fn a_trailing_comma_in_the_tsql_column_list_is_ignored() {
+    let t = ORDERS_T.replace("CHECK (Amount >= 0)\n)", "CHECK (Amount >= 0),\n)");
+    assert_ne!(t, ORDERS_T);
+    equal(&t, ORDERS_P);
+    let two = ORDERS_T.replace("CHECK (Amount >= 0)\n)", "CHECK (Amount >= 0),,\n)");
+    unknown(&two, ORDERS_P, "empty item");
+}
+
 #[test]
 fn a_converted_table_is_equal_under_what_it_relies_on() {
     let r = equal(ORDERS_T, ORDERS_P);
