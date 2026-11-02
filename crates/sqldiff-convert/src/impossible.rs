@@ -51,10 +51,9 @@ pub const DATABASE_LEVEL: Feature = f(
     "database-level",
     "database-level statements (USE, CREATE and ALTER DATABASE)",
 );
-pub const BULK_INSERT: Feature = f("bulk-insert-format", "BULK INSERT file formats");
 
 /// Every feature the converter can name, in report order.
-pub const ALL: [Feature; 15] = [
+pub const ALL: [Feature; 14] = [
     IN_MEMORY_OLTP,
     SECURITY_POLICY,
     SERVER_AUDIT,
@@ -69,7 +68,6 @@ pub const ALL: [Feature; 15] = [
     ALWAYS_ENCRYPTED,
     INSTANCE_METADATA,
     DATABASE_LEVEL,
-    BULK_INSERT,
 ];
 
 const PREFIX: &str = "impossible to convert automatically [";

@@ -2189,7 +2189,6 @@ impl<'a> Cx<'a> {
                 "ALTER INDEX (REBUILD, REORGANIZE, DISABLE, SET …): maintenance with no exact PostgreSQL counterpart (REINDEX rebuilds, nothing disables an index); no rule",
                 "ALTER INDEX: maintenance with no exact Db2 for i counterpart; no rule",
             )),
-            "BULK" if w(1) == "INSERT" => return self.bulk_insert(&ts),
             "ALTER" if crate::impossible::of_ddl(&[w(1).as_str(), w(2).as_str()]).is_some() => {
                 let x = crate::impossible::of_ddl(&[w(1).as_str(), w(2).as_str()]).unwrap();
                 return impossible(x, format!("ALTER {} {}: SQL Server only; {} has nothing to convert it to", w(1), w(2), self.to.display_name()));
@@ -4335,47 +4334,6 @@ impl<'a> Cx<'a> {
         self.note(Status::Assumptions, "ASM-NO-CALLER-TXN", "T-SQL commits this statement on its own (no transaction is open), so a COMMIT follows it: a later failure leaves it durable on both sides. That holds when the procedure is CALLed outside a transaction block (autocommit); inside a caller's transaction T-SQL leaves it to the caller, where PostgreSQL refuses the COMMIT.");
         self.txn_control = true;
         format!("{text}\nCOMMIT;")
-    }
-
-    /// `BULK INSERT`: PostgreSQL's COPY reads UTF-8 (or one named encoding)
-    /// text with one single-character field delimiter and a newline row
-    /// terminator. A file in SQL Server's `widechar` / `widenative` format,
-    /// or with a longer field terminator or another row terminator, cannot
-    /// be read by COPY at all; any other BULK INSERT has no rule yet. Always
-    /// a refusal.
-    fn bulk_insert<T2>(&mut self, ts: &[T]) -> R<T2> {
-        let s = sig(ts);
-        let option = |name: &str| -> Option<String> {
-            (0..s.len().saturating_sub(2)).find_map(|k| {
-                (ts[s[k]].is(name) && ts[s[k + 1]].s == "=" && ts[s[k + 2]].k == STRING)
-                    .then(|| string_value(&ts[s[k + 2]].s))
-            })
-        };
-        let why = "BULK INSERT: PostgreSQL's COPY cannot read this file format";
-        if !self.db2() {
-            let unescape = |v: &str| {
-                v.replace("\\t", "\t")
-                    .replace("\\r", "\r")
-                    .replace("\\n", "\n")
-            };
-            if let Some(t) = option("DATAFILETYPE")
-                .filter(|t| matches!(t.to_ascii_lowercase().as_str(), "widechar" | "widenative"))
-            {
-                return impossible(crate::impossible::BULK_INSERT, format!("{why} (DATAFILETYPE = '{t}' is UTF-16 text; COPY reads text in one encoding, UTF-8 here)"));
-            }
-            if let Some(f) = option("FIELDTERMINATOR").filter(|f| unescape(f).chars().count() > 1) {
-                return impossible(crate::impossible::BULK_INSERT, format!("{why} (FIELDTERMINATOR = '{f}' has several characters; COPY's delimiter is one character)"));
-            }
-            if let Some(r) = option("ROWTERMINATOR")
-                .filter(|r| !matches!(unescape(r).as_str(), "\n" | "\r\n" | "\r"))
-            {
-                return impossible(
-                    crate::impossible::BULK_INSERT,
-                    format!("{why} (ROWTERMINATOR = '{r}'; COPY ends rows at a newline only)"),
-                );
-            }
-        }
-        no("BULK INSERT: no rule yet; a plain character file could become COPY under an assumption about the file's encoding")
     }
 
     /// `ALTER DATABASE name ADD FILEGROUP fg [CONTAINS MEMORY_OPTIMIZED_DATA |
