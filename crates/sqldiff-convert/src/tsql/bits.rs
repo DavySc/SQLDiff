@@ -816,11 +816,11 @@ impl Cx<'_> {
             || self
                 .own_tables
                 .iter()
-                .any(|t| t.columns.iter().any(|c| c.data_type.base == "BIT"))
+                .any(|t| t.columns.iter().any(|c| self.dt_cat(&c.data_type.base, &c.data_type.args) == Dt::Bit))
             || self.type_catalog().is_some_and(|c| {
                 c.tables
                     .iter()
-                    .any(|t| t.columns.iter().any(|c| c.data_type.base == "BIT"))
+                    .any(|t| t.columns.iter().any(|c| self.dt_cat(&c.data_type.base, &c.data_type.args) == Dt::Bit))
             })
     }
 
@@ -1010,7 +1010,7 @@ impl Cx<'_> {
                 let c: String = trimmed(c).iter().map(|t| tsql_unquote(&t.s)).collect();
                 table
                     .column(Dialect::Tsql, &Ident::plain(c))
-                    .is_some_and(|c| c.data_type.base == "BIT")
+                    .is_some_and(|c| self.dt_cat(&c.data_type.base, &c.data_type.args) == Dt::Bit)
             })
             .collect();
         bit.contains(&true).then_some(bit)
@@ -1247,7 +1247,7 @@ impl Cx<'_> {
             Dialect::Tsql,
             &sqldiff_core::catalog::Ident::plain(col.clone()),
         )?;
-        match Dt::of(&c.data_type.base, &c.data_type.args) {
+        match self.dt_cat(&c.data_type.base, &c.data_type.args) {
             Dt::Bit => Some(Held::Bit),
             Dt::Int | Dt::BigInt | Dt::Fraction | Dt::Money => Some(Held::Number),
             _ => None,
@@ -1414,7 +1414,7 @@ impl Cx<'_> {
             .map(|t| {
                 t.columns
                     .iter()
-                    .filter(|c| c.data_type.base == "BIT")
+                    .filter(|c| self.dt_cat(&c.data_type.base, &c.data_type.args) == Dt::Bit)
                     .map(|c| c.name.to_ascii_lowercase())
                     .collect()
             })

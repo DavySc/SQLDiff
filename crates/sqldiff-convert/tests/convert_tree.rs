@@ -469,3 +469,30 @@ fn alias_types_become_domains() {
     let t = pg("CREATE TYPE [dbo].[Ids] AS TABLE (Id int);\nGO\n");
     assert_eq!(t.units[0].status, Status::NotConverted);
 }
+
+/// An alias type is its base type wherever it is used: a bit alias takes the
+/// bit literal rewrites, the base type's notes appear at the use, and a name
+/// that PostgreSQL reads in another way is not left unquoted.
+#[test]
+fn alias_types_behave_as_their_base_type() {
+    let src = "CREATE TYPE [Flag] FROM bit NOT NULL;\nGO\nCREATE TYPE [Small] FROM tinyint NULL;\nGO\nCREATE TYPE [Serial] FROM int NOT NULL;\nGO\nCREATE TYPE [Date] FROM varchar(10) NULL;\nGO\nCREATE TABLE dbo.T(Active Flag DEFAULT 1, S Small, N Serial);\nGO\nCREATE TABLE dbo.T2(D date, E dbo.Date);\nGO\nCREATE VIEW dbo.V AS SELECT Active FROM dbo.T WHERE Active = 1;\nGO\nCREATE PROCEDURE dbo.P @s Small, @f Flag = 1\nAS\nBEGIN\n    SELECT @s;\n    IF @f = 1 SELECT 1;\nEND;\nGO\n";
+    let c = pg(src);
+    let o = &c.output;
+    for want in [
+        // The column default and the view's comparison are boolean.
+        "Active Flag DEFAULT TRUE NOT NULL",
+        "WHERE Active = TRUE",
+        // `serial` would be an auto-increment column; `Serial` is quoted.
+        "CREATE DOMAIN \"Serial\" AS integer;",
+        "N \"Serial\" NOT NULL",
+        // A plain `date` column is the built-in type, `dbo.Date` the alias.
+        "D date",
+        "E \"Date\"",
+    ] {
+        assert!(o.contains(want), "missing {want}\n{o}");
+    }
+    // The procedure's header carries the notes of the base types.
+    let u = unit(&c, src, "CREATE PROCEDURE dbo.P");
+    let notes: String = u.notes.iter().map(|n| format!("{} ", n.text)).collect();
+    assert!(notes.to_ascii_lowercase().contains("tinyint"), "{notes}");
+}
