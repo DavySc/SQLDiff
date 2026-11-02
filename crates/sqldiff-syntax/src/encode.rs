@@ -319,6 +319,15 @@ impl W {
                 self.open("Str");
                 self.s(s);
             }
+            Expr::Bytes(h) => {
+                self.open("Bytes");
+                self.s(h);
+            }
+            Expr::Duration(x, unit) => {
+                self.open("Duration");
+                self.s(unit);
+                self.expr(x);
+            }
             Expr::Null => self.open("Null"),
             Expr::Star(q) => {
                 self.open("Star");
