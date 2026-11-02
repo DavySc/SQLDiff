@@ -1476,6 +1476,34 @@ fn fresh_draws_pair_in_source_order() {
     );
     assert!(assumption_ids(&r).contains(&"ASM-RANDOM-FRESH"));
 
+    // A RAND() under a query is drawn once per row the query reads on
+    // PostgreSQL but once per query on T-SQL: not compared.
+    let ts_sub = "CREATE PROCEDURE dbo.p_sub @R float OUTPUT AS
+                  BEGIN
+                    SET @R = (SELECT MAX(RAND()) FROM dbo.s);
+                  END";
+    let pg_sub = "CREATE PROCEDURE p_sub(INOUT p_r double precision DEFAULT NULL)
+                  LANGUAGE plpgsql AS $$
+                  BEGIN
+                    p_r := (SELECT MAX(random()) FROM s);
+                  END; $$;";
+    let r = run(ts_sub, T, pg_sub, P, false);
+    assert!(not_equal(&r), "{:?}", r.findings);
+    assert!(!assumption_ids(&r).contains(&"ASM-RANDOM-FRESH"));
+
+    let ts_exists = "CREATE PROCEDURE dbo.p_ex @Hit bit OUTPUT AS
+                     BEGIN
+                       IF EXISTS (SELECT 1 FROM dbo.s WHERE RAND() < 0.1) SET @Hit = 1;
+                     END";
+    let pg_exists = "CREATE PROCEDURE p_ex(INOUT p_hit boolean DEFAULT NULL)
+                     LANGUAGE plpgsql AS $$
+                     BEGIN
+                       p_hit := EXISTS (SELECT 1 FROM s WHERE random() < 0.1);
+                     END; $$;";
+    let r = run(ts_exists, T, pg_exists, P, false);
+    assert!(not_equal(&r), "{:?}", r.findings);
+    assert!(!assumption_ids(&r).contains(&"ASM-RANDOM-FRESH"));
+
     // Two RAND() draws in one statement are not compared (the second draw
     // has no counterpart the engine can pair).
     let ts_two_rand = "CREATE PROCEDURE dbo.roll2 @R float OUTPUT AS

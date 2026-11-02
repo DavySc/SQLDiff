@@ -356,6 +356,8 @@ pub struct Canon<'a> {
     single_row: bool,
     /// Random draws (`RAND()`, `random()`) lowered in the statement so far.
     rand_seen: usize,
+    /// Queries (`query_inner`) the lowering is inside of, at this point.
+    query_depth: usize,
     /// Random draws lowered in the unit so far, numbered (see `fresh`).
     fresh_seq: usize,
     seen_tables: HashMap<String, usize>,
@@ -733,6 +735,7 @@ impl<'a> Canon<'a> {
             discharged: Vec::new(),
             single_row: false,
             rand_seen: 0,
+            query_depth: 0,
             fresh_seq: 0,
             seen_tables: HashMap::new(),
             excluded: None,
@@ -758,6 +761,7 @@ impl<'a> Canon<'a> {
         self.discharged.clear();
         self.single_row = false;
         self.rand_seen = 0;
+        self.query_depth = 0;
         self.fresh_seq = 0;
         self.seen_tables.clear();
         self.excluded = None;
@@ -1992,10 +1996,11 @@ impl<'a> Canon<'a> {
         })
     }
 
-    /// Whether a random draw may be compared here: a procedure or a script
-    /// runs its statements once. A function, a view or a trigger may run
-    /// the same draw in another statement or for another caller, which the
-    /// draw's own numbering does not show, so it stays not compared.
+    /// Whether a random draw may be compared here. A procedure or a script
+    /// is lowered once, and each loop body once on each side, so the draw's
+    /// numbering holds. A function, a view or a trigger may run the same
+    /// draw in another statement or for another caller, which the numbering
+    /// does not show, so it stays not compared.
     fn fresh_allowed(&self) -> bool {
         matches!(self.unit.kind, UnitKind::Proc | UnitKind::Script)
     }
@@ -3256,7 +3261,10 @@ impl<'a> Canon<'a> {
             // RAND() draws once per statement in T-SQL and random() once per
             // row: only a statement that evaluates it once, and holds one draw.
             (Dialect::Tsql, "rand", 0) | (Dialect::Postgres, "random", 0)
-                if self.fresh_allowed() && self.single_row && self.rand_seen == 0 =>
+                if self.fresh_allowed()
+                    && self.single_row
+                    && self.query_depth == 0
+                    && self.rand_seen == 0 =>
             {
                 self.rand_seen += 1;
                 self.fresh(Fam::Float, "float")
@@ -4888,6 +4896,15 @@ impl<'a> Canon<'a> {
     }
 
     fn query_inner(&mut self, s: &Select, ctx: QCtx) -> R<Parts> {
+        // A draw inside a query runs once per row the query reads (see
+        // `fresh`), so a RAND() under any query is not compared.
+        self.query_depth += 1;
+        let r = self.query_body(s, ctx);
+        self.query_depth -= 1;
+        r
+    }
+
+    fn query_body(&mut self, s: &Select, ctx: QCtx) -> R<Parts> {
         let from = self.push_from(&s.from)?;
         let mut items = Vec::new();
         for it in &s.items {
@@ -5181,6 +5198,7 @@ impl<'a> Canon<'a> {
     pub fn condition(&mut self, e: &Expr) -> R<Term> {
         self.seen_tables.clear();
         self.rand_seen = 0;
+        self.query_depth = 0;
         self.single_row = true;
         Ok(self.cond(e)?.0)
     }
@@ -5449,6 +5467,7 @@ impl<'a> Canon<'a> {
         }
         self.seen_tables.clear();
         self.rand_seen = 0;
+        self.query_depth = 0;
         self.single_row = false;
         match s {
             Stmt::Select(sel) if !sel.ctes.is_empty() => {
