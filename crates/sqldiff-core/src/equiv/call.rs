@@ -48,6 +48,10 @@ use crate::model::Assumption;
 type R<T> = Result<T, String>;
 
 pub mod asms {
+    pub const RETURN_CODE: (&str, &str) = (
+        "ASM-RETURN-CODE",
+        "PostgreSQL procedures cannot return a value: the T-SQL return status (0 unless RETURN n says otherwise, never NULL) becomes the INOUT parameter return_code, so callers must read return_code, and take 0 from a converted procedure that has none.",
+    );
     pub const CALLEE: (&str, &str) = (
         "ASM-CALLEE-CONVERTED",
         "The procedure a call names on side B is the conversion of the one it names on side A; that procedure's own conversion (signature, body, result sets) is compared in the file that creates it",
@@ -1491,7 +1495,39 @@ fn calls(x: &Call, t: &Side, y: &Call, p: &Side) -> R<Verdict> {
     if object_key(&x.name, t.d)?.0.is_none() && object_key(&y.name, p.d)?.0.is_none() {
         asms.push(asm::make(asm::DEFAULT_SCHEMA));
     }
-    if rt.params.len() != rp.params.len() {
+    // The conversion of a procedure that returns a status adds a last
+    // `INOUT return_code integer DEFAULT NULL` (ASM-RETURN-CODE). A call
+    // that does not read the status (no `@rc =`, which is not compared at
+    // all) leaves it to its default on both sides, and the status the
+    // procedure sets is then read by nobody.
+    let extra_return_code = rp.params.len() == rt.params.len() + 1
+        && rp.params.last().is_some_and(|q| {
+            q.name == "return_code"
+                && q.mode == ParamMode::InOut
+                && q.has_default
+                && q.default
+                    .as_deref()
+                    .is_some_and(|d| d.trim().eq_ignore_ascii_case("null"))
+        });
+    if extra_return_code {
+        if y.args.iter().any(|a| a.name.as_deref() == Some("return_code"))
+            || y.args.len() > rt.params.len()
+        {
+            return Err(format!(
+                "{} passes the return_code parameter, which T-SQL's status does not correspond to",
+                p.name
+            ));
+        }
+        // A top-level CALL returns its INOUT parameters, return_code
+        // included, to the client as a row; T-SQL's EXEC returns no row.
+        if p.unit.kind == super::lower::UnitKind::Script && !p.in_do {
+            return Err(format!(
+                "{} takes a return_code INOUT parameter, which a CALL outside PL/pgSQL returns to the client as a row",
+                rp.display()
+            ));
+        }
+        asms.push(asm::make(asms::RETURN_CODE));
+    } else if rt.params.len() != rp.params.len() {
         return Err(format!(
             "{} takes {} parameter(s) on {} and {} on {}",
             rt.display(),
