@@ -1193,6 +1193,7 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 id = "tsql.table.alias-not-null"
 kind = "converter"
 proof = "engine"
+note = "A column of an alias type that spells no nullability gets the type's NOT NULL; not compared by the engine yet"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
@@ -1359,6 +1360,13 @@ kind = "converter"
 proof = "lemma:Sqldiff.Mirror/C2b strings/Types"
 family = "tsql.type.*"
 note = "`nvarchar(n)` with 1 <= n <= 4000 against `varchar(n)` (read with the `wide` bound); `max` and `nchar(n)` engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.type.alias-domain"
+kind = "converter"
+proof = "engine"
+note = "`CREATE TYPE n FROM base` becomes `CREATE DOMAIN n AS base`; the engine does not compare the pair yet (a unit stays not proven)"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]

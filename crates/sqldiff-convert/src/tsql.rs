@@ -181,11 +181,55 @@ struct Decl {
 /// PostgreSQL built-in type names (and their spellings) that an unqualified
 /// name finds in pg_catalog before any schema of the search path.
 const PG_TYPE_NAMES: &[&str] = &[
-    "bigint", "bit", "bool", "boolean", "box", "bpchar", "bytea", "char", "character", "cidr",
-    "circle", "date", "decimal", "double", "float4", "float8", "inet", "int", "int2", "int4",
-    "int8", "integer", "interval", "json", "jsonb", "line", "lseg", "macaddr", "money", "name",
-    "numeric", "oid", "path", "point", "polygon", "real", "smallint", "text", "time", "timestamp",
-    "timestamptz", "timetz", "tsquery", "tsvector", "uuid", "varbit", "varchar", "xid", "xml",
+    "bigint",
+    "bit",
+    "bool",
+    "boolean",
+    "box",
+    "bpchar",
+    "bytea",
+    "char",
+    "character",
+    "cidr",
+    "circle",
+    "date",
+    "decimal",
+    "double",
+    "float4",
+    "float8",
+    "inet",
+    "int",
+    "int2",
+    "int4",
+    "int8",
+    "integer",
+    "interval",
+    "json",
+    "jsonb",
+    "line",
+    "lseg",
+    "macaddr",
+    "money",
+    "name",
+    "numeric",
+    "oid",
+    "path",
+    "point",
+    "polygon",
+    "real",
+    "smallint",
+    "text",
+    "time",
+    "timestamp",
+    "timestamptz",
+    "timetz",
+    "tsquery",
+    "tsvector",
+    "uuid",
+    "varbit",
+    "varchar",
+    "xid",
+    "xml",
 ];
 
 /// An alias type created in the file: the domain it became and what a
@@ -5317,7 +5361,9 @@ impl<'a> Cx<'a> {
             return no("CREATE TYPE with a name of more than two parts: no rule");
         }
         let Some(&from) = s.get(k).filter(|&&j| ts[j].is("FROM")) else {
-            return no("CREATE TYPE … AS TABLE / EXTERNAL NAME (a table type or a CLR type): no rule");
+            return no(
+                "CREATE TYPE … AS TABLE / EXTERNAL NAME (a table type or a CLR type): no rule",
+            );
         };
         let mut body: Vec<T> = ts[from + 1..].to_vec();
         while body.last().is_some_and(|t| !t.sig() || t.k == SEMICOLON) {
@@ -5378,7 +5424,13 @@ impl<'a> Cx<'a> {
         let words: Vec<String> = trimmed(ts)
             .iter()
             .filter(|t| matches!(t.k, IDENT | QUOTED_IDENT | DOT))
-            .map(|t| if t.k == DOT { ".".into() } else { tsql_unquote(&t.s) })
+            .map(|t| {
+                if t.k == DOT {
+                    ".".into()
+                } else {
+                    tsql_unquote(&t.s)
+                }
+            })
             .collect();
         let key = match words.as_slice() {
             [n] => ("dbo".to_string(), n.to_ascii_lowercase()),
@@ -6155,13 +6207,15 @@ impl<'a> Cx<'a> {
         }
         // A column of an alias type that spells neither NULL nor NOT NULL
         // takes the nullability the type was created with.
-        let inherited = self.alias_type(&it[ty_at..=ty_end]).and_then(|a| a.not_null);
+        let inherited = self
+            .alias_type(&it[ty_at..=ty_end])
+            .and_then(|a| a.not_null);
         let spells_null = {
             let ds = crate::tok::depths(&rest);
             let top: Vec<usize> = sig(&rest).into_iter().filter(|&k| ds[k] == 0).collect();
-            top.iter().enumerate().any(|(n, &k)| {
-                rest[k].is("NULL") && !(n > 0 && rest[top[n - 1]].is("DEFAULT"))
-            })
+            top.iter()
+                .enumerate()
+                .any(|(n, &k)| rest[k].is("NULL") && !(n > 0 && rest[top[n - 1]].is("DEFAULT")))
         };
         let inherit_not_null = inherited == Some(true) && !spells_null;
         // NOT NULL or a PRIMARY KEY of the column itself (not inside CHECK).

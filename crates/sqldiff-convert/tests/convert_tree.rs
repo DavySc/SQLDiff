@@ -432,3 +432,40 @@ fn exec_with_output_in_a_script_becomes_a_call_in_a_do_block() {
         c.output
     );
 }
+
+#[test]
+fn alias_types_become_domains() {
+    let src = "CREATE TYPE [AccountNumber] FROM nvarchar(15) NULL;\nGO\nCREATE TYPE [Flag] FROM bit NOT NULL;\nGO\nCREATE TYPE [Name] FROM nvarchar(50) NULL;\nGO\nCREATE TYPE [Sales].[Money Amt] FROM decimal(19, 4) NOT NULL;\nGO\nCREATE TABLE [dbo].[Thing](\n    [Name] [Name] NOT NULL,\n    [Alt] [Name] NULL,\n    [Active] [Flag] NOT NULL,\n    [Seen] [dbo].[Flag],\n    [Maybe] [Flag] NULL,\n    [Dflt] [Flag] DEFAULT NULL,\n    [Acct] [AccountNumber],\n    [Amt] [Sales].[Money Amt] DEFAULT 0\n);\nGO\n";
+    let c = pg(src);
+    let o = &c.output;
+    for want in [
+        "CREATE DOMAIN AccountNumber AS varchar(15);",
+        "CREATE DOMAIN Flag AS boolean;",
+        // A domain named like a built-in type is never found unquoted.
+        "CREATE DOMAIN \"Name\" AS varchar(50);",
+        "CREATE DOMAIN sales.\"Money Amt\" AS numeric(19, 4);",
+        "Name \"Name\" NOT NULL,",
+        "Alt \"Name\" NULL,",
+        "Maybe Flag NULL,",
+        // NOT NULL comes from the alias type only where the column says nothing.
+        "Seen Flag NOT NULL,",
+        "Dflt Flag DEFAULT NULL NOT NULL,",
+        "Acct AccountNumber,",
+        "Amt sales.\"Money Amt\" DEFAULT 0 NOT NULL",
+    ] {
+        assert!(o.contains(want), "missing {want}\n{o}");
+    }
+    // The nullability stays off the domain: a column can still say NULL.
+    assert!(!o.contains("DOMAIN Flag AS boolean NOT NULL"), "{o}");
+    // A name PostgreSQL's own type would win over cannot be a domain.
+    let lower = pg("CREATE TYPE [name] FROM nvarchar(50);\nGO\n");
+    assert_eq!(lower.units[0].status, Status::NotConverted);
+    // Db2 for i distinct types are not alias types.
+    assert_eq!(
+        db2("CREATE TYPE [Flag] FROM bit NOT NULL;\nGO\n").units[0].status,
+        Status::NotConverted
+    );
+    // A table type is not an alias type.
+    let t = pg("CREATE TYPE [dbo].[Ids] AS TABLE (Id int);\nGO\n");
+    assert_eq!(t.units[0].status, Status::NotConverted);
+}

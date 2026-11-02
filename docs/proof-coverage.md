@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 185 | 35 (19%) | 6 (3%) | 144 (78%) |
+| `converter` | 186 | 35 (19%) | 6 (3%) | 145 (78%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 214 | 38 (18%) | 8 (4%) | 168 (79%) |
+| **All** | 215 | 38 (18%) | 8 (4%) | 169 (79%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -194,7 +194,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.table-builtin` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.add-column` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.add-default` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
-| `tsql.table.alias-not-null` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.table.alias-not-null` | `converter` | engine | A column of an alias type that spells no nullability gets the type's NOT NULL; not compared by the engine yet | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.check-constraint` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.column-default` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.column-option-dropped` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
@@ -227,6 +227,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.txn.trancount-guard` | `converter` | engine | the `IF @@TRANCOUNT > 0` guard outside idiom.rollback-rethrow | `sqldiff-convert/src/tsql.rs` |
 | `tsql.txn.wrapper` | `converter` | engine | the call is one transaction: outside the C4 bracket shape | `sqldiff-convert/src/tsql.rs` |
 | `tsql.type.*` | `converter` | engine | The type mapping, named after the T-SQL type (`tsql.type.bigint`); the members with a lemma are listed on their own | `sqldiff-convert/src/tsql.rs` |
+| `tsql.type.alias-domain` | `converter` | engine | `CREATE TYPE n FROM base` becomes `CREATE DOMAIN n AS base`; the engine does not compare the pair yet (a unit stays not proven) | `sqldiff-convert/src/tsql.rs` |
 | `tsql.type.int` | `converter` | lemma: `Sqldiff.Mirror/C2a types` | `int` against PostgreSQL `integer` (also 'Parameter and return types') | `sqldiff-convert/src/tsql.rs` |
 | `tsql.type.integer` | `converter` | lemma: `Sqldiff.Mirror/C2a types` | `integer` against PostgreSQL `integer` (also 'Parameter and return types') | `sqldiff-convert/src/tsql.rs` |
 | `tsql.type.nvarchar` | `converter` | lemma: `Sqldiff.Mirror/C2b strings/Types` | `nvarchar(n)` with 1 <= n <= 4000 against `varchar(n)` (read with the `wide` bound); `max` and `nchar(n)` engine | `sqldiff-convert/src/tsql.rs` |
