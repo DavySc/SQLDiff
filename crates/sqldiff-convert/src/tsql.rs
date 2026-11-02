@@ -105,6 +105,7 @@ pub(crate) fn convert(
         in_table_check: false,
         table_items: Vec::new(),
         left_out_indexes: Vec::new(),
+        alias_types: HashMap::new(),
         update_ctes: Vec::new(),
         stmt_ctes: Vec::new(),
         stmt_insert: false,
@@ -175,6 +176,28 @@ struct Decl {
     lines: Vec<String>,
     notes: Vec<Note>,
     trace: Vec<crate::Step>,
+}
+
+/// PostgreSQL built-in type names (and their spellings) that an unqualified
+/// name finds in pg_catalog before any schema of the search path.
+const PG_TYPE_NAMES: &[&str] = &[
+    "bigint", "bit", "bool", "boolean", "box", "bpchar", "bytea", "char", "character", "cidr",
+    "circle", "date", "decimal", "double", "float4", "float8", "inet", "int", "int2", "int4",
+    "int8", "integer", "interval", "json", "jsonb", "line", "lseg", "macaddr", "money", "name",
+    "numeric", "oid", "path", "point", "polygon", "real", "smallint", "text", "time", "timestamp",
+    "timestamptz", "timetz", "tsquery", "tsvector", "uuid", "varbit", "varchar", "xid", "xml",
+];
+
+/// An alias type created in the file: the domain it became and what a
+/// column of it inherits.
+#[derive(Clone)]
+struct AliasType {
+    /// The domain name as written in the target.
+    domain: String,
+    /// `Some(true)` for `NOT NULL`, `Some(false)` for `NULL`.
+    not_null: Option<bool>,
+    string: bool,
+    numeric: bool,
 }
 
 struct Cx<'a> {
@@ -303,6 +326,9 @@ struct Cx<'a> {
     table_items: Vec<Vec<T>>,
     /// Indexes the conversion left out (columnstore), lower case.
     left_out_indexes: Vec<String>,
+    /// Alias types this file creates (`CREATE TYPE n FROM base`), by schema
+    /// and name (lower case, `dbo` for none).
+    alias_types: HashMap<(String, String), AliasType>,
     /// The CTEs of the `WITH … UPDATE … FROM` being converted (lower case),
     /// with the GROUP BY key their query returns (`group_key`), if any.
     update_ctes: Vec<(String, Option<Vec<String>>)>,
@@ -5181,6 +5207,7 @@ impl<'a> Cx<'a> {
             "UNIQUE" | "INDEX" | "CLUSTERED" | "NONCLUSTERED" => self.create_index(ts, &w1),
             "SCHEMA" => self.create_schema(&ts),
             "SEQUENCE" => self.create_sequence(&ts, s[2..].to_vec()),
+            "TYPE" => self.create_alias_type(&ts),
             _ => no(format!("CREATE {w1}: no rule yet")),
         }
     }
@@ -5267,6 +5294,104 @@ impl<'a> Cx<'a> {
     /// `CREATE SCHEMA s [AUTHORIZATION owner]`. T-SQL's `dbo` is the
     /// database owner, a principal the target has no counterpart of by that
     /// name: the target schema goes to the user running the script.
+    /// `CREATE TYPE [schema.]name FROM base [NULL | NOT NULL]` → PostgreSQL
+    /// `CREATE DOMAIN name AS base`. A T-SQL alias type is its base type
+    /// under another name; the nullability it names applies to a column of
+    /// the type that spells none (`column_def`), not to the domain, since a
+    /// column (or variable) of the type can still be declared nullable.
+    fn create_alias_type(&mut self, ts: &[T]) -> R<String> {
+        if self.db2() {
+            return no("CREATE TYPE … FROM: Db2 for i has distinct types, which are not assignment-compatible with their source type as a T-SQL alias type is; no rule");
+        }
+        let s = sig(ts);
+        let mut k = 2;
+        let first = *s.get(k).ok_or(No("CREATE TYPE without a name".into()))?;
+        let mut parts = vec![tsql_unquote(&ts[first].s)];
+        k += 1;
+        while s.get(k).is_some_and(|&j| ts[j].k == DOT) {
+            let n = *s.get(k + 1).ok_or(No("unfinished type name".into()))?;
+            parts.push(tsql_unquote(&ts[n].s));
+            k += 2;
+        }
+        if parts.len() > 2 {
+            return no("CREATE TYPE with a name of more than two parts: no rule");
+        }
+        let Some(&from) = s.get(k).filter(|&&j| ts[j].is("FROM")) else {
+            return no("CREATE TYPE … AS TABLE / EXTERNAL NAME (a table type or a CLR type): no rule");
+        };
+        let mut body: Vec<T> = ts[from + 1..].to_vec();
+        while body.last().is_some_and(|t| !t.sig() || t.k == SEMICOLON) {
+            body.pop();
+        }
+        let bs = sig(&body);
+        let n = bs.len();
+        let not_null = match n.checked_sub(2).map(|i| (&body[bs[i]], &body[bs[n - 1]])) {
+            Some((a, b)) if a.is("NOT") && b.is("NULL") => {
+                body.truncate(bs[n - 2]);
+                Some(true)
+            }
+            _ if n >= 1 && body[bs[n - 1]].is("NULL") => {
+                body.truncate(bs[n - 1]);
+                Some(false)
+            }
+            _ => None,
+        };
+        let (base, string, numeric) = self.ty(&body)?;
+        let (schema, name) = match parts.as_slice() {
+            [n] => ("dbo".to_string(), n.clone()),
+            [s, n] => (s.to_ascii_lowercase(), n.clone()),
+            _ => unreachable!(),
+        };
+        let domain = if schema == "dbo" {
+            self.note(Status::Assumptions, "ASM-DBO-SCHEMA", "The dbo schema is dropped: objects are assumed to be found through search_path (usually the public schema).");
+            // pg_catalog is searched before the schema of an unqualified
+            // name, so a domain spelled like a built-in type would never be
+            // found. Quoted with a capital it is a different name.
+            let lower = name.to_ascii_lowercase();
+            if PG_TYPE_NAMES.contains(&lower.as_str()) {
+                if name == lower {
+                    return no(format!("CREATE TYPE {name}: a PostgreSQL domain named {name} is never found, since the built-in type of that name comes first on the search path; rename the type"));
+                }
+                format!("\"{}\"", name.replace('"', "\"\""))
+            } else {
+                quoted(&name)
+            }
+        } else {
+            format!("{}.{}", quoted(&schema), quoted(&name))
+        };
+        self.step_ts("tsql.type.alias-domain", ts);
+        self.alias_types.insert(
+            (schema, name.to_ascii_lowercase()),
+            AliasType {
+                domain: domain.clone(),
+                not_null,
+                string,
+                numeric,
+            },
+        );
+        Ok(format!("CREATE DOMAIN {domain} AS {base}"))
+    }
+
+    /// The alias type a type name (one or two parts, as tokens) names, if
+    /// this file created it.
+    fn alias_type(&self, ts: &[T]) -> Option<&AliasType> {
+        let words: Vec<String> = trimmed(ts)
+            .iter()
+            .filter(|t| matches!(t.k, IDENT | QUOTED_IDENT | DOT))
+            .map(|t| if t.k == DOT { ".".into() } else { tsql_unquote(&t.s) })
+            .collect();
+        let key = match words.as_slice() {
+            [n] => ("dbo".to_string(), n.to_ascii_lowercase()),
+            [s, d, n] if d == "." => (s.to_ascii_lowercase(), n.to_ascii_lowercase()),
+            _ => return None,
+        };
+        // A parenthesised length means a built-in type, not an alias.
+        if trimmed(ts).iter().any(|t| t.k == L_PAREN) {
+            return None;
+        }
+        self.alias_types.get(&key)
+    }
+
     fn create_schema(&mut self, ts: &[T]) -> R<String> {
         let s = sig(ts);
         let body: Vec<usize> = s
@@ -6028,8 +6153,19 @@ impl<'a> Cx<'a> {
             rest.push(t.clone());
             j += 1;
         }
+        // A column of an alias type that spells neither NULL nor NOT NULL
+        // takes the nullability the type was created with.
+        let inherited = self.alias_type(&it[ty_at..=ty_end]).and_then(|a| a.not_null);
+        let spells_null = {
+            let ds = crate::tok::depths(&rest);
+            let top: Vec<usize> = sig(&rest).into_iter().filter(|&k| ds[k] == 0).collect();
+            top.iter().enumerate().any(|(n, &k)| {
+                rest[k].is("NULL") && !(n > 0 && rest[top[n - 1]].is("DEFAULT"))
+            })
+        };
+        let inherit_not_null = inherited == Some(true) && !spells_null;
         // NOT NULL or a PRIMARY KEY of the column itself (not inside CHECK).
-        let not_null = pk_col || {
+        let not_null = pk_col || inherit_not_null || {
             let ds = crate::tok::depths(&rest);
             let top: Vec<usize> = sig(&rest).into_iter().filter(|&k| ds[k] == 0).collect();
             top.windows(2).any(|w| {
@@ -6045,6 +6181,10 @@ impl<'a> Cx<'a> {
             // T-SQL makes primary key columns NOT NULL; Db2 wants it written.
             self.step_ts("tsql.table.primary-key-not-null", it);
             rest = format!("NOT NULL {}", rest.trim());
+        }
+        if inherit_not_null {
+            self.step_ts("tsql.table.alias-not-null", it);
+            rest = format!("{} NOT NULL", rest.trim());
         }
         if seq_default && !not_null {
             // A NULL written into the column stays NULL in T-SQL; the trigger
@@ -8180,6 +8320,9 @@ impl<'a> Cx<'a> {
         let Some(first) = ts.first() else {
             return no("missing type");
         };
+        if let Some(a) = self.alias_type(ts) {
+            return Ok((a.domain.clone(), a.string, a.numeric));
+        }
         if let Some(d) = next_sig(ts, 0).filter(|&d| ts[d].k == DOT) {
             // `sys.geography` is the built-in type; any other schema holds a
             // user-defined type, which has no rule.

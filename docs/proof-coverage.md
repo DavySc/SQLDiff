@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 184 | 35 (19%) | 6 (3%) | 143 (78%) |
+| `converter` | 185 | 35 (19%) | 6 (3%) | 144 (78%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 213 | 38 (18%) | 8 (4%) | 167 (78%) |
+| **All** | 214 | 38 (18%) | 8 (4%) | 168 (79%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -194,6 +194,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.table-builtin` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.add-column` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.add-default` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.table.alias-not-null` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.check-constraint` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.column-default` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.column-option-dropped` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
