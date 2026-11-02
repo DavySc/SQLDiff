@@ -1398,6 +1398,28 @@ fn unread_scratch(u: &Unit, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether a value of the varying-length string type `p` can be longer than
+/// the varying-length string variable type `v` it is copied into, and the
+/// copy is the only difference between them (the variable keeps the
+/// character set: a national `p` into a non-national `v` is not this).
+fn narrower_string(p: &Ty, v: &Ty) -> bool {
+    match (p, v) {
+        (
+            Ty::Str {
+                fixed: false,
+                national: n1,
+                len: l1,
+            },
+            Ty::Str {
+                fixed: false,
+                national: n2,
+                len: Some(b),
+            },
+        ) => (*n2 || !*n1) && l1.map_or(true, |a| a > *b),
+        _ => false,
+    }
+}
+
 /// A PostgreSQL value of type `v` passes to a parameter of type `p`
 /// unchanged: an implicit cast that keeps the value (the parameter's own
 /// length, precision and scale are ignored).
@@ -1691,7 +1713,18 @@ fn calls(x: &Call, t: &Side, y: &Call, p: &Side) -> R<Verdict> {
                         "{what}: the variable's type does not pass unchanged to the parameter's"
                     ));
                 }
-                if out && (!fits_tsql(&ty_t, &vty_t) || !fits_pg(&ty_p, &vty_p)) {
+                // A string longer than the variable it is copied back into:
+                // SQL Server cuts it off, PostgreSQL raises. Strings assigned
+                // to a variable fit it (ASM-VARIABLE-LENGTH), the OUTPUT
+                // copy-back being such an assignment.
+                let cut_off = out
+                    && !fits_tsql(&ty_t, &vty_t)
+                    && narrower_string(&ty_t, &vty_t)
+                    && fits_pg(&ty_p, &vty_p);
+                if cut_off {
+                    asms.push(asm::make(super::script::VARIABLE_LENGTH));
+                }
+                if out && !cut_off && (!fits_tsql(&ty_t, &vty_t) || !fits_pg(&ty_p, &vty_p)) {
                     return Err(format!(
                         "{what}: the OUTPUT value does not copy back unchanged into the variable"
                     ));

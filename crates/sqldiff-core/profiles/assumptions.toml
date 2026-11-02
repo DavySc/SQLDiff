@@ -1485,9 +1485,9 @@ sites = ["sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-VARIABLE-LENGTH"
-statement = "Strings assigned to a T-SQL variable fit its declared length (SQL Server cuts them off, PostgreSQL raises)."
+statement = "Strings assigned to a T-SQL variable fit its declared length, whether by SET, SELECT or the copy back of a procedure's OUTPUT parameter (SQL Server cuts them off, PostgreSQL raises)."
 discharge = "deployment"
-fact = "The data assigned to the variable."
+fact = "The data assigned to the variable, including what a called procedure gives back through an OUTPUT parameter."
 sites = ["sqldiff-core/src/equiv/script.rs"]
 
 [[assumption]]
