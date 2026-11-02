@@ -5265,9 +5265,6 @@ impl<'a> Cx<'a> {
         self.with_bit_cols(cols, |cx| Ok(collapse_spaces(&cx.expr(&kept))))
     }
 
-    /// `CREATE SCHEMA s [AUTHORIZATION owner]`. T-SQL's `dbo` is the
-    /// database owner, a principal the target has no counterpart of by that
-    /// name: the target schema goes to the user running the script.
     /// `CREATE ROLE name` becomes `CREATE ROLE name NOLOGIN`: a PostgreSQL
     /// role has no login of its own unless it is given one (ASM-ROLE-NOLOGIN).
     /// Options (LOGIN, AUTHORIZATION, …) have no rule yet.
@@ -5292,6 +5289,9 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// `CREATE SCHEMA s [AUTHORIZATION owner]`. T-SQL's `dbo` is the
+    /// database owner, a principal the target has no counterpart of by that
+    /// name: the target schema goes to the user running the script.
     fn create_schema(&mut self, ts: &[T]) -> R<String> {
         let s = sig(ts);
         let body: Vec<usize> = s

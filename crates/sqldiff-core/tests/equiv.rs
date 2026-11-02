@@ -1561,4 +1561,9 @@ fn database_roles_are_nologin_roles() {
 
     let r = run(ts, T, "CREATE ROLE report_writers NOLOGIN;", P, false);
     assert!(not_equal(&r), "{:?}", r.findings);
+
+    // Db2 for i has no roles: the rule does not apply to it.
+    let r = run(ts, T, "CREATE ROLE report_readers NOLOGIN;", D, false);
+    assert!(not_equal(&r), "{:?}", r.findings);
+    assert!(!assumption_ids(&r).contains(&"ASM-ROLE-NOLOGIN"));
 }

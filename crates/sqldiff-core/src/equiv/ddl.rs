@@ -2124,6 +2124,13 @@ fn roles(x: &RoleDef, y: &RoleDef, na: &str, nb: &str, ev: &mut Vec<Event>) -> R
         });
         return Ok(());
     }
+    // ASM-ROLE-NOLOGIN speaks of PostgreSQL roles only: Db2 for i has none.
+    if p.dialect != Dialect::Postgres {
+        ev.push(Event::Unknown(format!(
+            "{pn} is not PostgreSQL, which is the only target with roles this rule converts to"
+        )));
+        return Ok(());
+    }
     if t.nologin || !p.nologin {
         ev.push(Event::Unknown(format!(
             "{tn} creates the role with no options, and {pn} must create it NOLOGIN to compare"
