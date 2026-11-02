@@ -437,6 +437,32 @@ fn extended_properties_with_bracketed_names() {
     );
 }
 
+/// The converter drops `dbo`, so its comment targets are unqualified.
+#[test]
+fn unqualified_comment_targets_are_in_the_default_schema() {
+    let cases = [
+        ("@level1type = N'TABLE', @level1name = N'Things'", "COMMENT ON TABLE Things IS 'Kept things';"),
+        ("@level1type = N'TABLE', @level1name = N'Things', @level2type = N'COLUMN', @level2name = N'Qty'", "COMMENT ON COLUMN Things.Qty IS 'Kept things';"),
+        ("@level1type = N'VIEW', @level1name = N'ThingNames'", "COMMENT ON VIEW ThingNames IS 'Kept things';"),
+        ("@level1type = N'TABLE', @level1name = N'Things', @level2type = N'INDEX', @level2name = N'IX_Things_Qty'", "COMMENT ON INDEX IX_Things_Qty IS 'Kept things';"),
+        ("@level1type = N'TABLE', @level1name = N'Things', @level2type = N'CONSTRAINT', @level2name = N'UQ_Things_Name'", "COMMENT ON CONSTRAINT UQ_Things_Name ON Things IS 'Kept things';"),
+        ("@level1type = N'PROCEDURE', @level1name = N'Touch'", "COMMENT ON PROCEDURE Touch IS 'Kept things';"),
+    ];
+    for (levels, pg) in cases {
+        let r = equal(&extprop("N'Kept things'", levels), pg);
+        assert_eq!(r.verdict(), Verdict::EqualUnderAssumptions, "{pg}");
+    }
+    // The wrong object is still no match.
+    unknown(
+        &extprop(
+            "N'Kept things'",
+            "@level1type = N'TABLE', @level1name = N'Things'",
+        ),
+        "COMMENT ON TABLE ThingNames IS 'Kept things';",
+        "no counterpart",
+    );
+}
+
 #[test]
 fn comment_near_misses() {
     let table = "@level1type = N'TABLE', @level1name = N'Things'";
