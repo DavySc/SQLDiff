@@ -89,7 +89,7 @@ fn a_missing_rule_is_not_impossible() {
 
 #[test]
 fn hashes_and_instance_metadata_in_a_body_are_marked() {
-    let c = pg("CREATE PROCEDURE dbo.p AS\nBEGIN\n  DECLARE @h varbinary(32)\n  SET @h = HASHBYTES('SHA2_256', 'x')\nEND\n");
+    let c = pg("CREATE PROCEDURE dbo.p AS\nBEGIN\n  DECLARE @h varbinary(32)\n  SET @h = CHECKSUM('x')\nEND\n");
     let u = c
         .units
         .iter()

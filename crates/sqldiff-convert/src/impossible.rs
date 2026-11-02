@@ -43,8 +43,7 @@ pub const COLUMNSTORE: Feature = f("columnstore", "columnstore index");
 pub const PARTITIONING: Feature = f("partition-scheme", "partition function or scheme");
 pub const XML_SCHEMA: Feature = f("xml-schema-collection", "XML schema collection");
 pub const HIERARCHYID: Feature = f("hierarchyid", "hierarchyid type");
-pub const HASH_FUNCTIONS: Feature = f("sql-server-hash", "CHECKSUM, BINARY_CHECKSUM and HASHBYTES");
-pub const SYSTEM_TIME_QUERY: Feature = f("system-time-query", "FOR SYSTEM_TIME query");
+pub const HASH_FUNCTIONS: Feature = f("sql-server-hash", "CHECKSUM and BINARY_CHECKSUM");
 pub const ALWAYS_ENCRYPTED: Feature = f("always-encrypted", "Always Encrypted keys");
 pub const INSTANCE_METADATA: Feature = f("instance-metadata", "instance and catalog metadata");
 pub const DATABASE_LEVEL: Feature = f(
@@ -53,7 +52,7 @@ pub const DATABASE_LEVEL: Feature = f(
 );
 
 /// Every feature the converter can name, in report order.
-pub const ALL: [Feature; 14] = [
+pub const ALL: [Feature; 13] = [
     IN_MEMORY_OLTP,
     SECURITY_POLICY,
     SERVER_AUDIT,
@@ -64,7 +63,6 @@ pub const ALL: [Feature; 14] = [
     XML_SCHEMA,
     HIERARCHYID,
     HASH_FUNCTIONS,
-    SYSTEM_TIME_QUERY,
     ALWAYS_ENCRYPTED,
     INSTANCE_METADATA,
     DATABASE_LEVEL,

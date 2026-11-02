@@ -1996,13 +1996,10 @@ impl<'a> Cx<'a> {
         if s.windows(3)
             .any(|p| !ts[p[0]].is("PERIOD") && ts[p[1]].is("FOR") && ts[p[2]].is("SYSTEM_TIME"))
         {
-            if !self.db2() {
-                return impossible(
-                    crate::impossible::SYSTEM_TIME_QUERY,
-                    "FOR SYSTEM_TIME reads the history of a system-versioned table: PostgreSQL has no temporal queries (a UNION ALL of the table and its history filtered on the period columns reads other rows than the period semantics of FROM, TO, BETWEEN and CONTAINED IN)",
-                );
-            }
-            return no("FOR SYSTEM_TIME: system-versioned tables are not converted for Db2 for i yet; no rule yet");
+            return no(self.pick(
+                "FOR SYSTEM_TIME reads the history of a system-versioned table: PostgreSQL has no temporal queries; a UNION ALL of the table and its history filtered on the period columns would do it; no rule yet",
+                "FOR SYSTEM_TIME: system-versioned tables are not converted for Db2 for i yet; no rule yet",
+            ));
         }
         let w = |k: usize| s.get(k).map(|&i| ts[i].up()).unwrap_or_default();
         let ind = column(self.src, Self::range(n).0);
@@ -8175,7 +8172,7 @@ impl<'a> Cx<'a> {
             // counterpart; every other built-in only lacks a rule.
             let text = if server_metadata(&up) {
                 crate::impossible::reason(crate::impossible::INSTANCE_METADATA, &text)
-            } else if matches!(up.as_str(), "CHECKSUM" | "BINARY_CHECKSUM" | "HASHBYTES") {
+            } else if matches!(up.as_str(), "CHECKSUM" | "BINARY_CHECKSUM") {
                 crate::impossible::reason(crate::impossible::HASH_FUNCTIONS, &text)
             } else {
                 text
