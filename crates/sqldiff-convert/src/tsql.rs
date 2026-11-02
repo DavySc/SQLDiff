@@ -6081,7 +6081,12 @@ impl<'a> Cx<'a> {
         // `AS expr`: the parentheses are optional in T-SQL; the expression
         // runs to PERSISTED or the end of the column. Read as `AS (expr)`.
         let bare;
-        let (it, open, close) = if it[first].k == L_PAREN {
+        // `AS (a + 1) * b` starts with a parenthesis too: the parenthesised
+        // form ends at the matching one, followed by nothing or PERSISTED.
+        let wrapped = it[first].k == L_PAREN
+            && matching(it, first)
+                .is_some_and(|c| next_sig(it, c).map_or(true, |n| it[n].is("PERSISTED")));
+        let (it, open, close) = if wrapped {
             let close = matching(it, first).ok_or(No("unbalanced computed column".into()))?;
             (it, first, close)
         } else {
@@ -6149,16 +6154,16 @@ impl<'a> Cx<'a> {
                 if not_null { " NOT NULL" } else { "" }
             ));
         }
-        if let Some((ty, expr, _)) = self.computed_arith(e, it[as_at].pos.0)? {
+        if let Some((ty, expr, isnull)) = self.computed_arith(e, it[as_at].pos.0, persisted)? {
             self.step_ts("tsql.table.computed-arith", &it[as_at..]);
             self.note(Status::Assumptions, "ASM-COMPUTED-STORED", &format!(
-                "The computed column {0} (arithmetic over columns of the table) becomes a STORED generated column of the type SQL Server derives for it. T-SQL computes a column that is not PERSISTED when the row is read, PostgreSQL when the row is written; both raise an error when an operation overflows, so the same value is computed. Both refuse a value written into it. Not the same: an INSERT without a column list skips the column in T-SQL but not in PostgreSQL (the engine compares no such INSERT), and PostgreSQL accepts the keyword DEFAULT for it.",
+                "The computed column {0} (arithmetic over columns of the table) becomes a STORED generated column of the type SQL Server derives for it. T-SQL computes a column that is not PERSISTED when the row is read, PostgreSQL when the row is written; integer arithmetic is converted only for PERSISTED columns (SQL Server then raises an overflow error when the row is written, as PostgreSQL does), and decimal arithmetic within 38 digits cannot overflow. Both refuse a value written into it. Not the same: an INSERT without a column list skips the column in T-SQL but not in PostgreSQL (the engine compares no such INSERT), and PostgreSQL accepts the keyword DEFAULT for it.",
                 name.trim(),
             ));
             return Ok(format!(
                 "{} {ty} GENERATED ALWAYS AS ({expr}) STORED{}",
                 name.trim(),
-                if not_null { " NOT NULL" } else { "" }
+                if not_null || isnull { " NOT NULL" } else { "" }
             ));
         }
         if let Some((ty, expr, json)) = self.computed_iso126(e, it[as_at].pos.0)? {
@@ -6388,10 +6393,17 @@ impl<'a> Cx<'a> {
     /// rule when it stays within 38 digits. `None` for anything else: money
     /// (the expression engine has no money type yet), tinyint (T-SQL's
     /// overflows at 255, PostgreSQL has no such type) and decimal literals.
-    fn arith_type(&self, e: &[T]) -> Option<Arith> {
+    fn arith_type(&self, e: &[T], persisted: bool) -> Option<Arith> {
         let s = sig(e);
         let (ty, used) = self.arith_sum(e, &s, 0)?;
-        (used == s.len()).then_some(ty)
+        // Integer arithmetic raises its overflow error when SQL Server
+        // reads a column that is not PERSISTED, but when PostgreSQL's
+        // STORED column is written: only a PERSISTED column converts
+        // (decimal arithmetic within 38 digits cannot overflow).
+        (used == s.len()
+            && !matches!(ty, Arith::Lit(_))
+            && (persisted || !matches!(ty, Arith::Int(_))))
+        .then_some(ty)
     }
 
     fn arith_sum(&self, e: &[T], s: &[usize], mut i: usize) -> Option<(Arith, usize)> {
@@ -6423,7 +6435,7 @@ impl<'a> Cx<'a> {
                 let v: i64 = t.s.parse().ok()?;
                 (0..=i64::from(i32::MAX))
                     .contains(&v)
-                    .then_some((Arith::Int(32), i + 1))
+                    .then(|| (Arith::Lit(v.to_string().len() as u32), i + 1))
             }
             IDENT | QUOTED_IDENT if !t.s.starts_with('@') => Some((self.column_arith(t)?, i + 1)),
             L_PAREN => {
@@ -6438,7 +6450,12 @@ impl<'a> Cx<'a> {
     /// PostgreSQL type and expression of the generated column, and whether
     /// ISNULL made it NOT NULL (ASM-ISNULL-TYPE: the fallback fits the type
     /// of the first argument, which is checked here).
-    fn computed_arith(&mut self, e: &[T], at: usize) -> R<Option<(String, String, bool)>> {
+    fn computed_arith(
+        &mut self,
+        e: &[T],
+        at: usize,
+        persisted: bool,
+    ) -> R<Option<(String, String, bool)>> {
         let es = sig(e);
         let isnull = es.len() >= 3
             && e[es[0]].is("ISNULL")
@@ -6453,7 +6470,7 @@ impl<'a> Cx<'a> {
         } else {
             (e, None)
         };
-        let Some(ty) = self.arith_type(body) else {
+        let Some(ty) = self.arith_type(body, persisted) else {
             return Ok(None);
         };
         // The expression must do arithmetic, not name one column.
@@ -10173,6 +10190,10 @@ enum Arith {
     /// smallint, int or bigint, by bit width.
     Int(u8),
     Dec(u32, u32),
+    /// A bare int literal of this many digits (parenthesised or not): next
+    /// to a decimal it is a decimal(digits, 0), not an int; next to an int
+    /// it is an int (SQL Server 2022, sys.columns).
+    Lit(u32),
 }
 
 impl Arith {
@@ -10182,6 +10203,7 @@ impl Arith {
             Arith::Int(32) => "int",
             Arith::Int(_) => "bigint",
             Arith::Dec(..) => "decimal",
+            Arith::Lit(_) => "int",
         }
     }
 
@@ -10192,6 +10214,7 @@ impl Arith {
             Arith::Int(32) => Some((10, 0)),
             Arith::Int(_) => Some((19, 0)),
             Arith::Dec(p, s) => Some((p, s)),
+            Arith::Lit(d) => Some((d, 0)),
         }
     }
 
@@ -10200,6 +10223,8 @@ impl Arith {
     fn combine(a: Arith, b: Arith, mul: bool) -> Option<Arith> {
         use Arith::*;
         match (a, b) {
+            (Lit(_), Lit(_)) => Some(Int(32)),
+            (Lit(_), Int(w)) | (Int(w), Lit(_)) => Some(Int(w.max(32))),
             (Int(x), Int(y)) => Some(Int(x.max(y))),
             _ => {
                 let ((p1, s1), (p2, s2)) = (a.as_dec()?, b.as_dec()?);
@@ -10234,6 +10259,7 @@ impl Arith {
                         }
             }
             Arith::Dec(p, s) => frac.len() as u32 <= s && int.len() as u32 <= p - s,
+            Arith::Lit(_) => false,
         }
     }
 }

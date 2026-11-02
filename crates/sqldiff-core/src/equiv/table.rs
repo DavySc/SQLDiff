@@ -96,6 +96,9 @@ pub struct Column {
     /// A computed (T-SQL) or generated (PostgreSQL `GENERATED ALWAYS AS
     /// (…)`) column: its expression, parentheses included.
     pub computed: Option<Vec<Tok>>,
+    /// A T-SQL computed column declared PERSISTED (stored when the row is
+    /// written, as a PostgreSQL generated column is).
+    pub persisted: bool,
     /// Byte offset of the column definition.
     pub off: usize,
 }
@@ -766,6 +769,7 @@ fn column(ts: &[Tok], d: Dialect, t: &mut Table) -> R<()> {
         identity: None,
         default: None,
         computed: None,
+        persisted: false,
         off: ts[0].off,
     };
     let mut cname: Option<Name> = None;
@@ -977,7 +981,9 @@ fn computed_column(ts: &[Tok], d: Dialect, t: &mut Table) -> R<()> {
     // which runs to PERSISTED or the end of the column and is read as
     // `AS (expr)`.
     let owned;
-    let ts = if ts[2].kind == K::LParen {
+    let wrapped = ts[2].kind == K::LParen
+        && close(ts, 2).is_ok_and(|c| ts.get(c + 1).map_or(true, |n| n.up == "PERSISTED"));
+    let ts = if wrapped {
         ts
     } else {
         let mut depth = 0i32;
@@ -1028,6 +1034,7 @@ fn computed_column(ts: &[Tok], d: Dialect, t: &mut Table) -> R<()> {
         identity: None,
         default: None,
         computed: Some(ts[2..=end].to_vec()),
+        persisted: words.first() == Some(&"PERSISTED"),
         off: ts[0].off,
     });
     Ok(())
@@ -1065,8 +1072,12 @@ fn computed_types(t: &mut Table) -> R<()> {
         // Arithmetic over the table's integer, money and decimal columns,
         // perhaps inside ISNULL(…, number): the type SQL Server derives
         // (eval/builtins/2026-11-02-o/computed-types-tsql.out).
-        if let Some(ty) = arith_computed(t, e) {
-            let (ty, ty_text) = ty;
+        if let Some((ty, ty_text, isnull)) = arith_computed(t, e, t.columns[k].persisted) {
+            // ISNULL(…, number) is never NULL: SQL Server reports the column
+            // NOT NULL.
+            if isnull && t.columns[k].null.is_none() {
+                t.columns[k].null = Some(false);
+            }
             t.columns[k].ty = ty;
             t.columns[k].ty_text = ty_text;
             continue;
@@ -1167,6 +1178,10 @@ fn computed_types(t: &mut Table) -> R<()> {
 enum Ar {
     Int(u8),
     Dec(u32, u32),
+    /// A bare int literal of this many digits (parenthesised or not): next
+    /// to a decimal it is a decimal(digits, 0), not an int; next to an int
+    /// it is an int (SQL Server 2022, sys.columns).
+    Lit(u32),
 }
 
 impl Ar {
@@ -1176,6 +1191,7 @@ impl Ar {
             Ar::Int(32) => Some((10, 0)),
             Ar::Int(_) => Some((19, 0)),
             Ar::Dec(p, s) => Some((p, s)),
+            Ar::Lit(d) => Some((d, 0)),
         }
     }
 
@@ -1183,6 +1199,8 @@ impl Ar {
     /// where they are not read here (decimal digits beyond 38).
     fn combine(a: Ar, b: Ar, mul: bool) -> Option<Ar> {
         match (a, b) {
+            (Ar::Lit(_), Ar::Lit(_)) => Some(Ar::Int(32)),
+            (Ar::Lit(_), Ar::Int(w)) | (Ar::Int(w), Ar::Lit(_)) => Some(Ar::Int(w.max(32))),
             (Ar::Int(x), Ar::Int(y)) => Some(Ar::Int(x.max(y))),
             _ => {
                 let ((p1, s1), (p2, s2)) = (a.as_dec()?, b.as_dec()?);
@@ -1209,6 +1227,7 @@ impl Ar {
                 .into(),
             ),
             Ar::Dec(p, s) => (Ty::Dec(Some((p, s))), format!("decimal({p}, {s})")),
+            Ar::Lit(_) => (Ty::Int(32), "int".into()),
         }
     }
 }
@@ -1216,7 +1235,7 @@ impl Ar {
 /// `[ISNULL(] a op b … [, number)]` over the table's smallint, int, bigint
 /// and decimal columns and int literals, with `+`, `-`, `*` and
 /// parentheses: its type, as `Ty` and as written.
-fn arith_computed(t: &Table, e: &[Tok]) -> Option<(Ty, String)> {
+fn arith_computed(t: &Table, e: &[Tok], persisted: bool) -> Option<(Ty, String, bool)> {
     let col = |tok: &Tok| -> Option<Ar> {
         let n = name_of(tok)?;
         let c = t
@@ -1257,7 +1276,7 @@ fn arith_computed(t: &Table, e: &[Tok]) -> Option<(Ty, String)> {
                 let v: i64 = t.text.parse().ok()?;
                 (0..=i64::from(i32::MAX))
                     .contains(&v)
-                    .then_some((Ar::Int(32), i + 1))
+                    .then(|| (Ar::Lit(v.to_string().len() as u32), i + 1))
             }
             K::Word | K::Quoted => Some((col(t)?, i + 1)),
             K::LParen => {
@@ -1267,9 +1286,14 @@ fn arith_computed(t: &Table, e: &[Tok]) -> Option<(Ty, String)> {
             _ => None,
         }
     }
+    // Integer arithmetic raises its overflow error when SQL Server reads a
+    // column that is not PERSISTED, but when PostgreSQL's STORED column is
+    // written, so a non-persisted column of integer type is left unread
+    // (decimal arithmetic within 38 digits cannot overflow).
     let whole = |e: &[Tok]| -> Option<Ar> {
         let (ty, n) = sum(e, 0, &col)?;
-        (n == e.len()).then_some(ty)
+        (n == e.len() && !matches!(ty, Ar::Lit(_)) && (persisted || !matches!(ty, Ar::Int(_))))
+            .then_some(ty)
     };
     // ISNULL(arithmetic, number): the type of the first argument.
     if e.len() > 3
@@ -1284,10 +1308,16 @@ fn arith_computed(t: &Table, e: &[Tok]) -> Option<(Ty, String)> {
         if fb.kind != K::Num {
             return None;
         }
-        return whole(body).map(Ar::ty);
+        return whole(body).map(|ty| {
+            let (ty, text) = ty.ty();
+            (ty, text, true)
+        });
     }
     // Arithmetic, not a bare column or number.
-    (e.len() >= 3).then(|| whole(e)).flatten().map(Ar::ty)
+    (e.len() >= 3).then(|| whole(e)).flatten().map(|ty| {
+        let (ty, text) = ty.ty();
+        (ty, text, false)
+    })
 }
 
 fn arg(ty: &ast::Type, i: usize) -> R<Option<u32>> {

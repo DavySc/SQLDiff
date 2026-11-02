@@ -491,46 +491,51 @@ fn a_default_the_column_converts_is_not_compared() {
 
 /// Arithmetic computed columns over integer and decimal columns: the type
 /// SQL Server derives is compared with the generated column's declared
-/// type (eval/builtins/2026-11-02-o/computed-types-tsql.out), with or
-/// without parentheses after AS.
+/// type (eval/builtins/2026-11-02-o/computed-types-tsql.out, and
+/// eval/pr-review/2026-11-02-pr254 for literals next to decimals).
 #[test]
 fn arithmetic_computed_columns_take_the_derived_type() {
     let t = |col: &str| {
-        format!("CREATE TABLE L (A DECIMAL(8,2) NOT NULL, B DECIMAL(8,2) NOT NULL, I INT NOT NULL, S SMALLINT NOT NULL, {col});")
+        format!("CREATE TABLE L (A DECIMAL(5,1) NOT NULL, B DECIMAL(8,2) NOT NULL, I INT NOT NULL, S SMALLINT NOT NULL, {col});")
     };
-    let p = |ty: &str, e: &str| {
-        format!("CREATE TABLE l (a numeric(8,2) NOT NULL, b numeric(8,2) NOT NULL, i integer NOT NULL, s smallint NOT NULL, c {ty} GENERATED ALWAYS AS ({e}) STORED);")
+    let p = |ty: &str, e: &str, nn: &str| {
+        format!("CREATE TABLE l (a numeric(5,1) NOT NULL, b numeric(8,2) NOT NULL, i integer NOT NULL, s smallint NOT NULL, c {ty} GENERATED ALWAYS AS ({e}) STORED{nn});")
     };
-    // decimal(8,2) - decimal(8,2) is decimal(9,2); smallint * smallint stays smallint.
-    for (c, ty, e) in [
-        ("C AS A - B", "numeric(9,2)", "a - b"),
-        ("C AS (A - B)", "numeric(9,2)", "a - b"),
+    let equal = |r: &sqldiff_core::Report| {
+        matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions)
+    };
+    for (c, ty, e, nn) in [
+        ("C AS A + 1", "numeric(6,1)", "a + 1", ""),
+        ("C AS A * 2", "numeric(7,1)", "a * 2", ""),
+        ("C AS (S + 1) * A", "numeric(16,1)", "(s + 1) * a", ""),
+        ("C AS (1 + 2) * A", "numeric(16,1)", "(1 + 2) * a", ""),
+        ("C AS A * (2)", "numeric(7,1)", "a * (2)", ""),
+        ("C AS B - A", "numeric(10,2)", "b - a", ""),
+        ("C AS (I + A)", "numeric(16,1)", "i + a", ""),
         (
-            "C AS ISNULL(A - B, 0.00)",
+            "C AS ISNULL(B - B, 0.00)",
             "numeric(9,2)",
-            "COALESCE(a - b, 0.00)",
+            "COALESCE(b - b, 0.00)",
+            " NOT NULL",
         ),
-        ("C AS (S * S)", "smallint", "s * s"),
-        ("C AS (I - S)", "integer", "i - s"),
-        ("C AS (A + I)", "numeric(13,2)", "a + i"),
+        ("C AS (S * S) PERSISTED", "smallint", "s * s", ""),
+        ("C AS (I - S) PERSISTED", "integer", "i - s", ""),
     ] {
-        let r = run(&t(c), &p(ty, e));
-        assert!(
-            matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
-            "{c}: {:#?} {:#?}",
-            r.findings,
-            r.unknown_reasons
-        );
+        let r = run(&t(c), &p(ty, e, nn));
+        assert!(equal(&r), "{c}: {:#?} {:#?}", r.findings, r.unknown_reasons);
     }
-    // A wrong declared type is a difference, not an equal.
-    for (c, ty, e) in [
-        ("C AS A - B", "numeric(8,2)", "a - b"),
-        ("C AS (I - S)", "smallint", "i - s"),
-    ] {
-        let r = run(&t(c), &p(ty, e));
-        assert!(
-            !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
-            "{c} as {ty}"
-        );
+    // The literal is decimal(digits, 0) next to a decimal: A + 1 is
+    // decimal(6,1), so numeric(5,1) cannot hold it (a wider column is the
+    // accepted ASM-COLUMN-RANGE reading, a narrower one a difference).
+    let r = run(&t("C AS A + 1"), &p("numeric(5,1)", "a + 1", ""));
+    assert!(!equal(&r));
+    // A narrower type is a difference.
+    let r = run(&t("C AS (I - S) PERSISTED"), &p("smallint", "i - s", ""));
+    assert!(!equal(&r));
+    // Integer arithmetic in a column that is not PERSISTED is not read:
+    // SQL Server fails when it is read, PostgreSQL when the row is written.
+    for c in ["C AS (I * I)", "C AS (S * S)", "C AS S + 1"] {
+        let r = run(&t(c), &p("integer", "i * i", ""));
+        assert!(!equal(&r), "{c}");
     }
 }
