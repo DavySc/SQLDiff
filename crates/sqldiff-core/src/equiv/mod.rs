@@ -492,7 +492,31 @@ fn compare_units(
             out.normalize(note.clone());
         }
     }
-    signature(ua, ub, &na, &nb, out);
+    let cursors = result_cursors(ua, ub, &na, &nb);
+    match &cursors {
+        Some(Ok(trimmed)) => {
+            out.assume(asm::make(asm::RESULTSET_REFCURSOR));
+            if ua.dialect == Dialect::Postgres {
+                signature(trimmed, ub, &na, &nb, out);
+            } else {
+                signature(ua, trimmed, &na, &nb, out);
+            }
+        }
+        Some(Err(why)) => {
+            // Each result statement is named on its own line, so none of
+            // them counts as converted.
+            for (side, u, name) in [(a, ua, &na), (b, ub, &nb)] {
+                for r in &u.results {
+                    let at = side.line_of(&u.stmts[r.at].node);
+                    out.unknown_reasons.push(format!(
+                        "{name} line {at}: a result set is not compared: {why}"
+                    ));
+                }
+            }
+            signature(ua, ub, &na, &nb, out);
+        }
+        None => signature(ua, ub, &na, &nb, out),
+    }
     script::locals(a, b, ua, ub, &na, &nb, out);
     let mut places = Vec::new();
     tables(a, b, ua, ub, sa, sb, &mut places, out);
@@ -3901,6 +3925,256 @@ fn result_set_function(ua: &Unit, ub: &Unit, na: &str, nb: &str) -> Option<Resul
         one(f, nf, "RETURN QUERY")?;
         result_set_atomic(p, np, nf)
     })())
+}
+
+/// A T-SQL procedure against the PL/pgSQL procedure it became when it
+/// returns result sets (decision D8 of 2026-11-02): `None` for any other
+/// pair. The procedure gets one INOUT refcursor parameter `result_set_N`
+/// per result set after its own parameters (and before an INOUT
+/// `return_code`), each opened by `OPEN result_set_N FOR query`. On success
+/// the PostgreSQL unit without those parameters, for the signature check;
+/// otherwise why the result sets are not compared.
+///
+/// A PostgreSQL cursor reads its rows when they are fetched, under the
+/// snapshot of its OPEN, in the caller's transaction (probed on PostgreSQL
+/// 18, eval/refcursor/probe-pg.sql). It matches T-SQL, which sends each
+/// result set as its statement runs, only where:
+/// - every result statement is a plain SELECT directly in the routine body
+///   on both sides, in step, so the sets T-SQL sends are always the first
+///   parameters, with their numbers;
+/// - nothing controls a transaction (a COMMIT or ROLLBACK closes the
+///   cursors, and a procedure cannot COMMIT inside the caller's block);
+/// - after the first result set only data changes, assignments, settings,
+///   messages and RETURN: DROP, TRUNCATE and ALTER of a table a cursor
+///   reads fail in PostgreSQL, and a call may do either or run a statement
+///   the cursor would see;
+/// - a result query calls nothing PostgreSQL runs when the rows are fetched
+///   instead of when T-SQL runs the SELECT (`lazy_call`).
+fn result_cursors(ua: &Unit, ub: &Unit, na: &str, nb: &str) -> Option<Result<Unit, String>> {
+    let (p, f, np, nf) = match (ua.dialect, ub.dialect) {
+        (Dialect::Tsql, Dialect::Postgres) => (ua, ub, na, nb),
+        (Dialect::Postgres, Dialect::Tsql) => (ub, ua, nb, na),
+        _ => return None,
+    };
+    if p.kind != UnitKind::Proc
+        || f.kind != UnitKind::Proc
+        || !f.results.iter().any(|r| r.cursor.is_some())
+    {
+        return None;
+    }
+    Some((|| {
+        let k = f.results.len();
+        if f.results
+            .iter()
+            .enumerate()
+            .any(|(i, r)| r.cursor != Some(i + 1))
+        {
+            return Err(format!(
+                "{nf} opens its refcursor parameters out of order, or returns rows another way"
+            ));
+        }
+        if p.results.len() != k {
+            return Err(format!(
+                "{np} returns {} result set(s) and {nf} opens {k} cursor(s)",
+                p.results.len()
+            ));
+        }
+        let pk = p.params.len();
+        let extra = f.params.get(pk..).unwrap_or_default();
+        let cursor_params = extra.get(..k).unwrap_or_default();
+        let rest = extra.get(k..).unwrap_or_default();
+        let is_cursor = |i: usize, x: &lower::Param| {
+            x.out
+                && x.name == format!("result_set_{}", i + 1)
+                && x.decl
+                    .as_ref()
+                    .is_some_and(|t| t.name.eq_ignore_ascii_case("refcursor"))
+        };
+        if cursor_params.len() != k
+            || !cursor_params
+                .iter()
+                .enumerate()
+                .all(|(i, x)| is_cursor(i, x))
+            || !(rest.is_empty() || matches!(rest, [r] if r.name == "return_code" && r.out))
+        {
+            return Err(format!("{nf} does not take {k} INOUT refcursor parameter(s) result_set_1, … after the parameters of {np}"));
+        }
+        for (u, name) in [(p, np), (f, nf)] {
+            for r in &u.results {
+                if !r.top {
+                    return Err(format!("{name} returns a result set from inside an IF, a loop or error handling: the numbers of the cursors would not follow the result sets T-SQL sends"));
+                }
+                if !matches!(u.stmts[r.at].ast, Ok(ast::Stmt::Select(_)))
+                    || u.stmts[r.at].output.is_some()
+                {
+                    return Err(format!("{name} returns rows other than a plain SELECT"));
+                }
+                if let Some(w) = lazy_call(&u.stmts[r.at].toks) {
+                    return Err(format!("a result query of {name} uses {w}, which PostgreSQL evaluates when the rows are fetched, not when the cursor is opened"));
+                }
+            }
+            // A well-placed BEGIN TRAN … COMMIT around the body is not kept
+            // in the unit, so the routine's text is searched.
+            let txn_in_text = u.stmts[u.results[0].at]
+                .node
+                .ancestors()
+                .find(|x| {
+                    matches!(
+                        x.kind(),
+                        sqldiff_syntax::SyntaxKind::ROUTINE_BODY
+                            | sqldiff_syntax::SyntaxKind::ROUTINE
+                    )
+                })
+                .map_or(true, |body| {
+                    body.descendants().filter(|d| d.kind().is_unit()).any(|d| {
+                        use crate::classify::StmtKind as K;
+                        matches!(
+                            crate::classify::stmt_kind(&d, u.dialect),
+                            K::TxnBegin | K::TxnCommit | K::TxnRollback | K::Savepoint
+                        )
+                    })
+                });
+            if txn_in_text
+                || !u.txn_stmts.is_empty()
+                || !u.txn_placed.is_empty()
+                || !u.cursor_loops.is_empty()
+            {
+                return Err(format!("{name} controls a transaction or uses cursors: a PostgreSQL cursor closes at COMMIT or ROLLBACK"));
+            }
+            // After the first result set: only what leaves an open cursor's
+            // rows and the cursor alone. Searched in the text, so that no
+            // statement the unit did not keep escapes.
+            let first = &u.stmts[u.results[0].at].node;
+            let Some(body) = first.ancestors().find(|x| {
+                matches!(
+                    x.kind(),
+                    sqldiff_syntax::SyntaxKind::ROUTINE_BODY | sqldiff_syntax::SyntaxKind::ROUTINE
+                )
+            }) else {
+                return Err(format!("{name}: the body of the routine is not known"));
+            };
+            let result_nodes: Vec<&SyntaxNode> =
+                u.results.iter().map(|r| &u.stmts[r.at].node).collect();
+            for d in body.descendants().filter(|d| d.kind().is_unit()) {
+                use crate::classify::{stmt_kind, StmtKind as K};
+                if result_nodes.contains(&&d) {
+                    continue;
+                }
+                let kind = stmt_kind(&d, u.dialect);
+                if d.text_range().end() <= first.text_range().start() {
+                    // Before the first result set only what writes nothing:
+                    // T-SQL autocommits a write that ran before a later
+                    // failing statement, while the procedure here runs in
+                    // the caller's transaction, where the error surfaces at
+                    // FETCH and PostgreSQL rolls the write back.
+                    if !matches!(
+                        kind,
+                        K::Assign
+                            | K::Declare
+                            | K::SessionSetting
+                            | K::TxnSetting
+                            | K::Return
+                            | K::Raise
+                            | K::Select
+                            | K::Block
+                            | K::If
+                            | K::Loop
+                            | K::Case
+                            | K::Label
+                            | K::Container
+                    ) {
+                        return Err(format!("{name} runs a {} before its first result set: T-SQL keeps the write when a later statement fails, PostgreSQL rolls it back because the error only surfaces when the cursor is fetched", kind.label()));
+                    }
+                    continue;
+                }
+                if d.text_range().start() < first.text_range().end() {
+                    continue;
+                }
+                let ok = matches!(
+                    kind,
+                    K::Insert
+                        | K::Update
+                        | K::Delete
+                        | K::Assign
+                        | K::Declare
+                        | K::SessionSetting
+                        | K::Return
+                        | K::Raise
+                        | K::Select
+                        | K::Block
+                        | K::If
+                        | K::Loop
+                        | K::Case
+                        | K::Label
+                        | K::Container
+                );
+                if !ok {
+                    return Err(format!("{name} runs a {} after its first result set: PostgreSQL fails to DROP, TRUNCATE or ALTER a table an open cursor reads, a call may do either, and COMMIT closes the cursor", kind.label()));
+                }
+            }
+        }
+        let mut t = f.clone();
+        t.params.drain(pk..pk + k);
+        Ok(t)
+    })())
+}
+
+/// What a result query calls that PostgreSQL would run when the rows are
+/// fetched, after the procedure returned, instead of when T-SQL runs the
+/// SELECT: a user function (its own statements see later changes), a clock,
+/// a random value, a sequence, or a session value.
+fn lazy_call(ts: &[ast::Tok]) -> Option<String> {
+    const WORDS: &[&str] = &[
+        "NEWID",
+        "NEWSEQUENTIALID",
+        "RAND",
+        "GETDATE",
+        "GETUTCDATE",
+        "SYSDATETIME",
+        "SYSUTCDATETIME",
+        "SYSDATETIMEOFFSET",
+        "CURRENT_TIMESTAMP",
+        "SCOPE_IDENTITY",
+        "IDENT_CURRENT",
+        "NEXT",
+        "CRYPT_GEN_RANDOM",
+        "RANDOM",
+        "SETSEED",
+        "NEXTVAL",
+        "CURRVAL",
+        "SETVAL",
+        "LASTVAL",
+        "CLOCK_TIMESTAMP",
+        "STATEMENT_TIMESTAMP",
+        "TIMEOFDAY",
+        "NOW",
+        "TRANSACTION_TIMESTAMP",
+        "LOCALTIMESTAMP",
+        "CURRENT_TIME",
+        "CURRENT_DATE",
+        "GEN_RANDOM_UUID",
+        "UUID_GENERATE_V4",
+        "PG_SLEEP",
+        "SET_CONFIG",
+        "CURRENT_SETTING",
+        "TXID_CURRENT",
+    ];
+    for t in ts {
+        if t.kind == ast::K::Var && t.text.starts_with("@@") {
+            return Some(t.text.clone());
+        }
+        if t.kind == ast::K::Word && WORDS.contains(&t.up.as_str()) {
+            return Some(t.up.clone());
+        }
+    }
+    ts.windows(4)
+        .any(|w| {
+            matches!(w[0].kind, ast::K::Word | ast::K::Quoted)
+                && w[1].kind == ast::K::Dot
+                && matches!(w[2].kind, ast::K::Word | ast::K::Quoted)
+                && w[3].kind == ast::K::LParen
+        })
+        .then(|| "a schema-qualified call (a user function)".to_string())
 }
 
 /// The function runs inside its caller's statement, so an error anywhere in

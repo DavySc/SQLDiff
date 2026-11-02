@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 186 | 35 (19%) | 6 (3%) | 145 (78%) |
+| `converter` | 188 | 35 (19%) | 6 (3%) | 147 (78%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 215 | 38 (18%) | 8 (4%) | 169 (79%) |
+| **All** | 217 | 38 (18%) | 8 (4%) | 171 (79%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -159,6 +159,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.routine.param` | `converter` | lemma: `Sqldiff.Mirror/Routines/lowerParam` | name, mode and a NULL or slice default; the types under 'Parameter and return types' | `sqldiff-convert/src/tsql.rs` |
 | `tsql.routine.procedure` | `converter` | lemma: `Sqldiff.Mirror/Routines` | CREATE [OR ALTER] PROCEDURE against CREATE OR REPLACE PROCEDURE ... LANGUAGE plpgsql; the body is checked statement by statement | `sqldiff-convert/src/tsql.rs` |
 | `tsql.routine.result-set` | `converter` | engine | the casts of a result set's columns to their declared types (RETURN QUERY needs exact types, checked on PostgreSQL 18.6) | `sqldiff-convert/src/tsql.rs` |
+| `tsql.routine.result-set-cursors` | `converter` | engine | a procedure's result sets as INOUT refcursor parameters (result_set_1, …) under ASM-RESULTSET-REFCURSOR | `sqldiff-convert/src/tsql.rs` |
 | `tsql.routine.result-set-function` | `converter` | engine | a procedure's one result set as a function RETURNS TABLE under ASM-RESULT-SET-FUNCTION | `sqldiff-convert/src/tsql.rs` |
 | `tsql.routine.return-code` | `converter` | lemma: `Sqldiff.Mirror/T-SQL return status` | `INOUT return_code integer DEFAULT NULL` as the last parameter, the status set to 0 first | `sqldiff-convert/src/tsql.rs` |
 | `tsql.routine.returns` | `converter` | lemma: `Sqldiff.Mirror/Parameter and return types` | int and slice string return types; others engine | `sqldiff-convert/src/tsql.rs` |
@@ -185,6 +186,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.stmt.print` | `converter` | engine | a message is outside the spec (`Message`) | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.raiserror` | `converter` | engine | RAISERROR is outside the C4 spec (V10: it does not honour XACT_ABORT) | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.result-set` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.stmt.result-set-cursor` | `converter` | engine | a result set's SELECT opened as OPEN result_set_N FOR …, its name = expr items written expr AS name | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.return` | `converter` | lemma: `Sqldiff.Mirror/T-SQL return status` | the `return-code` form in a procedure (`return_code := COALESCE(e, 0); RETURN;`); the trigger form (`RETURN NULL`) engine | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.set-option` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.set-variable` | `converter` | lemma: `Sqldiff.Mirror/Statements` | `SET @x = e` with `e` in the slice (`x := e`), and `SET @x = (SELECT e FROM ...)` over a table or (C3d) a block of tables, more than one row the cardinality error (C3b rule 2); compound operators (`+=`) engine | `sqldiff-convert/src/tsql.rs` |
