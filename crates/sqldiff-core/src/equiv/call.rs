@@ -374,6 +374,22 @@ fn pg_call(ts: &[Tok]) -> R<Call> {
     Ok(Call { name, args })
 }
 
+/// An unqualified PostgreSQL target is in the default schema (`public`), the
+/// one the converter's dropped `dbo` stands for (ASM-DBO-SCHEMA), as
+/// `object_key` reads a call.
+fn in_public(mut p: Vec<Name>, full: usize) -> Vec<Name> {
+    if p.len() + 1 == full {
+        p.insert(
+            0,
+            Name {
+                text: "public".into(),
+                quoted: false,
+            },
+        );
+    }
+    p
+}
+
 fn pg_comment(ts: &[Tok]) -> R<Comment> {
     if !word(ts.get(1), "ON") {
         return Err("COMMENT without ON".into());
@@ -398,14 +414,14 @@ fn pg_comment(ts: &[Tok]) -> R<Comment> {
                 "PROCEDURE" => "PROCEDURE",
                 _ => "FUNCTION",
             };
-            match <[Name; 2]>::try_from(p) {
+            match <[Name; 2]>::try_from(in_public(p, 2)) {
                 Ok([s, o]) => (Target::Object(k, s, o), i),
                 _ => return Err(format!("COMMENT ON {kind} without a schema name")),
             }
         }
         "COLUMN" => {
             let (p, i) = dotted(ts, 3)?;
-            match <[Name; 3]>::try_from(p) {
+            match <[Name; 3]>::try_from(in_public(p, 3)) {
                 // TABLE or VIEW: PostgreSQL does not say which.
                 Ok([s, o, c]) => (Target::Column("", s, o, c), i),
                 _ => return Err("COMMENT ON COLUMN without schema, table and column".into()),
@@ -413,7 +429,7 @@ fn pg_comment(ts: &[Tok]) -> R<Comment> {
         }
         "INDEX" => {
             let (p, i) = dotted(ts, 3)?;
-            match <[Name; 2]>::try_from(p) {
+            match <[Name; 2]>::try_from(in_public(p, 2)) {
                 Ok([s, x]) => (Target::Index(s, None, x), i),
                 _ => return Err("COMMENT ON INDEX without a schema name".into()),
             }
@@ -424,7 +440,7 @@ fn pg_comment(ts: &[Tok]) -> R<Comment> {
                 return Err("COMMENT ON CONSTRAINT not on a table".into());
             }
             let (p, i) = dotted(ts, 5)?;
-            match <[Name; 2]>::try_from(p) {
+            match <[Name; 2]>::try_from(in_public(p, 2)) {
                 Ok([s, t]) => (Target::Constraint(s, t, c), i),
                 _ => return Err("COMMENT ON CONSTRAINT without a schema name".into()),
             }
@@ -448,7 +464,8 @@ fn pg_comment(ts: &[Tok]) -> R<Comment> {
     })
 }
 
-/// `sp_addextendedproperty` with string literal arguments.
+/// `sp_addextendedproperty` with string literal arguments, or bracketed
+/// identifiers (read as the name they spell).
 fn extended_property(rest: &[Tok]) -> R<Comment> {
     const NAMES: [&str; 8] = [
         "@name",
@@ -488,6 +505,15 @@ fn extended_property(rest: &[Tok]) -> R<Comment> {
             [t] if t.kind == K::Str => {
                 let narrow = !t.text.starts_with(['N', 'n']);
                 val.insert(key, (string_value(&t.text)?, narrow));
+            }
+            // A bracketed identifier is the name string (AdventureWorks
+            // writes `N'SCHEMA', [Person], N'TABLE', [Address]`).
+            [t] if t.kind == K::Quoted
+                && t.text.starts_with('[')
+                && key.ends_with("name")
+                && key.starts_with("@level") =>
+            {
+                val.insert(key, (cst::unquote(&t.text), false));
             }
             [t] if word(Some(t), "NULL") || word(Some(t), "DEFAULT") => {}
             _ => return Err(format!("{key} is not a string literal")),
