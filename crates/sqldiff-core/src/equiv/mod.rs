@@ -494,8 +494,8 @@ fn compare_units(
     }
     signature(ua, ub, &na, &nb, out);
     script::locals(a, b, ua, ub, &na, &nb, out);
-    tables(a, b, ua, ub, sa, sb, out);
     let mut places = Vec::new();
+    tables(a, b, ua, ub, sa, sb, &mut places, out);
     table_vars(a, b, ua, ub, sa, sb, &mut places, out);
     dynamic_sql(a, b, ua, ub, sa, sb, out);
     ddl_stmts(a, b, ua, ub, sa, sb, &mut places, out);
@@ -1437,30 +1437,34 @@ fn constraint_name_clashes(side: &Analyzed, u: &Unit, name: &str, out: &mut Outc
         }
     }
     for (node, _) in &u.ddl {
-        match ddl::parse(&ast::tokens(node), d) {
-            Ok(ddl::Ddl::Constraint(c)) => {
-                let (Ok((schema, tname)), Some(cn)) = (ddl::stored_key(&c.table, d), norm(&c.name))
-                else {
-                    continue;
-                };
-                let ix = matches!(c.added, ddl::Added::Key(_));
-                objects.push((schema.clone(), cn.clone(), c.off));
-                named.push((schema, tname, cn, ix, c.off));
-            }
-            Ok(ddl::Ddl::Default(x)) => {
-                if let (Ok((schema, _)), Some(cn)) =
-                    (ddl::stored_key(&x.table, d), x.name.as_ref().and_then(norm))
-                {
-                    objects.push((schema, cn, x.off));
+        for parsed in ddl::parse_all(&ast::tokens(node), d) {
+            match parsed {
+                Ok(ddl::Ddl::Constraint(c)) => {
+                    let (Ok((schema, tname)), Some(cn)) =
+                        (ddl::stored_key(&c.table, d), norm(&c.name))
+                    else {
+                        continue;
+                    };
+                    let ix = matches!(c.added, ddl::Added::Key(_));
+                    objects.push((schema.clone(), cn.clone(), c.off));
+                    named.push((schema, tname, cn, ix, c.off));
                 }
-            }
-            Ok(ddl::Ddl::Index(ix)) => {
-                if let (Ok((schema, _)), Some(n)) = (ddl::stored_key(&ix.table, d), norm(&ix.name))
-                {
-                    relations.push((schema, n));
+                Ok(ddl::Ddl::Default(x)) => {
+                    if let (Ok((schema, _)), Some(cn)) =
+                        (ddl::stored_key(&x.table, d), x.name.as_ref().and_then(norm))
+                    {
+                        objects.push((schema, cn, x.off));
+                    }
                 }
+                Ok(ddl::Ddl::Index(ix)) => {
+                    if let (Ok((schema, _)), Some(n)) =
+                        (ddl::stored_key(&ix.table, d), norm(&ix.name))
+                    {
+                        relations.push((schema, n));
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
     for (i, (schema, tname, cn, ix, off)) in named.iter().enumerate() {
@@ -1518,7 +1522,7 @@ fn tables_by_name(a: &Analyzed, b: &Analyzed, ua: &Unit, ub: &Unit) -> Option<Ve
             .tables
             .iter()
             .map(|(n, _)| {
-                table::created_name(&ast::tokens(n))
+                table::created_name_any(&ast::tokens(n))
                     .and_then(|name| table::table_key(&name, side.dialect()))
                     .ok()
             })
@@ -1542,6 +1546,7 @@ fn tables(
     ub: &Unit,
     sa: &Schema,
     sb: &Schema,
+    places: &mut Vec<Place>,
     out: &mut Outcome,
 ) {
     if ua.tables.is_empty() && ub.tables.is_empty() {
@@ -1584,10 +1589,15 @@ fn tables(
     }) {
         let (la, lb) = (a.line_of(xa), b.line_of(xb));
         if pa != pb {
-            out.unknown_reasons.push(format!(
-                "{na} line {la}: the CREATE TABLE (and {nb} line {lb}) is not compared: it comes after {pa} data statement(s) on one side and {pb} on the other"
-            ));
-            continue;
+            // Decided once the data statements are paired (`Place`): the
+            // trace must place both tables among the same statements.
+            places.push(Place {
+                x: xa.clone(),
+                y: xb.clone(),
+                reason: format!(
+                    "{na} line {la}: the CREATE TABLE (and {nb} line {lb}) is not compared: it comes after {pa} data statement(s) on one side and {pb} on the other"
+                ),
+            });
         }
         let pair = TablePair {
             what: "the CREATE TABLE".into(),
@@ -2744,6 +2754,8 @@ fn ddl_stmts(
         pos: usize,
         ddl: Result<ddl::Ddl, String>,
         key: Option<String>,
+        /// How many constraints the statement adds at once (`ddl::split_adds`).
+        adds: usize,
     }
     fn read<'n>(side: &Analyzed, u: &'n Unit) -> Vec<Stmt<'n>> {
         // PostgreSQL: the `DROP FUNCTION IF EXISTS f()` right after a DROP
@@ -2770,8 +2782,12 @@ fn ddl_stmts(
             .iter()
             .enumerate()
             .filter(|(i, _)| !absorbed.contains(i))
-            .map(|(i, (node, pos))| {
-                let mut ddl = ddl::parse(&ast::tokens(node), side.dialect());
+            .flat_map(|(i, (node, pos))| {
+                let all = ddl::parse_all(&ast::tokens(node), side.dialect());
+                let adds = all.len();
+                all.into_iter().map(move |ddl| (i, node, pos, adds, ddl))
+            })
+            .map(|(i, node, pos, adds, mut ddl)| {
                 if let Ok(ddl::Ddl::Drop(x)) = &mut ddl {
                     x.function = functions[i].clone();
                 }
@@ -2796,6 +2812,7 @@ fn ddl_stmts(
                     pos: *pos,
                     ddl,
                     key,
+                    adds,
                 }
             })
             .collect()
@@ -2969,6 +2986,16 @@ fn ddl_stmts(
                 "{na} line {la}: the {what} (and {nb} line {lb}) is not compared: {why}"
             ));
         };
+        if x.adds != y.adds {
+            unknown(
+                out,
+                format!(
+                    "the ALTER TABLE adds {} constraint(s) at once on one side and {} on the other, so a failing one leaves different constraints behind",
+                    x.adds, y.adds
+                ),
+            );
+            continue;
+        }
         if x.pos != y.pos {
             // Decided once the data statements are paired (`Place`).
             places.push(Place {
