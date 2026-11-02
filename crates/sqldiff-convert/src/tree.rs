@@ -217,6 +217,11 @@ pub struct UnitReport {
     /// a converted unit, which has none. The rewrites themselves are `trace`.
     pub rules: Vec<String>,
     pub reason: String,
+    /// The SQL Server-only feature this not converted unit names
+    /// ([`crate::impossible`]): impossible to convert automatically. Its
+    /// status stays `not converted`; this only sorts it into its own bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impossible: Option<String>,
     /// Rules of the engine's findings (diff and output check) on this unit,
     /// gating or not.
     pub findings: Vec<String>,
@@ -395,6 +400,10 @@ pub struct Totals {
     #[serde(deserialize_with = "by_status")]
     pub units: std::collections::BTreeMap<&'static str, usize>,
     pub seconds: f64,
+    /// Units marked impossible to convert automatically, by feature id: a
+    /// part of the `not converted` units, which they stay.
+    #[serde(default)]
+    pub impossible: std::collections::BTreeMap<String, usize>,
     /// Most frequent reasons a unit is not converted, with counts.
     pub top_reasons: Vec<(String, usize)>,
     /// The proof checker's answers, when a proof mode is on.
@@ -1619,6 +1628,7 @@ fn file_report(rel: &str, input: &str, c: &Conversion, lines: &[usize], secs: f6
                 worst.iter().map(|n| n.rule.to_string()).collect()
             },
             reason,
+            impossible: u.impossible().map(|x| x.id.to_string()),
             findings,
             trace: u.trace.clone(),
             review: None,
@@ -1990,6 +2000,9 @@ fn totals(files: &[FileReport], seconds: f64) -> Totals {
             *t.units.entry(s.label()).or_default() += n;
         }
         for u in &f.units {
+            if let Some(x) = &u.impossible {
+                *t.impossible.entry(x.clone()).or_default() += 1;
+            }
             if u.status >= Status::Unproven {
                 let key = format!(
                     "{} | {}",

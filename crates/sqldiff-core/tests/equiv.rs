@@ -1417,3 +1417,126 @@ fn a_qualified_call_is_a_user_function_not_the_built_in() {
     );
     assert!(not_equal(&r), "{:?} {:?}", r.verdict(), r.findings);
 }
+
+/// NEWID() and gen_random_uuid() draw a fresh value from one range
+/// (`ASM-RANDOM-FRESH`): one draw per side is equal under that assumption.
+/// A RAND() in a statement that reads many rows is not compared, because
+/// T-SQL draws it once per statement and PostgreSQL's random() once per row.
+#[test]
+fn fresh_random_values_are_equal_under_an_assumption() {
+    let ts = "CREATE PROCEDURE dbo.new_token @Token uniqueidentifier OUTPUT AS
+              BEGIN
+                SET @Token = NEWID();
+              END";
+    let pg = "CREATE PROCEDURE new_token(INOUT p_token uuid DEFAULT NULL)
+              LANGUAGE plpgsql AS $$
+              BEGIN
+                p_token := gen_random_uuid();
+              END; $$;";
+    let r = run(ts, T, pg, P, false);
+    assert!(
+        matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.findings
+    );
+    assert!(assumption_ids(&r).contains(&"ASM-RANDOM-FRESH"));
+
+    let ts_rows = "CREATE PROCEDURE dbo.roll AS
+                   BEGIN
+                     SELECT name, RAND() AS r FROM dbo.item;
+                   END";
+    let pg_rows = "CREATE PROCEDURE roll()
+                   LANGUAGE sql AS $$
+                     SELECT name, random() AS r FROM item;
+                   $$;";
+    let r = run(ts_rows, T, pg_rows, P, true);
+    assert!(not_equal(&r), "{:?}", r.findings);
+    assert!(!assumption_ids(&r).contains(&"ASM-RANDOM-FRESH"));
+}
+
+/// Other shapes of the fresh draws (`ASM-RANDOM-FRESH`): one RAND() assigned
+/// is compared, two RAND() draws in one statement are not, and two NEWID() draws in one procedure pair
+/// with two gen_random_uuid() draws in the same order.
+#[test]
+fn fresh_draws_pair_in_source_order() {
+    let ts_rand = "CREATE PROCEDURE dbo.roll @R float OUTPUT AS
+                   BEGIN
+                     SET @R = RAND();
+                   END";
+    let pg_rand = "CREATE PROCEDURE roll(INOUT p_r double precision DEFAULT NULL)
+                   LANGUAGE plpgsql AS $$
+                   BEGIN
+                     p_r := random();
+                   END; $$;";
+    let r = run(ts_rand, T, pg_rand, P, false);
+    assert!(
+        matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.findings
+    );
+    assert!(assumption_ids(&r).contains(&"ASM-RANDOM-FRESH"));
+
+    // A RAND() under a query is drawn once per row the query reads on
+    // PostgreSQL but once per query on T-SQL: not compared.
+    let ts_sub = "CREATE PROCEDURE dbo.p_sub @R float OUTPUT AS
+                  BEGIN
+                    SET @R = (SELECT MAX(RAND()) FROM dbo.s);
+                  END";
+    let pg_sub = "CREATE PROCEDURE p_sub(INOUT p_r double precision DEFAULT NULL)
+                  LANGUAGE plpgsql AS $$
+                  BEGIN
+                    p_r := (SELECT MAX(random()) FROM s);
+                  END; $$;";
+    let r = run(ts_sub, T, pg_sub, P, false);
+    assert!(not_equal(&r), "{:?}", r.findings);
+    assert!(!assumption_ids(&r).contains(&"ASM-RANDOM-FRESH"));
+
+    let ts_exists = "CREATE PROCEDURE dbo.p_ex @Hit bit OUTPUT AS
+                     BEGIN
+                       IF EXISTS (SELECT 1 FROM dbo.s WHERE RAND() < 0.1) SET @Hit = 1;
+                     END";
+    let pg_exists = "CREATE PROCEDURE p_ex(INOUT p_hit boolean DEFAULT NULL)
+                     LANGUAGE plpgsql AS $$
+                     BEGIN
+                       p_hit := EXISTS (SELECT 1 FROM s WHERE random() < 0.1);
+                     END; $$;";
+    let r = run(ts_exists, T, pg_exists, P, false);
+    assert!(not_equal(&r), "{:?}", r.findings);
+    assert!(!assumption_ids(&r).contains(&"ASM-RANDOM-FRESH"));
+
+    // Two RAND() draws in one statement are not compared (the second draw
+    // has no counterpart the engine can pair).
+    let ts_two_rand = "CREATE PROCEDURE dbo.roll2 @R float OUTPUT AS
+                       BEGIN
+                         SET @R = RAND() + RAND();
+                       END";
+    let pg_two_rand = "CREATE PROCEDURE roll2(INOUT p_r double precision DEFAULT NULL)
+                       LANGUAGE plpgsql AS $$
+                       BEGIN
+                         p_r := random() + random();
+                       END; $$;";
+    let r = run(ts_two_rand, T, pg_two_rand, P, false);
+    assert!(not_equal(&r), "{:?}", r.findings);
+
+    let ts_two =
+        "CREATE PROCEDURE dbo.two_tokens @A uniqueidentifier OUTPUT, @B uniqueidentifier OUTPUT AS
+                  BEGIN
+                    SET XACT_ABORT ON;
+                    SET @A = NEWID();
+                    SET @B = NEWID();
+                  END";
+    let pg_two =
+        "CREATE PROCEDURE two_tokens(INOUT p_a uuid DEFAULT NULL, INOUT p_b uuid DEFAULT NULL)
+                      LANGUAGE plpgsql AS $$
+                      BEGIN
+                        p_a := gen_random_uuid();
+                        p_b := gen_random_uuid();
+                      END; $$;";
+    let r = run(ts_two, T, pg_two, P, false);
+    assert!(
+        matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.findings
+    );
+    assert!(assumption_ids(&r).contains(&"ASM-RANDOM-FRESH"));
+}
