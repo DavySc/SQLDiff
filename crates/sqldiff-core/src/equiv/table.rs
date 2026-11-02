@@ -387,7 +387,12 @@ pub fn parse(ts: &[Tok], d: Dialect) -> R<Table> {
         checks: Vec::new(),
         storage: Vec::new(),
     };
-    for item in split(&ts[i + 1..end]) {
+    let mut items = split(&ts[i + 1..end]);
+    // SQL Server takes one trailing comma in the column list.
+    if d == Dialect::Tsql && items.len() > 1 && items.last().is_some_and(|l| l.is_empty()) {
+        items.pop();
+    }
+    for item in items {
         let first = item.first().ok_or("an empty item in the column list")?;
         let constraint = first.kind == K::Word
             && matches!(

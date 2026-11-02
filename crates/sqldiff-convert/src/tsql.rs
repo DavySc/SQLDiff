@@ -5585,6 +5585,12 @@ impl<'a> Cx<'a> {
             .position(|t| t.k == L_PAREN)
             .ok_or(No("CREATE TABLE without columns".into()))?;
         let close = matching(&ts, open).ok_or(No("unbalanced parentheses".into()))?;
+        // SQL Server takes one trailing comma in the column list (the
+        // AdventureWorks install script has it); it is not an item.
+        let list_end = match (open + 1..close).rev().find(|&j| ts[j].sig()) {
+            Some(j) if ts[j].k == COMMA => j,
+            _ => close,
+        };
         let name_t: Vec<T> = ts[..open]
             .iter()
             .skip_while(|t| !t.is("TABLE"))
@@ -5595,11 +5601,11 @@ impl<'a> Cx<'a> {
         let name = self.expr(&name_t).trim().to_string();
         let mut cols = Vec::new();
         let pk = if self.db2() {
-            primary_key_columns(&ts[open + 1..close])
+            primary_key_columns(&ts[open + 1..list_end])
         } else {
             Vec::new()
         };
-        self.table_cols = split_commas(&ts[open + 1..close])
+        self.table_cols = split_commas(&ts[open + 1..list_end])
             .iter()
             .filter_map(|item| {
                 let &f = sig(item).first()?;
@@ -5607,13 +5613,13 @@ impl<'a> Cx<'a> {
                     .then(|| tsql_unquote(&item[f].s).to_ascii_lowercase())
             })
             .collect();
-        self.table_items = split_commas(&ts[open + 1..close])
+        self.table_items = split_commas(&ts[open + 1..list_end])
             .into_iter()
             .map(<[T]>::to_vec)
             .collect();
         let mut names = Vec::new();
         let mut indexes = Vec::new();
-        for item in split_commas(&ts[open + 1..close]) {
+        for item in split_commas(&ts[open + 1..list_end]) {
             if sig(item).first().is_some_and(|&f| item[f].is("INDEX")) && !temp {
                 // `INDEX name CLUSTERED COLUMNSTORE` only stores the rows
                 // column by column: no key, no order, nothing enforced.
@@ -5645,7 +5651,7 @@ impl<'a> Cx<'a> {
         }
         if temp {
             if let Some(&n) = sig(&name_t).first() {
-                self.own_table(&name_t[n].s.clone(), &ts[open + 1..close]);
+                self.own_table(&name_t[n].s.clone(), &ts[open + 1..list_end]);
             }
         }
         let tail = self.expr(&ts[close + 1..]);
