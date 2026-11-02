@@ -1227,6 +1227,15 @@ fn one_trailing_comma_in_a_column_list_is_dropped() {
         assert_ne!(u.status, Status::NotConverted, "{:?}", u.notes);
         assert!(!c.output.contains(",\n)"), "{}", c.output);
     }
+    // A comma with no item before it is no trailing comma: refused cleanly,
+    // and the other statements of the file still convert.
+    for bad in ["CREATE TABLE t1 (,);", "CREATE TABLE t1 (a INT,,);", "CREATE TABLE t1 (, a INT);"] {
+        let src = format!("{bad}\nGO\nCREATE TABLE t2 (a INT);\n");
+        let c = convert(&src, Dialect::Tsql, Dialect::Postgres).unwrap();
+        assert_eq!(unit(&c, &src, bad).status, Status::NotConverted, "{bad}\n{}", c.output);
+        assert!(unit(&c, &src, "CREATE TABLE t2").status <= Status::Assumptions, "{bad}\n{}", c.output);
+        assert!(!c.output.contains("without a trace step"), "{bad}\n{}", c.output);
+    }
     // More than one is still refused, not a crash.
     let two = src.replace("(film_id),\n)", "(film_id),,\n)");
     let c = convert(&two, Dialect::Tsql, Dialect::Postgres).unwrap();
