@@ -1220,6 +1220,13 @@ enum Ar {
     /// to a decimal it is a decimal(digits, 0), not an int; next to an int
     /// it is an int (SQL Server 2022, sys.columns).
     Lit(u32),
+    /// `money`: exact like a decimal(19, 4), but a sum, a difference or a
+    /// product with an integer stays money (checked in `sys.columns`,
+    /// eval/builtins/2026-11-02-o/computed-types-tsql); with a decimal it is
+    /// decimal arithmetic on a decimal(19, 4). A product of two money values
+    /// is rounded to four decimals, which numeric does not do, so it is not
+    /// read.
+    Money,
 }
 
 impl Ar {
@@ -1230,6 +1237,7 @@ impl Ar {
             Ar::Int(_) => Some((19, 0)),
             Ar::Dec(p, s) => Some((p, s)),
             Ar::Lit(d) => Some((d, 0)),
+            Ar::Money => Some((19, 4)),
         }
     }
 
@@ -1238,6 +1246,12 @@ impl Ar {
     fn combine(a: Ar, b: Ar, mul: bool) -> Option<Ar> {
         match (a, b) {
             (Ar::Lit(_), Ar::Lit(_)) => Some(Ar::Int(32)),
+            (Ar::Money, Ar::Money) => (!mul).then_some(Ar::Money),
+            // SQL Server converts the integer to money first: a bigint may
+            // be outside the money range (10^15 * money 0 fails, numeric
+            // stores 0), so only integers of at most 32 bits.
+            (Ar::Money, Ar::Int(w)) | (Ar::Int(w), Ar::Money) => (w <= 32).then_some(Ar::Money),
+            (Ar::Money, Ar::Lit(_)) | (Ar::Lit(_), Ar::Money) => Some(Ar::Money),
             (Ar::Lit(_), Ar::Int(w)) | (Ar::Int(w), Ar::Lit(_)) => Some(Ar::Int(w.max(32))),
             (Ar::Int(x), Ar::Int(y)) => Some(Ar::Int(x.max(y))),
             _ => {
@@ -1266,6 +1280,7 @@ impl Ar {
             ),
             Ar::Dec(p, s) => (Ty::Dec(Some((p, s))), format!("decimal({p}, {s})")),
             Ar::Lit(_) => (Ty::Int(32), "int".into()),
+            Ar::Money => (Ty::Money, "money".into()),
         }
     }
 }
@@ -1283,6 +1298,7 @@ fn arith_computed(t: &Table, e: &[Tok], persisted: bool) -> Option<(Ty, String, 
         match c.ty {
             Ty::Int(w @ (16 | 32 | 64)) => Some(Ar::Int(w)),
             Ty::Dec(Some((p, s))) => Some(Ar::Dec(p, s)),
+            Ty::Money => Some(Ar::Money),
             _ => None,
         }
     };
@@ -1324,14 +1340,28 @@ fn arith_computed(t: &Table, e: &[Tok], persisted: bool) -> Option<(Ty, String, 
             _ => None,
         }
     }
-    // Integer arithmetic raises its overflow error when SQL Server reads a
-    // column that is not PERSISTED, but when PostgreSQL's STORED column is
-    // written, so a non-persisted column of integer type is left unread
-    // (decimal arithmetic within 38 digits cannot overflow).
+    // Integer and money arithmetic raise their overflow error when SQL
+    // Server reads a column that is not PERSISTED, but when PostgreSQL's
+    // STORED column is written, so a non-persisted column of such a type is
+    // left unread (decimal arithmetic within 38 digits cannot overflow).
     let whole = |e: &[Tok]| -> Option<Ar> {
         let (ty, n) = sum(e, 0, &col)?;
-        (n == e.len() && !matches!(ty, Ar::Lit(_)) && (persisted || !matches!(ty, Ar::Int(_))))
-            .then_some(ty)
+        // An intermediate money value may leave the money range where the
+        // stored result does not (ASM-COLUMN-RANGE says nothing about it):
+        // a chain of operations over money is left unread, see
+        // `MONEY_CHAINS`.
+        let ops = e
+            .iter()
+            .filter(|t| t.kind == K::Op && matches!(t.text.as_str(), "+" | "-" | "*"))
+            .count();
+        let money = e
+            .iter()
+            .any(|t| matches!(t.kind, K::Word | K::Quoted) && col(t) == Some(Ar::Money));
+        (n == e.len()
+            && (super::canon::MONEY_CHAINS || !money || ops <= 1)
+            && !matches!(ty, Ar::Lit(_))
+            && (persisted || !matches!(ty, Ar::Int(_) | Ar::Money)))
+        .then_some(ty)
     };
     // ISNULL(arithmetic, number): the type of the first argument.
     if e.len() > 3
@@ -1519,7 +1549,7 @@ pub struct TyCmp {
 pub mod asm {
     pub const COLUMN_RANGE: (&str, &str) = (
         "ASM-COLUMN-RANGE",
-        "Stored values stay within what both sides' column types accept: a converted column that accepts more (larger numbers, longer strings, wider date ranges, NaN and infinity, 24:00:00) lets a write succeed that the original rejects",
+        "Stored values, and the money intermediates that compute them, stay within what both sides' column types accept: a converted column that accepts more (larger numbers, longer strings, wider date ranges, NaN and infinity, 24:00:00) lets a write succeed that the original rejects",
     );
     pub const TSQL_CODE_PAGE: (&str, &str) = (
         "ASM-TSQL-CODE-PAGE",

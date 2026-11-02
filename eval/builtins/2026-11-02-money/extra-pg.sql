@@ -1,0 +1,14 @@
+SELECT 'todec 2.5->dec(18,0)', CAST(CAST('2.5' AS numeric(19,4)) AS numeric(18,0));
+SELECT 'todec -2.5->dec(18,0)', CAST(CAST('-2.5' AS numeric(19,4)) AS numeric(18,0));
+SELECT 'todec 1.2345->dec(10,2)', CAST(CAST('1.2345' AS numeric(19,4)) AS numeric(10,2));
+SELECT 'todec 1.2350->dec(10,2)', CAST(CAST('1.2350' AS numeric(19,4)) AS numeric(10,2));
+SELECT 'todec -1.2350->dec(10,2)', CAST(CAST('-1.2350' AS numeric(19,4)) AS numeric(10,2));
+SELECT 'tosmallint 2.5', CAST(CAST('2.5' AS numeric(19,4)) AS smallint);
+SELECT 'm+d', CAST('1.2345' AS numeric(19,4)) + CAST(0.01 AS numeric(9,2));
+SELECT 'm*d', CAST('1.2345' AS numeric(19,4)) * CAST(1.25 AS numeric(9,2));
+CREATE TABLE ch (a numeric(19,4) NOT NULL, b numeric(19,4) NOT NULL, c numeric(19,4) NOT NULL, s numeric(19,4) GENERATED ALWAYS AS (a + b - c) STORED);
+INSERT INTO ch VALUES (600000000000000, 600000000000000, 500000000000000);
+SELECT 'chain', s FROM ch;
+CREATE TABLE ct (bi bigint NOT NULL, m numeric(19,4) NOT NULL, c2 numeric(19,4) GENERATED ALWAYS AS (bi * m) STORED);
+INSERT INTO ct VALUES (1000000000000000, 0);
+SELECT 'bigint 1e15 * money 0', c2 FROM ct;

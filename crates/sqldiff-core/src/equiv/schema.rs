@@ -17,6 +17,12 @@ use crate::catalog::{ddl, Catalog, CatalogView, DataType, TableKind};
 pub enum Fam {
     Int,
     Exact,
+    /// T-SQL money: an exact decimal(19, 4) that rounds a product and a
+    /// quotient to four decimals, prints two on CAST to a string and raises
+    /// an error outside +/-922,337,203,685,477.5808. Only the forms checked
+    /// on SQL Server 2022 against PostgreSQL numeric(19, 4) are portable
+    /// (eval/builtins/2026-11-02-money); every other use stays per dialect.
+    Money,
     Float,
     /// Fixed-length character (blank-padded).
     Char,
@@ -160,6 +166,11 @@ impl Ty {
                 fam: Fam::Int,
                 len: Some(64),
                 scale: None,
+            },
+            "MONEY" if d == Dialect::Tsql => Ty {
+                fam: Fam::Money,
+                len: Some(19),
+                scale: Some(4),
             },
             "DECIMAL" | "NUMERIC" | "DEC" => {
                 // Without precision: T-SQL (18,0), Db2 for i (5,0), PostgreSQL unbounded.
