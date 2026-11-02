@@ -2196,6 +2196,10 @@ impl<'a> Cx<'a> {
                 "ALTER INDEX (REBUILD, REORGANIZE, DISABLE, SET …): maintenance with no exact PostgreSQL counterpart (REINDEX rebuilds, nothing disables an index); no rule",
                 "ALTER INDEX: maintenance with no exact Db2 for i counterpart; no rule",
             )),
+            "BULK" if w(1) == "INSERT" => return no(self.pick(
+                "BULK INSERT: reads a file on the SQL Server host with its own field and row terminators, code page and format options; PostgreSQL's COPY has different file rules (single-character delimiters, one encoding), so there is no checked rule",
+                "BULK INSERT: reads a file on the SQL Server host; Db2 for i has no statement with the same file rules; no rule",
+            )),
             "ALTER" if crate::impossible::of_ddl(&[w(1).as_str(), w(2).as_str()]).is_some() => {
                 let x = crate::impossible::of_ddl(&[w(1).as_str(), w(2).as_str()]).unwrap();
                 return impossible(x, format!("ALTER {} {}: SQL Server only; {} has nothing to convert it to", w(1), w(2), self.to.display_name()));
