@@ -2756,6 +2756,35 @@ impl<'a> Cx<'a> {
             {
                 return Err("it controls its transaction, and a PostgreSQL cursor closes at COMMIT or ROLLBACK".into());
             }
+            if n.text_range().end() <= first.text_range().start()
+                && !n.children().any(|c| c.kind() == STATEMENT)
+            {
+                // Before the first result set only what writes nothing.
+                // T-SQL autocommits a write that ran before a later
+                // failing statement; the procedure here runs in the
+                // caller's transaction, where the error surfaces at FETCH
+                // and the write is rolled back (as txn.atomicity finds).
+                let assign_select = w == "SELECT" && !select_rows(&ts);
+                let pure = matches!(
+                    w.as_str(),
+                    "SET"
+                        | "DECLARE"
+                        | "PRINT"
+                        | "RETURN"
+                        | "THROW"
+                        | "RAISERROR"
+                        | "IF"
+                        | "ELSE"
+                        | "WHILE"
+                        | "BEGIN"
+                        | "END"
+                        | "TRY"
+                        | "CATCH"
+                ) || assign_select && find_word(&ts, 0, "INTO").is_none();
+                if !pure {
+                    return Err(format!("{w} runs before the first result set: T-SQL keeps its write when a later statement fails, while the procedure runs in the caller's transaction and PostgreSQL rolls the write back when the error surfaces on FETCH"));
+                }
+            }
             if n.text_range().start() >= start
                 && !sets.contains(&n)
                 && !n.children().any(|c| c.kind() == STATEMENT)

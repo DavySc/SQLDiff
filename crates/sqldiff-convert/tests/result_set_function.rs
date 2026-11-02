@@ -164,7 +164,7 @@ fn other_result_sets_stay_refused_with_the_reason() {
         "SELECT ItemID FROM dbo.Item;\n    RETURN 2;",
         "SELECT ISNULL(ItemName, N'') AS Label FROM dbo.Item;",
         "SELECT ItemID + 1 FROM dbo.Item;",
-        "UPDATE dbo.Item SET Qty = 0 WHERE ItemID = @ItemID;\n    DELETE FROM dbo.Item WHERE Qty IS NULL;\n    SELECT ItemID FROM dbo.Item;",
+        "SELECT ItemID FROM dbo.Item;\n    UPDATE dbo.Item SET Qty = 0 WHERE ItemID = @ItemID;\n    DELETE FROM dbo.Item WHERE Qty IS NULL;",
         "SELECT ItemID FROM dbo.Item;\n    UPDATE dbo.Item SET Qty = 0 WHERE ItemID = @ItemID;",
         "SELECT ItemID FROM dbo.Item UNION ALL SELECT ItemID FROM dbo.Item;",
     ] {

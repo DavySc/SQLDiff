@@ -93,7 +93,7 @@ fn refused(c: &Conversion, why: &str) {
 #[test]
 fn several_result_sets_and_a_write_become_cursors_in_order() {
     let c = convert(&proc(
-        "UPDATE dbo.Item SET Qty = Qty + 1 WHERE ItemID = @ItemID;\n    SELECT ItemID, ItemName FROM dbo.Item WHERE ItemID = @ItemID ORDER BY ItemID;\n    SELECT Qty, ItemName FROM dbo.Item ORDER BY Qty, ItemID;",
+        "SELECT ItemID, ItemName FROM dbo.Item WHERE ItemID = @ItemID ORDER BY ItemID;\n    SELECT Qty, ItemName FROM dbo.Item ORDER BY Qty, ItemID;\n    UPDATE dbo.Item SET Qty = Qty + 1 WHERE ItemID = @ItemID;",
     ));
     let out = c.output.as_str();
     for want in [
@@ -208,4 +208,17 @@ fn shapes_where_a_cursor_would_read_differently_are_refused() {
     ] {
         refused(&convert(&proc(&body)), why);
     }
+}
+
+#[test]
+fn a_write_before_the_first_result_set_stays_refused() {
+    let c = convert(&proc(
+        "UPDATE dbo.Item SET Qty = Qty + 1 WHERE ItemID = @ItemID;\n    SELECT 1 / (Qty - 2) AS x FROM dbo.Item;",
+    ));
+    assert!(
+        !c.output.contains("OPEN result_set_1")
+            && c.output.contains("runs before the first result set"),
+        "{}",
+        c.output
+    );
 }

@@ -708,7 +708,7 @@ sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-RESULTSET-REFCURSOR"
-statement = "Callers of the procedure that returns its result sets through INOUT refcursor parameters (result_set_1, …) call it inside a transaction block, FETCH ALL from each cursor in the order of the parameters before they commit, treat a cursor left NULL as a result set T-SQL did not send, and accept the PostgreSQL column types and that a failure while the rows are read surfaces on FETCH, after the procedure returned."
+statement = "Callers of the procedure that returns its result sets through INOUT refcursor parameters (result_set_1, …) call it inside a transaction block, FETCH ALL from each cursor in the order of the parameters before they commit, treat a cursor left NULL as a result set T-SQL did not send, and accept the PostgreSQL column types and that a failure while the rows are read surfaces on FETCH, after the procedure returned. Rows T-SQL had already sent are lost when a later statement of the procedure fails (the failed CALL returns no cursors), as under ASM-RESULT-SET-FUNCTION."
 discharge = "deployment"
 fact = "How the application calls the procedure and reads its result sets."
 sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]

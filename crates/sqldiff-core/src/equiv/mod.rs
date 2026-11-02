@@ -3918,10 +3918,39 @@ fn result_cursors(ua: &Unit, ub: &Unit, na: &str, nb: &str) -> Option<Result<Uni
                 u.results.iter().map(|r| &u.stmts[r.at].node).collect();
             for d in body.descendants().filter(|d| d.kind().is_unit()) {
                 use crate::classify::{stmt_kind, StmtKind as K};
-                if d.text_range().start() < first.text_range().end() || result_nodes.contains(&&d) {
+                if result_nodes.contains(&&d) {
                     continue;
                 }
                 let kind = stmt_kind(&d, u.dialect);
+                if d.text_range().end() <= first.text_range().start() {
+                    // Before the first result set only what writes nothing:
+                    // T-SQL autocommits a write that ran before a later
+                    // failing statement, while the procedure here runs in
+                    // the caller's transaction, where the error surfaces at
+                    // FETCH and PostgreSQL rolls the write back.
+                    if !matches!(
+                        kind,
+                        K::Assign
+                            | K::Declare
+                            | K::SessionSetting
+                            | K::TxnSetting
+                            | K::Return
+                            | K::Raise
+                            | K::Select
+                            | K::Block
+                            | K::If
+                            | K::Loop
+                            | K::Case
+                            | K::Label
+                            | K::Container
+                    ) {
+                        return Err(format!("{name} runs a {} before its first result set: T-SQL keeps the write when a later statement fails, PostgreSQL rolls it back because the error only surfaces when the cursor is fetched", kind.label()));
+                    }
+                    continue;
+                }
+                if d.text_range().start() < first.text_range().end() {
+                    continue;
+                }
                 let ok = matches!(
                     kind,
                     K::Insert

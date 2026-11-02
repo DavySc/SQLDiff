@@ -97,13 +97,23 @@ fn writes_around_the_result_sets_are_ordinary_statements() {
     // Later changes are invisible to a cursor opened before them (probe P2);
     // one write only, so that T-SQL's autocommit and PostgreSQL's one
     // transaction commit the same work.
-    equal(
+    // A write before the first result set is not compared: when a later
+    // statement fails T-SQL keeps the autocommitted write, while PostgreSQL
+    // rolls it back (the error only surfaces on FETCH).
+    not_equal(
         &ts(&format!(
             "UPDATE dbo.item SET qty = qty + 1 WHERE item_id = @id;\n  {Q1}\n  {Q2}"
         )),
         &pg(
             2,
             &format!("UPDATE item SET qty = qty + 1 WHERE item_id = p_id;\n  {O1}\n  {O2}"),
+        ),
+    );
+    not_equal(
+        &ts("UPDATE dbo.item SET qty = qty + 1 WHERE item_id = @id;\n  SELECT 1 / (qty - 2) AS x FROM dbo.item;"),
+        &pg(
+            1,
+            "UPDATE item SET qty = qty + 1 WHERE item_id = p_id;\n  OPEN result_set_1 FOR SELECT 1 / (qty - 2) AS x FROM item;",
         ),
     );
     equal(
