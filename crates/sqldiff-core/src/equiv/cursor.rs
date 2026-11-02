@@ -28,7 +28,9 @@
 //!   loop, CATCH or GOTO between).
 //! - A T-SQL cursor that is not STATIC may see the loop's own writes, a
 //!   PostgreSQL cursor never does: the loop writes no table the query reads
-//!   and calls nothing that might.
+//!   and calls nothing that might. The one write allowed is a change of the
+//!   row just fetched, by its unique key (`keyed_writes`), which the catalog
+//!   must show unique (`KeyReq`, checked in `Canon::cursor_op`).
 //! - PostgreSQL closes a cursor at COMMIT and ROLLBACK, T-SQL does not: no
 //!   transaction control in the loop.
 //!
@@ -66,6 +68,20 @@ pub struct CursorLoop {
     pub stat: bool,
     /// T-SQL LOCAL (PostgreSQL: always).
     pub local: bool,
+    /// Unique keys the loop's own writes to a table the cursor reads rely
+    /// on (`keyed_writes`); empty when it writes none.
+    pub keyed: Vec<KeyReq>,
+}
+
+/// A table that must be unique on `cols` for a cursor loop's own writes to
+/// be invisible to a cursor that is not STATIC: a joined table the cursor
+/// meets at most once per row, or the table the loop writes by its key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyReq {
+    /// Name parts as written, lower case.
+    pub table: Vec<String>,
+    /// Column names, lower case.
+    pub cols: Vec<String>,
 }
 
 /// A statement of a cursor loop, compared as `Canon::cursor_op` says.
@@ -76,6 +92,8 @@ pub enum CursorOp {
         query: Result<Box<Select>, String>,
         /// T-SQL: (STATIC, LOCAL); `None` for PostgreSQL.
         tsql: Option<(bool, bool)>,
+        /// Unique keys the loop's own writes rely on (`CursorLoop::keyed`).
+        keyed: Vec<KeyReq>,
     },
     Fetch {
         key: String,
@@ -421,6 +439,7 @@ fn shape(
         }
     }
     let mut body_writes: Vec<String> = Vec::new();
+    let mut write_nodes: Vec<(SyntaxNode, Vec<String>)> = Vec::new();
     for x in body.descendants() {
         if x.kind() == SyntaxKind::LABEL {
             return Err("a label in a cursor loop".into());
@@ -453,14 +472,24 @@ fn shape(
                 return Err("a cursor loop that calls a procedure or runs dynamic SQL, which may change the rows a cursor that is not STATIC still has to fetch".into());
             }
             if kind.is_write() || w0 == "WITH" {
-                body_writes.extend(written(&x, kind));
+                let w = written(&x, kind);
+                body_writes.extend(w.clone());
+                write_nodes.push((x.clone(), w));
             }
         }
     }
+    let mut keyed = Vec::new();
     if !stat {
         let reads = read_tables(&query);
         if let Some(t) = reads.iter().find(|t| body_writes.contains(t)) {
-            return Err(format!("a cursor loop that writes {t}, which the cursor reads: a T-SQL cursor that is not STATIC may see the change, a PostgreSQL cursor does not"));
+            let conflicting: Vec<&SyntaxNode> = write_nodes
+                .iter()
+                .filter(|(_, w)| w.iter().any(|x| reads.contains(x)))
+                .map(|(x, _)| x)
+                .collect();
+            keyed = keyed_writes(&query, &conflicting, body, last, &targets).map_err(|why| {
+                format!("a cursor loop that writes {t}, which the cursor reads: a T-SQL cursor that is not STATIC may see the change, a PostgreSQL cursor does not ({why})")
+            })?;
         }
     }
     // FETCH targets: not parameters.
@@ -492,6 +521,7 @@ fn shape(
         targets,
         stat,
         local,
+        keyed,
     })
 }
 
@@ -746,4 +776,432 @@ fn jumps(
         }
     }
     Ok(())
+}
+
+/// What a loop's writes to a table its cursor reads must look like for a
+/// cursor that is not STATIC to see none of them: every such write is a
+/// single-statement `UPDATE t SET … WHERE k = @v [AND …]` or `DELETE [FROM]
+/// t WHERE k = @v [AND …]` of the table `t` the cursor query reads once,
+/// where `k` is a column of `t` that the cursor's select list fetches into
+/// `@v`, and `@v` is assigned in the loop only by its closing FETCH. The
+/// write then changes only the row just fetched. No other row of the result
+/// can change if (a) `t` is unique on the matched columns, (b) every other
+/// table of the query is an inner join matched in full by equalities on a
+/// unique key to columns of the tables before it (so a row of `t` is in at
+/// most one row of the result), both checked by the caller against the
+/// catalog (`KeyReq`), and (c) the columns the write sets appear nowhere in
+/// the query outside its select list (no row can leave or enter the result,
+/// nor move in its order, because of the write). Returns the unique keys
+/// (a) and (b) need.
+pub fn keyed_writes(
+    query: &[Tok],
+    writes: &[&SyntaxNode],
+    body: &SyntaxNode,
+    last: &SyntaxNode,
+    targets: &[String],
+) -> Result<Vec<KeyReq>, String> {
+    let sc = scan_query(query, targets)?;
+    let mut reqs = sc.joins.clone();
+    let mut keyvars: Vec<String> = Vec::new();
+    for w in writes {
+        let (r, v) = keyed_write(w, &sc)?;
+        reqs.extend(r);
+        keyvars.extend(v);
+    }
+    // The fetched variables the writes are keyed by keep their value.
+    for x in body.descendants() {
+        if x.kind() != SyntaxKind::STATEMENT || x == *last {
+            continue;
+        }
+        let ts = words(&x);
+        let w0 = ts.first().map(|t| t.up.as_str()).unwrap_or("");
+        for v in &keyvars {
+            let hit = |i: usize| ts[i].kind == K::Var && ts[i].up == *v;
+            let assigns = match w0 {
+                "SET" => ts.get(1).is_some_and(|t| t.kind == K::Var && t.up == *v),
+                "SELECT" => (0..ts.len()).any(|i| {
+                    hit(i)
+                        && ts
+                            .get(i + 1)
+                            .is_some_and(|t| t.kind == K::Op && t.text.ends_with('='))
+                }),
+                "FETCH" | "EXEC" | "EXECUTE" => (0..ts.len()).any(hit),
+                _ => false,
+            };
+            if assigns {
+                return Err(format!("{v} is assigned inside the loop"));
+            }
+        }
+    }
+    reqs.sort_by(|a, b| (&a.table, &a.cols).cmp(&(&b.table, &b.cols)));
+    reqs.dedup();
+    Ok(reqs)
+}
+
+struct Scan {
+    /// The table the cursor reads, name parts lower case.
+    base: Vec<String>,
+    /// Base table columns the select list fetches, by column: the variable
+    /// (upper case).
+    cols: std::collections::HashMap<String, String>,
+    joins: Vec<KeyReq>,
+    /// Every word of the query after its select list.
+    outside: std::collections::HashSet<String>,
+}
+
+fn name_parts(q: &[Tok], mut i: usize) -> Option<(Vec<String>, usize)> {
+    let mut parts = Vec::new();
+    loop {
+        let t = q.get(i).filter(|t| matches!(t.kind, K::Word | K::Quoted))?;
+        parts.push(cst::unquote(&t.text).to_lowercase());
+        i += 1;
+        if q.get(i).is_some_and(|t| t.kind == K::Dot) {
+            i += 1;
+        } else {
+            return Some((parts, i));
+        }
+    }
+}
+
+const CLAUSE: &[&str] = &[
+    "INNER",
+    "JOIN",
+    "WHERE",
+    "ORDER",
+    "ON",
+    "GROUP",
+    "HAVING",
+    "UNION",
+    "LEFT",
+    "RIGHT",
+    "FULL",
+    "CROSS",
+    "OUTER",
+    "APPLY",
+    "EXCEPT",
+    "INTERSECT",
+    "FOR",
+    "OPTION",
+];
+
+fn lc(t: &Tok) -> String {
+    cst::unquote(&t.text).to_lowercase()
+}
+
+fn scan_query(q: &[Tok], targets: &[String]) -> Result<Scan, String> {
+    let no = |m: &str| Err::<Scan, String>(m.to_string());
+    if !is_word(q.first(), "SELECT") {
+        return no("the cursor query is not a plain SELECT");
+    }
+    let mut depth = vec![0i32; q.len() + 1];
+    for (i, t) in q.iter().enumerate() {
+        depth[i + 1] = depth[i] + (t.kind == K::LParen) as i32 - (t.kind == K::RParen) as i32;
+    }
+    let d0 = |i: usize| depth[i] == 0;
+    let Some(from) = (0..q.len()).find(|&i| q[i].kind == K::Word && q[i].up == "FROM" && d0(i))
+    else {
+        return no("the cursor query has no FROM");
+    };
+    if matches!(
+        q.get(1).map(|t| t.up.as_str()),
+        Some("DISTINCT" | "TOP" | "ALL")
+    ) {
+        return no("the cursor query is DISTINCT or TOP");
+    }
+    if q.iter().enumerate().any(|(i, t)| {
+        t.kind == K::Word
+            && matches!(
+                t.up.as_str(),
+                "GROUP" | "HAVING" | "UNION" | "EXCEPT" | "INTERSECT" | "OVER"
+            )
+            && d0(i)
+    }) || q[1..from]
+        .iter()
+        .any(|t| t.kind == K::Word && t.up == "OVER")
+    {
+        return no("the cursor query groups, unions or uses a window");
+    }
+    // Select list items: a bare column, `a.col`, or something else.
+    let mut items: Vec<Option<(Option<String>, String)>> = Vec::new();
+    let mut cur: Vec<&Tok> = Vec::new();
+    let mut d = 0i32;
+    let sentinel = Tok {
+        kind: K::Comma,
+        text: ",".into(),
+        up: ",".into(),
+        off: 0,
+    };
+    for t in q[1..from].iter().chain(std::iter::once(&sentinel)) {
+        match t.kind {
+            K::LParen => d += 1,
+            K::RParen => d -= 1,
+            _ => {}
+        }
+        if t.kind == K::Comma && d == 0 {
+            let w = |t: &Tok| matches!(t.kind, K::Word | K::Quoted);
+            items.push(match cur.as_slice() {
+                [c] if w(c) => Some((None, lc(c))),
+                [a, dot, c] if dot.kind == K::Dot && w(a) && w(c) => Some((Some(lc(a)), lc(c))),
+                _ => None,
+            });
+            cur.clear();
+        } else {
+            cur.push(t);
+        }
+    }
+    if items.len() != targets.len() {
+        return no("the select list and the FETCH targets differ in number");
+    }
+    // FROM table [AS] alias.
+    let Some((base, mut i)) = name_parts(q, from + 1) else {
+        return no("the cursor reads something other than a table");
+    };
+    let alias_at = |i: usize| -> (Option<String>, usize) {
+        let j = if is_word(q.get(i), "AS") { i + 1 } else { i };
+        match q.get(j) {
+            Some(t) if t.kind == K::Word && !CLAUSE.contains(&t.up.as_str()) => {
+                (Some(lc(t)), j + 1)
+            }
+            Some(t) if t.kind == K::Quoted => (Some(lc(t)), j + 1),
+            _ => (None, i),
+        }
+    };
+    let (alias, ni) = alias_at(i);
+    i = ni;
+    let base_last = base.last().cloned().unwrap_or_default();
+    let base_names: Vec<String> = alias.iter().cloned().chain([base_last.clone()]).collect();
+    let mut seen = vec![alias.clone().unwrap_or_else(|| base_last.clone())];
+    let mut joins = Vec::new();
+    loop {
+        if is_word(q.get(i), "INNER") {
+            i += 1;
+        }
+        if !is_word(q.get(i), "JOIN") {
+            break;
+        }
+        let Some((jt, ni)) = name_parts(q, i + 1) else {
+            return no("a join with something other than a table");
+        };
+        let (ja, ni) = alias_at(ni);
+        if !is_word(q.get(ni), "ON") {
+            return no("a join without ON");
+        }
+        let jname = ja.unwrap_or_else(|| jt.last().cloned().unwrap_or_default());
+        if seen.contains(&jname) {
+            return no("two tables of the query share a name");
+        }
+        let mut k = ni + 1;
+        let mut cols: Vec<String> = Vec::new();
+        let mut conj: Vec<&Tok> = Vec::new();
+        loop {
+            let t = q.get(k);
+            let boundary = t.map_or(true, |t| {
+                t.kind == K::Word
+                    && CLAUSE.contains(&t.up.as_str())
+                    && !matches!(t.up.as_str(), "ON" | "OUTER")
+            });
+            let and = t.is_some_and(|t| t.kind == K::Word && t.up == "AND");
+            if boundary || and {
+                if let [a, d1, b, op, c, d2, e] = conj.as_slice() {
+                    if d1.kind == K::Dot && d2.kind == K::Dot && op.text == "=" {
+                        let (qa, ca, qc, cc) = (lc(a), lc(b), lc(c), lc(e));
+                        if qa == jname && seen.contains(&qc) {
+                            cols.push(ca);
+                        } else if qc == jname && seen.contains(&qa) {
+                            cols.push(cc);
+                        }
+                    }
+                }
+                conj.clear();
+                if boundary {
+                    break;
+                }
+            } else if let Some(t) = t {
+                if matches!(t.kind, K::LParen | K::RParen) || (t.kind == K::Word && t.up == "OR") {
+                    return no("a join condition with OR or parentheses");
+                }
+                conj.push(t);
+            }
+            k += 1;
+        }
+        i = k;
+        if cols.is_empty() {
+            return no("a join not matched by equalities on the tables before it");
+        }
+        cols.sort();
+        cols.dedup();
+        joins.push(KeyReq { table: jt, cols });
+        seen.push(jname);
+    }
+    if q.get(i).is_some_and(|t| {
+        t.kind == K::Comma
+            || (t.kind == K::Word
+                && matches!(
+                    t.up.as_str(),
+                    "LEFT" | "RIGHT" | "FULL" | "CROSS" | "APPLY" | "OUTER"
+                ))
+    }) {
+        return no("an outer join, cross join, APPLY or comma join");
+    }
+    if read_tables(q).iter().filter(|r| **r == base_last).count() != 1 {
+        return no("the table is read more than once by the query");
+    }
+    let mut cols = std::collections::HashMap::new();
+    for (it, v) in items.iter().zip(targets) {
+        if let Some((qual, c)) = it {
+            let ours = match qual {
+                Some(x) => base_names.contains(x),
+                None => joins.is_empty(),
+            };
+            if ours {
+                cols.insert(c.clone(), v.to_uppercase());
+            }
+        }
+    }
+    let outside = q[from..]
+        .iter()
+        .filter(|t| matches!(t.kind, K::Word | K::Quoted))
+        .map(lc)
+        .collect();
+    Ok(Scan {
+        base,
+        cols,
+        joins,
+        outside,
+    })
+}
+
+fn keyed_write(x: &SyntaxNode, sc: &Scan) -> Result<(Vec<KeyReq>, Vec<String>), String> {
+    let ts = words(x);
+    let w0 = ts.first().map(|t| t.up.as_str()).unwrap_or("");
+    let upd = w0 == "UPDATE";
+    if !upd && w0 != "DELETE" {
+        return Err(format!("a {w0} statement writes a table the cursor reads"));
+    }
+    let mut i = 1;
+    if !upd && is_word(ts.get(i), "FROM") {
+        i += 1;
+    }
+    let Some((name, ni)) = name_parts(&ts, i) else {
+        return Err("a write target that is not a table".into());
+    };
+    i = ni;
+    if name.last() != sc.base.last()
+        || (name.len() > 1
+            && sc.base.len() > 1
+            && name[name.len() - 2] != sc.base[sc.base.len() - 2])
+    {
+        return Err("a write to another table the cursor reads".into());
+    }
+    let mut d = 0i32;
+    let (mut set_at, mut where_at) = (None, None);
+    for (k, t) in ts.iter().enumerate().skip(i) {
+        match t.kind {
+            K::LParen => d += 1,
+            K::RParen => d -= 1,
+            K::Word if d == 0 => match t.up.as_str() {
+                "SET" if set_at.is_none() && upd => set_at = Some(k),
+                "WHERE" if where_at.is_none() => where_at = Some(k),
+                "FROM" | "OUTPUT" | "JOIN" | "INTO" | "TOP" | "OPTION" | "CURRENT" => {
+                    return Err("an UPDATE or DELETE with FROM, OUTPUT, TOP or CURRENT OF".into())
+                }
+                "OR" if where_at.is_some() => return Err("an OR in the write's WHERE".into()),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    let Some(w) = where_at else {
+        return Err("a write without WHERE".into());
+    };
+    if upd {
+        let Some(s) = set_at.filter(|&s| s == i && s < w) else {
+            return Err("an UPDATE that is not UPDATE t SET … WHERE".into());
+        };
+        let mut d = 0i32;
+        let mut item_start = true;
+        for t in &ts[s + 1..w] {
+            match t.kind {
+                K::LParen => d += 1,
+                K::RParen => d -= 1,
+                K::Comma if d == 0 => {
+                    item_start = true;
+                    continue;
+                }
+                _ => {}
+            }
+            if item_start && d == 0 && matches!(t.kind, K::Word | K::Quoted) {
+                let c = lc(t);
+                if sc.outside.contains(&c) {
+                    return Err(format!(
+                        "the write sets {c}, which the cursor query uses outside its select list"
+                    ));
+                }
+            }
+            // `t.col = …`: the column follows the dot.
+            item_start = t.kind == K::Dot;
+        }
+    } else if w != i {
+        return Err("a DELETE that is not DELETE FROM t WHERE".into());
+    }
+    // WHERE conjuncts `col = @v`.
+    let mut cols = Vec::new();
+    let mut vars = Vec::new();
+    let mut conj: Vec<&Tok> = Vec::new();
+    let mut d = 0i32;
+    let sentinel = Tok {
+        kind: K::Word,
+        text: "AND".into(),
+        up: "AND".into(),
+        off: 0,
+    };
+    let base_last = sc.base.last().cloned().unwrap_or_default();
+    for t in ts[w + 1..].iter().chain(std::iter::once(&sentinel)) {
+        match t.kind {
+            K::LParen => d += 1,
+            K::RParen => d -= 1,
+            _ => {}
+        }
+        if d == 0 && t.kind == K::Word && t.up == "AND" {
+            let wd = |t: &Tok| matches!(t.kind, K::Word | K::Quoted);
+            let col_var = match conj.as_slice() {
+                [c, op, v] | [v, op, c] if op.text == "=" && v.kind == K::Var && wd(c) => {
+                    Some((c, v))
+                }
+                [q, dot, c, op, v] | [v, op, q, dot, c]
+                    if op.text == "="
+                        && dot.kind == K::Dot
+                        && v.kind == K::Var
+                        && wd(c)
+                        && wd(q)
+                        && lc(q) == base_last =>
+                {
+                    Some((c, v))
+                }
+                _ => None,
+            };
+            if let Some((c, v)) = col_var {
+                let c = lc(c);
+                if sc.cols.get(&c).is_some_and(|x| *x == v.up) {
+                    cols.push(c);
+                    vars.push(v.up.clone());
+                }
+            }
+            conj.clear();
+        } else {
+            conj.push(t);
+        }
+    }
+    if cols.is_empty() {
+        return Err("the write is not keyed by a column the cursor fetches into a variable".into());
+    }
+    cols.sort();
+    cols.dedup();
+    Ok((
+        vec![KeyReq {
+            table: sc.base.clone(),
+            cols,
+        }],
+        vars,
+    ))
 }

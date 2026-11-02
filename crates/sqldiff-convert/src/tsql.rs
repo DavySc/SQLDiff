@@ -4477,7 +4477,9 @@ impl<'a> Cx<'a> {
     /// (so the variables are not read after the loop before they are set
     /// again). A cursor that is not STATIC may see the loop's own writes in
     /// T-SQL; a PostgreSQL cursor reads the rows as of OPEN, so the loop must
-    /// not write the tables the cursor reads or call procedures.
+    /// not write the tables the cursor reads or call procedures, except for
+    /// changes of the row just fetched by its unique key
+    /// (`equiv::cursor::keyed_writes`, keys checked against the catalog).
     fn cursor_plan(&self, ts: &[T], n: &SyntaxNode) -> Result<CursorPlan, String> {
         let s = sig(ts);
         let raw = tsql_unquote(&ts[s[1]].s);
@@ -4654,6 +4656,7 @@ impl<'a> Cx<'a> {
         }
         if !stat {
             let reads = table_names(&query);
+            let mut conflicts: Vec<(SyntaxNode, String)> = Vec::new();
             for d in body.descendants().filter(|d| d.kind() == STATEMENT) {
                 let w = sig_words(&d);
                 match w.first().map(String::as_str) {
@@ -4663,10 +4666,36 @@ impl<'a> Cx<'a> {
                     Some("INSERT" | "UPDATE" | "DELETE" | "MERGE" | "WITH") => {
                         let names = written_tables(&tokens(&d));
                         if let Some(t) = reads.iter().find(|t| names.contains(t)) {
-                            return Err(format!("the cursor loop writes {t}, which the cursor reads: a T-SQL cursor that is not STATIC may see the change, a PostgreSQL cursor reads the rows as of OPEN; declare it STATIC to convert it"));
+                            conflicts.push((d.clone(), t.clone()));
                         }
                     }
                     _ => {}
+                }
+            }
+            // Allowed only where every such write changes the row just
+            // fetched and no other (`keyed_writes`), on unique keys the
+            // catalog shows.
+            if let Some((_, t)) = conflicts.first() {
+                let refuse = |why: String| {
+                    format!("the cursor loop writes {t}, which the cursor reads: a T-SQL cursor that is not STATIC may see the change, a PostgreSQL cursor reads the rows as of OPEN; declare it STATIC to convert it ({why})")
+                };
+                let Some(Ok((_, _, _, q))) = sqldiff_core::equiv::cursor::tsql_declaration(n)
+                else {
+                    return Err(refuse("the cursor declaration was not read".into()));
+                };
+                let nodes: Vec<&SyntaxNode> = conflicts.iter().map(|(x, _)| x).collect();
+                let targets: Vec<String> = vars.iter().map(|v| format!("@{v}")).collect();
+                let reqs =
+                    sqldiff_core::equiv::cursor::keyed_writes(&q, &nodes, &body, last, &targets)
+                        .map_err(refuse)?;
+                for r in &reqs {
+                    if !self.has_unique_key(&r.table, &r.cols) {
+                        return Err(refuse(format!(
+                            "the source catalog does not show {} unique on ({})",
+                            r.table.join("."),
+                            r.cols.join(", ")
+                        )));
+                    }
                 }
             }
         }

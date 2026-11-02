@@ -5673,6 +5673,22 @@ impl<'a> Canon<'a> {
         Ok(n(if m.error { "raise-error" } else { "message" }, parts))
     }
 
+    /// Whether the catalog shows the table (name parts as written) unique on
+    /// a key all of whose columns are among `cols`.
+    fn schema_unique(&self, table: &[String], cols: &[String]) -> bool {
+        let Some(last) = table.last() else {
+            return false;
+        };
+        let t = if table.len() >= 2 {
+            let sch = table[table.len() - 2].as_str();
+            let sch = (!matches!(sch, "dbo" | "public")).then_some(sch);
+            self.schema.table_exact(sch, last)
+        } else {
+            self.schema.table(last)
+        };
+        t.is_some_and(|t| t.is_unique(cols))
+    }
+
     /// A statement of a cursor loop (`cursor.rs`): `cursor-open(key, q)`
     /// with the query as a list of values per row and its ORDER BY,
     /// `cursor-fetch(key, assign…)` with each target set to its column as an
@@ -5681,7 +5697,23 @@ impl<'a> Canon<'a> {
     pub fn cursor_op(&mut self, op: &super::cursor::CursorOp) -> R<Term> {
         use super::cursor::CursorOp;
         match op {
-            CursorOp::Open { key, query, tsql } => {
+            CursorOp::Open {
+                key,
+                query,
+                tsql,
+                keyed,
+            } => {
+                for r in keyed {
+                    if !self.schema_unique(&r.table, &r.cols) {
+                        let why = format!(
+                            "a cursor loop's write relies on {} being unique on ({}), which the catalog does not show",
+                            r.table.join("."),
+                            r.cols.join(", ")
+                        );
+                        self.cursor_failed.insert(key.clone(), why.clone());
+                        return Err(why);
+                    }
+                }
                 let read = query
                     .as_ref()
                     .map_err(Clone::clone)

@@ -8,8 +8,8 @@
 
 use sqldiff_core::{diff, Artifact, Dialect, Options, Report, Verdict};
 
-const CATALOG_T: &str = "CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, v int NULL);\nCREATE TABLE dbo.log (id int NOT NULL, v int NULL);";
-const CATALOG_P: &str = "CREATE TABLE t (id integer NOT NULL PRIMARY KEY, v integer NULL);\nCREATE TABLE log (id integer NOT NULL, v integer NULL);";
+const CATALOG_T: &str = "CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, v int NULL);\nCREATE TABLE dbo.log (id int NOT NULL, v int NULL);\nCREATE TABLE dbo.u (id int NOT NULL PRIMARY KEY, w int NULL);";
+const CATALOG_P: &str = "CREATE TABLE t (id integer NOT NULL PRIMARY KEY, v integer NULL);\nCREATE TABLE log (id integer NOT NULL, v integer NULL);\nCREATE TABLE u (id integer NOT NULL PRIMARY KEY, w integer NULL);";
 
 /// A T-SQL procedure with `body`, against a PostgreSQL one with `body_p`.
 /// Both declare `@id int`, `@v int`, `@total int = 0`, `@min int = 1`; the
@@ -335,10 +335,121 @@ fn a_cursor_that_is_not_static_sees_the_loops_writes() {
             "    UPDATE t SET v = 0 WHERE id = v_id;\n",
         )
         .replace("\n  INSERT INTO log (id, v) VALUES (0, v_total);", "");
-    refused(
-        &t(T_DECL, &write),
-        &p(P_OPEN, &write_p),
+    // The row just fetched, by its unique key, changing a column the query
+    // uses only in its select list: no row not yet fetched changes.
+    equal(&t(T_DECL, &write), &p(P_OPEN, &write_p));
+    equal(
+        &t(
+            T_DECL,
+            &write.replace(
+                "UPDATE dbo.t SET v = 0 WHERE id = @id;",
+                "DELETE FROM dbo.t WHERE id = @id;",
+            ),
+        ),
+        &p(
+            P_OPEN,
+            &write_p.replace(
+                "UPDATE t SET v = 0 WHERE id = v_id;",
+                "DELETE FROM t WHERE id = v_id;",
+            ),
+        ),
+    );
+    // A unique join keeps one result row per row of t.
+    equal(
+        &t(
+            "  DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT x.id, x.v FROM dbo.t AS x INNER JOIN dbo.u AS y ON y.id = x.id ORDER BY x.id;",
+            &write,
+        ),
+        &p(
+            "  OPEN cur_c FOR SELECT x.id, x.v FROM t AS x INNER JOIN u AS y ON y.id = x.id ORDER BY x.id;",
+            &write_p,
+        ),
+    );
+    // Near misses: each may change a row the cursor still has to fetch.
+    let miss = |upd_t: &str, upd_p: &str, why: &str| {
+        let (a, b) = (
+            t(
+                T_DECL,
+                &write.replace("UPDATE dbo.t SET v = 0 WHERE id = @id;", upd_t),
+            ),
+            p(
+                P_OPEN,
+                &write_p.replace("UPDATE t SET v = 0 WHERE id = v_id;", upd_p),
+            ),
+        );
+        // A key the catalog does not show is found while comparing the
+        // OPEN, which says why only in the finding it leaves.
+        if why == "unique" {
+            not_equal(&a, &b);
+        } else {
+            refused(&a, &b, why);
+        }
+    };
+    miss(
+        "UPDATE dbo.t SET v = 0;",
+        "UPDATE t SET v = 0;",
         "writes t, which the cursor reads",
+    );
+    miss(
+        "UPDATE dbo.t SET v = 0 WHERE id > @id;",
+        "UPDATE t SET v = 0 WHERE id > v_id;",
+        "writes t, which the cursor reads",
+    );
+    miss(
+        "UPDATE dbo.t SET v = 0 WHERE id = @id OR id = 1;",
+        "UPDATE t SET v = 0 WHERE id = v_id OR id = 1;",
+        "writes t, which the cursor reads",
+    );
+    // The key is not unique: a fetched v can name several rows.
+    miss(
+        "UPDATE dbo.t SET v = 0 WHERE v = @v;",
+        "UPDATE t SET v = 0 WHERE v = v_v;",
+        "unique",
+    );
+    // The write moves the row in the query's order.
+    miss(
+        "UPDATE dbo.t SET id = id + 100 WHERE id = @id;",
+        "UPDATE t SET id = id + 100 WHERE id = v_id;",
+        "writes t, which the cursor reads",
+    );
+    // The key variable changes before the write.
+    miss(
+        "SET @id = @id + 1; UPDATE dbo.t SET v = 0 WHERE id = @id;",
+        "v_id := v_id + 1; UPDATE t SET v = 0 WHERE id = v_id;",
+        "assigned inside the loop",
+    );
+    miss(
+        "INSERT INTO dbo.t (id, v) VALUES (@id + 1000, 0);",
+        "INSERT INTO t (id, v) VALUES (v_id + 1000, 0);",
+        "writes t, which the cursor reads",
+    );
+    // A join that can repeat a row of t.
+    not_equal(
+        &t(
+            "  DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT x.id, x.v FROM dbo.t AS x INNER JOIN dbo.log AS y ON y.id = x.id ORDER BY x.id;",
+            &write,
+        ),
+        &p(
+            "  OPEN cur_c FOR SELECT x.id, x.v FROM t AS x INNER JOIN log AS y ON y.id = x.id ORDER BY x.id;",
+            &write_p,
+        ),
+    );
+    // A table without a key: a fetched id can name several rows.
+    not_equal(
+        &t(
+            "  DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT id, v FROM dbo.log ORDER BY id;",
+            &write.replace(
+                "UPDATE dbo.t SET v = 0 WHERE id = @id;",
+                "UPDATE dbo.log SET v = 0 WHERE id = @id;",
+            ),
+        ),
+        &p(
+            "  OPEN cur_c FOR SELECT id, v FROM log ORDER BY id;",
+            &write_p.replace(
+                "UPDATE t SET v = 0 WHERE id = v_id;",
+                "UPDATE log SET v = 0 WHERE id = v_id;",
+            ),
+        ),
     );
     // STATIC reads the rows at OPEN, as PostgreSQL does.
     equal(

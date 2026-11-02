@@ -122,17 +122,50 @@ fn shapes_that_mean_something_else_stay_refused() {
         ),
         "transaction control in the cursor loop",
     );
-    // A cursor that is not STATIC may see the loop's writes.
-    refused(
-        &body(
+    // A cursor that is not STATIC may see the loop's writes, unless they
+    // only change the row just fetched, by its unique key.
+    let upd = |set: &str| {
+        body(
             DECL,
-            &LOOP.replace(
-                "INSERT INTO dbo.log (id, v) VALUES (@id, @v);",
-                "UPDATE dbo.t SET v = 0 WHERE id = @id;",
-            ),
+            &LOOP.replace("INSERT INTO dbo.log (id, v) VALUES (@id, @v);", set),
+        )
+    };
+    for (set, why) in [
+        // Not the key: a fetched v can name several rows.
+        ("UPDATE dbo.t SET v = 0 WHERE v = @v;", "unique"),
+        ("UPDATE dbo.t SET v = 0;", "without WHERE"),
+        ("UPDATE dbo.t SET v = 0 WHERE id > @id;", "not keyed"),
+        // Moves the row in the query's order.
+        (
+            "UPDATE dbo.t SET id = id + 100 WHERE id = @id;",
+            "outside its select list",
         ),
-        "writes t, which the cursor reads",
+        (
+            "SET @id = @id + 1; UPDATE dbo.t SET v = 0 WHERE id = @id;",
+            "assigned inside the loop",
+        ),
+        (
+            "INSERT INTO dbo.t (id, v) VALUES (@id + 1000, 0);",
+            "writes a table",
+        ),
+    ] {
+        let c = pg(&upd(set));
+        let u = at(&c, 9)[0];
+        assert_eq!(u.status, Status::NotConverted, "{set}\n{}", c.output);
+        let text = &u.notes[0].text;
+        assert!(
+            text.contains("writes t, which the cursor reads") && text.contains(why),
+            "{set}: {text}"
+        );
+    }
+    let c = pg(&upd("UPDATE dbo.t SET v = 0 WHERE id = @id;"));
+    assert!(
+        c.output.contains("UPDATE t SET v = 0 WHERE id = v_id;"),
+        "{}",
+        c.output
     );
+    assert!(c.output.contains("WHILE FOUND LOOP"), "{}", c.output);
+    assert_ne!(at(&c, 9)[0].status, Status::NotConverted);
     // Only forward-only cursors.
     refused(
         &body(
