@@ -904,6 +904,13 @@ fact = "The converted statement draws the value once (a variable)."
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-RANDOM-FRESH"
+statement = "NEWID() and gen_random_uuid() are the same, and RAND() and random() (both without a seed) are the same: each evaluation draws a fresh value from the same range, and a RAND() is compared only in a statement that evaluates it once."
+discharge = "nothing"
+fact = "The vendor documentation of NEWID() and RAND() (SQL Server 2022) and of gen_random_uuid() and random() (PostgreSQL 18): each call returns a new random value of the same type and range."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-READ-COMMITTED"
 statement = "The routine runs at READ COMMITTED (the default)."
 discharge = "deployment"
