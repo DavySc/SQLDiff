@@ -321,11 +321,29 @@ impl How {
     }
 }
 
+/// Whether a chain of money operations is read (`a + b - c`). SQL Server
+/// raises an error when an intermediate money value leaves its range where
+/// the final value is inside it, and numeric(19, 4) does not; ASM-COLUMN-RANGE
+/// covers it since the owner approved its wording to include "the money
+/// intermediates that compute" the stored values (2026-11-02).
+/// `sqldiff-convert` follows this switch.
+pub const MONEY_CHAINS: bool = true;
+
+/// A term made by arithmetic (an intermediate result, not a column).
+fn chained(t: &Term) -> bool {
+    matches!(t.head(), "add" | "sub" | "mul" | "arith")
+}
+
 /// Whether a conversion means the same in every dialect.
 enum Rule {
     Same,
     /// T-SQL drops the fraction first.
     Trunc,
+    /// T-SQL money to a whole number: rounded half away from zero, like
+    /// PostgreSQL numeric(19, 4) (1.5 → 2, -2.5 → -3). It is written as the
+    /// PostgreSQL conversion of that numeric, so the two sides meet in one
+    /// term and every other pairing keeps its existing classification.
+    MoneyAsNumeric,
     /// Dialect-specific (or not checked).
     Dialect,
 }
@@ -374,6 +392,10 @@ pub struct Canon<'a> {
     /// with the bytes the code before it fixes them to (lower-case name,
     /// lower-case hex): see `known_bytes`.
     pub known_bytes: Vec<(String, String)>,
+    /// The expression's value is stored in a column of the declared type
+    /// (a computed or generated column), so T-SQL's money range errors fall
+    /// under ASM-COLUMN-RANGE (see `money_arith`).
+    pub stored_values: bool,
     /// The dialect of the statements this one is compared with, when known:
     /// an unqualified PostgreSQL call may then be the conversion of a T-SQL
     /// `dbo` function (`user_fn`).
@@ -751,6 +773,7 @@ impl<'a> Canon<'a> {
             by_name: false,
             fold_quoted: false,
             known_bytes: Vec::new(),
+            stored_values: false,
             other: None,
             names: Vec::new(),
             output: None,
@@ -1244,6 +1267,10 @@ impl<'a> Canon<'a> {
 
     /// Whether a value of type `src` is stored in `dst` unchanged.
     fn fits(&self, dst: &Ty, src: &Ty) -> bool {
+        // An int (up to 32 bits) is inside the money range; a bigint is not.
+        if dst.fam == Fam::Money && src.fam == Fam::Int {
+            return src.len.is_some_and(|l| l <= 32);
+        }
         if dst.fam != src.fam {
             // PostgreSQL drops the trailing blanks of a CHAR value converted
             // to varchar or text ('a  ' becomes 'a'); SQL Server keeps them.
@@ -1278,6 +1305,8 @@ impl<'a> Canon<'a> {
             // IMAGE, MONEY, an alias type, …): the store may pad, cut off,
             // round or fail.
             Fam::Other => false,
+            // Money against money: the same decimal(19, 4).
+            Fam::Money => true,
             Fam::Date
             | Fam::Interval
             | Fam::Bool
@@ -1764,6 +1793,11 @@ impl<'a> Canon<'a> {
                     } else {
                         (n("not", vec![self.bare_bool(t, ty)]), None)
                     }
+                } else if ty.is_some_and(|t| t.fam == Fam::Money) {
+                    // SQL Server raises an error for the negative of the
+                    // smallest money value (-922,337,203,685,477.5808),
+                    // numeric(19, 4) negates it: per dialect.
+                    (n("dneg", vec![self.dtag(), t]), ty)
                 } else {
                     (n("neg", vec![t]), ty)
                 }
@@ -2419,6 +2453,23 @@ impl<'a> Canon<'a> {
                 ),
                 to,
             ),
+            Rule::MoneyAsNumeric => (
+                n(
+                    "dcast",
+                    vec![
+                        a(Dialect::Postgres.id()),
+                        a(how.name()),
+                        Self::ty_term(&to),
+                        Self::ty_term(&Some(Ty {
+                            fam: Fam::Exact,
+                            len: Some(19),
+                            scale: Some(4),
+                        })),
+                        v.0,
+                    ],
+                ),
+                to,
+            ),
             Rule::Dialect => (
                 n(
                     "dcast",
@@ -2482,6 +2533,14 @@ impl<'a> Canon<'a> {
             };
         }
         match (src.fam, dst.fam) {
+            // T-SQL money converts to a whole number and to a decimal the
+            // way PostgreSQL numeric(19, 4) does: rounded half away from
+            // zero, an error when it does not fit (eval/builtins/
+            // 2026-11-02-money: toint, tobigint, todec, todec0, todec4).
+            (Money, Int) => Rule::MoneyAsNumeric,
+            (Money, Exact) => Rule::Same,
+            (Money, Money) => Rule::Same,
+            (Money, _) | (_, Money) => Rule::Dialect,
             // Out of range is an error on both sides.
             (Int, Int | Exact | Float) => Rule::Same,
             // Both round half away from zero (1.555 → 1.56, -2.5 → -3).
@@ -3324,6 +3383,12 @@ impl<'a> Canon<'a> {
             }
             (_, "upper" | "ucase", 1) => portable("upper", args, first_ty),
             (_, "lower" | "lcase", 1) => portable("lower", args, first_ty),
+            // ABS of the smallest money value raises an error in SQL Server
+            // where numeric(19, 4) returns it: per dialect.
+            (_, "abs", 1) if first_ty.is_some_and(|t| t.fam == Fam::Money) => (
+                n("dfn", vec![self.dtag(), a(name.clone()), args[0].0.clone()]),
+                first_ty,
+            ),
             (_, "abs", 1) => portable("abs", args, first_ty),
             (_, "min" | "max", 1) => match first_ty {
                 Some(t) if t.orders_per_dialect() => (
@@ -3769,6 +3834,16 @@ impl<'a> Canon<'a> {
                         Some(Ty::of(Fam::Bool)),
                     ));
                 }
+                // T-SQL converts money to a float it meets (to real, when
+                // that is the float): not the same comparison as numeric
+                // against double precision.
+                if any(&|t| t.fam == Fam::Money) && any(&|t| t.fam == Fam::Float) {
+                    let (x, y, op) = order_operands(op, lt, rt);
+                    return Ok((
+                        n("cmp-dialect", vec![self.dtag(), a(op), x, y]),
+                        Some(Ty::of(Fam::Bool)),
+                    ));
+                }
                 let string = any(&|t| t.is_string());
                 let known = lty.is_some() || rty.is_some();
                 if string && any(&|t| !t.is_string()) {
@@ -3882,6 +3957,16 @@ impl<'a> Canon<'a> {
                 }),
             )),
             "+" | "-" | "*" | "/" | "%" => {
+                // T-SQL money (see `Fam::Money`).
+                let (lty, rty) = match self.money_operands(op, &lt, lty, &rt, rty) {
+                    Ok(types) => types,
+                    Err(()) => {
+                        return Ok(self.money_arith(op, lt, lty, rt, rty));
+                    }
+                };
+                let any = |f: &dyn Fn(&Ty) -> bool| {
+                    lty.as_ref().is_some_and(f) || rty.as_ref().is_some_and(f)
+                };
                 // Only numbers add alike everywhere: T-SQL `+` concatenates
                 // binary strings, PostgreSQL has no bytea `+`.
                 if any(&|t| !t.is_numeric()) || lt.is("bytes") || rt.is("bytes") {
@@ -4001,6 +4086,105 @@ impl<'a> Canon<'a> {
                 .and_then(Term::atom)
                 .and_then(|x| x.parse::<i64>().ok())
                 .is_some_and(|x| x.abs() <= 1 << 24)
+    }
+
+    /// The operand types of an arithmetic operator when one is T-SQL money.
+    /// Money with a decimal is decimal arithmetic on a decimal(19, 4), the
+    /// result a decimal that no money range limits (SQL Server 2022:
+    /// money + decimal(9, 2) is decimal(20, 4), money * 2.5 decimal(22, 5)),
+    /// so the operands go on as exact numbers. `Err` for every other use of
+    /// money, which `money_arith` decides. Without money: unchanged.
+    fn money_operands(
+        &self,
+        _op: &str,
+        _lt: &Term,
+        lty: Option<Ty>,
+        _rt: &Term,
+        rty: Option<Ty>,
+    ) -> Result<(Option<Ty>, Option<Ty>), ()> {
+        let money = |t: &Option<Ty>| t.is_some_and(|t| t.fam == Fam::Money);
+        if !money(&lty) && !money(&rty) {
+            return Ok((lty, rty));
+        }
+        // An intermediate money value may leave the money range.
+        if !MONEY_CHAINS && ((money(&lty) && chained(_lt)) || (money(&rty) && chained(_rt))) {
+            return Err(());
+        }
+        let known_dec = |t: &Option<Ty>| {
+            t.is_some_and(|t| t.fam == Fam::Exact && t.len.is_some() && t.scale.is_some())
+        };
+        let as_dec = |t: Option<Ty>| {
+            if money(&t) {
+                Some(Ty {
+                    fam: Fam::Exact,
+                    len: Some(19),
+                    scale: Some(4),
+                })
+            } else {
+                t
+            }
+        };
+        if (money(&lty) && known_dec(&rty)) || (known_dec(&lty) && money(&rty)) {
+            return Ok((as_dec(lty), as_dec(rty)));
+        }
+        Err(())
+    }
+
+    /// `+`, `-` and `*` where an operand is T-SQL money and the other money
+    /// or an integer: exact on both sides (SQL Server 2022 against
+    /// PostgreSQL numeric(19, 4), eval/builtins/2026-11-02-money: add, sub,
+    /// mulint, intmul, addint), except that SQL Server raises an error
+    /// outside the money range where numeric(19, 4) holds 10^15. That
+    /// difference is ASM-COLUMN-RANGE when the value is stored in a column
+    /// (`stored_values`); anywhere else the operation stays per dialect.
+    /// A money product or quotient is rounded to four decimals by SQL
+    /// Server and exact in PostgreSQL, a quotient of two money values keeps
+    /// four decimals where numeric division keeps more, and money with a
+    /// float or a string converts differently: all per dialect.
+    fn money_arith(
+        &mut self,
+        op: &str,
+        lt: Term,
+        lty: Option<Ty>,
+        rt: Term,
+        rty: Option<Ty>,
+    ) -> (Term, Option<Ty>) {
+        let is = |t: &Option<Ty>, f: Fam| t.is_some_and(|t| t.fam == f);
+        // SQL Server converts an integer to money before it computes, and a
+        // bigint may be outside the money range where the sum or product of
+        // it is not (bigint 10^15 * money 0 fails, numeric stores 0): only
+        // integers of at most 32 bits.
+        let int = |t: &Option<Ty>| {
+            t.is_some_and(|t| t.fam == Fam::Int && t.len.is_some_and(|l| l > 1 && l <= 32))
+        };
+        let (lm, rm) = (is(&lty, Fam::Money), is(&rty, Fam::Money));
+        let ok = self.stored_values
+            && (MONEY_CHAINS || !(chained(&lt) || chained(&rt)))
+            && self.d == Dialect::Tsql
+            && match op {
+                "+" | "-" => (lm || int(&lty)) && (rm || int(&rty)),
+                "*" => (lm && int(&rty)) || (int(&lty) && rm),
+                _ => false,
+            };
+        if !ok {
+            return (n("arith", vec![self.dtag(), a(op), lt, rt]), None);
+        }
+        self.assume(super::table::asm::COLUMN_RANGE);
+        let ty = Some(Ty {
+            fam: Fam::Money,
+            len: Some(19),
+            scale: Some(4),
+        });
+        let head = match op {
+            "+" => "add",
+            "-" => "sub",
+            _ => "mul",
+        };
+        let mut v = vec![lt, rt];
+        if head != "sub" {
+            v.sort();
+        }
+        (n(head, v), ty)
     }
 
     /// The type of an exact product of two exact numbers (integers or
@@ -4606,14 +4790,18 @@ impl<'a> Canon<'a> {
                 self.scopes = saved;
                 let (mut parts, items) = q?;
                 let key = alias.clone().map(|x| lc(&x)).unwrap_or_default();
-                // The bit and boolean columns, by the name the item gives them.
+                // The typed columns, by the name the item gives them: a column
+                // read through a derived table has the type of the item (a
+                // decimal read through `(SELECT Amt FROM t) x` is still a
+                // decimal, whose fraction an integer store drops). An item of
+                // unknown type stays unknown.
                 if query.set_ops.is_empty() && query.items.len() == items.len() {
                     let bits: Vec<(String, Ty)> = query
                         .items
                         .iter()
                         .zip(&items)
                         .filter_map(|(it, (_, ty))| {
-                            let ty = ty.filter(|_| self.is_bit(ty) || self.is_bool(ty))?;
+                            let ty = (*ty)?;
                             let name = match (&it.alias, &it.expr) {
                                 (Some(a), _) => a.clone(),
                                 (None, Expr::Name(p)) => p.last()?.clone(),
@@ -4622,9 +4810,15 @@ impl<'a> Canon<'a> {
                             Some((lc(name.trim_matches(['[', ']', '"'])), ty))
                         })
                         .collect();
-                    if !bits.is_empty() {
+                    // Replaces what an earlier derived table of the same alias
+                    // left, also when this one has no typed column.
+                    if bits.is_empty() {
+                        self.sub_bits.remove(&format!("sub:{key}"));
+                    } else {
                         self.sub_bits.insert(format!("sub:{key}"), bits);
                     }
+                } else {
+                    self.sub_bits.remove(&format!("sub:{key}"));
                 }
                 let unique = sqldiff_syntax::abstract_syntax::group_key(query)
                     .map(|k| k.iter().map(|c| lc(c)).collect());
@@ -4829,7 +5023,12 @@ impl<'a> Canon<'a> {
             return Err("SELECT INTO here is not supported".into());
         }
         self.scopes.push(Vec::new());
+        // The derived tables this query binds (their column types) end with
+        // it: a subquery's `(SELECT …) x` must not leave its types under the
+        // alias of an outer `x`.
+        let derived_types = self.sub_bits.clone();
         let r = self.query_inner(s, ctx);
+        self.sub_bits = derived_types;
         self.scopes.pop();
         r
     }

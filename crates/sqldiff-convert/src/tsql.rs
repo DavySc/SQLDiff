@@ -5175,6 +5175,7 @@ impl<'a> Cx<'a> {
             vars: vars.clone(),
             stat,
             local,
+            declare_at: Self::range(n),
             open_at: Self::range(open),
             fetch_at: vec![Self::range(first), Self::range(last)],
             loop_at: Self::range(lp),
@@ -5192,6 +5193,29 @@ impl<'a> Cx<'a> {
             .values()
             .find(|p| p.as_ref().is_ok_and(|p| p.loop_at == at))
             .cloned()
+    }
+
+    /// The steps from index `before` on convert the cursor's query, which
+    /// the DECLARE wrote and the OPEN converts: they lie in the DECLARE, not
+    /// in the OPEN's unit, so they move to the DECLARE's unit (to the OPEN's
+    /// place when that unit is gone).
+    fn query_steps_to_declare(&mut self, before: usize, plan: &CursorPlan) {
+        let moved: Vec<crate::Step> = self.trace.drain(before..).collect();
+        let (a, b) = plan.declare_at;
+        let decl = self.decls.iter().position(|d| d.src == plan.declare_at);
+        for mut st in moved {
+            let in_decl = st.start >= a && st.end <= b;
+            let target = match decl {
+                Some(i) if in_decl => &mut self.decls[i].trace,
+                _ => {
+                    (st.start, st.end) = plan.open_at;
+                    &mut self.trace
+                }
+            };
+            if !target.contains(&st) {
+                target.push(st);
+            }
+        }
     }
 
     /// PostgreSQL: OPEN, FETCH, CLOSE and DEALLOCATE of a converted cursor
@@ -5217,11 +5241,20 @@ impl<'a> Cx<'a> {
         match first {
             "OPEN" if at == plan.open_at => {
                 let outer = std::mem::replace(&mut self.scope, scope_of(&plan.query));
+                let before = self.trace.len();
                 let q = self.select(&plan.query);
                 self.scope = outer;
                 let (q, assigns) = q?;
                 if assigns {
                     return no("cursor query that assigns variables");
+                }
+                // Only a converted OPEN moves the query's steps: a refused
+                // one (a note says the query is not converted) leaves the
+                // DECLARE's unit as it was and keeps none of them.
+                if self.blocked().is_some() {
+                    self.trace.truncate(before);
+                } else {
+                    self.query_steps_to_declare(before, &plan);
                 }
                 if !plan.stat {
                     self.note(Status::Assumptions, "ASM-CURSOR-SNAPSHOT", "No other session changes the tables the cursor reads while the loop runs: a T-SQL cursor that is not STATIC may see such changes, a PostgreSQL cursor reads the rows as of OPEN.");
@@ -6957,6 +6990,7 @@ impl<'a> Cx<'a> {
             ["smallint"] => Some(Arith::Int(16)),
             ["int"] | ["integer"] => Some(Arith::Int(32)),
             ["bigint"] => Some(Arith::Int(64)),
+            ["money"] => Some(Arith::Money),
             ["decimal" | "numeric", "(", p, ",", s, ")"] => {
                 Some(Arith::Dec(p.parse().ok()?, s.parse().ok()?))
             }
@@ -6969,19 +7003,33 @@ impl<'a> Cx<'a> {
     /// `+`, `-` and `*` over smallint, int, bigint and decimal columns of the
     /// table and int literals: the same type for equal integer types, the
     /// wider integer for different ones, decimal(p, s) by the documented
-    /// rule when it stays within 38 digits. `None` for anything else: money
-    /// (the expression engine has no money type yet), tinyint (T-SQL's
+    /// rule when it stays within 38 digits; money with money or an integer is
+    /// money, with a decimal a decimal. `None` for anything else: a product
+    /// of two money values, smallmoney, tinyint (T-SQL's
     /// overflows at 255, PostgreSQL has no such type) and decimal literals.
     fn arith_type(&self, e: &[T], persisted: bool) -> Option<Arith> {
         let s = sig(e);
         let (ty, used) = self.arith_sum(e, &s, 0)?;
+        // A chain of operations over money is left unread (the engine does
+        // not prove it either): an intermediate money value may leave the
+        // money range where the result does not. `MONEY_CHAINS`.
+        let ops = s
+            .iter()
+            .filter(|&&k| e[k].k == OP && matches!(e[k].s.as_str(), "+" | "-" | "*"))
+            .count();
+        let money = s.iter().any(|&k| {
+            matches!(e[k].k, IDENT | QUOTED_IDENT) && self.column_arith(&e[k]) == Some(Arith::Money)
+        });
+        if money && ops > 1 && !sqldiff_core::equiv::canon::MONEY_CHAINS {
+            return None;
+        }
         // Integer arithmetic raises its overflow error when SQL Server
         // reads a column that is not PERSISTED, but when PostgreSQL's
         // STORED column is written: only a PERSISTED column converts
         // (decimal arithmetic within 38 digits cannot overflow).
         (used == s.len()
             && !matches!(ty, Arith::Lit(_))
-            && (persisted || !matches!(ty, Arith::Int(_))))
+            && (persisted || !matches!(ty, Arith::Int(_) | Arith::Money)))
         .then_some(ty)
     }
 
@@ -10789,6 +10837,11 @@ enum Arith {
     /// to a decimal it is a decimal(digits, 0), not an int; next to an int
     /// it is an int (SQL Server 2022, sys.columns).
     Lit(u32),
+    /// `money`: exact like a decimal(19, 4); a sum, a difference or a product
+    /// with an integer stays money, with a decimal it is decimal arithmetic
+    /// on a decimal(19, 4), and a product of two money values (rounded to
+    /// four decimals by SQL Server, not by numeric) is not read.
+    Money,
 }
 
 impl Arith {
@@ -10799,6 +10852,7 @@ impl Arith {
             Arith::Int(_) => "bigint",
             Arith::Dec(..) => "decimal",
             Arith::Lit(_) => "int",
+            Arith::Money => "money",
         }
     }
 
@@ -10810,6 +10864,7 @@ impl Arith {
             Arith::Int(_) => Some((19, 0)),
             Arith::Dec(p, s) => Some((p, s)),
             Arith::Lit(d) => Some((d, 0)),
+            Arith::Money => Some((19, 4)),
         }
     }
 
@@ -10819,6 +10874,12 @@ impl Arith {
         use Arith::*;
         match (a, b) {
             (Lit(_), Lit(_)) => Some(Int(32)),
+            (Money, Money) => (!mul).then_some(Money),
+            // SQL Server converts the integer to money first: a bigint may be
+            // outside the money range (10^15 * money 0 fails, numeric stores
+            // 0), so only integers of at most 32 bits.
+            (Money, Int(w)) | (Int(w), Money) => (w <= 32).then_some(Money),
+            (Money, Lit(_)) | (Lit(_), Money) => Some(Money),
             (Lit(_), Int(w)) | (Int(w), Lit(_)) => Some(Int(w.max(32))),
             (Int(x), Int(y)) => Some(Int(x.max(y))),
             _ => {
@@ -10855,6 +10916,11 @@ impl Arith {
             }
             Arith::Dec(p, s) => frac.len() as u32 <= s && int.len() as u32 <= p - s,
             Arith::Lit(_) => false,
+            Arith::Money => {
+                frac.len() <= 4
+                    && int.len() <= 15
+                    && int.parse::<u64>().unwrap_or(0) < 922_337_203_685_477
+            }
         }
     }
 }
@@ -11481,6 +11547,8 @@ struct CursorPlan {
     stat: bool,
     /// LOCAL: T-SQL frees it when the routine ends.
     local: bool,
+    /// The DECLARE statement: the steps that convert `query` belong to it.
+    declare_at: (usize, usize),
     open_at: (usize, usize),
     /// The FETCH before the loop and the one that ends its body.
     fetch_at: Vec<(usize, usize)>,

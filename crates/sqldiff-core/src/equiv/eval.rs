@@ -499,8 +499,10 @@ pub fn fits_type(v: &V, t: &Ty) -> bool {
             }
             _ => false,
         },
-        (Fam::Exact, V::Int(_) | V::Num(_)) => {
+        (Fam::Exact | Fam::Money, V::Int(_) | V::Num(_)) => {
             let Some(x) = num_of(v) else { return false };
+            // Money is a decimal(19, 4); the range check below is far inside
+            // its limits.
             match (t.len, t.scale) {
                 (Some(p), Some(s)) => {
                     let m = x * 10f64.powi(s as i32);
@@ -1017,9 +1019,13 @@ impl<'s> Ctx<'s> {
             Fam::Timestamp | Fam::TimestampTz => Class::Stamp,
             Fam::Interval => Class::Ivl,
             Fam::Time => return None,
-            Fam::Binary | Fam::Uuid | Fam::Geography | Fam::Text | Fam::NoCompare | Fam::Other => {
-                return None
-            }
+            Fam::Binary
+            | Fam::Uuid
+            | Fam::Geography
+            | Fam::Text
+            | Fam::NoCompare
+            | Fam::Money
+            | Fam::Other => return None,
         })
     }
 
