@@ -45,6 +45,8 @@ witnesses = [
 [[expect]]
 a = "pg"
 b = "db2i"
-verdict = "equal-under-assumptions"
-assumptions = ["the Db2 for i routine without USRPRF runs with the caller's authority", "unquoted names name the same objects after case folding", "unqualified names, dbo and public resolve to the same schema"]
-classes = ["structural"]
+verdict = "different"
+classes = ["semantic"]
+witnesses = [
+  "created_at: Db2 for i CURRENT TIMESTAMP is the INSERT statement's start; PostgreSQL's statement_timestamp() inside the procedure is the CALL's start.",
+]

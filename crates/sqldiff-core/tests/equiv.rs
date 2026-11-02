@@ -1540,3 +1540,28 @@ fn fresh_draws_pair_in_source_order() {
     );
     assert!(assumption_ids(&r).contains(&"ASM-RANDOM-FRESH"));
 }
+
+/// PostgreSQL's statement_timestamp() is the CALL's start for every statement
+/// in a routine, so it never equals T-SQL's per-statement SYSDATETIME().
+#[test]
+fn routine_clock_is_not_per_statement() {
+    let ts = "CREATE PROCEDURE dbo.stamp @Out datetime2(6) OUTPUT AS
+              BEGIN
+                SET XACT_ABORT ON;
+                DECLARE @d datetime2(6);
+                SET @d = SYSDATETIME();
+                SET @Out = @d;
+              END";
+    let pg = "CREATE PROCEDURE stamp(INOUT p_out timestamp(6) DEFAULT NULL) LANGUAGE plpgsql AS $$
+              DECLARE v_d timestamp(6);
+              BEGIN
+                v_d := statement_timestamp();
+                p_out := v_d;
+              END; $$;";
+    let r = run(ts, T, pg, P, true);
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.findings
+    );
+}
