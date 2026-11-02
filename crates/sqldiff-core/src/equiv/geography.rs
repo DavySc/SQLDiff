@@ -158,8 +158,11 @@ pub enum Wkb {
 ///   PostGIS. Coordinates inside the ranges stay as they are.
 /// - Neither engine checks validity at this point: a self-intersecting
 ///   polygon, a hole outside its shell or a clockwise exterior ring is
-///   accepted by both unchanged (`STIsValid()` is 0 afterwards), so validity
-///   is not asked here.
+///   accepted by both unchanged (`STIsValid()` is 0 afterwards). The bytes
+///   are then the same but the region is not (SQL Server takes the left of
+///   the ring, PostGIS the smaller side), so a polygon is read only when
+///   [`super::geography_area::same_region`] accepts it: counter-clockwise
+///   exterior, clockwise holes, simple rings, small extent.
 ///
 /// A geometry collection nested in a collection is accepted by both but not
 /// read here.
