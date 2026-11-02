@@ -18,6 +18,33 @@ pub struct DataType {
     pub text: String,
 }
 
+/// A T-SQL type named as a bracketed identifier (`[sysname]`, `[nvarchar]`,
+/// as SSMS scripts write every type) is the type of that name: the brackets
+/// go, whether the lexer gave the name as one word (`[sysname]`) or as `[`,
+/// `sysname`, `]`. An empty pair or one around a number is a PostgreSQL array
+/// bound and stays as written.
+fn unbracket(words: &[&str]) -> Vec<String> {
+    let name = |w: &str| w.starts_with(|c: char| c.is_alphabetic() || c == '_');
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i];
+        if let (Some(&x), Some(&"]"), "[") = (words.get(i + 1), words.get(i + 2), w) {
+            if name(x) {
+                out.push(x.to_string());
+                i += 3;
+                continue;
+            }
+        }
+        match w.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+            Some(inner) if name(inner) => out.push(inner.to_string()),
+            _ => out.push(w.to_string()),
+        }
+        i += 1;
+    }
+    out
+}
+
 impl DataType {
     pub fn unknown() -> Self {
         DataType {
@@ -34,6 +61,10 @@ impl DataType {
 
     /// Parses a type from its words, e.g. `["character", "varying", "(", "50", ")"]`.
     pub fn parse(words: &[&str]) -> Self {
+        let text = render(words);
+        let words = unbracket(words);
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        let words = &words[..];
         let mut names = Vec::new();
         let mut args = Vec::new();
         let mut max = false;
@@ -67,7 +98,6 @@ impl DataType {
                 _ => names.push(w.to_ascii_uppercase()),
             }
         }
-        let text = render(words);
         if names.is_empty() {
             return DataType {
                 text,
@@ -217,5 +247,32 @@ mod tests {
         assert!(t.max && t.char_length().is_none());
         assert_eq!(DataType::parse_str("int").base, "INTEGER");
         assert_eq!(DataType::parse_str("char").char_length(), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod bracket_tests {
+    use super::DataType;
+
+    #[test]
+    fn a_bracketed_type_name_is_the_type() {
+        // Lexed as one word or as `[`, name, `]`.
+        for words in [
+            vec!["[nvarchar]", "(", "20", ")"],
+            vec!["[", "nvarchar", "]", "(", "20", ")"],
+        ] {
+            let t = DataType::parse(&words);
+            assert_eq!(
+                (t.base.as_str(), t.args.as_slice()),
+                ("NVARCHAR", &[20][..])
+            );
+        }
+        assert_eq!(DataType::parse(&["[sysname]"]).base, "SYSNAME");
+    }
+
+    #[test]
+    fn an_array_bound_is_still_an_array() {
+        assert_eq!(DataType::parse(&["integer", "[", "]"]).base, "INTEGER[]");
+        assert_eq!(DataType::parse(&["integer", "[]"]).base, "INTEGER[]");
     }
 }
