@@ -318,3 +318,87 @@ fn a_lower_case_name_the_catalog_also_spells_in_another_case_is_not_equal() {
     );
     not_equal(&r, "differ only in letter case");
 }
+
+// An IF condition names columns and tables like a statement does: its
+// quoted names fold the same way (no corpus file is special here).
+
+const IF_T: &str = "IF NOT EXISTS (SELECT 1 FROM Integration.Lineage WHERE [Lineage Key] = @k)\n    UPDATE Integration.Lineage SET [Rows Loaded] = @n WHERE [Lineage Key] = 0;";
+const IF_P: &str = "IF NOT EXISTS (SELECT 1 FROM Integration.Lineage WHERE \"Lineage Key\" = p_k) THEN\n        UPDATE Integration.Lineage SET \"Rows Loaded\" = p_n WHERE \"Lineage Key\" = 0;\n    END IF;";
+
+#[test]
+fn an_if_condition_on_quoted_columns_is_equal() {
+    // An error in the UPDATE would let T-SQL go on: XACT_ABORT ON, as the
+    // converter's procedures say.
+    let a = tsql_proc(&format!("SET XACT_ABORT ON;\n    {IF_T}"));
+    equal(&run(&a, &pg_proc(IF_P)));
+}
+
+#[test]
+fn an_if_condition_whose_names_differ_only_in_case_is_not_equal() {
+    // The catalog has "Lineage Key" and "lineage key": [Lineage Key] could be either.
+    let clash = CAT_P.replace(
+        "\"Rows Loaded\" integer NULL",
+        "\"Rows Loaded\" integer NULL,\n    \"lineage key\" integer NULL",
+    );
+    let r = run_with(&tsql_proc(IF_T), &pg_proc(IF_P), Some(&clash));
+    never_equal(&r);
+}
+
+// SSMS scripts write every type as a bracketed identifier. `[nvarchar](20)`
+// and `[sysname]` are the types of those names, so a string literal against
+// such a column is a string comparison, as it is against `nvarchar(20)`.
+
+const CAT_BRACKETED_T: &str = "CREATE SCHEMA Integration;
+GO
+CREATE TABLE Integration.Lineage (
+    [Lineage Key] [int] NOT NULL CONSTRAINT PK_Lineage PRIMARY KEY,
+    [Table Name] [sysname] NOT NULL,
+    [Source] [nvarchar](20) NULL
+);
+";
+
+const CAT_BRACKETED_P: &str = "CREATE SCHEMA integration;
+CREATE TABLE Integration.Lineage (
+    \"Lineage Key\" integer NOT NULL CONSTRAINT PK_Lineage PRIMARY KEY,
+    \"Table Name\" varchar(128) NOT NULL,
+    \"Source\" varchar(20) NULL
+);
+";
+
+fn run_bracketed(a: &str, b: &str) -> Report {
+    let o = Options {
+        catalog_a: vec![Artifact::new("cat.sql", T, CAT_BRACKETED_T)],
+        catalog_b: vec![Artifact::new("cat.pg.sql", P, CAT_BRACKETED_P)],
+        ..Options::default()
+    };
+    diff(
+        &Artifact::new("a.sql", T, a),
+        &Artifact::new("b.sql", P, b),
+        &o,
+    )
+}
+
+#[test]
+fn a_literal_against_a_bracketed_type_column_is_a_string_comparison() {
+    let a = tsql_proc("UPDATE Integration.Lineage SET [Lineage Key] = @k WHERE [Table Name] = N'City' AND [Source] IS NULL;");
+    let b = pg_proc("UPDATE Integration.Lineage SET \"Lineage Key\" = p_k WHERE \"Table Name\" = 'City' AND \"Source\" IS NULL;");
+    let r = run_bracketed(&a, &b);
+    // A typed string comparison: the plain diff reports T-SQL's case
+    // and trailing-space rules (an untyped comparison could not say which
+    // rule differs); in a conversion check it is the reviewer's
+    // ASM-CI-COLLATION.
+    assert_eq!(
+        rules(&r),
+        ["equiv.case-sensitivity", "equiv.trailing-spaces"]
+    );
+    let _ci = sqldiff_core::equiv::compare::ci_collation_scope(true);
+    let r = run_bracketed(&a, &b);
+    assert_eq!(
+        r.verdict(),
+        Verdict::EqualUnderAssumptions,
+        "{:?} {:?}",
+        rules(&r),
+        r.unknown_reasons
+    );
+    assert!(r.assumptions.iter().any(|a| a.id == "ASM-CI-COLLATION"));
+}

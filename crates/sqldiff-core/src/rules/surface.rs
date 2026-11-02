@@ -320,6 +320,8 @@ impl Scope {
             Expr::Var(v) => n("var", vec![a(v.clone())]),
             Expr::Num(s) => n("num", vec![a(s.clone())]),
             Expr::Str(s) => n("str", vec![a(s.clone())]),
+            Expr::Bytes(h) => n("bytes", vec![a(h.clone())]),
+            Expr::Duration(x, unit) => n("duration", vec![a(unit.clone()), self.expr(x)?]),
             Expr::Null => n("null", vec![]),
             Expr::Star(None) => n("star", vec![]),
             Expr::Star(Some(t)) => n("star", vec![a(t.clone())]),
