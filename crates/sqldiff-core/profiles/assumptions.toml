@@ -264,9 +264,9 @@ sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/ddl.rs"]
 
 [[assumption]]
 id = "ASM-COLUMN-RANGE"
-statement = "Stored values stay within what both sides' column types accept."
+statement = "Stored values, and the money intermediates that compute them, stay within what both sides' column types accept."
 discharge = "generated"
-fact = "CHECK constraints on the converted columns that reject what the original type rejects."
+fact = "CHECK constraints on the converted columns that reject what the original type rejects; and the operands of a money computed column (a sum, difference or product of money columns and integers of at most 32 bits, possibly several operations) never take an intermediate result outside the money range (+/-922,337,203,685,477.5808), where SQL Server raises an error and numeric(19, 4) does not."
 sites = ["sqldiff-core/src/equiv/table.rs"]
 
 [[assumption]]
@@ -707,6 +707,13 @@ fact = "How the application calls the procedure and reads its result set."
 sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
+id = "ASM-RESULTSET-REFCURSOR"
+statement = "Callers of the procedure that returns its result sets through INOUT refcursor parameters (result_set_1, …) call it inside a transaction block, FETCH ALL from each cursor in the order of the parameters before they commit, treat a cursor left NULL as a result set T-SQL did not send, and accept the PostgreSQL column types and that a failure while the rows are read surfaces on FETCH, after the procedure returned. Rows T-SQL had already sent are lost when a later statement of the procedure fails (the failed CALL returns no cursors), as under ASM-RESULT-SET-FUNCTION."
+discharge = "deployment"
+fact = "How the application calls the procedure and reads its result sets."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-SEQUENCE-DEFAULT-TRIGGER"
 statement = "Db2 for i: no INSERT writes NULL into a column whose T-SQL default is NEXT VALUE FOR (T-SQL refuses it; the converted BEFORE INSERT trigger fills in the next value), and nothing drops the default by its constraint name."
 discharge = "deployment"
@@ -732,7 +739,7 @@ id = "ASM-POSTGIS-GEOGRAPHY"
 statement = "PostgreSQL: the postgis extension is installed and its types are on the search path; a T-SQL GEOGRAPHY value is carried unchanged as a PostGIS geography (spatial methods are converted, or refused, on their own)."
 discharge = "deployment"
 fact = "The target database has CREATE EXTENSION postgis."
-sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/bind/mod.rs"]
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-convert/src/tsql/geography.rs", "sqldiff-core/src/bind/mod.rs"]
 
 [[assumption]]
 id = "ASM-NO-CALLER-TXN"
@@ -904,6 +911,13 @@ fact = "The converted statement draws the value once (a variable)."
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-ROLE-NOLOGIN"
+statement = "A T-SQL database role is the PostgreSQL role of the same name created NOLOGIN: the role has no login of its own, and no other PostgreSQL role of that name exists on the target cluster."
+discharge = "deployment"
+fact = "The target cluster has no other role of that name (PostgreSQL roles are cluster-wide), and the T-SQL role has no login of its own."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/ddl.rs"]
+
+[[assumption]]
 id = "ASM-RANDOM-FRESH"
 statement = "NEWID() and gen_random_uuid() are the same, and RAND() and random() (both without a seed) are the same: each evaluation draws a fresh value from the same range, and a RAND() is compared only in a statement that evaluates it once."
 discharge = "nothing"
@@ -944,7 +958,7 @@ id = "ASM-RETURN-CODE"
 statement = "Callers read a PostgreSQL procedure's return code from its return_code INOUT parameter."
 discharge = "deployment"
 fact = "How callers read the return code."
-sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/call.rs"]
 
 [[assumption]]
 id = "ASM-RETURN-LENGTHS"

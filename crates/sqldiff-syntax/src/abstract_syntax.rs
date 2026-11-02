@@ -1048,6 +1048,22 @@ impl<'a> Parser<'a> {
     fn postfix(&mut self) -> PResult<Expr> {
         let mut e = self.primary()?;
         loop {
+            // T-SQL `geography::Point(…)`: a static method of a CLR type, read
+            // as a call named `geography::Point`. Only the call form is read.
+            if let (Dialect::Tsql, Expr::Name(n)) = (self.d, &e) {
+                if let [ty] = n.as_slice() {
+                    if self.is_op("::")
+                        && self.peek_at(1).is_some_and(|t| t.kind == K::Word)
+                        && self.is_kind_at(2, K::LParen)
+                    {
+                        let ty = ty.clone();
+                        self.i += 1;
+                        let method = self.any_ident()?;
+                        e = self.call(vec![format!("{ty}::{method}")])?;
+                        continue;
+                    }
+                }
+            }
             if self.eat_op("::") {
                 let ty = self.ty()?;
                 e = Expr::Cast(Box::new(e), ty);
@@ -1728,6 +1744,24 @@ impl<'a> Parser<'a> {
                     assign: Some(v),
                 });
             }
+        }
+        // T-SQL `alias = expr`: a column alias (a comparison needs more than
+        // the name in front of the `=`; checked on SQL Server 2022).
+        if self.d == Dialect::Tsql
+            && self
+                .peek()
+                .is_some_and(|t| t.kind == K::Quoted || t.kind == K::Word && !is_reserved(&t.up))
+            && self.is_kind_at(1, K::Op)
+            && self.peek_at(1).unwrap().text == "="
+        {
+            let alias = self.ident()?;
+            self.i += 1;
+            let expr = self.expr()?;
+            return Ok(SelItem {
+                expr,
+                alias: Some(alias),
+                assign: None,
+            });
         }
         let expr = self.expr()?;
         let alias = self.alias()?;

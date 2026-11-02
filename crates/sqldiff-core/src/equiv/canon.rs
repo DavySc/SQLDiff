@@ -194,6 +194,10 @@ pub mod asm {
         "ASM-RESULT-SET-FUNCTION",
         "Callers of the procedure that became a PostgreSQL function RETURNS TABLE read its rows with SELECT … FROM the function (in the order it returns them) where they ran EXEC, and accept that the columns have the PostgreSQL types and that a failing statement returns no rows (SQL Server may have sent some before the error)",
     );
+    pub const RESULTSET_REFCURSOR: (&str, &str) = (
+        "ASM-RESULTSET-REFCURSOR",
+        "Callers of the procedure that returns its result sets through INOUT refcursor parameters (result_set_1, …) call it inside a transaction block, FETCH ALL from each cursor in the order of the parameters before they commit, treat a cursor left NULL as a result set T-SQL did not send, and accept the PostgreSQL column types and that a failure while the rows are read surfaces on FETCH, after the procedure returned",
+    );
     pub const OUTPUT_TARGET_TRIGGERS: (&str, &str) = (
         "ASM-OUTPUT-TARGET-TRIGGERS",
         "The table a statement with OUTPUT but no INTO changes has no enabled trigger: SQL Server rejects the statement otherwise (Msg 334), where PostgreSQL returns the rows",
@@ -321,11 +325,29 @@ impl How {
     }
 }
 
+/// Whether a chain of money operations is read (`a + b - c`). SQL Server
+/// raises an error when an intermediate money value leaves its range where
+/// the final value is inside it, and numeric(19, 4) does not; ASM-COLUMN-RANGE
+/// covers it since the owner approved its wording to include "the money
+/// intermediates that compute" the stored values (2026-11-02).
+/// `sqldiff-convert` follows this switch.
+pub const MONEY_CHAINS: bool = true;
+
+/// A term made by arithmetic (an intermediate result, not a column).
+fn chained(t: &Term) -> bool {
+    matches!(t.head(), "add" | "sub" | "mul" | "arith")
+}
+
 /// Whether a conversion means the same in every dialect.
 enum Rule {
     Same,
     /// T-SQL drops the fraction first.
     Trunc,
+    /// T-SQL money to a whole number: rounded half away from zero, like
+    /// PostgreSQL numeric(19, 4) (1.5 → 2, -2.5 → -3). It is written as the
+    /// PostgreSQL conversion of that numeric, so the two sides meet in one
+    /// term and every other pairing keeps its existing classification.
+    MoneyAsNumeric,
     /// Dialect-specific (or not checked).
     Dialect,
 }
@@ -370,6 +392,14 @@ pub struct Canon<'a> {
     /// PostgreSQL compared with T-SQL: quoted names may fold to lower case
     /// (see `stmt`).
     pub fold_quoted: bool,
+    /// Binary variables the statement passes to a geography-from-WKB call
+    /// with the bytes the code before it fixes them to (lower-case name,
+    /// lower-case hex): see `known_bytes`.
+    pub known_bytes: Vec<(String, String)>,
+    /// The expression's value is stored in a column of the declared type
+    /// (a computed or generated column), so T-SQL's money range errors fall
+    /// under ASM-COLUMN-RANGE (see `money_arith`).
+    pub stored_values: bool,
     /// The dialect of the statements this one is compared with, when known:
     /// an unqualified PostgreSQL call may then be the conversion of a T-SQL
     /// `dbo` function (`user_fn`).
@@ -746,6 +776,8 @@ impl<'a> Canon<'a> {
             rec_bounds: Vec::new(),
             by_name: false,
             fold_quoted: false,
+            known_bytes: Vec::new(),
+            stored_values: false,
             other: None,
             names: Vec::new(),
             output: None,
@@ -780,6 +812,104 @@ impl<'a> Canon<'a> {
             (Dialect::Postgres, "str") => g::from_ewkb(&g::unhex(text)?),
             _ => None,
         }
+    }
+
+    /// The constant term of a geography point: its coordinates as bits.
+    fn geog_term(p: &super::geography::Point) -> Term {
+        let bits = |f: Option<f64>| a(f.map_or("-".into(), |f| format!("{:016x}", f.to_bits())));
+        n(
+            "geog",
+            vec![
+                a(p.srid.to_string()),
+                bits(Some(p.x)),
+                bits(Some(p.y)),
+                bits(p.z),
+                bits(p.m),
+            ],
+        )
+    }
+
+    /// The geography calls with a constant value: T-SQL
+    /// `geography::STGeomFromWKB(wkb, 4326)` and `geography::Point(lat, lon,
+    /// 4326)` against PostGIS `ST_GeomFromWKB(wkb, 4326)` and
+    /// `ST_SetSRID(ST_MakePoint(lon, lat), 4326)`, which the cast to
+    /// geography then completes. Equal only where the arguments are
+    /// constants both engines read to the same value
+    /// ([`super::geography::wkb`]); every other call keeps its dialect's
+    /// marker, because SQL Server raises on input PostGIS moves into range
+    /// or accepts (latitude beyond ±90, NaN, trailing bytes).
+    fn geography_call(&mut self, c: &Call, name: &str) -> R<Option<(Term, Option<Ty>)>> {
+        use super::geography as g;
+        let tsql_wkb = self.d == Dialect::Tsql && name == "geography::stgeomfromwkb";
+        let tsql_point = self.d == Dialect::Tsql && name == "geography::point";
+        let pg_wkb = self.d == Dialect::Postgres && name == "st_geomfromwkb";
+        let pg_srid = self.d == Dialect::Postgres && name == "st_setsrid";
+        if c.name.len() != 1 || !(tsql_wkb || tsql_point || pg_wkb || pg_srid) {
+            return Ok(None);
+        }
+        let srid_4326 = |e: Option<&Expr>| matches!(e, Some(Expr::Num(s)) if s == "4326");
+        let value: Option<Term> = if tsql_wkb || pg_wkb {
+            let known = |x: &Expr| -> Option<Term> {
+                let v = match x {
+                    Expr::Var(v) => v.trim_start_matches('@').to_lowercase(),
+                    Expr::Name(p) if p.len() == 1 => p[0].to_lowercase(),
+                    _ => return None,
+                };
+                let (_, hex) = self.known_bytes.iter().find(|(k, _)| *k == v)?;
+                Some(n("bytes", vec![a(hex.clone())]))
+            };
+            let (bytes, _) = match c.args.first() {
+                Some(x) if c.args.len() == 2 && srid_4326(c.args.get(1)) => match known(x) {
+                    Some(t) => (t, None),
+                    None => self.expr(x)?,
+                },
+                _ => (n("none", vec![]), None),
+            };
+            match (bytes.kid(0).and_then(Term::atom), bytes.is("bytes")) {
+                (Some(h), true) => match g::unhex(h).and_then(|b| g::wkb(&b)) {
+                    Some(g::Wkb::Point(p)) => Some(Self::geog_term(&p)),
+                    Some(g::Wkb::Shape(h)) => Some(n("geog-wkb", vec![a(h)])),
+                    None => None,
+                },
+                _ => None,
+            }
+        } else if tsql_point {
+            // Point(lat, lon, srid)
+            match c.args.as_slice() {
+                [la, lo, sr] if srid_4326(Some(sr)) => {
+                    g::point_of(la, lo).map(|p| Self::geog_term(&p))
+                }
+                _ => None,
+            }
+        } else if pg_srid {
+            // ST_SetSRID(ST_MakePoint(lon, lat), 4326)
+            match c.args.as_slice() {
+                [Expr::Call(mk), sr]
+                    if srid_4326(Some(sr))
+                        && mk.name.len() == 1
+                        && lc(&mk.name[0]) == "st_makepoint"
+                        && mk.args.len() == 2 =>
+                {
+                    g::point_of(&mk.args[1], &mk.args[0]).map(|p| Self::geog_term(&p))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(v) = value {
+            return Ok(Some(if self.d == Dialect::Tsql {
+                (v, Some(Ty::of(Fam::Geography)))
+            } else {
+                (n("geom-of", vec![v]), None)
+            }));
+        }
+        let mut args = vec![self.dtag(), a(name)];
+        for x in &c.args {
+            args.push(self.expr(x)?.0);
+        }
+        let ty = (self.d == Dialect::Tsql).then(|| Ty::of(Fam::Geography));
+        Ok(Some((n("dfn", args), ty)))
     }
 
     /// SQL Server cannot compare geography, text, ntext, image or xml values
@@ -1141,6 +1271,10 @@ impl<'a> Canon<'a> {
 
     /// Whether a value of type `src` is stored in `dst` unchanged.
     fn fits(&self, dst: &Ty, src: &Ty) -> bool {
+        // An int (up to 32 bits) is inside the money range; a bigint is not.
+        if dst.fam == Fam::Money && src.fam == Fam::Int {
+            return src.len.is_some_and(|l| l <= 32);
+        }
         if dst.fam != src.fam {
             // PostgreSQL drops the trailing blanks of a CHAR value converted
             // to varchar or text ('a  ' becomes 'a'); SQL Server keeps them.
@@ -1175,6 +1309,8 @@ impl<'a> Canon<'a> {
             // IMAGE, MONEY, an alias type, …): the store may pad, cut off,
             // round or fail.
             Fam::Other => false,
+            // Money against money: the same decimal(19, 4).
+            Fam::Money => true,
             Fam::Date
             | Fam::Interval
             | Fam::Bool
@@ -1661,6 +1797,11 @@ impl<'a> Canon<'a> {
                     } else {
                         (n("not", vec![self.bare_bool(t, ty)]), None)
                     }
+                } else if ty.is_some_and(|t| t.fam == Fam::Money) {
+                    // SQL Server raises an error for the negative of the
+                    // smallest money value (-922,337,203,685,477.5808),
+                    // numeric(19, 4) negates it: per dialect.
+                    (n("dneg", vec![self.dtag(), t]), ty)
                 } else {
                     (n("neg", vec![t]), ty)
                 }
@@ -2245,21 +2386,14 @@ impl<'a> Canon<'a> {
             // A point constant both read alike: SQL Server's binary form,
             // PostGIS's hex EWKB text (super::geography has the runs).
             if let Some(p) = self.geog_point(&v.0) {
-                let bits =
-                    |f: Option<f64>| a(f.map_or("-".into(), |f| format!("{:016x}", f.to_bits())));
-                return (
-                    n(
-                        "geog",
-                        vec![
-                            a(p.srid.to_string()),
-                            bits(Some(p.x)),
-                            bits(Some(p.y)),
-                            bits(p.z),
-                            bits(p.m),
-                        ],
-                    ),
-                    to,
-                );
+                return (Self::geog_term(&p), to);
+            }
+            // PostGIS `ST_GeomFromWKB(…)::geography`, already read as the
+            // value both dialects keep (see `geography_call`).
+            if v.0.is("geom-of") {
+                if let Some(inner) = v.0.kid(0) {
+                    return (inner.clone(), to);
+                }
             }
             return (
                 n(
@@ -2320,6 +2454,23 @@ impl<'a> Canon<'a> {
                 n(
                     head,
                     vec![Self::ty_term(&to), n("fn", vec![a("trunc"), v.0])],
+                ),
+                to,
+            ),
+            Rule::MoneyAsNumeric => (
+                n(
+                    "dcast",
+                    vec![
+                        a(Dialect::Postgres.id()),
+                        a(how.name()),
+                        Self::ty_term(&to),
+                        Self::ty_term(&Some(Ty {
+                            fam: Fam::Exact,
+                            len: Some(19),
+                            scale: Some(4),
+                        })),
+                        v.0,
+                    ],
                 ),
                 to,
             ),
@@ -2386,6 +2537,14 @@ impl<'a> Canon<'a> {
             };
         }
         match (src.fam, dst.fam) {
+            // T-SQL money converts to a whole number and to a decimal the
+            // way PostgreSQL numeric(19, 4) does: rounded half away from
+            // zero, an error when it does not fit (eval/builtins/
+            // 2026-11-02-money: toint, tobigint, todec, todec0, todec4).
+            (Money, Int) => Rule::MoneyAsNumeric,
+            (Money, Exact) => Rule::Same,
+            (Money, Money) => Rule::Same,
+            (Money, _) | (_, Money) => Rule::Dialect,
             // Out of range is an error on both sides.
             (Int, Int | Exact | Float) => Rule::Same,
             // Both round half away from zero (1.555 → 1.56, -2.5 → -3).
@@ -2542,6 +2701,9 @@ impl<'a> Canon<'a> {
             }
         }
         let name = lc(c.name.last().map(String::as_str).unwrap_or(""));
+        if let Some(t) = self.geography_call(c, &name)? {
+            return Ok(t);
+        }
         // A qualified name is a user function, even `dbo.max`: T-SQL calls a
         // built-in unqualified only.
         if c.name.len() > 1 {
@@ -3225,6 +3387,12 @@ impl<'a> Canon<'a> {
             }
             (_, "upper" | "ucase", 1) => portable("upper", args, first_ty),
             (_, "lower" | "lcase", 1) => portable("lower", args, first_ty),
+            // ABS of the smallest money value raises an error in SQL Server
+            // where numeric(19, 4) returns it: per dialect.
+            (_, "abs", 1) if first_ty.is_some_and(|t| t.fam == Fam::Money) => (
+                n("dfn", vec![self.dtag(), a(name.clone()), args[0].0.clone()]),
+                first_ty,
+            ),
             (_, "abs", 1) => portable("abs", args, first_ty),
             (_, "min" | "max", 1) => match first_ty {
                 Some(t) if t.orders_per_dialect() => (
@@ -3255,6 +3423,12 @@ impl<'a> Canon<'a> {
             }
             (Dialect::Tsql, "sysdatetime", 0) => self.time("stmt"),
             (Dialect::Tsql, "getdate", 0) => self.time("stmt-datetime"),
+            // PostgreSQL fixes statement_timestamp() per client message, so inside a
+            // routine every statement of one CALL reads the call's start: never the
+            // per-statement time T-SQL's SYSDATETIME() gives.
+            (Dialect::Postgres, "statement_timestamp", 0) if self.unit.kind != UnitKind::Script => {
+                self.time("call")
+            }
             (Dialect::Postgres, "statement_timestamp", 0) => self.time("stmt"),
             (Dialect::Postgres, "now" | "transaction_timestamp", 0) => self.time("txn"),
             (Dialect::Postgres, "clock_timestamp", 0) => self.time("clock"),
@@ -3664,6 +3838,16 @@ impl<'a> Canon<'a> {
                         Some(Ty::of(Fam::Bool)),
                     ));
                 }
+                // T-SQL converts money to a float it meets (to real, when
+                // that is the float): not the same comparison as numeric
+                // against double precision.
+                if any(&|t| t.fam == Fam::Money) && any(&|t| t.fam == Fam::Float) {
+                    let (x, y, op) = order_operands(op, lt, rt);
+                    return Ok((
+                        n("cmp-dialect", vec![self.dtag(), a(op), x, y]),
+                        Some(Ty::of(Fam::Bool)),
+                    ));
+                }
                 let string = any(&|t| t.is_string());
                 let known = lty.is_some() || rty.is_some();
                 if string && any(&|t| !t.is_string()) {
@@ -3777,6 +3961,16 @@ impl<'a> Canon<'a> {
                 }),
             )),
             "+" | "-" | "*" | "/" | "%" => {
+                // T-SQL money (see `Fam::Money`).
+                let (lty, rty) = match self.money_operands(op, &lt, lty, &rt, rty) {
+                    Ok(types) => types,
+                    Err(()) => {
+                        return Ok(self.money_arith(op, lt, lty, rt, rty));
+                    }
+                };
+                let any = |f: &dyn Fn(&Ty) -> bool| {
+                    lty.as_ref().is_some_and(f) || rty.as_ref().is_some_and(f)
+                };
                 // Only numbers add alike everywhere: T-SQL `+` concatenates
                 // binary strings, PostgreSQL has no bytea `+`.
                 if any(&|t| !t.is_numeric()) || lt.is("bytes") || rt.is("bytes") {
@@ -3853,6 +4047,22 @@ impl<'a> Canon<'a> {
             return (n("dfn", vec![a("tsql"), a("+"), lt, rt]), None);
         }
         let len = if self.d == Dialect::Tsql { len } else { None };
+        // Two constants join into one: a geography built from a long binary
+        // assembled in pieces (`SET @b += 0x…`) is then read as a whole.
+        if let (true, Some(l), Some(r)) = (
+            lt.is("bytes") && rt.is("bytes"),
+            lt.kid(0).and_then(Term::atom),
+            rt.kid(0).and_then(Term::atom),
+        ) {
+            return (
+                n("bytes", vec![a(format!("{l}{r}"))]),
+                Some(Ty {
+                    fam: Fam::Binary,
+                    len,
+                    scale: None,
+                }),
+            );
+        }
         (
             n("concat-bin", vec![lt, rt]),
             Some(Ty {
@@ -3880,6 +4090,105 @@ impl<'a> Canon<'a> {
                 .and_then(Term::atom)
                 .and_then(|x| x.parse::<i64>().ok())
                 .is_some_and(|x| x.abs() <= 1 << 24)
+    }
+
+    /// The operand types of an arithmetic operator when one is T-SQL money.
+    /// Money with a decimal is decimal arithmetic on a decimal(19, 4), the
+    /// result a decimal that no money range limits (SQL Server 2022:
+    /// money + decimal(9, 2) is decimal(20, 4), money * 2.5 decimal(22, 5)),
+    /// so the operands go on as exact numbers. `Err` for every other use of
+    /// money, which `money_arith` decides. Without money: unchanged.
+    fn money_operands(
+        &self,
+        _op: &str,
+        _lt: &Term,
+        lty: Option<Ty>,
+        _rt: &Term,
+        rty: Option<Ty>,
+    ) -> Result<(Option<Ty>, Option<Ty>), ()> {
+        let money = |t: &Option<Ty>| t.is_some_and(|t| t.fam == Fam::Money);
+        if !money(&lty) && !money(&rty) {
+            return Ok((lty, rty));
+        }
+        // An intermediate money value may leave the money range.
+        if !MONEY_CHAINS && ((money(&lty) && chained(_lt)) || (money(&rty) && chained(_rt))) {
+            return Err(());
+        }
+        let known_dec = |t: &Option<Ty>| {
+            t.is_some_and(|t| t.fam == Fam::Exact && t.len.is_some() && t.scale.is_some())
+        };
+        let as_dec = |t: Option<Ty>| {
+            if money(&t) {
+                Some(Ty {
+                    fam: Fam::Exact,
+                    len: Some(19),
+                    scale: Some(4),
+                })
+            } else {
+                t
+            }
+        };
+        if (money(&lty) && known_dec(&rty)) || (known_dec(&lty) && money(&rty)) {
+            return Ok((as_dec(lty), as_dec(rty)));
+        }
+        Err(())
+    }
+
+    /// `+`, `-` and `*` where an operand is T-SQL money and the other money
+    /// or an integer: exact on both sides (SQL Server 2022 against
+    /// PostgreSQL numeric(19, 4), eval/builtins/2026-11-02-money: add, sub,
+    /// mulint, intmul, addint), except that SQL Server raises an error
+    /// outside the money range where numeric(19, 4) holds 10^15. That
+    /// difference is ASM-COLUMN-RANGE when the value is stored in a column
+    /// (`stored_values`); anywhere else the operation stays per dialect.
+    /// A money product or quotient is rounded to four decimals by SQL
+    /// Server and exact in PostgreSQL, a quotient of two money values keeps
+    /// four decimals where numeric division keeps more, and money with a
+    /// float or a string converts differently: all per dialect.
+    fn money_arith(
+        &mut self,
+        op: &str,
+        lt: Term,
+        lty: Option<Ty>,
+        rt: Term,
+        rty: Option<Ty>,
+    ) -> (Term, Option<Ty>) {
+        let is = |t: &Option<Ty>, f: Fam| t.is_some_and(|t| t.fam == f);
+        // SQL Server converts an integer to money before it computes, and a
+        // bigint may be outside the money range where the sum or product of
+        // it is not (bigint 10^15 * money 0 fails, numeric stores 0): only
+        // integers of at most 32 bits.
+        let int = |t: &Option<Ty>| {
+            t.is_some_and(|t| t.fam == Fam::Int && t.len.is_some_and(|l| l > 1 && l <= 32))
+        };
+        let (lm, rm) = (is(&lty, Fam::Money), is(&rty, Fam::Money));
+        let ok = self.stored_values
+            && (MONEY_CHAINS || !(chained(&lt) || chained(&rt)))
+            && self.d == Dialect::Tsql
+            && match op {
+                "+" | "-" => (lm || int(&lty)) && (rm || int(&rty)),
+                "*" => (lm && int(&rty)) || (int(&lty) && rm),
+                _ => false,
+            };
+        if !ok {
+            return (n("arith", vec![self.dtag(), a(op), lt, rt]), None);
+        }
+        self.assume(super::table::asm::COLUMN_RANGE);
+        let ty = Some(Ty {
+            fam: Fam::Money,
+            len: Some(19),
+            scale: Some(4),
+        });
+        let head = match op {
+            "+" => "add",
+            "-" => "sub",
+            _ => "mul",
+        };
+        let mut v = vec![lt, rt];
+        if head != "sub" {
+            v.sort();
+        }
+        (n(head, v), ty)
     }
 
     /// The type of an exact product of two exact numbers (integers or
@@ -4485,14 +4794,18 @@ impl<'a> Canon<'a> {
                 self.scopes = saved;
                 let (mut parts, items) = q?;
                 let key = alias.clone().map(|x| lc(&x)).unwrap_or_default();
-                // The bit and boolean columns, by the name the item gives them.
+                // The typed columns, by the name the item gives them: a column
+                // read through a derived table has the type of the item (a
+                // decimal read through `(SELECT Amt FROM t) x` is still a
+                // decimal, whose fraction an integer store drops). An item of
+                // unknown type stays unknown.
                 if query.set_ops.is_empty() && query.items.len() == items.len() {
                     let bits: Vec<(String, Ty)> = query
                         .items
                         .iter()
                         .zip(&items)
                         .filter_map(|(it, (_, ty))| {
-                            let ty = ty.filter(|_| self.is_bit(ty) || self.is_bool(ty))?;
+                            let ty = (*ty)?;
                             let name = match (&it.alias, &it.expr) {
                                 (Some(a), _) => a.clone(),
                                 (None, Expr::Name(p)) => p.last()?.clone(),
@@ -4501,9 +4814,15 @@ impl<'a> Canon<'a> {
                             Some((lc(name.trim_matches(['[', ']', '"'])), ty))
                         })
                         .collect();
-                    if !bits.is_empty() {
+                    // Replaces what an earlier derived table of the same alias
+                    // left, also when this one has no typed column.
+                    if bits.is_empty() {
+                        self.sub_bits.remove(&format!("sub:{key}"));
+                    } else {
                         self.sub_bits.insert(format!("sub:{key}"), bits);
                     }
+                } else {
+                    self.sub_bits.remove(&format!("sub:{key}"));
                 }
                 let unique = sqldiff_syntax::abstract_syntax::group_key(query)
                     .map(|k| k.iter().map(|c| lc(c)).collect());
@@ -4708,7 +5027,12 @@ impl<'a> Canon<'a> {
             return Err("SELECT INTO here is not supported".into());
         }
         self.scopes.push(Vec::new());
+        // The derived tables this query binds (their column types) end with
+        // it: a subquery's `(SELECT …) x` must not leave its types under the
+        // alias of an outer `x`.
+        let derived_types = self.sub_bits.clone();
         let r = self.query_inner(s, ctx);
+        self.sub_bits = derived_types;
         self.scopes.pop();
         r
     }
@@ -5271,7 +5595,8 @@ impl<'a> Canon<'a> {
                 return self.result_stmt(&s, Some(&o));
             }
         }
-        if self.d == Dialect::Postgres {
+        // A procedure's cursor has no declared columns to cast to.
+        if self.d == Dialect::Postgres && self.unit.kind != UnitKind::Proc {
             let items: Vec<&Expr> = match (s, o) {
                 (_, Some(o)) => o.items.iter().map(|i| &i.expr).collect(),
                 (Stmt::Select(q), None) => q.items.iter().map(|i| &i.expr).collect(),
@@ -5742,6 +6067,43 @@ impl<'a> Canon<'a> {
         Ok(n(if m.error { "raise-error" } else { "message" }, parts))
     }
 
+    /// Whether the catalog shows the table (name parts as written) unique on
+    /// a key all of whose columns are among `cols`.
+    fn schema_unique(&self, table: &[String], cols: &[String]) -> bool {
+        let Some(last) = table.last() else {
+            return false;
+        };
+        let t = if table.len() >= 2 {
+            let sch = table[table.len() - 2].as_str();
+            let sch = (!matches!(sch, "dbo" | "public")).then_some(sch);
+            self.schema.table_exact(sch, last)
+        } else {
+            self.schema.table(last)
+        };
+        t.is_some_and(|t| t.is_unique(cols))
+    }
+
+    /// Whether the catalog shows the table (name parts as written) and none
+    /// of `cols` in any of its keys or indexes.
+    fn schema_unindexed(&self, table: &[String], cols: &[String]) -> bool {
+        use crate::catalog::{Ident, Lookup};
+        let Some(view) = self.schema.catalog() else {
+            return false;
+        };
+        let parts: Vec<Ident> = table.iter().map(|p| Ident::plain(p.clone())).collect();
+        let Lookup::Found(t) = view.table(&parts) else {
+            return false;
+        };
+        t.keys
+            .iter()
+            .map(|k| &k.columns)
+            .chain(t.indexes.iter().map(|i| &i.columns))
+            .all(|k| {
+                !k.iter()
+                    .any(|c| cols.iter().any(|x| x.eq_ignore_ascii_case(c)))
+            })
+    }
+
     /// A statement of a cursor loop (`cursor.rs`): `cursor-open(key, q)`
     /// with the query as a list of values per row and its ORDER BY,
     /// `cursor-fetch(key, assign…)` with each target set to its column as an
@@ -5750,7 +6112,32 @@ impl<'a> Canon<'a> {
     pub fn cursor_op(&mut self, op: &super::cursor::CursorOp) -> R<Term> {
         use super::cursor::CursorOp;
         match op {
-            CursorOp::Open { key, query, tsql } => {
+            CursorOp::Open {
+                key,
+                query,
+                tsql,
+                keyed,
+            } => {
+                for r in keyed {
+                    let (ok, need) = match r.kind {
+                        super::cursor::KeyKind::Unique => {
+                            (self.schema_unique(&r.table, &r.cols), "being unique on")
+                        }
+                        super::cursor::KeyKind::Unindexed => (
+                            self.schema_unindexed(&r.table, &r.cols),
+                            "having none of these columns in a key or index:",
+                        ),
+                    };
+                    if !ok {
+                        let why = format!(
+                            "a cursor loop's write relies on {} {need} ({}), which the catalog does not show",
+                            r.table.join("."),
+                            r.cols.join(", ")
+                        );
+                        self.cursor_failed.insert(key.clone(), why.clone());
+                        return Err(why);
+                    }
+                }
                 let read = query
                     .as_ref()
                     .map_err(Clone::clone)

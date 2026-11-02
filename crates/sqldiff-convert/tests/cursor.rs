@@ -122,17 +122,77 @@ fn shapes_that_mean_something_else_stay_refused() {
         ),
         "transaction control in the cursor loop",
     );
-    // A cursor that is not STATIC may see the loop's writes.
-    refused(
-        &body(
+    // A cursor that is not STATIC may see the loop's writes, unless they
+    // only change the row just fetched, by its unique key.
+    let upd = |set: &str| {
+        body(
             DECL,
-            &LOOP.replace(
-                "INSERT INTO dbo.log (id, v) VALUES (@id, @v);",
-                "UPDATE dbo.t SET v = 0 WHERE id = @id;",
-            ),
+            &LOOP.replace("INSERT INTO dbo.log (id, v) VALUES (@id, @v);", set),
+        )
+    };
+    for (set, why) in [
+        // Not the key: a fetched v can name several rows.
+        ("UPDATE dbo.t SET v = 0 WHERE v = @v;", "unique"),
+        ("UPDATE dbo.t SET v = 0;", "without WHERE"),
+        ("UPDATE dbo.t SET v = 0 WHERE id > @id;", "not keyed"),
+        // Moves the row in the query's order.
+        (
+            "UPDATE dbo.t SET id = id + 100 WHERE id = @id;",
+            "outside its select list",
         ),
-        "writes t, which the cursor reads",
+        (
+            "SET @id = @id + 1; UPDATE dbo.t SET v = 0 WHERE id = @id;",
+            "assigned inside the loop",
+        ),
+        (
+            "INSERT INTO dbo.t (id, v) VALUES (@id + 1000, 0);",
+            "writes a table",
+        ),
+    ] {
+        let c = pg(&upd(set));
+        let u = at(&c, 9)[0];
+        assert_eq!(u.status, Status::NotConverted, "{set}\n{}", c.output);
+        let text = &u.notes[0].text;
+        assert!(
+            text.contains("writes t, which the cursor reads") && text.contains(why),
+            "{set}: {text}"
+        );
+    }
+    // Without an ORDER BY the query does not name the key, yet a dynamic
+    // cursor scanning the key's index meets a row whose key was changed
+    // again; and an UPDATE that assigns a variable changes it besides the
+    // FETCH.
+    let unordered = |set: &str| {
+        body(
+            "  DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT id, v FROM dbo.t;",
+            &LOOP.replace("INSERT INTO dbo.log (id, v) VALUES (@id, @v);", set),
+        )
+    };
+    for (set, why) in [
+        (
+            "UPDATE dbo.t SET id = id + 100 WHERE id = @id;",
+            "free of a key or index on",
+        ),
+        (
+            "UPDATE dbo.t SET @id = 7, v = 0 WHERE id = @id;",
+            "assigns a variable",
+        ),
+    ] {
+        let c = pg(&unordered(set));
+        let u = at(&c, 9)[0];
+        assert_eq!(u.status, Status::NotConverted, "{set}\n{}", c.output);
+        assert!(u.notes[0].text.contains(why), "{set}: {}", u.notes[0].text);
+    }
+    let c = pg(&unordered("UPDATE dbo.t SET v = 0 WHERE id = @id;"));
+    assert!(c.output.contains("WHILE FOUND LOOP"), "{}", c.output);
+    let c = pg(&upd("UPDATE dbo.t SET v = 0 WHERE id = @id;"));
+    assert!(
+        c.output.contains("UPDATE t SET v = 0 WHERE id = v_id;"),
+        "{}",
+        c.output
     );
+    assert!(c.output.contains("WHILE FOUND LOOP"), "{}", c.output);
+    assert_ne!(at(&c, 9)[0].status, Status::NotConverted);
     // Only forward-only cursors.
     refused(
         &body(
@@ -179,6 +239,34 @@ fn a_static_cursor_may_write_what_it_reads() {
     ));
     assert!(c.output.contains("WHILE FOUND LOOP"), "{}", c.output);
     assert_ne!(at(&c, 9)[0].status, Status::NotConverted);
+}
+
+/// The steps that convert the cursor's query belong to the DECLARE's unit
+/// when the OPEN is converted, and to nobody when the OPEN is refused.
+#[test]
+fn the_querys_steps_go_to_the_declare_only_when_the_open_converts() {
+    let step = "tsql.expr.dbo-schema";
+    let has = |c: &Conversion| {
+        at(c, 9)
+            .iter()
+            .any(|u| u.trace.iter().any(|s| s.rule == step))
+    };
+    let c = pg(&body(DECL, LOOP));
+    assert!(c.output.contains("OPEN cur_c FOR"), "{}", c.output);
+    assert!(has(&c), "{:#?}", at(&c, 9)[0].trace);
+    for u in &c.units {
+        for s in &u.trace {
+            assert!(u.src.start <= s.start && s.end <= u.src.end, "{s:?}");
+        }
+    }
+    // DIFFERENCE is not converted: the OPEN is refused, and the DECLARE's
+    // unit keeps no step for a query that was not converted.
+    let c = pg(&body(
+        "  DECLARE c CURSOR LOCAL STATIC FOR SELECT id, DIFFERENCE(CAST(v AS nvarchar(10)), N'x') FROM dbo.t ORDER BY id;",
+        LOOP,
+    ));
+    assert!(!c.output.contains("OPEN cur_c FOR"), "{}", c.output);
+    assert!(!has(&c), "{:#?}", at(&c, 9)[0].trace);
 }
 
 #[test]

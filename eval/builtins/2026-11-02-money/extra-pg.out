@@ -1,0 +1,16 @@
+todec 2.5->dec(18,0)|3
+todec -2.5->dec(18,0)|-3
+todec 1.2345->dec(10,2)|1.23
+todec 1.2350->dec(10,2)|1.24
+todec -1.2350->dec(10,2)|-1.24
+tosmallint 2.5|3
+m+d|1.2445
+m*d|1.543125
+ERROR:  relation "ch" already exists
+INSERT 0 1
+chain|700000000000000.0000
+chain|700000000000000.0000
+ERROR:  relation "ct" already exists
+INSERT 0 1
+bigint 1e15 * money 0|0.0000
+bigint 1e15 * money 0|0.0000

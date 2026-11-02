@@ -736,6 +736,27 @@ proof = "engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.geography.from-wkb"
+kind = "converter"
+proof = "engine"
+note = "geography::STGeomFromWKB(wkb, 4326) to ST_GeomFromWKB(wkb, 4326)::geography; the engine shows it equal for a constant WKB both engines read alike (equiv/geography.rs, eval/geography/2026-11-02)"
+sites = ["sqldiff-convert/src/tsql/geography.rs"]
+
+[[rule]]
+id = "tsql.geography.point"
+kind = "converter"
+proof = "engine"
+note = "geography::Point(lat, lon, 4326) to ST_SetSRID(ST_MakePoint(lon, lat), 4326)::geography for decimal literal coordinates inside ±90 / ±180"
+sites = ["sqldiff-convert/src/tsql/geography.rs"]
+
+[[rule]]
+id = "tsql.geography.static-method"
+kind = "converter"
+proof = "engine"
+note = "a CLR static method with no checked rule (and any on Db2 for i) is refused with the method named; no type::Method text reaches the output"
+sites = ["sqldiff-convert/src/tsql/geography.rs"]
+
+[[rule]]
 id = "tsql.geography.point-constant"
 kind = "converter"
 proof = "engine"
@@ -888,6 +909,13 @@ note = "the casts of a result set's columns to their declared types (RETURN QUER
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.routine.result-set-cursors"
+kind = "converter"
+proof = "engine"
+note = "a procedure's result sets as INOUT refcursor parameters (result_set_1, …) under ASM-RESULTSET-REFCURSOR"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
 id = "tsql.routine.result-set-function"
 kind = "converter"
 proof = "engine"
@@ -930,6 +958,12 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
 id = "tsql.rowcount.found"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.stmt.create-role"
 kind = "converter"
 proof = "engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
@@ -1061,6 +1095,13 @@ proof = "engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.stmt.result-set-cursor"
+kind = "converter"
+proof = "engine"
+note = "a result set's SELECT opened as OPEN result_set_N FOR …, its name = expr items written expr AS name"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
 id = "tsql.stmt.return"
 kind = "converter"
 proof = "lemma:Sqldiff.Mirror/T-SQL return status"
@@ -1160,6 +1201,12 @@ proof = "engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.table.computed-arith"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
 id = "tsql.table.computed-concat"
 kind = "converter"
 proof = "engine"
@@ -1185,6 +1232,19 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
 id = "tsql.table.inline-index"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.table.alias-not-null"
+kind = "converter"
+proof = "engine"
+note = "A column of an alias type that spells no nullability gets the type's NOT NULL; not compared by the engine yet"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.assign.int-trunc"
 kind = "converter"
 proof = "engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
@@ -1360,6 +1420,13 @@ kind = "converter"
 proof = "lemma:Sqldiff.Mirror/C2b strings/Types"
 family = "tsql.type.*"
 note = "`nvarchar(n)` with 1 <= n <= 4000 against `varchar(n)` (read with the `wide` bound); `max` and `nchar(n)` engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.type.alias-domain"
+kind = "converter"
+proof = "engine"
+note = "`CREATE TYPE n FROM base` becomes `CREATE DOMAIN n AS base`; the engine does not compare the pair yet (a unit stays not proven)"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]

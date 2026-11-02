@@ -261,7 +261,7 @@ fn one_file_or_text_converts_like_a_tree_of_one() {
         call(
             4,
             "convert",
-            json!({ "artifact": { "text": "CREATE TABLE t (a int,);\n", "dialect": "tsql" }, "to": "db2i" }),
+            json!({ "artifact": { "text": "CREATE TABLE t (a int,,);\n", "dialect": "tsql" }, "to": "db2i" }),
         ),
         call(
             5,
@@ -301,7 +301,7 @@ fn one_file_or_text_converts_like_a_tree_of_one() {
     assert_eq!(refused["file"]["status"], "not_converted");
     assert_eq!(refused["ok"], false);
     let reason = refused["file"]["units"][0]["reason"].as_str().unwrap();
-    assert!(reason.contains("trailing comma"), "{reason}");
+    assert!(reason.contains("stray comma"), "{reason}");
     assert!(refused["output"]
         .as_str()
         .unwrap()

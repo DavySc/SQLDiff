@@ -233,7 +233,9 @@ fn error_checks_are_not_guessed() {
 
 #[test]
 fn procedures_cannot_return_result_sets() {
-    let src = "CREATE PROCEDURE p AS\nBEGIN\n  SELECT a FROM t;\nEND\n";
+    // A result set in a loop has no cursor either (the numbers would shift).
+    let src =
+        "CREATE PROCEDURE p AS\nBEGIN\n  WHILE 1 = 0\n  BEGIN\n    SELECT a FROM t;\n  END\nEND\n";
     let c = tsql(src);
     assert_eq!(unit(&c, src, "SELECT").status, Status::NotConverted);
 }
@@ -404,7 +406,7 @@ fn alter_procedure_notes_the_overload_risk() {
 #[test]
 fn result_set_check_is_structural() {
     // ' INTO ' in a literal must not make a result set look like an assignment.
-    let src = "CREATE PROCEDURE p AS\nBEGIN\n  SELECT 'x INTO y' AS a, ':=' AS b FROM t;\nEND\n";
+    let src = "CREATE PROCEDURE p AS\nBEGIN\n  IF 1 = 1\n    SELECT 'x INTO y' AS a, ':=' AS b FROM t;\nEND\n";
     let c = tsql(src);
     assert_eq!(
         unit(&c, src, "SELECT").status,
@@ -536,7 +538,7 @@ fn context_refusals_are_not_handed_to_the_idiom_rules() {
         ),
         // A result set in a procedure.
         (
-            "CREATE PROCEDURE p AS\nBEGIN\n  SELECT a FROM t;\nEND\n",
+            "CREATE PROCEDURE p AS\nBEGIN\n  IF 1 = 1\n    SELECT a FROM t;\nEND\n",
             "SELECT",
         ),
     ];
@@ -1217,19 +1219,51 @@ fn fragments_convert_for_db2i_too() {
 }
 
 #[test]
-fn trailing_comma_in_a_column_list_is_refused_not_a_crash() {
-    // sakila's SQL Server schema has `PRIMARY KEY NONCLUSTERED (film_id),\n)`.
+fn one_trailing_comma_in_a_column_list_is_dropped() {
+    // sakila's SQL Server schema has `PRIMARY KEY NONCLUSTERED (film_id),\n)`,
+    // and so has AdventureWorks' install script: SQL Server takes it.
     let src = "CREATE TABLE film_text (\n  film_id SMALLINT NOT NULL,\n  title VARCHAR(255) NOT NULL,\n  PRIMARY KEY NONCLUSTERED (film_id),\n);\n";
     for to in [Dialect::Postgres, Dialect::Db2i] {
         let c = convert(src, Dialect::Tsql, to).unwrap();
         let u = unit(&c, src, "CREATE TABLE");
-        assert_eq!(u.status, Status::NotConverted, "{}", c.output);
+        assert_ne!(u.status, Status::NotConverted, "{:?}", u.notes);
+        assert!(!c.output.contains(",\n)"), "{}", c.output);
+    }
+    // A comma with no item before it is no trailing comma: refused cleanly,
+    // and the other statements of the file still convert.
+    for bad in [
+        "CREATE TABLE t1 (,);",
+        "CREATE TABLE t1 (a INT,,);",
+        "CREATE TABLE t1 (, a INT);",
+    ] {
+        let src = format!("{bad}\nGO\nCREATE TABLE t2 (a INT);\n");
+        let c = convert(&src, Dialect::Tsql, Dialect::Postgres).unwrap();
+        assert_eq!(
+            unit(&c, &src, bad).status,
+            Status::NotConverted,
+            "{bad}\n{}",
+            c.output
+        );
         assert!(
-            u.notes.iter().any(|n| n.text.contains("trailing comma")),
-            "{:?}",
-            u.notes
+            unit(&c, &src, "CREATE TABLE t2").status <= Status::Assumptions,
+            "{bad}\n{}",
+            c.output
+        );
+        assert!(
+            !c.output.contains("without a trace step"),
+            "{bad}\n{}",
+            c.output
         );
     }
+    // More than one is still refused, not a crash.
+    let two = src.replace("(film_id),\n)", "(film_id),,\n)");
+    let c = convert(&two, Dialect::Tsql, Dialect::Postgres).unwrap();
+    assert_eq!(
+        unit(&c, &two, "CREATE TABLE").status,
+        Status::NotConverted,
+        "{}",
+        c.output
+    );
 }
 
 /// Incomplete statements (a file cut short, or typed half-way in the GUI)
@@ -1350,4 +1384,47 @@ fn db_name_of_an_id_is_not_converted() {
     let out = out_of(&c, u);
     assert!(!out.contains("current_database"), "{out}");
     assert_ne!(u.status, Status::Converted, "{out}");
+}
+
+/// A PL/pgSQL CALL cannot leave a callee's INOUT return_code out, so a call
+/// that ignores the status passes a variable nobody reads; only callees that
+/// return a status get one (a bare RETURN does not).
+#[test]
+fn a_call_passes_a_scratch_variable_for_the_callees_return_code() {
+    let src = "CREATE PROCEDURE dbo.Status @a int AS BEGIN RETURN 1; END\nGO\nCREATE PROCEDURE dbo.Bare @a int AS BEGIN IF @a IS NULL\n RETURN\n\n PRINT 'x'; END\nGO\nCREATE PROCEDURE dbo.Caller AS\nBEGIN\n  EXEC dbo.Status 5;\n  EXEC dbo.Bare 5;\n  EXEC dbo.Status @a = 6;\nEND\nGO\n";
+    let c = tsql(src);
+    let o = &c.output;
+    assert!(o.contains("DECLARE\n  rc_scratch integer;\nBEGIN"), "{o}");
+    assert!(
+        o.contains("CALL Status(5, return_code => rc_scratch);"),
+        "{o}"
+    );
+    assert!(o.contains("CALL Bare(5);"), "{o}");
+    assert!(
+        o.contains("CALL Status(p_a => 6, return_code => rc_scratch);"),
+        "{o}"
+    );
+    assert_eq!(o.matches("rc_scratch integer;").count(), 1, "{o}");
+    // A script outside any block: a top-level CALL takes NULL.
+    let c =
+        tsql("CREATE PROCEDURE dbo.Status @a int AS BEGIN RETURN 1; END\nGO\nEXEC dbo.Status 9;\n");
+    assert!(
+        c.output.contains("CALL Status(9, return_code => NULL);"),
+        "{}",
+        c.output
+    );
+}
+
+/// Inside a trigger function a CALL passes the scratch variable too:
+/// `return_code => NULL` raises in PL/pgSQL ("argument is not writable").
+#[test]
+fn a_trigger_passes_a_scratch_variable_for_the_callees_return_code() {
+    let src = "CREATE TABLE dbo.T (a int)\nGO\nCREATE PROCEDURE dbo.Status @a int AS BEGIN RETURN 1; END\nGO\nCREATE TRIGGER dbo.TrgT ON dbo.T AFTER INSERT AS\nBEGIN\n  EXEC dbo.Status 5;\nEND\nGO\n";
+    let o = tsql(src).output;
+    assert!(
+        o.contains("CALL Status(5, return_code => rc_scratch);"),
+        "{o}"
+    );
+    assert!(o.contains("rc_scratch integer;"), "{o}");
+    assert!(!o.contains("return_code => NULL"), "{o}");
 }

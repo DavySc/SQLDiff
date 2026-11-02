@@ -224,6 +224,9 @@ pub struct ResultStmt {
     pub top: bool,
     /// A RETURN comes before it, so some runs may end without it.
     pub after_return: bool,
+    /// PostgreSQL `OPEN result_set_N FOR query` on an INOUT refcursor
+    /// parameter of a procedure: N (`result_open`).
+    pub cursor: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -2217,7 +2220,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         mark(u, CtlKind::Rethrow, c);
         return;
     }
-    if jump(c, u) || cursor_stmt(c, u) {
+    if jump(c, u) || result_open(c, u) || cursor_stmt(c, u) {
         return;
     }
     let dynamic = match d {
@@ -2367,6 +2370,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                     at: u.stmts.len(),
                     top: u.depth == 0 && !in_handled_block(c),
                     after_return,
+                    cursor: None,
                 });
             }
             let mut from_declare = false;
@@ -2543,6 +2547,65 @@ fn add_filegroup(c: &SyntaxNode) -> bool {
     )
 }
 
+/// The N of a PostgreSQL procedure's INOUT refcursor parameter
+/// `result_set_N` that `ts` (an `OPEN name FOR …` statement) opens.
+pub fn result_cursor(u: &Unit, ts: &[Tok]) -> Option<usize> {
+    if u.dialect != Dialect::Postgres || u.kind != UnitKind::Proc {
+        return None;
+    }
+    let [open, name, for_, ..] = ts else {
+        return None;
+    };
+    if open.up != "OPEN" || for_.up != "FOR" || name.kind != K::Word {
+        return None;
+    }
+    let lower = name.text.to_lowercase();
+    let n: usize = lower
+        .strip_prefix("result_set_")?
+        .parse()
+        .ok()
+        .filter(|n| *n >= 1)?;
+    u.params
+        .iter()
+        .any(|p| {
+            p.out
+                && p.name == lower
+                && p.decl
+                    .as_ref()
+                    .is_some_and(|t| t.name.eq_ignore_ascii_case("refcursor"))
+        })
+        .then_some(n)
+}
+
+/// PostgreSQL `OPEN result_set_N FOR query` on a procedure's own INOUT
+/// refcursor parameter: a statement whose rows reach the caller (a result
+/// set, `Unit::results`), compared as the query it opens. Returns whether
+/// `c` was one.
+fn result_open(c: &SyntaxNode, u: &mut Unit) -> bool {
+    let toks = tokens(c);
+    let Some(n) = result_cursor(u, &toks) else {
+        return false;
+    };
+    let ast = parse_stmt_lowered(&toks[3..], u.dialect);
+    let after_return = u.stmts.iter().any(|s| matches!(s.ast, Ok(Stmt::Return(_))));
+    u.results.push(ResultStmt {
+        at: u.stmts.len(),
+        top: u.depth == 0 && !in_handled_block(c),
+        after_return,
+        cursor: Some(n),
+    });
+    u.stmts.push(LStmt {
+        node: c.clone(),
+        toks,
+        ast,
+        from_declare: false,
+        msg: None,
+        output: None,
+        cursor: None,
+    });
+    true
+}
+
 /// A statement of a cursor loop (`cursor.rs`): the T-SQL DECLARE or
 /// PostgreSQL OPEN that starts one (checked there; refused with the reason
 /// when the loop is not of the shape), and the OPEN, FETCH, CLOSE and
@@ -2585,6 +2648,7 @@ fn cursor_stmt(c: &SyntaxNode, u: &mut Unit) -> bool {
             key,
             query: l.query.clone(),
             tsql: (d == Dialect::Tsql).then_some((l.stat, l.local)),
+            keyed: l.keyed.clone(),
         }
     } else if l.fetches.contains(c) {
         let targets = l
