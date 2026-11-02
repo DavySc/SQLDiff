@@ -48,6 +48,10 @@ use crate::model::Assumption;
 type R<T> = Result<T, String>;
 
 pub mod asms {
+    pub const RETURN_CODE: (&str, &str) = (
+        "ASM-RETURN-CODE",
+        "PostgreSQL procedures cannot return a value: the T-SQL return status (0 unless RETURN n says otherwise, never NULL) becomes the INOUT parameter return_code, so callers must read return_code, and take 0 from a converted procedure that has none.",
+    );
     pub const CALLEE: (&str, &str) = (
         "ASM-CALLEE-CONVERTED",
         "The procedure a call names on side B is the conversion of the one it names on side A; that procedure's own conversion (signature, body, result sets) is compared in the file that creates it",
@@ -370,6 +374,22 @@ fn pg_call(ts: &[Tok]) -> R<Call> {
     Ok(Call { name, args })
 }
 
+/// An unqualified PostgreSQL target is in the default schema (`public`), the
+/// one the converter's dropped `dbo` stands for (ASM-DBO-SCHEMA), as
+/// `object_key` reads a call.
+fn in_public(mut p: Vec<Name>, full: usize) -> Vec<Name> {
+    if p.len() + 1 == full {
+        p.insert(
+            0,
+            Name {
+                text: "public".into(),
+                quoted: false,
+            },
+        );
+    }
+    p
+}
+
 fn pg_comment(ts: &[Tok]) -> R<Comment> {
     if !word(ts.get(1), "ON") {
         return Err("COMMENT without ON".into());
@@ -394,14 +414,14 @@ fn pg_comment(ts: &[Tok]) -> R<Comment> {
                 "PROCEDURE" => "PROCEDURE",
                 _ => "FUNCTION",
             };
-            match <[Name; 2]>::try_from(p) {
+            match <[Name; 2]>::try_from(in_public(p, 2)) {
                 Ok([s, o]) => (Target::Object(k, s, o), i),
                 _ => return Err(format!("COMMENT ON {kind} without a schema name")),
             }
         }
         "COLUMN" => {
             let (p, i) = dotted(ts, 3)?;
-            match <[Name; 3]>::try_from(p) {
+            match <[Name; 3]>::try_from(in_public(p, 3)) {
                 // TABLE or VIEW: PostgreSQL does not say which.
                 Ok([s, o, c]) => (Target::Column("", s, o, c), i),
                 _ => return Err("COMMENT ON COLUMN without schema, table and column".into()),
@@ -409,7 +429,7 @@ fn pg_comment(ts: &[Tok]) -> R<Comment> {
         }
         "INDEX" => {
             let (p, i) = dotted(ts, 3)?;
-            match <[Name; 2]>::try_from(p) {
+            match <[Name; 2]>::try_from(in_public(p, 2)) {
                 Ok([s, x]) => (Target::Index(s, None, x), i),
                 _ => return Err("COMMENT ON INDEX without a schema name".into()),
             }
@@ -420,7 +440,7 @@ fn pg_comment(ts: &[Tok]) -> R<Comment> {
                 return Err("COMMENT ON CONSTRAINT not on a table".into());
             }
             let (p, i) = dotted(ts, 5)?;
-            match <[Name; 2]>::try_from(p) {
+            match <[Name; 2]>::try_from(in_public(p, 2)) {
                 Ok([s, t]) => (Target::Constraint(s, t, c), i),
                 _ => return Err("COMMENT ON CONSTRAINT without a schema name".into()),
             }
@@ -444,7 +464,8 @@ fn pg_comment(ts: &[Tok]) -> R<Comment> {
     })
 }
 
-/// `sp_addextendedproperty` with string literal arguments.
+/// `sp_addextendedproperty` with string literal arguments, or bracketed
+/// identifiers (read as the name they spell).
 fn extended_property(rest: &[Tok]) -> R<Comment> {
     const NAMES: [&str; 8] = [
         "@name",
@@ -484,6 +505,15 @@ fn extended_property(rest: &[Tok]) -> R<Comment> {
             [t] if t.kind == K::Str => {
                 let narrow = !t.text.starts_with(['N', 'n']);
                 val.insert(key, (string_value(&t.text)?, narrow));
+            }
+            // A bracketed identifier is the name string (AdventureWorks
+            // writes `N'SCHEMA', [Person], N'TABLE', [Address]`).
+            [t] if t.kind == K::Quoted
+                && t.text.starts_with('[')
+                && key.ends_with("name")
+                && key.starts_with("@level") =>
+            {
+                val.insert(key, (cst::unquote(&t.text), false));
             }
             [t] if word(Some(t), "NULL") || word(Some(t), "DEFAULT") => {}
             _ => return Err(format!("{key} is not a string literal")),
@@ -1345,6 +1375,55 @@ fn fits_tsql(v: &Ty, p: &Ty) -> bool {
     }
 }
 
+/// Whether the PL/pgSQL local `name` is an integer that the routine (or DO
+/// block) only declares and passes as `return_code => name`: nothing reads
+/// it, so the status the callee sets reaches nobody, as in T-SQL.
+fn unread_scratch(u: &Unit, name: &str) -> Result<(), String> {
+    let local = u
+        .locals
+        .iter()
+        .rev()
+        .find(|l| l.name == name)
+        .ok_or_else(|| format!("{name} is not a local variable"))?;
+    let ty = local.decl.as_ref().map(|t| pg_base(&t.name));
+    if ty.as_deref() != Some("int4") {
+        return Err(format!("{name} is not an integer variable"));
+    }
+    let scope = local
+        .node
+        .ancestors()
+        .find(|a| a.kind() == sqldiff_syntax::SyntaxKind::ROUTINE)
+        .or_else(|| local.node.ancestors().last())
+        .ok_or_else(|| "the variable's scope is not known".to_string())?;
+    let toks: Vec<String> = scope
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| !t.kind().is_trivia())
+        .map(|t| t.text().to_ascii_lowercase())
+        .collect();
+    let mut declared = 0;
+    for (i, t) in toks.iter().enumerate() {
+        if t != name {
+            continue;
+        }
+        let passed = (i >= 2 && toks[i - 2] == "return_code" && toks[i - 1] == "=>")
+            || (i >= 3 && toks[i - 3] == "return_code" && toks[i - 2] == "=" && toks[i - 1] == ">");
+        let decl = toks
+            .get(i + 1)
+            .is_some_and(|n| n == "integer" || n == "int")
+            && toks.get(i + 2).is_some_and(|n| n == ";");
+        if decl {
+            declared += 1;
+        } else if !passed {
+            return Err(format!("{name} is used for something besides return_code"));
+        }
+    }
+    if declared != 1 {
+        return Err(format!("{name} is not declared exactly once"));
+    }
+    Ok(())
+}
+
 /// A PostgreSQL value of type `v` passes to a parameter of type `p`
 /// unchanged: an implicit cast that keeps the value (the parameter's own
 /// length, precision and scale are ignored).
@@ -1491,7 +1570,54 @@ fn calls(x: &Call, t: &Side, y: &Call, p: &Side) -> R<Verdict> {
     if object_key(&x.name, t.d)?.0.is_none() && object_key(&y.name, p.d)?.0.is_none() {
         asms.push(asm::make(asm::DEFAULT_SCHEMA));
     }
-    if rt.params.len() != rp.params.len() {
+    // The conversion of a procedure that returns a status adds a last
+    // `INOUT return_code integer DEFAULT NULL` (ASM-RETURN-CODE). A PL/pgSQL
+    // CALL cannot leave an INOUT parameter out ("argument is not writable"),
+    // so a call that does not read the status (no `@rc =`, which is not
+    // compared at all) passes a variable nobody reads, `return_code => v`.
+    let extra_return_code = rp.params.len() == rt.params.len() + 1
+        && rp.params.last().is_some_and(|q| {
+            q.name == "return_code"
+                && q.mode == ParamMode::InOut
+                && q.has_default
+                && q.default
+                    .as_deref()
+                    .is_some_and(|d| d.trim().eq_ignore_ascii_case("null"))
+        });
+    if extra_return_code {
+        // A top-level CALL returns its INOUT parameters, return_code
+        // included, to the client as a row; T-SQL's EXEC returns no row.
+        if p.unit.kind == super::lower::UnitKind::Script && !p.in_do {
+            return Err(format!(
+                "{} takes a return_code INOUT parameter, which a CALL outside PL/pgSQL returns to the client as a row",
+                rp.display()
+            ));
+        }
+        let mut given = y
+            .args
+            .iter()
+            .filter(|a| a.name.as_deref() == Some("return_code"));
+        let (Some(arg), None) = (given.next(), given.next()) else {
+            return Err(format!(
+                "{}: the call leaves out the INOUT parameter return_code, which a CALL inside PL/pgSQL cannot do (\"argument is not writable\"); it must pass a variable",
+                p.name
+            ));
+        };
+        let [v] = arg.value.as_slice() else {
+            return Err(format!(
+                "{}: return_code receives something other than a variable",
+                p.name
+            ));
+        };
+        let name = name_of(v).and_then(|n| key(&n, p.d).ok()).ok_or_else(|| {
+            format!(
+                "{}: return_code receives something other than a variable",
+                p.name
+            )
+        })?;
+        unread_scratch(p.unit, &name).map_err(|why| format!("{}: {why}", p.name))?;
+        asms.push(asm::make(asms::RETURN_CODE));
+    } else if rt.params.len() != rp.params.len() {
         return Err(format!(
             "{} takes {} parameter(s) on {} and {} on {}",
             rt.display(),

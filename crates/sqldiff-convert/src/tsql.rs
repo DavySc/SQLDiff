@@ -87,6 +87,7 @@ pub(crate) fn convert(
         wrapper: None,
         autocommit: Vec::new(),
         decls: Vec::new(),
+        rc_scratch: false,
         context: false,
         dynamic: Vec::new(),
         dynamic_from: Vec::new(),
@@ -168,6 +169,9 @@ struct Var {
     /// The T-SQL type, for DATEADD.
     dt: Dt,
 }
+
+/// The variable a CALL passes for a callee's `return_code` it does not read.
+const RC_SCRATCH: &str = "rc_scratch";
 
 /// A hoisted declaration: the DECLARE statement's span and the lines it adds.
 struct Decl {
@@ -257,6 +261,8 @@ struct Cx<'a> {
     /// a COMMIT follows each of them.
     autocommit: Vec<usize>,
     decls: Vec<Decl>,
+    /// A CALL passed `RC_SCRATCH`: the DECLARE section declares it.
+    rc_scratch: bool,
     /// The unit being converted was refused because of where it stands, not
     /// for want of a rule: the idiom rules, which see statements out of
     /// context, must not take it either.
@@ -320,6 +326,12 @@ type R<T> = Result<T, No>;
 
 fn no<T>(reason: impl Into<String>) -> R<T> {
     Err(No(reason.into()))
+}
+
+/// A refusal for a SQL Server-only feature the target has no counterpart
+/// for (`impossible`): still not converted, reported in its own bucket.
+fn impossible<T>(x: crate::impossible::Feature, why: impl AsRef<str>) -> R<T> {
+    no(crate::impossible::reason(x, why.as_ref()))
 }
 
 impl<'a> Cx<'a> {
@@ -510,6 +522,7 @@ impl<'a> Cx<'a> {
     fn reset(&mut self) {
         self.vars.clear();
         self.decls.clear();
+        self.rc_scratch = false;
         self.cursors.clear();
         self.loops.clear();
         self.labels = 0;
@@ -579,12 +592,15 @@ impl<'a> Cx<'a> {
             }
             return;
         }
-        if self.decls.is_empty() {
+        if self.decls.is_empty() && !self.rc_scratch {
             return;
         }
         out.push("DECLARE\n");
         for d in std::mem::take(&mut self.decls) {
             out.unit(d.src, INDENT, &d.lines.join("\n"), d.notes, d.trace);
+        }
+        if std::mem::take(&mut self.rc_scratch) {
+            out.lines(INDENT, &format!("{RC_SCRATCH} integer;"));
         }
     }
 
@@ -2163,7 +2179,7 @@ impl<'a> Cx<'a> {
                 self.step_ts("tsql.stmt.truncate", &ts);
                 format!("{} RESTART IDENTITY", self.expr(&Self::body_toks(&ts)).trim_end())
             }
-            "USE" => return no(self.pick(
+            "USE" => return impossible(crate::impossible::DATABASE_LEVEL, self.pick(
                 "USE: connect to the other database instead; PostgreSQL cannot switch databases in a session",
                 "USE: Db2 for i has one database per system; use SET SCHEMA or qualify names with the library",
             )),
@@ -2171,7 +2187,7 @@ impl<'a> Cx<'a> {
                 "WAITFOR: PostgreSQL's pg_sleep waits a number of seconds; WAITFOR DELAY takes a time of day as text or datetime and WAITFOR TIME a clock time; no checked rule for converting the value",
                 "WAITFOR: Db2 for i SQL has no statement that waits; no rule",
             )),
-            "BEGIN" if w(1) == "ATOMIC" => return no("BEGIN ATOMIC WITH (…): the body of a natively compiled module (In-Memory OLTP), with its own isolation level and language; no rule (convert it as an ordinary body after review)"),
+            "BEGIN" if w(1) == "ATOMIC" => return impossible(crate::impossible::IN_MEMORY_OLTP, "BEGIN ATOMIC WITH (…): the body of a natively compiled module, with its own isolation level and language; the target has no native compilation (convert it as an ordinary body by hand)"),
             "ALTER" if w(1) == "ROLE" && matches!(w(3).as_str(), "ADD" | "DROP") => return no(self.pick(
                 "ALTER ROLE … ADD/DROP MEMBER: PostgreSQL's forms are GRANT role TO member and REVOKE role FROM member, but the role and the database user it names map to PostgreSQL roles only by a decision about logins and users, which has no rule",
                 "ALTER ROLE … ADD/DROP MEMBER: Db2 for i has no database roles; grant to group profiles instead; no rule",
@@ -2180,6 +2196,10 @@ impl<'a> Cx<'a> {
                 "ALTER INDEX (REBUILD, REORGANIZE, DISABLE, SET …): maintenance with no exact PostgreSQL counterpart (REINDEX rebuilds, nothing disables an index); no rule",
                 "ALTER INDEX: maintenance with no exact Db2 for i counterpart; no rule",
             )),
+            "ALTER" if crate::impossible::of_ddl(&[w(1).as_str(), w(2).as_str()]).is_some() => {
+                let x = crate::impossible::of_ddl(&[w(1).as_str(), w(2).as_str()]).unwrap();
+                return impossible(x, format!("ALTER {} {}: SQL Server only; {} has nothing to convert it to", w(1), w(2), self.to.display_name()));
+            }
             "REVERT" => return no("REVERT ends an EXECUTE AS context, which is not converted; no rule"),
             _ => return no("no rule for this statement yet"),
         };
@@ -2312,11 +2332,16 @@ impl<'a> Cx<'a> {
                     .vars
                     .get(&t[0].s.trim_start_matches('@').to_ascii_lowercase())
                     .is_some_and(|v| v.dt == Dt::Bit);
-                exprs.push(if bit {
+                let tdt = self
+                    .vars
+                    .get(&t[0].s.trim_start_matches('@').to_ascii_lowercase())
+                    .map_or(Dt::Other, |v| v.dt);
+                let e = if bit {
                     self.bit_store_text(&t[eq + 1..])
                 } else {
                     self.expr(&t[eq + 1..]).trim().to_string()
-                });
+                };
+                exprs.push(self.store_int(tdt, &t[eq + 1..], e));
             }
             // Without FROM the list runs to the end of the statement, so a
             // clause there would end up inside the last expression.
@@ -2844,7 +2869,8 @@ impl<'a> Cx<'a> {
     }
 
     fn dml_once(&mut self, ts: &[T]) -> R<String> {
-        let mut ts = Self::body_toks(ts);
+        let ts = Self::body_toks(ts);
+        let mut ts = self.int_stores(ts);
         // A closing `OPTION (MAXRECURSION n)`: the recursion limit of the
         // statement's CTEs, which ASM-CTE-MAXRECURSION states. Dropped as
         // in a SELECT; other hints stay as written.
@@ -3693,6 +3719,22 @@ impl<'a> Cx<'a> {
             .any(|k| !k.is_empty() && k.iter().all(|c| cols.contains(&c.to_ascii_lowercase())))
     }
 
+    /// Whether the table is in the catalog and none of `cols` is in any of
+    /// its keys or indexes.
+    fn has_no_indexed_column(&self, name: &[String], cols: &[String]) -> bool {
+        let Some(t) = self.catalog_table(name) else {
+            return false;
+        };
+        t.keys
+            .iter()
+            .map(|k| &k.columns)
+            .chain(t.indexes.iter().map(|i| &i.columns))
+            .all(|k| {
+                !k.iter()
+                    .any(|c| cols.iter().any(|x| x.eq_ignore_ascii_case(c)))
+            })
+    }
+
     fn catalog_table(&self, name: &[String]) -> Option<&sqldiff_core::catalog::Table> {
         use sqldiff_core::catalog::{table_position, Ident};
         let cat = self.type_catalog()?;
@@ -3726,6 +3768,222 @@ impl<'a> Cx<'a> {
         Some(n)
     }
 
+    /// The text of a value stored in an integer target: T-SQL drops a
+    /// number's fraction on assignment (eval/casts: also on INSERT, UPDATE,
+    /// SET and parameters), PostgreSQL rounds it, so a value known to have
+    /// a fraction is wrapped in `trunc()`. A value of unknown type is left
+    /// as it is (the engine compares it). Db2 for i is not changed here.
+    fn store_int(&mut self, target: Dt, value: &[T], converted: String) -> String {
+        if self.db2() || !matches!(target, Dt::Int | Dt::BigInt) {
+            return converted;
+        }
+        if self.expr_dt(value) != Some(Dt::Fraction) {
+            return converted;
+        }
+        self.step_ts("tsql.assign.int-trunc", value);
+        format!("trunc({converted})")
+    }
+
+    /// The type of column `col` of the catalog table named by `table`.
+    fn target_col_dt(&self, table: &[T], col: &str) -> Option<Dt> {
+        use sqldiff_core::catalog::Ident;
+        let parts: Vec<String> = table
+            .iter()
+            .filter(|t| matches!(t.k, IDENT | QUOTED_IDENT))
+            .map(|t| tsql_unquote(&t.s).to_ascii_lowercase())
+            .collect();
+        if parts.is_empty() || parts.len() > 2 {
+            return None;
+        }
+        let entry = ScopeEntry {
+            name: parts,
+            alias: None,
+            named: true,
+        };
+        let t = self.entry_table(&entry)?;
+        let c = t.column(Dialect::Tsql, &Ident::plain(col))?;
+        Some(Dt::of(&c.data_type.base, &c.data_type.args))
+    }
+
+    /// Wraps `value` (tokens) as `trunc(value)` tokens.
+    fn wrap_trunc(value: &[T]) -> Vec<T> {
+        let at = value.iter().find(|t| t.sig()).map_or(0, |t| t.pos.0);
+        let rule = "tsql.assign.int-trunc";
+        let mut out = vec![
+            T::made(IDENT, "trunc", at, rule),
+            T::made(L_PAREN, "(", at, rule),
+        ];
+        out.extend(value.iter().cloned());
+        out.push(T::made(R_PAREN, ")", at, rule));
+        out
+    }
+
+    /// Plain `UPDATE t SET c = v` and `INSERT INTO t (c) VALUES (v)`: a
+    /// value with a fraction stored in an integer column is truncated
+    /// (`store_int`). Other shapes are returned as they are.
+    fn int_stores(&mut self, ts: Vec<T>) -> Vec<T> {
+        if self.db2() {
+            return ts;
+        }
+        let s = sig(&ts);
+        let ds = crate::tok::depths(&ts);
+        let top =
+            |ts: &[T], w: &str, from: usize| (from..ts.len()).find(|&j| ds[j] == 0 && ts[j].is(w));
+        let Some(&first) = s.first() else { return ts };
+        let at = |v: &[T]| {
+            v.iter()
+                .find(|t| t.sig())
+                .map_or(ts[first].pos.0, |t| t.pos.0)
+        };
+        if ts[first].is("UPDATE") {
+            let (Some(set), None) = (top(&ts, "SET", 0), top(&ts, "FROM", 0)) else {
+                return ts;
+            };
+            if top(&ts, "OUTPUT", 0).is_some() {
+                return ts;
+            }
+            let table = &ts[first + 1..set];
+            let end = top(&ts, "WHERE", set).unwrap_or(ts.len());
+            let mut out = ts[..=set].to_vec();
+            let mut changed = false;
+            for (k, item) in split_commas(&ts[set + 1..end]).into_iter().enumerate() {
+                if k > 0 {
+                    out.push(T::made(
+                        COMMA,
+                        ",",
+                        item.first().map_or(0, |t| t.pos.0),
+                        "tsql.assign.int-trunc",
+                    ));
+                }
+                let it = sig(item);
+                let eq = it.iter().position(|&j| item[j].k == OP && item[j].s == "=");
+                match eq {
+                    Some(e) if e >= 1 => {
+                        let col = &item[it[e - 1]];
+                        let dt = (it[..e]
+                            .iter()
+                            .all(|&j| matches!(item[j].k, IDENT | QUOTED_IDENT | DOT)))
+                        .then(|| self.target_col_dt(table, &tsql_unquote(&col.s)))
+                        .flatten();
+                        let value = &item[it[e] + 1..];
+                        match dt {
+                            Some(d)
+                                if matches!(d, Dt::Int | Dt::BigInt)
+                                    && self.expr_dt(value) == Some(Dt::Fraction) =>
+                            {
+                                self.step_ts("tsql.assign.int-trunc", value);
+                                out.extend(item[..=it[e]].iter().cloned());
+                                out.push(T::made(
+                                    WHITESPACE,
+                                    " ",
+                                    at(value),
+                                    "tsql.assign.int-trunc",
+                                ));
+                                out.extend(Self::wrap_trunc(trimmed(value)));
+                                // What followed the value (a space before WHERE).
+                                let tail = value.iter().rposition(|t| t.sig()).map_or(0, |p| p + 1);
+                                out.extend(value[tail..].iter().cloned());
+                                changed = true;
+                            }
+                            _ => out.extend(item.iter().cloned()),
+                        }
+                    }
+                    _ => out.extend(item.iter().cloned()),
+                }
+            }
+            if !changed {
+                return ts;
+            }
+            out.extend(ts[end..].iter().cloned());
+            return out;
+        }
+        if ts[first].is("INSERT") {
+            let Some(&n1) = s.get(1) else { return ts };
+            let name_at = if ts[n1].is("INTO") {
+                s.get(2).copied()
+            } else {
+                Some(n1)
+            };
+            let Some(name_at) = name_at else { return ts };
+            let Some(open) = (name_at..ts.len()).find(|&j| ts[j].k == L_PAREN) else {
+                return ts;
+            };
+            let Some(close) = matching(&ts, open) else {
+                return ts;
+            };
+            let Some(values) = next_sig(&ts, close).filter(|&j| ts[j].is("VALUES")) else {
+                return ts;
+            };
+            let table = &ts[name_at..open];
+            if table
+                .iter()
+                .any(|t| t.sig() && !matches!(t.k, IDENT | QUOTED_IDENT | DOT))
+            {
+                return ts;
+            }
+            // Per column: does it take a truncated value?
+            let cols: Vec<Option<Dt>> = split_commas(&ts[open + 1..close])
+                .iter()
+                .map(|c| {
+                    let c = trimmed(c);
+                    match c {
+                        [t] if matches!(t.k, IDENT | QUOTED_IDENT) => {
+                            self.target_col_dt(table, &tsql_unquote(&t.s))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+            if !cols.iter().any(|d| matches!(d, Some(Dt::Int | Dt::BigInt))) {
+                return ts;
+            }
+            let mut out = ts[..=values].to_vec();
+            let mut changed = false;
+            let mut i = values + 1;
+            while i < ts.len() {
+                let t = &ts[i];
+                if t.k == L_PAREN {
+                    let Some(r) = matching(&ts, i) else { return ts };
+                    let items = split_commas(&ts[i + 1..r]);
+                    if items.len() != cols.len() {
+                        return ts;
+                    }
+                    out.push(t.clone());
+                    for (k, item) in items.iter().enumerate() {
+                        if k > 0 {
+                            out.push(T::made(
+                                COMMA,
+                                ",",
+                                item.first().map_or(0, |t| t.pos.0),
+                                "tsql.assign.int-trunc",
+                            ));
+                        }
+                        let v = trimmed(item);
+                        if matches!(cols[k], Some(Dt::Int | Dt::BigInt))
+                            && self.expr_dt(v) == Some(Dt::Fraction)
+                        {
+                            self.step_ts("tsql.assign.int-trunc", v);
+                            out.push(T::made(WHITESPACE, " ", at(v), "tsql.assign.int-trunc"));
+                            out.extend(Self::wrap_trunc(v));
+                            changed = true;
+                        } else {
+                            out.extend(item.iter().cloned());
+                        }
+                    }
+                    out.push(ts[r].clone());
+                    i = r + 1;
+                } else if t.k == COMMA || !t.sig() {
+                    out.push(t.clone());
+                    i += 1;
+                } else {
+                    return ts;
+                }
+            }
+            return if changed { out } else { ts };
+        }
+        ts
+    }
+
     fn set(&mut self, ts: &[T]) -> R<String> {
         let ts = Self::body_toks(ts);
         let s = sig(&ts);
@@ -3752,12 +4010,24 @@ impl<'a> Cx<'a> {
             } else {
                 self.expr(&ts[value..]).trim().to_string()
             };
+            // `SET @i = @x * 1.5` into an integer: T-SQL truncates.
+            let fraction = self.expr_dt(&ts[value..]) == Some(Dt::Fraction);
+            let rhs = if op.s == "=" {
+                self.store_int(dt, &ts[value..], rhs)
+            } else {
+                rhs
+            };
             self.step_ts_with("tsql.stmt.set-variable", &ts, op.s.clone());
             // `SET @b += 0x…` on a VARBINARY variable appends bytes.
             let bin_concat =
                 op.s == "+=" && self.is_varbinary_var(&a.s) && self.binary_chain(&ts[value..]);
             if bin_concat {
                 self.binary_concat_note(std::slice::from_ref(op));
+            }
+            let compound_trunc =
+                op.s != "=" && fraction && !self.db2() && matches!(dt, Dt::Int | Dt::BigInt);
+            if compound_trunc {
+                self.step_ts("tsql.assign.int-trunc", &ts[value..]);
             }
             let assign = |v: String| {
                 if self.db2() {
@@ -3774,7 +4044,13 @@ impl<'a> Cx<'a> {
                     } else {
                         op.s[..1].to_string()
                     };
-                    Ok(assign(format!("{target} {o} {rhs}")))
+                    let whole = format!("{target} {o} {rhs}");
+                    let whole = if compound_trunc {
+                        format!("trunc({whole})")
+                    } else {
+                        whole
+                    };
+                    Ok(assign(whole))
                 }
                 _ => no("compound assignment operator"),
             };
@@ -3970,7 +4246,8 @@ impl<'a> Cx<'a> {
                 } else if *bit {
                     self.bit_store_text(init)
                 } else {
-                    self.expr(init).trim().to_string()
+                    let e = self.expr(init).trim().to_string();
+                    self.store_int(*dt, init, e)
                 };
                 self.step_ts_with("tsql.decl.init", init, name.clone());
                 if db2 {
@@ -4339,7 +4616,7 @@ impl<'a> Cx<'a> {
                     && w[6] == "CONTAINS"
                     && matches!(w[7].as_str(), "MEMORY_OPTIMIZED_DATA" | "FILESTREAM")));
         if !storage {
-            return no(self.pick(
+            return impossible(crate::impossible::DATABASE_LEVEL, self.pick(
                 "ALTER DATABASE: database options and files are server configuration with no one-to-one PostgreSQL statement (ALTER DATABASE … SET, postgresql.conf); not converted",
                 "ALTER DATABASE: database options and files are server configuration with no Db2 for i statement; not converted",
             ));
@@ -4477,7 +4754,9 @@ impl<'a> Cx<'a> {
     /// (so the variables are not read after the loop before they are set
     /// again). A cursor that is not STATIC may see the loop's own writes in
     /// T-SQL; a PostgreSQL cursor reads the rows as of OPEN, so the loop must
-    /// not write the tables the cursor reads or call procedures.
+    /// not write the tables the cursor reads or call procedures, except for
+    /// changes of the row just fetched by its unique key
+    /// (`equiv::cursor::keyed_writes`, keys checked against the catalog).
     fn cursor_plan(&self, ts: &[T], n: &SyntaxNode) -> Result<CursorPlan, String> {
         let s = sig(ts);
         let raw = tsql_unquote(&ts[s[1]].s);
@@ -4654,6 +4933,7 @@ impl<'a> Cx<'a> {
         }
         if !stat {
             let reads = table_names(&query);
+            let mut conflicts: Vec<(SyntaxNode, String)> = Vec::new();
             for d in body.descendants().filter(|d| d.kind() == STATEMENT) {
                 let w = sig_words(&d);
                 match w.first().map(String::as_str) {
@@ -4663,10 +4943,44 @@ impl<'a> Cx<'a> {
                     Some("INSERT" | "UPDATE" | "DELETE" | "MERGE" | "WITH") => {
                         let names = written_tables(&tokens(&d));
                         if let Some(t) = reads.iter().find(|t| names.contains(t)) {
-                            return Err(format!("the cursor loop writes {t}, which the cursor reads: a T-SQL cursor that is not STATIC may see the change, a PostgreSQL cursor reads the rows as of OPEN; declare it STATIC to convert it"));
+                            conflicts.push((d.clone(), t.clone()));
                         }
                     }
                     _ => {}
+                }
+            }
+            // Allowed only where every such write changes the row just
+            // fetched and no other (`keyed_writes`), on unique keys the
+            // catalog shows.
+            if let Some((_, t)) = conflicts.first() {
+                let refuse = |why: String| {
+                    format!("the cursor loop writes {t}, which the cursor reads: a T-SQL cursor that is not STATIC may see the change, a PostgreSQL cursor reads the rows as of OPEN; declare it STATIC to convert it ({why})")
+                };
+                let Some(Ok((_, _, _, q))) = sqldiff_core::equiv::cursor::tsql_declaration(n)
+                else {
+                    return Err(refuse("the cursor declaration was not read".into()));
+                };
+                let nodes: Vec<&SyntaxNode> = conflicts.iter().map(|(x, _)| x).collect();
+                let targets: Vec<String> = vars.iter().map(|v| format!("@{v}")).collect();
+                let reqs =
+                    sqldiff_core::equiv::cursor::keyed_writes(&q, &nodes, &body, last, &targets)
+                        .map_err(refuse)?;
+                for r in &reqs {
+                    use sqldiff_core::equiv::cursor::KeyKind;
+                    let (ok, need) = match r.kind {
+                        KeyKind::Unique => (self.has_unique_key(&r.table, &r.cols), "unique on"),
+                        KeyKind::Unindexed => (
+                            self.has_no_indexed_column(&r.table, &r.cols),
+                            "free of a key or index on",
+                        ),
+                    };
+                    if !ok {
+                        return Err(refuse(format!(
+                            "the source catalog does not show {} {need} ({})",
+                            r.table.join("."),
+                            r.cols.join(", ")
+                        )));
+                    }
                 }
             }
         }
@@ -5022,6 +5336,18 @@ impl<'a> Cx<'a> {
                 ));
             }
         }
+        // A callee that returns a status got a last INOUT return_code (a
+        // PL/pgSQL CALL cannot leave it out: "argument is not writable"), so
+        // pass a variable nobody reads; a top-level CALL takes NULL.
+        if !self.db2() && self.callee_returns_status(&raw_name) {
+            let target = if matches!(self.mode, Mode::Proc | Mode::Do) {
+                self.rc_scratch = true;
+                RC_SCRATCH
+            } else {
+                "NULL"
+            };
+            args.push(format!("return_code => {target}"));
+        }
         self.step_ts("tsql.stmt.exec", &ts);
         Ok(format!("CALL {name}({})", args.join(", ")))
     }
@@ -5029,7 +5355,21 @@ impl<'a> Cx<'a> {
     /// The procedure `name` (as written, possibly qualified) in the source
     /// catalog, when exactly one matches. `dbo` and no schema are the same.
     fn callee(&self, name: &str) -> Option<&'a sqldiff_core::catalog::Routine> {
-        let cat = self.catalog?;
+        Self::routine_in(self.catalog?, name)
+    }
+
+    /// Whether the procedure `name` returns a status: it gets a `return_code`.
+    /// Known from the tree's catalog, or else from this input's own routines.
+    fn callee_returns_status(&self, name: &str) -> bool {
+        self.type_catalog()
+            .and_then(|c| Self::routine_in(c, name))
+            .is_some_and(|r| r.returns_status)
+    }
+
+    fn routine_in<'c>(
+        cat: &'c sqldiff_core::catalog::Catalog,
+        name: &str,
+    ) -> Option<&'c sqldiff_core::catalog::Routine> {
         let parts: Vec<String> = name.split('.').map(tsql_unquote).collect();
         let (schema, proc) = match parts.as_slice() {
             [p] => (None, p.clone()),
@@ -5087,6 +5427,18 @@ impl<'a> Cx<'a> {
                 [t] if t.k == STRING => {
                     val.insert(key, t.clone());
                 }
+                // A bracketed identifier is the name string: the same
+                // text as the string literal of its unbracketed name.
+                [t] if t.k == QUOTED_IDENT
+                    && t.s.starts_with('[')
+                    && key.starts_with("level")
+                    && key.ends_with("name") =>
+                {
+                    let mut t = t.clone();
+                    t.k = STRING;
+                    t.s = format!("N'{}'", tsql_unquote(&t.s).replace('\'', "''"));
+                    val.insert(key, t);
+                }
                 [t] if t.is("NULL") => {}
                 _ => return no("sp_addextendedproperty with a non-literal argument: no rule yet"),
             }
@@ -5099,14 +5451,32 @@ impl<'a> Cx<'a> {
             .ok_or(No("sp_addextendedproperty without a value".into()))?
             .clone();
         let target = match (kind("level0type"), kind("level1type"), kind("level2type")) {
+            (Some(s), None, None)
+                if s == "SCHEMA"
+                    && text("level0name").is_some_and(|n| n.eq_ignore_ascii_case("dbo")) =>
+            {
+                return no("sp_addextendedproperty on the dbo schema: the conversion drops dbo, so there is no schema to comment on")
+            }
             (Some(s), None, None) if s == "SCHEMA" => {
                 format!("SCHEMA {}", ident("level0name").unwrap_or_default())
             }
             (Some(s), Some(o), l2) if s == "SCHEMA" => {
                 let schema = ident("level0name")
                     .ok_or(No("sp_addextendedproperty without a schema name".into()))?;
+                // `dbo` is dropped as everywhere else (ASM-DBO-SCHEMA).
+                let dbo = text("level0name").is_some_and(|n| n.eq_ignore_ascii_case("dbo"));
+                let prefix = if dbo {
+                    let text = self.pick(
+                        "The dbo schema is dropped: objects are assumed to be found through search_path (usually the public schema).",
+                        "The dbo schema is dropped: objects are assumed to be found through the default schema (CURRENT SCHEMA, or the library list with system naming).",
+                    ).to_string();
+                    self.note(Status::Assumptions, "ASM-DBO-SCHEMA", &text);
+                    String::new()
+                } else {
+                    format!("{schema}.")
+                };
                 let obj = format!(
-                    "{schema}.{}",
+                    "{prefix}{}",
                     ident("level1name")
                         .ok_or(No("sp_addextendedproperty without an object name".into()))?
                 );
@@ -5127,7 +5497,7 @@ impl<'a> Cx<'a> {
                         ))
                     }
                     ("TABLE", Some("INDEX"), Some(i)) if !self.db2() => {
-                        format!("INDEX {schema}.{i}")
+                        format!("INDEX {prefix}{i}")
                     }
                     ("TABLE", Some("CONSTRAINT"), Some(c)) if !self.db2() => {
                         format!("CONSTRAINT {c} ON {obj}")
@@ -5182,7 +5552,21 @@ impl<'a> Cx<'a> {
             "SCHEMA" => self.create_schema(&ts),
             "ROLE" => self.create_role(&ts),
             "SEQUENCE" => self.create_sequence(&ts, s[2..].to_vec()),
-            _ => no(format!("CREATE {w1}: no rule yet")),
+            _ => {
+                let words: Vec<String> = s[1..].iter().take(2).map(|&i| ts[i].up()).collect();
+                let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                match crate::impossible::of_ddl(&words) {
+                    Some(x) => impossible(
+                        x,
+                        format!(
+                            "CREATE {}: SQL Server only; {} has nothing to convert it to",
+                            words.join(" "),
+                            self.to.display_name()
+                        ),
+                    ),
+                    None => no(format!("CREATE {w1}: no rule yet")),
+                }
+            }
         }
     }
 
@@ -5194,11 +5578,16 @@ impl<'a> Cx<'a> {
             .take_while(|t| !t.is("INDEX"))
             .find(|t| t.is("COLUMNSTORE") || t.is("XML") || t.is("SPATIAL"))
         {
-            return no(format!(
+            let why = format!(
                 "{} index: {} has no counterpart; create a plain index (or none) after review",
                 t.up(),
                 self.to.display_name()
-            ));
+            );
+            return if t.is("COLUMNSTORE") {
+                impossible(crate::impossible::COLUMNSTORE, why)
+            } else {
+                no(why)
+            };
         }
         let ts = self.strip_partition_scheme(&ts);
         let ts = self.strip_storage(&ts)?;
@@ -6102,10 +6491,51 @@ impl<'a> Cx<'a> {
             "computed column: use GENERATED ALWAYS AS (…) STORED after checking the expression";
         let s = sig(it);
         let name = self.expr(&it[s[0]..=s[0]]);
-        let open = next_sig(it, as_at)
-            .filter(|&p| it[p].k == L_PAREN)
-            .ok_or(No(REASON.into()))?;
-        let close = matching(it, open).ok_or(No("unbalanced computed column".into()))?;
+        let first = next_sig(it, as_at).ok_or(No(REASON.into()))?;
+        // `AS expr`: the parentheses are optional in T-SQL; the expression
+        // runs to PERSISTED or the end of the column. Read as `AS (expr)`.
+        let bare;
+        // `AS (a + 1) * b` starts with a parenthesis too: the parenthesised
+        // form ends at the matching one, followed by nothing or PERSISTED.
+        let wrapped = it[first].k == L_PAREN
+            && matching(it, first)
+                .is_some_and(|c| next_sig(it, c).map_or(true, |n| it[n].is("PERSISTED")));
+        let (it, open, close) = if wrapped {
+            let close = matching(it, first).ok_or(No("unbalanced computed column".into()))?;
+            (it, first, close)
+        } else {
+            let mut end = it.len();
+            let mut depth = 0i32;
+            for (k, t) in it.iter().enumerate().skip(first) {
+                match t.k {
+                    L_PAREN => depth += 1,
+                    R_PAREN => depth -= 1,
+                    _ if depth == 0 && t.is("PERSISTED") => {
+                        end = k;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let mut v: Vec<T> = it[..as_at + 1].to_vec();
+            v.push(T::made(
+                L_PAREN,
+                "(",
+                it[as_at].pos.0,
+                "tsql.table.computed-arith",
+            ));
+            v.extend(it[as_at + 1..end].iter().cloned());
+            v.push(T::made(
+                R_PAREN,
+                ")",
+                it[as_at].pos.0,
+                "tsql.table.computed-arith",
+            ));
+            let close = v.len() - 1;
+            v.extend(it[end..].iter().cloned());
+            bare = v;
+            (&bare[..], as_at + 1, close)
+        };
         // After the expression: PERSISTED, then NULL or NOT NULL, and nothing else.
         let after: Vec<&T> = sig(&it[close + 1..])
             .into_iter()
@@ -6136,6 +6566,18 @@ impl<'a> Cx<'a> {
                 "{} {ty} GENERATED ALWAYS AS ({expr}) STORED{}",
                 name.trim(),
                 if not_null { " NOT NULL" } else { "" }
+            ));
+        }
+        if let Some((ty, expr, isnull)) = self.computed_arith(e, it[as_at].pos.0, persisted)? {
+            self.step_ts("tsql.table.computed-arith", &it[as_at..]);
+            self.note(Status::Assumptions, "ASM-COMPUTED-STORED", &format!(
+                "The computed column {0} (arithmetic over columns of the table) becomes a STORED generated column of the type SQL Server derives for it. T-SQL computes a column that is not PERSISTED when the row is read, PostgreSQL when the row is written; integer arithmetic is converted only for PERSISTED columns (SQL Server then raises an overflow error when the row is written, as PostgreSQL does), and decimal arithmetic within 38 digits cannot overflow. Both refuse a value written into it. Not the same: an INSERT without a column list skips the column in T-SQL but not in PostgreSQL (the engine compares no such INSERT), and PostgreSQL accepts the keyword DEFAULT for it.",
+                name.trim(),
+            ));
+            return Ok(format!(
+                "{} {ty} GENERATED ALWAYS AS ({expr}) STORED{}",
+                name.trim(),
+                if not_null || isnull { " NOT NULL" } else { "" }
             ));
         }
         if let Some((ty, expr, json)) = self.computed_iso126(e, it[as_at].pos.0)? {
@@ -6316,6 +6758,165 @@ impl<'a> Cx<'a> {
         ];
         let (ty, _, _) = self.ty(&ty)?;
         Ok(Some((ty, parts.join(" || "))))
+    }
+
+    /// The type words and arguments of a column of the table being
+    /// created, lower-cased (`["decimal", "(", "9", ",", "2", ")"]`).
+    fn column_type_words(&self, t: &T) -> Option<Vec<String>> {
+        let key = tsql_unquote(&t.s).to_ascii_lowercase();
+        let item = self.table_items.iter().find(|item| {
+            let s = sig(item);
+            s.first().is_some_and(|&f| {
+                tsql_unquote(&item[f].s).to_ascii_lowercase() == key && !constraint_item(&item[f])
+            })
+        })?;
+        let s = sig(item);
+        let mut words = vec![tsql_unquote(&item[*s.get(1)?].s).to_ascii_lowercase()];
+        if s.get(2).is_some_and(|&n| item[n].k == L_PAREN) {
+            for &k in &s[2..] {
+                words.push(item[k].s.to_ascii_lowercase());
+                if item[k].k == R_PAREN {
+                    break;
+                }
+            }
+        }
+        Some(words)
+    }
+
+    /// The type of a column of the table being created, when it is an
+    /// integer, `money` or `decimal(p, s)` column.
+    fn column_arith(&self, t: &T) -> Option<Arith> {
+        let w = self.column_type_words(t)?;
+        let w: Vec<&str> = w.iter().map(String::as_str).collect();
+        match w.as_slice() {
+            ["smallint"] => Some(Arith::Int(16)),
+            ["int"] | ["integer"] => Some(Arith::Int(32)),
+            ["bigint"] => Some(Arith::Int(64)),
+            ["decimal" | "numeric", "(", p, ",", s, ")"] => {
+                Some(Arith::Dec(p.parse().ok()?, s.parse().ok()?))
+            }
+            _ => None,
+        }
+    }
+
+    /// The type SQL Server gives an arithmetic computed column (checked in
+    /// `sys.columns`, eval/builtins/2026-11-02-o/computed-types-tsql.out), for
+    /// `+`, `-` and `*` over smallint, int, bigint and decimal columns of the
+    /// table and int literals: the same type for equal integer types, the
+    /// wider integer for different ones, decimal(p, s) by the documented
+    /// rule when it stays within 38 digits. `None` for anything else: money
+    /// (the expression engine has no money type yet), tinyint (T-SQL's
+    /// overflows at 255, PostgreSQL has no such type) and decimal literals.
+    fn arith_type(&self, e: &[T], persisted: bool) -> Option<Arith> {
+        let s = sig(e);
+        let (ty, used) = self.arith_sum(e, &s, 0)?;
+        // Integer arithmetic raises its overflow error when SQL Server
+        // reads a column that is not PERSISTED, but when PostgreSQL's
+        // STORED column is written: only a PERSISTED column converts
+        // (decimal arithmetic within 38 digits cannot overflow).
+        (used == s.len()
+            && !matches!(ty, Arith::Lit(_))
+            && (persisted || !matches!(ty, Arith::Int(_))))
+        .then_some(ty)
+    }
+
+    fn arith_sum(&self, e: &[T], s: &[usize], mut i: usize) -> Option<(Arith, usize)> {
+        let (mut ty, n) = self.arith_product(e, s, i)?;
+        i = n;
+        while i < s.len() && e[s[i]].k == OP && matches!(e[s[i]].s.as_str(), "+" | "-") {
+            let (rhs, n) = self.arith_product(e, s, i + 1)?;
+            ty = Arith::combine(ty, rhs, false)?;
+            i = n;
+        }
+        Some((ty, i))
+    }
+
+    fn arith_product(&self, e: &[T], s: &[usize], mut i: usize) -> Option<(Arith, usize)> {
+        let (mut ty, n) = self.arith_atom(e, s, i)?;
+        i = n;
+        while i < s.len() && e[s[i]].k == OP && e[s[i]].s == "*" {
+            let (rhs, n) = self.arith_atom(e, s, i + 1)?;
+            ty = Arith::combine(ty, rhs, true)?;
+            i = n;
+        }
+        Some((ty, i))
+    }
+
+    fn arith_atom(&self, e: &[T], s: &[usize], i: usize) -> Option<(Arith, usize)> {
+        let t = &e[*s.get(i)?];
+        match t.k {
+            NUMBER => {
+                let v: i64 = t.s.parse().ok()?;
+                (0..=i64::from(i32::MAX))
+                    .contains(&v)
+                    .then(|| (Arith::Lit(v.to_string().len() as u32), i + 1))
+            }
+            IDENT | QUOTED_IDENT if !t.s.starts_with('@') => Some((self.column_arith(t)?, i + 1)),
+            L_PAREN => {
+                let (ty, n) = self.arith_sum(e, s, i + 1)?;
+                (e[*s.get(n)?].k == R_PAREN).then_some((ty, n + 1))
+            }
+            _ => None,
+        }
+    }
+
+    /// `[ISNULL(] arithmetic [, literal)]` over the table's columns: the
+    /// PostgreSQL type and expression of the generated column, and whether
+    /// ISNULL made it NOT NULL (ASM-ISNULL-TYPE: the fallback fits the type
+    /// of the first argument, which is checked here).
+    fn computed_arith(
+        &mut self,
+        e: &[T],
+        at: usize,
+        persisted: bool,
+    ) -> R<Option<(String, String, bool)>> {
+        let es = sig(e);
+        let isnull = es.len() >= 3
+            && e[es[0]].is("ISNULL")
+            && e[es[1]].k == L_PAREN
+            && matching(e, es[1]) == Some(*es.last().unwrap());
+        let (body, fallback) = if isnull {
+            let args = split_commas(&e[es[1] + 1..*es.last().unwrap()]);
+            if args.len() != 2 {
+                return Ok(None);
+            }
+            (args[0], Some(args[1]))
+        } else {
+            (e, None)
+        };
+        let Some(ty) = self.arith_type(body, persisted) else {
+            return Ok(None);
+        };
+        // The expression must do arithmetic, not name one column.
+        if sig(body).len() < 3 && !isnull {
+            return Ok(None);
+        }
+        let mut expr = self.expr(body).trim().to_string();
+        if let Some(fb) = fallback {
+            let fb = trimmed(fb);
+            let fit = match (sig(fb).as_slice(), ty) {
+                ([k], _) if fb[*k].k == NUMBER => ty.holds(&fb[*k].s),
+                _ => false,
+            };
+            if !fit {
+                return no("computed column: the ISNULL fallback is not a number that fits the type of the first argument");
+            }
+            self.note(Status::Assumptions, "ASM-ISNULL-TYPE", "The ISNULL fallback fits the type of the first argument (ISNULL converts to it, COALESCE takes the wider type).");
+            expr = format!("COALESCE({expr}, {})", self.expr(fb).trim());
+        }
+        let made = |k, s: &str| T::made(k, s, at, "tsql.table.computed-arith");
+        let mut tt = vec![made(IDENT, ty.type_name())];
+        if let Arith::Dec(p, s) = ty {
+            tt.extend([
+                made(L_PAREN, "("),
+                made(NUMBER, &p.to_string()),
+                made(COMMA, ","),
+                made(NUMBER, &s.to_string()),
+                made(R_PAREN, ")"),
+            ]);
+        }
+        let (pg, _, _) = self.ty(&tt)?;
+        Ok(Some((pg, expr, isnull)))
     }
 
     /// A varying-string column of the table being created:
@@ -8128,6 +8729,7 @@ impl<'a> Cx<'a> {
         } else {
             format!("sys.{name}: {}", sys_catalog_refusal(&name))
         };
+        let text = crate::impossible::reason(crate::impossible::INSTANCE_METADATA, &text);
         self.note(Status::NotConverted, METADATA, &text);
     }
 
@@ -8162,6 +8764,15 @@ impl<'a> Cx<'a> {
                 METADATA
             } else {
                 "tsql.builtin"
+            };
+            // SQL Server's own metadata and hashes have no target
+            // counterpart; every other built-in only lacks a rule.
+            let text = if server_metadata(&up) {
+                crate::impossible::reason(crate::impossible::INSTANCE_METADATA, &text)
+            } else if matches!(up.as_str(), "CHECKSUM" | "BINARY_CHECKSUM") {
+                crate::impossible::reason(crate::impossible::HASH_FUNCTIONS, &text)
+            } else {
+                text
             };
             self.note(Status::NotConverted, rule, &text);
         }
@@ -8309,7 +8920,8 @@ impl<'a> Cx<'a> {
                 self.note(Status::Assumptions, "ASM-POSTGIS-GEOGRAPHY", "GEOGRAPHY becomes PostGIS geography (no type modifier, so each value keeps its own SRID, as in SQL Server): the database has the postgis extension and its types are on the search path. A value is carried as it is; SQL Server's geography methods (STDistance, Lat, …) and PostGIS's functions differ, so every spatial expression is converted and checked on its own, and clients read PostGIS's formats.");
                 ("geography".into(), false, false)
             }
-            "SQL_VARIANT" | "HIERARCHYID" | "GEOMETRY" | "CURSOR" | "TABLE" => return no(format!("type {up} has no PostgreSQL equivalent rule yet")),
+            "HIERARCHYID" => return impossible(crate::impossible::HIERARCHYID, "type HIERARCHYID: its values, ordering and methods (GetAncestor, IsDescendantOf, …) have no PostgreSQL counterpart (ltree is a different path type)"),
+            "SQL_VARIANT" | "GEOMETRY" | "CURSOR" | "TABLE" => return no(format!("type {up} has no PostgreSQL equivalent rule yet")),
             _ => {
                 self.note(Status::Assumptions, "ASM-USER-TYPE", "A type without a rule was kept as written: it must exist in PostgreSQL under that name.");
                 let t: String = ts.iter().map(|t| t.s.clone()).collect();
@@ -8413,7 +9025,8 @@ impl<'a> Cx<'a> {
             }
             "XML" => other("XML".into()),
             "ROWVERSION" | "TIMESTAMP" => return no("ROWVERSION/TIMESTAMP: use a row change timestamp column (TIMESTAMP GENERATED ALWAYS FOR EACH ROW ON UPDATE AS ROW CHANGE TIMESTAMP)"),
-            "SQL_VARIANT" | "HIERARCHYID" | "GEOGRAPHY" | "GEOMETRY" | "CURSOR" | "TABLE" => return no(format!("type {up} has no Db2 for i equivalent rule yet")),
+            "HIERARCHYID" => return impossible(crate::impossible::HIERARCHYID, "type HIERARCHYID: its values, ordering and methods (GetAncestor, IsDescendantOf, …) have no Db2 for i counterpart"),
+            "SQL_VARIANT" | "GEOGRAPHY" | "GEOMETRY" | "CURSOR" | "TABLE" => return no(format!("type {up} has no Db2 for i equivalent rule yet")),
             _ => {
                 self.note(Status::Assumptions, "ASM-USER-TYPE", "A type without a rule was kept as written: it must exist in Db2 for i under that name.");
                 let t: String = ts.iter().map(|t| t.s.clone()).collect();
@@ -9997,6 +10610,86 @@ fn simple_operand(ts: &[T]) -> bool {
         && s.len() % 2 == 1
 }
 
+/// The numeric types an arithmetic computed column is read over.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Arith {
+    /// smallint, int or bigint, by bit width.
+    Int(u8),
+    Dec(u32, u32),
+    /// A bare int literal of this many digits (parenthesised or not): next
+    /// to a decimal it is a decimal(digits, 0), not an int; next to an int
+    /// it is an int (SQL Server 2022, sys.columns).
+    Lit(u32),
+}
+
+impl Arith {
+    fn type_name(self) -> &'static str {
+        match self {
+            Arith::Int(16) => "smallint",
+            Arith::Int(32) => "int",
+            Arith::Int(_) => "bigint",
+            Arith::Dec(..) => "decimal",
+            Arith::Lit(_) => "int",
+        }
+    }
+
+    /// An integer type as the decimal SQL Server converts it to.
+    fn as_dec(self) -> Option<(u32, u32)> {
+        match self {
+            Arith::Int(16) => Some((5, 0)),
+            Arith::Int(32) => Some((10, 0)),
+            Arith::Int(_) => Some((19, 0)),
+            Arith::Dec(p, s) => Some((p, s)),
+            Arith::Lit(d) => Some((d, 0)),
+        }
+    }
+
+    /// The type of `a op b`; `mul` for `*`. `None` where this rule does not
+    /// read it.
+    fn combine(a: Arith, b: Arith, mul: bool) -> Option<Arith> {
+        use Arith::*;
+        match (a, b) {
+            (Lit(_), Lit(_)) => Some(Int(32)),
+            (Lit(_), Int(w)) | (Int(w), Lit(_)) => Some(Int(w.max(32))),
+            (Int(x), Int(y)) => Some(Int(x.max(y))),
+            _ => {
+                let ((p1, s1), (p2, s2)) = (a.as_dec()?, b.as_dec()?);
+                let (p, s) = if mul {
+                    (p1 + p2 + 1, s1 + s2)
+                } else {
+                    let s = s1.max(s2);
+                    ((p1 - s1).max(p2 - s2) + s + 1, s)
+                };
+                (p <= 38).then_some(Dec(p, s))
+            }
+        }
+    }
+
+    /// Whether an unsigned number written as `text` is stored in this
+    /// type without rounding or overflow.
+    fn holds(self, text: &str) -> bool {
+        let (int, frac) = text.split_once('.').unwrap_or((text, ""));
+        if !int.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        let int = int.trim_start_matches('0');
+        match self {
+            Arith::Int(w) => {
+                frac.is_empty()
+                    && int.len() <= 10
+                    && int.parse::<u64>().unwrap_or(0)
+                        <= match w {
+                            16 => 32767,
+                            32 => 2_147_483_647,
+                            _ => 9_223_372_036_854_775_807,
+                        }
+            }
+            Arith::Dec(p, s) => frac.len() as u32 <= s && int.len() as u32 <= p - s,
+            Arith::Lit(_) => false,
+        }
+    }
+}
+
 /// The PostgreSQL to_char format that prints what CONVERT(varchar, x, style)
 /// prints, and the text's length: the engine's table, for a date or a
 /// datetime / datetime2 (smalldatetime and time are left out).
@@ -10238,7 +10931,7 @@ fn memory_optimized(opts: &[&[T]]) -> R<bool> {
     }
     match value("DURABILITY").as_deref() {
         None | Some("SCHEMA_AND_DATA") => Ok(true),
-        Some(d) => no(format!("table option DURABILITY = {d}: SQL Server keeps none of the table's rows across a restart; a plain table keeps them. No rule yet")),
+        Some(d) => impossible(crate::impossible::IN_MEMORY_OLTP, format!("table option DURABILITY = {d}: SQL Server keeps none of the table's rows across a restart; a plain table keeps them")),
     }
 }
 
@@ -11098,7 +11791,52 @@ impl Cx<'_> {
                     _ => None,
                 }
             }
-            _ => self.column_dt(ts),
+            _ => self.arith_dt(ts).or_else(|| self.column_dt(ts)),
+        }
+    }
+
+    /// The type of `a op b op c …` with `op` one of `+ - * / %` at the top
+    /// level, when every operand is a number: a fraction if any operand is
+    /// one (decimal, float or a literal with a point), else bigint or int
+    /// (int `/` int stays an int in T-SQL). Money mixed with anything but
+    /// integers, strings, dates and unknown operands give `None`.
+    fn arith_dt(&self, ts: &[T]) -> Option<Dt> {
+        let ts = trimmed(ts);
+        let ds = crate::tok::depths(ts);
+        let mut parts: Vec<&[T]> = Vec::new();
+        let (mut start, mut prev_op) = (0, true);
+        for (i, t) in ts.iter().enumerate() {
+            if !t.sig() {
+                continue;
+            }
+            let op = ds[i] == 0 && t.k == OP && matches!(t.s.as_str(), "+" | "-" | "*" | "/" | "%");
+            if op && !prev_op {
+                parts.push(&ts[start..i]);
+                start = i + 1;
+                prev_op = true;
+            } else {
+                prev_op = op;
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        parts.push(&ts[start..]);
+        let (mut fraction, mut money, mut big) = (false, false, false);
+        for p in parts {
+            match self.expr_dt(p)? {
+                Dt::Int => {}
+                Dt::BigInt => big = true,
+                Dt::Fraction => fraction = true,
+                Dt::Money => money = true,
+                _ => return None,
+            }
+        }
+        match (fraction, money) {
+            (true, false) => Some(Dt::Fraction),
+            (false, true) => Some(Dt::Money),
+            (false, false) => Some(if big { Dt::BigInt } else { Dt::Int }),
+            (true, true) => None,
         }
     }
 
@@ -11142,6 +11880,25 @@ impl Cx<'_> {
         };
         let ty = trimmed(a[0]);
         let words: Vec<String> = sig(ty).iter().map(|&i| ty[i].up()).collect();
+        // A compact date literal read with style 112 is the CAST of the
+        // same literal (the engine proves it the same way).
+        if let (Some(name), [lit], [num]) = (
+            words.first(),
+            sig(trimmed(a[1])).as_slice(),
+            sig(trimmed(a[2])).as_slice(),
+        ) {
+            let (lit, num) = (&trimmed(a[1])[*lit], &trimmed(a[2])[*num]);
+            if lit.k == STRING
+                && num.k == NUMBER
+                && sqldiff_core::equiv::canon::compact_date_convert(
+                    name,
+                    &string_value(&lit.s),
+                    &num.s,
+                )
+            {
+                return self.cast_pg(a[1], a[0]);
+            }
+        }
         let len = match words
             .iter()
             .map(String::as_str)

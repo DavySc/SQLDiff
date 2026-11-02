@@ -1044,6 +1044,25 @@ const PG_ROUTINE_OPTIONS: &[&str] = &[
     "CONCURRENT",
 ];
 
+/// Whether a T-SQL body has a statement `RETURN expression`.
+fn returns_a_value(node: &SyntaxNode) -> bool {
+    node.descendants()
+        .filter(|d| d.kind() == SyntaxKind::STATEMENT)
+        .any(|d| {
+            let mut sig = d
+                .descendants_with_tokens()
+                .filter_map(|e| e.into_token())
+                .filter(|t| {
+                    !t.kind().is_trivia()
+                        && t.kind() != SyntaxKind::SEMICOLON
+                        && !t.text().is_empty()
+                });
+            sig.next()
+                .is_some_and(|t| t.text().eq_ignore_ascii_case("RETURN"))
+                && sig.next().is_some()
+        })
+}
+
 /// Reads the name, parameters and return type of a ROUTINE node.
 pub fn routine_header(node: &SyntaxNode, dialect: Dialect) -> Option<RoutineHeader> {
     let t = tokens::header(node);
@@ -1066,6 +1085,9 @@ pub fn routine_header(node: &SyntaxNode, dialect: Dialect) -> Option<RoutineHead
             kind,
             params: Vec::new(),
             returns: None,
+            returns_status: dialect == Dialect::Tsql
+                && kind == RoutineKind::Procedure
+                && returns_a_value(node),
         },
         param_spans: Vec::new(),
         trigger: None,

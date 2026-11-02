@@ -421,6 +421,48 @@ fn extended_properties_become_comments() {
     equal(schema, "COMMENT ON SCHEMA Sales IS 'Sales data';");
 }
 
+/// A bracketed identifier is the name string, positional or named, for
+/// any schema, table, view or column name (spaces included).
+#[test]
+fn extended_properties_with_bracketed_names() {
+    let t = "EXECUTE [sys].[sp_addextendedproperty] N'Description', N'Kept things', N'SCHEMA', [dbo], N'TABLE', [Things], N'COLUMN', [Qty];";
+    equal(t, "COMMENT ON COLUMN public.Things.qty IS 'Kept things';");
+    let named = "EXEC sys.sp_addextendedproperty @name = N'Description', @value = N'Kept things', @level0type = N'SCHEMA', @level0name = [dbo], @level1type = N'VIEW', @level1name = [ThingNames];";
+    equal(named, "COMMENT ON VIEW public.ThingNames IS 'Kept things';");
+    // Another column is a different comment target.
+    unknown(
+        t,
+        "COMMENT ON COLUMN public.Things.name IS 'Kept things';",
+        "no counterpart",
+    );
+}
+
+/// The converter drops `dbo`, so its comment targets are unqualified.
+#[test]
+fn unqualified_comment_targets_are_in_the_default_schema() {
+    let cases = [
+        ("@level1type = N'TABLE', @level1name = N'Things'", "COMMENT ON TABLE Things IS 'Kept things';"),
+        ("@level1type = N'TABLE', @level1name = N'Things', @level2type = N'COLUMN', @level2name = N'Qty'", "COMMENT ON COLUMN Things.Qty IS 'Kept things';"),
+        ("@level1type = N'VIEW', @level1name = N'ThingNames'", "COMMENT ON VIEW ThingNames IS 'Kept things';"),
+        ("@level1type = N'TABLE', @level1name = N'Things', @level2type = N'INDEX', @level2name = N'IX_Things_Qty'", "COMMENT ON INDEX IX_Things_Qty IS 'Kept things';"),
+        ("@level1type = N'TABLE', @level1name = N'Things', @level2type = N'CONSTRAINT', @level2name = N'UQ_Things_Name'", "COMMENT ON CONSTRAINT UQ_Things_Name ON Things IS 'Kept things';"),
+        ("@level1type = N'PROCEDURE', @level1name = N'Touch'", "COMMENT ON PROCEDURE Touch IS 'Kept things';"),
+    ];
+    for (levels, pg) in cases {
+        let r = equal(&extprop("N'Kept things'", levels), pg);
+        assert_eq!(r.verdict(), Verdict::EqualUnderAssumptions, "{pg}");
+    }
+    // The wrong object is still no match.
+    unknown(
+        &extprop(
+            "N'Kept things'",
+            "@level1type = N'TABLE', @level1name = N'Things'",
+        ),
+        "COMMENT ON TABLE ThingNames IS 'Kept things';",
+        "no counterpart",
+    );
+}
+
 #[test]
 fn comment_near_misses() {
     let table = "@level1type = N'TABLE', @level1name = N'Things'";
@@ -567,4 +609,82 @@ fn a_traced_call_keeps_its_place_among_the_paired_statements() {
     assert!(place(&r), "{:?}", r.unknown_reasons);
     assert_ne!(r.verdict(), Verdict::Equal);
     assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
+}
+
+/// A converted procedure that returns a status gets a last `INOUT
+/// return_code integer DEFAULT NULL`. A PL/pgSQL CALL cannot leave it out
+/// ("argument is not writable"), so a call that ignores the status passes a
+/// variable nothing reads.
+#[test]
+fn an_ignored_status_goes_to_a_variable_nobody_reads() {
+    let cat_t = format!("{CAT_T}\nGO\nCREATE PROCEDURE dbo.Status @a int AS BEGIN RETURN 1; END;");
+    let cat_p = |tail: &str| {
+        format!(
+            "{CAT_P}\nCREATE PROCEDURE Status(p_a integer{tail}) LANGUAGE plpgsql AS $$ BEGIN return_code := 1; END $$;"
+        )
+    };
+    let good = cat_p(", INOUT return_code integer DEFAULT NULL");
+    let t = caller_t("EXEC dbo.Status 5;");
+    let p = |decl: &str, body: &str| {
+        format!(
+            "CREATE PROCEDURE Caller(p_n varchar(50))\nLANGUAGE plpgsql\nAS $$\nDECLARE\n  v_newid integer;\n  {decl}\nBEGIN\n  {body}\nEND;\n$$;"
+        )
+    };
+    let scratch = p(
+        "rc_scratch integer;",
+        "CALL Status(5, return_code => rc_scratch);",
+    );
+    let r = run_with(&t, &scratch, &opts(&cat_t, &good));
+    assert!(
+        !r.unknown_reasons.iter().any(|x| x.contains("call")),
+        "{:?}",
+        r.unknown_reasons
+    );
+    assert!(asms(&r).contains(&"ASM-RETURN-CODE"), "{:?}", asms(&r));
+    let o = opts(&cat_t, &good);
+    // Leaving it out raises in PL/pgSQL, T-SQL does not.
+    unknown_with(&t, &caller_p("CALL Status(5);"), &o, "cannot do");
+    // The variable must be unread: here it is assigned from and used again.
+    unknown_with(
+        &t,
+        &p(
+            "rc_scratch integer;",
+            "CALL Status(5, return_code => rc_scratch);\n  v_newid := rc_scratch;",
+        ),
+        &o,
+        "besides return_code",
+    );
+    // Not a variable, not an integer.
+    unknown_with(
+        &t,
+        &caller_p("CALL Status(5, return_code => NULL);"),
+        &o,
+        "not a local variable",
+    );
+    unknown_with(
+        &t,
+        &p(
+            "rc_scratch bigint;",
+            "CALL Status(5, return_code => rc_scratch);",
+        ),
+        &o,
+        "not an integer",
+    );
+    // The extra parameter must be the converter's: INOUT, defaulted to NULL.
+    for tail in [
+        ", INOUT return_code integer",
+        ", INOUT return_code integer DEFAULT 0",
+        ", OUT return_code integer",
+        ", INOUT status integer DEFAULT NULL",
+        ", extra integer DEFAULT NULL",
+    ] {
+        unknown_with(&t, &scratch, &opts(&cat_t, &cat_p(tail)), "parameter(s)");
+    }
+    // A call outside PL/pgSQL returns the INOUT value to the client as a row.
+    unknown_with(
+        "EXEC dbo.Status 5;",
+        "CALL Status(5, return_code => NULL);",
+        &o,
+        "as a row",
+    );
 }
