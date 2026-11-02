@@ -743,9 +743,9 @@ sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-
 
 [[assumption]]
 id = "ASM-ERROR-CONTINUES-WARNING"
-statement = "A statement error after which T-SQL reports it and goes on (XACT_ABORT OFF: a constraint violation, divide by zero or overflow, string truncation) is reported as a warning here, and the procedure goes on with the next statement. Callers that read the error itself (a failed call, an error message) see a warning instead, and the routines called go on after their own statement errors the same way. Conversion errors and the other errors that stop the T-SQL batch stop the procedure here too (eval/xact-abort/)."
+statement = "A statement error after which T-SQL reports it and goes on (XACT_ABORT OFF: a constraint violation, divide by zero or overflow, string truncation) is reported as a warning here, and the procedure goes on with the next statement. Callers that read the error itself (a failed call, an error message) see a warning instead. Conversion errors and the other errors that stop the T-SQL batch stop the procedure here too (eval/xact-abort/)."
 discharge = "deployment"
-fact = "How callers learn of a failed statement, and that the routines called are converted the same way."
+fact = "How callers learn of a failed statement."
 sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/ir/behaviour.rs", "sqldiff-core/src/ir/interp.rs"]
 
 [[assumption]]

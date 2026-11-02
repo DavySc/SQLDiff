@@ -487,14 +487,16 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
     };
     let blocks = check_one(input, draft, opts);
     let without = check_one(input, *plain, opts);
-    // Fewer units open, then fewer with a difference found: a difference
-    // the plain conversion shows (T-SQL goes on, PostgreSQL stops) is gone
-    // from the blocks even when the engine cannot yet prove them.
+    // Never the version the engine has shown wrong over the one it cannot
+    // yet prove: fewer units with a difference found first, then fewer units
+    // open. (Both versions are the same code to run; only what the engine
+    // can tie down differs, and a difference it found in the plain version,
+    // T-SQL going on where PostgreSQL stops, is gone from the blocks.)
     let score = |c: &Conversion| {
         let open = |keep: fn(Status) -> bool| c.units.iter().filter(|u| keep(u.status)).count();
         (
-            open(|s| !matches!(s, Status::Converted | Status::Assumptions)),
             open(|s| s == Status::Differs),
+            open(|s| !matches!(s, Status::Converted | Status::Assumptions)),
         )
     };
     if score(&blocks) < score(&without) {

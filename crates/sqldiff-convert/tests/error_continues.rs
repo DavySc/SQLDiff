@@ -1,12 +1,12 @@
 //! T-SQL without `SET XACT_ABORT ON` goes on after a statement fails. A
 //! PostgreSQL procedure stops at the first error, so each statement that
-//! can fail gets its own `BEGIN … EXCEPTION WHEN <classes> THEN RAISE
-//! WARNING … END` and a COMMIT where T-SQL commits it on its own
-//! (`tsql.txn.continue`, `ASM-ERROR-CONTINUES-WARNING`). Only the classes
-//! after which T-SQL goes on are caught: constraint, divide by zero, overflow,
-//! truncation, cardinality (512). Conversion errors (245, 8114, 241) end the
-//! T-SQL batch and so the procedure here (SQL Server 2022 and PostgreSQL 18,
-//! `eval/xact-abort/`).
+//! can fail gets its own `BEGIN … EXCEPTION WHEN <errors that end the T-SQL
+//! batch> THEN RAISE; WHEN OTHERS THEN RAISE WARNING … END` and a COMMIT where
+//! T-SQL commits it on its own (`tsql.txn.continue`,
+//! `ASM-ERROR-CONTINUES-WARNING`). Conversion errors (245, 8114, 241), lock
+//! errors and missing objects end the T-SQL batch and so the procedure here
+//! (SQL Server 2022 and PostgreSQL 18, `eval/xact-abort/`); every other error
+//! is reported and the next statement runs.
 
 use std::collections::BTreeMap;
 
@@ -77,10 +77,13 @@ fn each_statement_gets_a_block_and_a_commit() {
         c.output
     );
     assert!(has_note(&c, "ASM-ERROR-CONTINUES-WARNING"));
-    // Conversion errors are not caught: T-SQL ends the batch at one.
-    assert!(!c.output.contains("OTHERS"), "{}", c.output);
-    assert!(
-        !c.output.contains("invalid_text_representation"),
+    // Conversion errors are re-raised: T-SQL ends the batch at one. Every
+    // other error is reported and the procedure goes on.
+    assert_eq!(count(&c, "WHEN OTHERS THEN"), 3, "{}", c.output);
+    assert_eq!(count(&c, "RAISE;"), 3, "{}", c.output);
+    assert_eq!(
+        count(&c, "EXCEPTION WHEN invalid_text_representation OR"),
+        3,
         "{}",
         c.output
     );
@@ -98,15 +101,14 @@ fn dml_that_may_raise_a_conversion_error_keeps_its_commits_unproven() {
 }
 
 #[test]
-fn a_body_the_engine_cannot_prove_better_keeps_the_plain_conversion() {
-    // `check` keeps the blocks only when strictly fewer units stay open than
-    // in the plain conversion. Calls to a procedure whose own statements the
-    // engine cannot yet tie down leave the COMMITs unproven either way, so
-    // the plain conversion stays and the output carries no blocks.
+fn a_call_is_never_wrapped() {
+    // A callee's own COMMIT cannot run inside the subtransaction of an
+    // exception block (2D000), and its error path is its own: a body that
+    // calls is converted without the blocks.
     let c = pg("CREATE PROCEDURE dbo.Two AS
 BEGIN
     SET NOCOUNT ON;
-    EXEC dbo.One @n = 1;
+    UPDATE dbo.A SET Qty = 1;
     EXEC dbo.One @n = 2;
 END;
 GO
@@ -114,11 +116,44 @@ CREATE PROCEDURE dbo.One @n int AS
 BEGIN
     SET NOCOUNT ON;
     UPDATE dbo.A SET Qty = @n;
+    UPDATE dbo.B SET Qty = @n;
+    DELETE FROM dbo.C WHERE Id = @n;
 END;
 ");
-    let blocks = count(&c, "EXCEPTION WHEN");
-    assert_eq!(blocks, count(&c, "RAISE WARNING"), "{}", c.output);
-    assert!(blocks == 0 || blocks == 2, "{}", c.output);
+    assert_eq!(count(&c, "EXCEPTION WHEN"), 3, "{}", c.output);
+    // Only the callee's three statements are wrapped.
+    let caller = c.output.split("PROCEDURE One").next().unwrap();
+    assert!(!caller.contains("EXCEPTION"), "{}", c.output);
+}
+
+#[test]
+fn many_routines_in_one_file_all_get_their_blocks() {
+    // The behaviour model compares one routine per artifact; the blocks must
+    // still win over the plain conversion, which the engine shows wrong.
+    let mut src = String::new();
+    for i in 0..4 {
+        src.push_str(&format!(
+            "CREATE PROCEDURE dbo.P{i} @Id int AS
+BEGIN
+    SET NOCOUNT ON;
+    INSERT dbo.A (Id, Qty) VALUES (@Id, 1);
+    UPDATE dbo.B SET Qty = Qty + 1 WHERE Id = @Id;
+    DELETE FROM dbo.C WHERE Id = @Id;
+END;
+GO
+"
+        ));
+    }
+    let c = pg(&src);
+    assert_eq!(count(&c, "EXCEPTION WHEN"), 12, "{}", c.output);
+    assert!(
+        c.units.iter().all(|u| u.status != Status::Differs),
+        "{:#?}",
+        c.units
+            .iter()
+            .map(|u| (u.status, &u.notes))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]

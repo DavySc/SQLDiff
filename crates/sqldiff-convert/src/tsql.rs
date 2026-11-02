@@ -47,6 +47,11 @@ mod rules {
 }
 
 /// The rule id of the per-statement exception blocks.
+/// The PostgreSQL conditions of the errors that end a T-SQL batch (the
+/// profile's batch-abort rows: conversion, lock, name resolution, cancel),
+/// which an exception block of [`CONTINUE_RULE`] re-raises.
+const CONTINUE_RERAISE: &str = "invalid_text_representation OR invalid_datetime_format OR datetime_field_overflow OR deadlock_detected OR serialization_failure OR lock_not_available OR undefined_table OR undefined_column OR undefined_function OR raise_exception OR query_canceled";
+
 pub(crate) const CONTINUE_RULE: &str = "tsql.txn.continue";
 
 thread_local! {
@@ -55,10 +60,15 @@ thread_local! {
 
 /// Runs `f` with the exception blocks of [`continuation_points`] switched off.
 pub(crate) fn without_continuation<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            NO_CONTINUE.with(|c| c.set(false));
+        }
+    }
     NO_CONTINUE.with(|c| c.set(true));
-    let r = f();
-    NO_CONTINUE.with(|c| c.set(false));
-    r
+    let _reset = Reset;
+    f()
 }
 
 pub(crate) fn convert(
@@ -630,12 +640,13 @@ impl<'a> Cx<'a> {
     /// of its statements is refused: the stand-in for a refused statement
     /// stops the procedure, where T-SQL goes on.
     fn routine(&mut self, out: &mut Out, r: &SyntaxNode) {
-        let saved = out.clone();
+        let (text, units) = (out.text.len(), out.units.len());
         self.cont_used = false;
         self.refusals = 0;
         self.routine_once(out, r);
         if self.cont_used && self.refusals > 0 {
-            *out = saved;
+            out.text.truncate(text);
+            out.units.truncate(units);
             let keep = self.no_cont;
             self.no_cont = true;
             self.routine_once(out, r);
@@ -4392,11 +4403,12 @@ impl<'a> Cx<'a> {
     /// A statement of a body that goes on after it fails (T-SQL without
     /// `SET XACT_ABORT ON`, [`continuation_points`]): its own exception block
     /// that reports the error as a warning and goes on, and a COMMIT after
-    /// it where T-SQL commits the statement on its own. Only the errors after
-    /// which T-SQL goes on are caught: constraint violations, arithmetic
-    /// errors (divide by zero, overflow) and string truncation. A conversion
-    /// error or any other stops the T-SQL batch, so it stops the procedure
-    /// here too (`eval/xact-abort/probe-tsql.out`, SQL Server 2022).
+    /// it where T-SQL commits the statement on its own. T-SQL goes on after
+    /// every statement error except the ones that end the batch (conversion,
+    /// deadlock and lock, missing objects, THROW/RAISERROR, cancel), so the
+    /// block re-raises those ([`CONTINUE_RERAISE`], which mirror the
+    /// profile's batch-abort rows) and reports every other error
+    /// (`WHEN OTHERS`; `eval/xact-abort/`, SQL Server 2022).
     fn continue_after(&mut self, n: &SyntaxNode, text: String) -> String {
         let at = tokens(n).iter().find(|t| t.sig()).map(|t| t.pos.0);
         if self.db2() || !matches!(self.mode, Mode::Proc | Mode::Do) {
@@ -4407,14 +4419,16 @@ impl<'a> Cx<'a> {
         };
         self.cont_used = true;
         self.step_node(CONTINUE_RULE, n);
-        self.note(Status::Assumptions, "ASM-ERROR-CONTINUES-WARNING", "T-SQL reports a failing statement's error to the caller and goes on with the next statement; here the statement's exception block reports it as a warning and the procedure goes on. Callers that read the error (a failed call, an error message) see a warning instead, and the routines called go on after their own statement errors the same way.");
-        let mut o = String::from("-- T-SQL (XACT_ABORT OFF): if this statement fails with a constraint, arithmetic, truncation or cardinality error, the error is reported and the next statement runs\nBEGIN\n");
+        self.note(Status::Assumptions, "ASM-ERROR-CONTINUES-WARNING", "T-SQL reports a failing statement's error to the caller and goes on with the next statement; here the statement's exception block reports it as a warning and the procedure goes on. Callers that read the error (a failed call, an error message) see a warning instead.");
+        let mut o = String::from("-- T-SQL (XACT_ABORT OFF): if this statement fails, the error is reported and the next statement runs, except for the errors that end the T-SQL batch (conversion, lock, missing object), which stop the procedure here too\nBEGIN\n");
         for l in text.lines() {
             o.push_str("  ");
             o.push_str(l);
             o.push('\n');
         }
-        o.push_str("EXCEPTION WHEN integrity_constraint_violation OR division_by_zero OR numeric_value_out_of_range OR string_data_right_truncation OR cardinality_violation THEN\n  RAISE WARNING '%', SQLERRM;\nEND;");
+        o.push_str(&format!(
+            "EXCEPTION WHEN {CONTINUE_RERAISE} THEN\n  RAISE;\nWHEN OTHERS THEN\n  RAISE WARNING '%', SQLERRM;\nEND;"
+        ));
         if commit {
             self.note(Status::Assumptions, "ASM-NO-CALLER-TXN", "T-SQL commits this statement on its own (no transaction is open), so a COMMIT follows it: a later failure leaves it durable on both sides. That holds when the procedure is CALLed outside a transaction block (autocommit); inside a caller's transaction T-SQL leaves it to the caller, where PostgreSQL refuses the COMMIT.");
             self.txn_control = true;
@@ -8982,7 +8996,7 @@ fn autocommit_points(body: &SyntaxNode) -> Option<Vec<usize>> {
 ///
 /// Only bodies whose error path is known: a flat statement list (BEGIN … END
 /// blocks flattened) with no IF, loop, TRY/CATCH, explicit transaction,
-/// cursor, GOTO, RAISERROR/THROW, `@@ERROR`, XACT_STATE or isolation level,
+/// cursor, GOTO, EXEC, RAISERROR/THROW, `@@ERROR`, XACT_STATE or isolation level,
 /// and no `XACT_ABORT ON`. The statements that cannot fail are declarations
 /// with a constant initializer, session SETs, `SET @v = constant` and PRINT;
 /// a result set (SELECT without INTO or assignment) is refused. At least
@@ -9007,6 +9021,11 @@ fn continuation_points(body: &SyntaxNode) -> Option<Vec<(usize, bool)>> {
             "ISOLATION",
             "TRY",
             "WAITFOR",
+            // A call's own COMMIT cannot run inside the subtransaction of
+            // an exception block (2D000), and dynamic SQL has no probed
+            // error continuation.
+            "EXEC",
+            "EXECUTE",
         ]
         .iter()
         .any(|w| t.is(w))

@@ -41,7 +41,7 @@ pub fn assumption(id: &str) -> Assumption {
         "ASM-NO-CALLER-TXN" => "The caller does not hold an open transaction".to_string(),
         "ASM-TSQL-CALLER-XACT-ABORT-OFF" => "The caller's XACT_ABORT setting is OFF".to_string(),
         "ASM-ERROR-CONTINUES-WARNING" => {
-            "A statement error that T-SQL reports and goes on after is reported as a warning here, and the routines called go on after their own statement errors the same way".to_string()
+            "A statement error that T-SQL reports and goes on after is reported as a warning here".to_string()
         }
         "ASM-NO-TRIGGERS" => {
             "No triggers on the written tables change the error or transaction outcome".to_string()
