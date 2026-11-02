@@ -1,0 +1,27 @@
+name|type|precision|scale|is_nullable
+----|----|---------|-----|-----------
+k01|decimal|6|1|1
+k02|decimal|7|1|1
+k03|decimal|10|2|1
+k04|decimal|16|1|1
+k05|int|10|0|1
+k06|decimal|16|1|1
+k07|int|10|0|1
+k08|smallint|5|0|1
+k09|decimal|12|2|1
+k10|decimal|38|8|0
+k11|decimal|25|1|1
+k12|decimal|6|1|1
+k13|decimal|16|1|1
+ | 
+-|-
+insert ok|1
+i
+-
+100000
+Msg 8115, Level 16, State 2, Server 313362c6676a, Line 7
+Arithmetic overflow error converting expression to data type int.
+Msg 8115, Level 16, State 2, Server 313362c6676a, Line 3
+Arithmetic overflow error converting expression to data type int.
+The statement has been terminated.
+SqlState 24000, Invalid cursor state

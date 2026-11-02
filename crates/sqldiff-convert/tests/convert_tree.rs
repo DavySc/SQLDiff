@@ -101,6 +101,47 @@ fn leftover_source_syntax_found_by_the_output_check_gates_the_unit() {
 }
 
 #[test]
+fn extended_properties_with_bracketed_arguments() {
+    let src = "CREATE SCHEMA [Hr Dept];\nGO\nCREATE TABLE [Hr Dept].[Staff List]([Staff Id] int NOT NULL);\nGO\nEXECUTE [sys].[sp_addextendedproperty] N'MS_Description', N'Who works here', N'SCHEMA', [Hr Dept], N'TABLE', [Staff List], N'COLUMN', [Staff Id];\nGO\nEXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'It''s staff', @level0type = N'SCHEMA', @level0name = [Hr Dept], @level1type = N'TABLE', @level1name = [Staff List];\nGO\n";
+    let c = pg(src);
+    assert!(
+        c.output.contains(
+            "COMMENT ON COLUMN \"Hr Dept\".\"Staff List\".\"Staff Id\" IS 'Who works here';"
+        ),
+        "{}",
+        c.output
+    );
+    assert!(
+        c.output
+            .contains("COMMENT ON TABLE \"Hr Dept\".\"Staff List\" IS 'It''s staff';"),
+        "{}",
+        c.output
+    );
+    for u in c.units.iter().skip(2) {
+        assert_eq!(rules_only(u), Status::Assumptions, "{:?}", u.notes);
+        assert!(has_rule(u, "ASM-EXTPROP-COMMENT"));
+    }
+    // A bracketed identifier is only a name string where a name goes.
+    let v = "EXEC sys.sp_addextendedproperty @name = N'D', @value = [x], @level0type = N'SCHEMA', @level0name = N'S';\n";
+    assert_eq!(pg(v).units[0].status, Status::NotConverted);
+}
+
+#[test]
+fn extended_properties_in_dbo_drop_the_schema() {
+    let src = "EXEC sys.sp_addextendedproperty N'D', N'Build', N'SCHEMA', [dbo], N'TABLE', [Version Info], N'COLUMN', [Version No];\nGO\n";
+    let c = pg(src);
+    assert!(
+        c.output
+            .contains("COMMENT ON COLUMN \"Version Info\".\"Version No\" IS 'Build';"),
+        "{}",
+        c.output
+    );
+    assert!(has_rule(&c.units[0], "ASM-DBO-SCHEMA"));
+    let s = "EXEC sys.sp_addextendedproperty N'D', N'Build', N'SCHEMA', [dbo];\nGO\n";
+    assert_eq!(pg(s).units[0].status, Status::NotConverted);
+}
+
+#[test]
 fn extended_properties_become_comments() {
     let src = "EXECUTE sp_addextendedproperty @name = N'Description', @value = N'It''s a table', @level0type = N'SCHEMA', @level0name = N'Sales', @level1type = N'TABLE', @level1name = N'Orders';\nGO\nEXEC sys.sp_addextendedproperty N'Description', N'Key', N'SCHEMA', N'Sales', N'TABLE', N'Orders', N'COLUMN', N'OrderID';\nGO\n";
     let c = pg(src);
@@ -431,4 +472,34 @@ fn exec_with_output_in_a_script_becomes_a_call_in_a_do_block() {
         u.notes,
         c.output
     );
+}
+
+/// T-SQL drops the fraction of a number stored in an integer (eval/casts);
+/// PostgreSQL rounds it, so the conversion truncates where the value has one.
+#[test]
+fn fractions_stored_in_integers_are_truncated() {
+    let src = "CREATE TABLE dbo.Cities(CityID int NOT NULL, Pop bigint NULL, Cnt int NOT NULL, Price money NULL);\nGO\nCREATE PROCEDURE dbo.Grow @f decimal(5,2), @i int\nAS\nBEGIN\n    DECLARE @n int = @f * 2;\n    DECLARE @b bigint = 5;\n    UPDATE dbo.Cities SET Pop = Pop * 1.04, Cnt = @i * 2, Price = Pop * 1.5 WHERE CityID = 1;\n    SET @n = @f * 3;\n    SET @n += @f;\n    SET @b = @b * 2;\n    SET @b = (@b + 1) / 2;\n    SELECT @n = Pop * 0.5 FROM dbo.Cities WHERE CityID = 1;\n    INSERT INTO dbo.Cities(CityID, Pop, Cnt) VALUES (2, @f * 100, @i * 2), (3, 7, @i * 1.5);\n    UPDATE dbo.Cities SET Cnt = CAST(Pop * 1.04 AS int) WHERE CityID = 1;\nEND;\nGO\n";
+    let o = pg(src).output;
+    for want in [
+        "v_n integer := trunc(p_f * 2);",
+        "UPDATE Cities SET Pop = trunc(Pop * 1.04), Cnt = p_i * 2, Price = Pop * 1.5 WHERE CityID = 1;",
+        "v_n := trunc(p_f * 3);",
+        "v_n := trunc(v_n + p_f);",
+        "v_b := v_b * 2;",
+        "v_b := (v_b + 1) / 2;",
+        "SELECT trunc(Pop * 0.5) AS sqldiff_c1",
+        "VALUES (2, trunc(p_f * 100), p_i * 2), (3, 7, trunc(p_i * 1.5));",
+        "SET Cnt = CAST(trunc(Pop * 1.04) AS integer)",
+    ] {
+        // DECLARE initialisers are hoisted; only check the ones present.
+        if want.starts_with("v_n integer") {
+            assert!(o.contains("v_n := trunc(p_f * 2);"), "{o}");
+            continue;
+        }
+        assert!(o.contains(want), "missing {want}\n{o}");
+    }
+    // Db2 for i is left as it was: no checked rule for its assignment.
+    let d =
+        db2("CREATE TABLE T(Pop bigint NULL);\nGO\nUPDATE T SET Pop = Pop * 1.04;\nGO\n").output;
+    assert!(!d.to_ascii_lowercase().contains("trunc"), "{d}");
 }

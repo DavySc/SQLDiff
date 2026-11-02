@@ -13,8 +13,8 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 57 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 21 |
 | `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 107 |
-| `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 29 |
-| | Total | 214 |
+| `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 30 |
+| | Total | 215 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -165,12 +165,13 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-RAISERROR-SEVERITY` | A RAISERROR severity variable is not NULL and at most 18 (T-SQL raises error 2754 for 19 and above without WITH LOG, and for a NULL severity uses the value the variable held before). | `deployment` | The values the routine puts in the severity variable (verified on SQL Server 2022: above 10 is an error, 10 and below, negatives included, a message). | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-RAISERROR-TEXT` | A RAISERROR message is 1 to 2,047 characters long (T-SQL cuts a longer one and sends an empty one as a space). | `deployment` | The values the message is built from. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-RAND-PER-QUERY` | A statement with RAND() produces a single value (T-SQL evaluates it once per query, the target once per row). | `generated` | The converted statement draws the value once (a variable). | `sqldiff-convert/src/tsql.rs` |
+| `ASM-RANDOM-FRESH` | NEWID() and gen_random_uuid() are the same, and RAND() and random() (both without a seed) are the same: each evaluation draws a fresh value from the same range, and a RAND() is compared only in a statement that evaluates it once. | `nothing` | The vendor documentation of NEWID() and RAND() (SQL Server 2022) and of gen_random_uuid() and random() (PostgreSQL 18): each call returns a new random value of the same type and range. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-READ-COMMITTED` | The routine runs at READ COMMITTED (the default). | `deployment` | The isolation level of the callers' sessions. (fact key `isolation`) | `sqldiff-core/src/ir/behaviour.rs` |
 | `ASM-READ-UNCOMMITTED` | Reading only committed rows where T-SQL reads uncommitted ones gives the same results (concurrency is not observed). | `deployment` | Callers do not depend on dirty reads. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-RESULT-NAMES-CI` | Clients read result columns by name case-insensitively. | `deployment` | How the clients read result columns. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-RESULT-SET-FUNCTION` | Callers of the procedure that became a PostgreSQL function RETURNS TABLE read its rows with SELECT … FROM the function (in the order it returns them) where they ran EXEC, and accept that the columns have the PostgreSQL types and that a failing statement returns no rows (SQL Server may have sent some before the error). | `deployment` | How the application calls the procedure and reads its result set. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-RESULT-TYPES` | Declared result column types hold the selected values without conversion. | `catalog` | The types of the selected columns. | `sqldiff-core/src/equiv/canon.rs` |
-| `ASM-RETURN-CODE` | Callers read a PostgreSQL procedure's return code from its return_code INOUT parameter. | `deployment` | How callers read the return code. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs` |
+| `ASM-RETURN-CODE` | Callers read a PostgreSQL procedure's return code from its return_code INOUT parameter. | `deployment` | How callers read the return code. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/call.rs` |
 | `ASM-RETURN-LENGTHS` | Returned values fit the shorter of the two sides' declared return types. | `catalog` | The types of the returned expressions. | `sqldiff-core/src/equiv/mod.rs` |
 | `ASM-RETURN-STATUS` | Callers read a Db2 for i procedure's return status with GET DIAGNOSTICS DB2_RETURN_STATUS (or the driver's return value). | `deployment` | How callers read the return status. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-ROUTINE-LABEL` | A routine's STABLE, IMMUTABLE or DETERMINISTIC label is truthful. | `catalog` | The routine's body in the catalog. | `sqldiff-core/src/equiv/canon.rs` |
