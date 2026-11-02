@@ -1353,3 +1353,32 @@ fn db_name_of_an_id_is_not_converted() {
     assert!(!out.contains("current_database"), "{out}");
     assert_ne!(u.status, Status::Converted, "{out}");
 }
+
+/// A PL/pgSQL CALL cannot leave a callee's INOUT return_code out, so a call
+/// that ignores the status passes a variable nobody reads; only callees that
+/// return a status get one (a bare RETURN does not).
+#[test]
+fn a_call_passes_a_scratch_variable_for_the_callees_return_code() {
+    let src = "CREATE PROCEDURE dbo.Status @a int AS BEGIN RETURN 1; END\nGO\nCREATE PROCEDURE dbo.Bare @a int AS BEGIN IF @a IS NULL\n RETURN\n\n PRINT 'x'; END\nGO\nCREATE PROCEDURE dbo.Caller AS\nBEGIN\n  EXEC dbo.Status 5;\n  EXEC dbo.Bare 5;\n  EXEC dbo.Status @a = 6;\nEND\nGO\n";
+    let c = tsql(src);
+    let o = &c.output;
+    assert!(o.contains("DECLARE\n  rc_scratch integer;\nBEGIN"), "{o}");
+    assert!(
+        o.contains("CALL Status(5, return_code => rc_scratch);"),
+        "{o}"
+    );
+    assert!(o.contains("CALL Bare(5);"), "{o}");
+    assert!(
+        o.contains("CALL Status(p_a => 6, return_code => rc_scratch);"),
+        "{o}"
+    );
+    assert_eq!(o.matches("rc_scratch integer;").count(), 1, "{o}");
+    // A script outside any block: a top-level CALL takes NULL.
+    let c =
+        tsql("CREATE PROCEDURE dbo.Status @a int AS BEGIN RETURN 1; END\nGO\nEXEC dbo.Status 9;\n");
+    assert!(
+        c.output.contains("CALL Status(9, return_code => NULL);"),
+        "{}",
+        c.output
+    );
+}

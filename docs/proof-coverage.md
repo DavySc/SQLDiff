@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 186 | 35 (19%) | 6 (3%) | 145 (78%) |
+| `converter` | 188 | 35 (19%) | 6 (3%) | 147 (78%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 215 | 38 (18%) | 8 (4%) | 169 (79%) |
+| **All** | 217 | 38 (18%) | 8 (4%) | 171 (79%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -66,6 +66,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `top-distinct/limit` | `translate` | engine |  | `sqldiff-core/profiles/rules/tsql-pg.rules` |
 | `top/limit` | `translate` | engine |  | `sqldiff-core/profiles/rules/tsql-pg.rules` |
 | `tsql.*` | `converter` | engine | T-SQL global variables (`@@ROWCOUNT` is `tsql.rowcount`) and built-ins without a rule (`OBJECT_ID()` is `tsql.object_id`), both refused with the reason | `sqldiff-convert/src/tsql.rs` |
+| `tsql.assign.int-trunc` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.bit.arithmetic` | `converter` | engine |  | `sqldiff-convert/src/tsql/bits.rs` |
 | `tsql.bit.between` | `converter` | engine |  | `sqldiff-convert/src/tsql/bits.rs` |
 | `tsql.bit.bitwise` | `converter` | engine |  | `sqldiff-convert/src/tsql/bits.rs` |
@@ -200,6 +201,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.table.column-default` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.column-option-dropped` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.columnstore` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.table.computed-arith` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.computed-column` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.computed-concat` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.computed-iso126` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |

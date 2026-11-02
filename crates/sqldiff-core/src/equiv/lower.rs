@@ -251,6 +251,10 @@ pub struct Unit {
     /// A script's top-level `CREATE TABLE` statements, with the number of
     /// data statements before each.
     pub tables: Vec<(SyntaxNode, usize)>,
+    /// `CREATE TABLE` statements of the script's earlier segments (a script
+    /// split by `segments`): tables this segment's constraints and grants
+    /// may name. Not compared here, only read.
+    pub earlier_tables: Vec<SyntaxNode>,
     /// Procedure calls (`EXEC`, `CALL`) and object comments
     /// (`sp_addextendedproperty`, `COMMENT ON`), compared call against call
     /// (`call.rs`), with where each one sits.
@@ -411,6 +415,7 @@ fn empty(d: Dialect) -> Unit {
         stmts: Vec::new(),
         uncovered: Vec::new(),
         tables: Vec::new(),
+        earlier_tables: Vec::new(),
         calls: Vec::new(),
         dynamic: Vec::new(),
         ddl: Vec::new(),
@@ -2579,6 +2584,7 @@ fn cursor_stmt(c: &SyntaxNode, u: &mut Unit) -> bool {
             key,
             query: l.query.clone(),
             tsql: (d == Dialect::Tsql).then_some((l.stat, l.local)),
+            keyed: l.keyed.clone(),
         }
     } else if l.fetches.contains(c) {
         let targets = l
