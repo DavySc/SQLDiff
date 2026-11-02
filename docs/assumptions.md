@@ -12,9 +12,9 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 |---|---|---|
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 57 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 21 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 107 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 108 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 29 |
-| | Total | 214 |
+| | Total | 215 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -170,6 +170,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-RESULT-NAMES-CI` | Clients read result columns by name case-insensitively. | `deployment` | How the clients read result columns. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-RESULT-SET-FUNCTION` | Callers of the procedure that became a PostgreSQL function RETURNS TABLE read its rows with SELECT … FROM the function (in the order it returns them) where they ran EXEC, and accept that the columns have the PostgreSQL types and that a failing statement returns no rows (SQL Server may have sent some before the error). | `deployment` | How the application calls the procedure and reads its result set. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-RESULT-TYPES` | Declared result column types hold the selected values without conversion. | `catalog` | The types of the selected columns. | `sqldiff-core/src/equiv/canon.rs` |
+| `ASM-RESULTSET-REFCURSOR` | Callers of the procedure that returns its result sets through INOUT refcursor parameters (result_set_1, …) call it inside a transaction block, FETCH ALL from each cursor in the order of the parameters before they commit, treat a cursor left NULL as a result set T-SQL did not send, and accept the PostgreSQL column types and that a failure while the rows are read surfaces on FETCH, after the procedure returned. | `deployment` | How the application calls the procedure and reads its result sets. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-RETURN-CODE` | Callers read a PostgreSQL procedure's return code from its return_code INOUT parameter. | `deployment` | How callers read the return code. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs` |
 | `ASM-RETURN-LENGTHS` | Returned values fit the shorter of the two sides' declared return types. | `catalog` | The types of the returned expressions. | `sqldiff-core/src/equiv/mod.rs` |
 | `ASM-RETURN-STATUS` | Callers read a Db2 for i procedure's return status with GET DIAGNOSTICS DB2_RETURN_STATUS (or the driver's return value). | `deployment` | How callers read the return status. | `sqldiff-convert/src/tsql.rs` |

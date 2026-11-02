@@ -190,6 +190,10 @@ pub mod asm {
         "ASM-RESULT-SET-FUNCTION",
         "Callers of the procedure that became a PostgreSQL function RETURNS TABLE read its rows with SELECT … FROM the function (in the order it returns them) where they ran EXEC, and accept that the columns have the PostgreSQL types and that a failing statement returns no rows (SQL Server may have sent some before the error)",
     );
+    pub const RESULTSET_REFCURSOR: (&str, &str) = (
+        "ASM-RESULTSET-REFCURSOR",
+        "Callers of the procedure that returns its result sets through INOUT refcursor parameters (result_set_1, …) call it inside a transaction block, FETCH ALL from each cursor in the order of the parameters before they commit, treat a cursor left NULL as a result set T-SQL did not send, and accept the PostgreSQL column types and that a failure while the rows are read surfaces on FETCH, after the procedure returned",
+    );
     pub const OUTPUT_TARGET_TRIGGERS: (&str, &str) = (
         "ASM-OUTPUT-TARGET-TRIGGERS",
         "The table a statement with OUTPUT but no INTO changes has no enabled trigger: SQL Server rejects the statement otherwise (Msg 334), where PostgreSQL returns the rows",
@@ -5204,7 +5208,8 @@ impl<'a> Canon<'a> {
                 return self.result_stmt(&s, Some(&o));
             }
         }
-        if self.d == Dialect::Postgres {
+        // A procedure's cursor has no declared columns to cast to.
+        if self.d == Dialect::Postgres && self.unit.kind != UnitKind::Proc {
             let items: Vec<&Expr> = match (s, o) {
                 (_, Some(o)) => o.items.iter().map(|i| &i.expr).collect(),
                 (Stmt::Select(q), None) => q.items.iter().map(|i| &i.expr).collect(),

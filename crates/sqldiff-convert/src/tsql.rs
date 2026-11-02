@@ -82,6 +82,8 @@ pub(crate) fn convert(
         results: Vec::new(),
         rows_failed: None,
         rows_why: None,
+        rs_cursors: Vec::new(),
+        cursor_why: None,
         stmt_top: false,
         txn_control: false,
         wrapper: None,
@@ -241,6 +243,12 @@ struct Cx<'a> {
     rows_failed: Option<String>,
     /// Why a procedure that returns a result set was not made a function.
     rows_why: Option<String>,
+    /// PostgreSQL: the procedure returns its result sets through INOUT
+    /// refcursor parameters (`result_set_1`, …): the start offset of each
+    /// result statement, in source order (`cursor_plan`).
+    rs_cursors: Vec<usize>,
+    /// Why the result sets were not given refcursor parameters.
+    cursor_why: Option<String>,
     /// The statement being converted runs exactly once whenever the
     /// routine gets that far: directly in the routine body, outside any IF,
     /// loop or TRY … CATCH.
@@ -407,12 +415,21 @@ impl<'a> Cx<'a> {
 
     /// Why the procedure was not made a function RETURNS TABLE, as a clause.
     fn rows_why(&self) -> String {
-        match (&self.rows_why, self.mode) {
-            (Some(w), Mode::Proc) if !self.db2() => {
-                format!(", and it was not made a function RETURNS TABLE because {w}")
-            }
-            _ => String::new(),
+        if self.mode != Mode::Proc || self.db2() {
+            return String::new();
         }
+        let mut out = String::new();
+        if let Some(w) = &self.rows_why {
+            out.push_str(&format!(
+                ", and it was not made a function RETURNS TABLE because {w}"
+            ));
+        }
+        if let Some(c) = &self.cursor_why {
+            out.push_str(&format!(
+                ", and it was not given refcursor parameters for its result sets because {c}"
+            ));
+        }
+        out
     }
 
     /// Refuses a statement of a procedure that returns a result set, and
@@ -682,6 +699,8 @@ impl<'a> Cx<'a> {
         self.results.clear();
         self.rows_failed = None;
         self.rows_why = None;
+        self.rs_cursors.clear();
+        self.cursor_why = None;
         self.txn_control = false;
         let all = tokens(r);
         self.dynamic = dynamic_sql_vars(&all);
@@ -839,15 +858,29 @@ impl<'a> Cx<'a> {
             if self.wrapper.is_none() && !owner {
                 self.autocommit = autocommit_points(&body).unwrap_or_default();
             }
-            match self.rows_plan(&body, has_output) {
+            let planned = self.rows_plan(&body, has_output);
+            match &planned {
                 // A function cannot commit: its one writing statement
                 // commits with the caller's statement, as T-SQL commits it.
                 Ok(true) => {
                     self.rows_fn = true;
                     self.autocommit.clear();
                 }
-                Ok(false) => {}
-                Err(why) => self.rows_why = Some(why),
+                Ok(false) | Err(_) => {
+                    if let Err(why) = &planned {
+                        self.rows_why = Some(why.clone());
+                    }
+                    // The shapes a function cannot take: refcursor OUT
+                    // parameters (Davy's decision D8 of 2026-11-02).
+                    match self.result_cursor_plan(&body) {
+                        Ok(at) => {
+                            self.rs_cursors = at;
+                            self.autocommit.clear();
+                        }
+                        Err(c) if !c.is_empty() => self.cursor_why = Some(c),
+                        Err(_) => {}
+                    }
+                }
             }
         }
         let mut b = Out::default();
@@ -865,6 +898,17 @@ impl<'a> Cx<'a> {
             }
             if self.results.len() != 1 {
                 return no("returns a result set that was not converted");
+            }
+        }
+        if !self.rs_cursors.is_empty() {
+            if self.txn_control {
+                return no("returns a result set and controls its transaction: a PostgreSQL cursor closes at COMMIT or ROLLBACK, and the procedure has to run in the caller's transaction block");
+            }
+            if self.results.len() != self.rs_cursors.len() {
+                return no("returns a result set that was not converted");
+            }
+            for i in 1..=self.rs_cursors.len() {
+                params.push(format!("INOUT result_set_{i} refcursor DEFAULT NULL"));
             }
         }
         if self.return_code && !self.db2() {
@@ -901,6 +945,14 @@ impl<'a> Cx<'a> {
                 Status::Assumptions,
                 "ASM-RETURN-CODE",
                 "PostgreSQL procedures cannot return a value: the T-SQL return status (0 unless RETURN n says otherwise, never NULL) becomes the INOUT parameter return_code, so callers must read return_code, and take 0 from a converted procedure that has none.",
+            );
+        }
+        if !self.rs_cursors.is_empty() {
+            self.step_ts("tsql.routine.result-set-cursors", ts);
+            self.note(
+                Status::Assumptions,
+                "ASM-RESULTSET-REFCURSOR",
+                "The procedure returns result sets, so each became an INOUT refcursor parameter (result_set_1, …) opened with OPEN … FOR: the caller must call it inside a transaction block, FETCH ALL from each cursor in the order of the parameters before it commits, treat a cursor left NULL as a result set the T-SQL procedure did not send, and accept PostgreSQL column types and that a failure while reading a cursor surfaces on FETCH.",
             );
         }
         let mut security = "";
@@ -2023,13 +2075,29 @@ impl<'a> Cx<'a> {
                     Err(No(why)) => return self.rows_refuse(&why),
                 }
             }
+            "SELECT" | "WITH"
+                if !self.rs_cursors.is_empty() && self.mode == Mode::Proc && is_cursor_result(&ts) =>
+            {
+                let at = Self::range(n).0;
+                let Some(k) = self.rs_cursors.iter().position(|&a| a == at) else {
+                    return self.misplaced("a result set the conversion did not plan");
+                };
+                let body_ts = Self::body_toks(&ts);
+                let (q, assigns) = self.select(&select_aliases(&body_ts))?;
+                if assigns {
+                    return no("a SELECT that assigns variables as well as returning rows");
+                }
+                self.step_node("tsql.stmt.result-set-cursor", n);
+                self.results.push(Vec::new());
+                format!("OPEN result_set_{} FOR {q}", k + 1)
+            }
             "SELECT" | "WITH" => {
                 let (q, assigns) = self.select(&ts)?;
                 if self.mode != Mode::Top && !assigns {
                     if self.db2() && self.mode == Mode::Proc {
                         return Ok(self.result_set(n, &q));
                     }
-                    let why = format!("returns a result set: a PostgreSQL procedure cannot{}; use a function RETURNS TABLE, a refcursor, or PERFORM if the rows are not needed", self.rows_why());
+                    let why = format!("returns a result set: a PostgreSQL procedure cannot{}; use PERFORM if the rows are not needed", self.rows_why());
                     return self.misplaced(self.pick(
                         &why,
                         "returns a result set: only a procedure can (through a cursor WITH RETURN), not a function or a compound statement",
@@ -2619,6 +2687,106 @@ impl<'a> Cx<'a> {
         self.step_ts_with(rule, ts, "return-query");
         self.results.push(cols);
         Ok(format!("RETURN QUERY {q}"))
+    }
+
+    /// PostgreSQL: whether the result sets of a procedure can be returned
+    /// through INOUT refcursor parameters (`result_set_1`, …, each opened
+    /// with `OPEN … FOR`), and the start offset of each result statement in
+    /// source order. Decision D8 (2026-11-02), for what a function RETURNS
+    /// TABLE cannot take. A cursor reads its rows when they are fetched,
+    /// under the snapshot of its OPEN (probed on PostgreSQL 18, eval/refcursor),
+    /// so the plan needs:
+    /// - every result statement is a SELECT directly in the body, so the
+    ///   result sets T-SQL sends are always a prefix of the parameters and
+    ///   keep their numbers;
+    /// - no transaction control, which closes the cursors (and a COMMIT may
+    ///   not run inside the caller's transaction block);
+    /// - after the first result set only data changes, assignments, messages
+    ///   and RETURN: DROP, TRUNCATE and ALTER of a table the cursor reads
+    ///   fail in PostgreSQL, and a call may do either;
+    /// - result queries that call nothing evaluated at FETCH instead of at
+    ///   OPEN (`lazy_call`).
+    fn result_cursor_plan(&self, body: &SyntaxNode) -> Result<Vec<usize>, String> {
+        let stmts: Vec<SyntaxNode> = body
+            .descendants()
+            .filter(|n| n.kind() == STATEMENT)
+            .collect();
+        let sets: Vec<&SyntaxNode> = stmts
+            .iter()
+            .filter(|n| is_cursor_result(&tokens(n)))
+            .collect();
+        let Some(first) = sets.first() else {
+            return Err(String::new());
+        };
+        for n in &sets {
+            let ts = tokens(n);
+            if !matches!(first_word(n).as_str(), "SELECT" | "WITH") {
+                return Err("a data change returns rows with OUTPUT, which a cursor cannot".into());
+            }
+            if let Some(f) = find_word(&ts, 0, "FOR") {
+                let what = sig(&ts)
+                    .into_iter()
+                    .find(|&j| j > f)
+                    .map(|j| ts[j].up())
+                    .unwrap_or_default();
+                if matches!(what.as_str(), "JSON" | "XML" | "BROWSE") {
+                    return Err(format!(
+                        "a result query uses FOR {what}, which is not converted"
+                    ));
+                }
+            }
+            if !top_stmt(n) {
+                return Err("a result set sits inside an IF, a loop or TRY … CATCH, so the numbers of the cursors would not follow the result sets T-SQL sends".into());
+            }
+            if let Some(w) = lazy_call(&ts) {
+                return Err(format!("a result query uses {w}, which PostgreSQL evaluates when the rows are fetched, not when the cursor is opened"));
+            }
+            if find_word(&ts, 0, "OPTION").is_some() {
+                return Err("a result query has an OPTION clause (query hints such as MAXRECURSION change what the statement does), which is not converted".into());
+            }
+        }
+        let start = first.text_range().end();
+        for n in &stmts {
+            let ts = tokens(n);
+            let s = sig(&ts);
+            let w = s.first().map(|&i| ts[i].up()).unwrap_or_default();
+            let second = s.get(1).map(|&i| ts[i].up()).unwrap_or_default();
+            if matches!(w.as_str(), "COMMIT" | "ROLLBACK" | "SAVE")
+                || w == "BEGIN" && matches!(second.as_str(), "TRAN" | "TRANSACTION")
+            {
+                return Err("it controls its transaction, and a PostgreSQL cursor closes at COMMIT or ROLLBACK".into());
+            }
+            if n.text_range().start() >= start
+                && !sets.contains(&n)
+                && !n.children().any(|c| c.kind() == STATEMENT)
+            {
+                let assign_select = w == "SELECT" && !select_rows(&ts);
+                let ok = matches!(
+                    w.as_str(),
+                    "INSERT"
+                        | "UPDATE"
+                        | "DELETE"
+                        | "SET"
+                        | "DECLARE"
+                        | "PRINT"
+                        | "RETURN"
+                        | "THROW"
+                        | "RAISERROR"
+                ) || assign_select && find_word(&ts, 0, "INTO").is_none();
+                if !ok {
+                    return Err(format!("{w} follows the first result set, and a PostgreSQL cursor reads its rows later: DROP, TRUNCATE or ALTER of a table it reads fails, and a call or COMMIT may do either"));
+                }
+                if !matches!(
+                    w.as_str(),
+                    "RETURN" | "SET" | "DECLARE" | "PRINT" | "THROW" | "RAISERROR"
+                ) {
+                    if let Some(w) = lazy_call(&ts) {
+                        return Err(format!("{w} follows the first result set"));
+                    }
+                }
+            }
+        }
+        Ok(sets.iter().map(|n| Self::range(n).0).collect())
     }
 
     /// PostgreSQL: whether a procedure that returns a result set can become
@@ -8588,6 +8756,43 @@ fn quiet(n: &SyntaxNode) -> bool {
     }
 }
 
+/// What a result query calls that PostgreSQL would run when the rows are
+/// fetched, after the procedure returned, instead of when T-SQL runs the
+/// SELECT: a user function (its own statements see later changes), a clock,
+/// a random value, a sequence, or a session value another statement changes.
+fn lazy_call(ts: &[T]) -> Option<String> {
+    const WORDS: &[&str] = &[
+        "NEWID",
+        "NEWSEQUENTIALID",
+        "RAND",
+        "GETDATE",
+        "GETUTCDATE",
+        "SYSDATETIME",
+        "SYSUTCDATETIME",
+        "SYSDATETIMEOFFSET",
+        "CURRENT_TIMESTAMP",
+        "SCOPE_IDENTITY",
+        "IDENT_CURRENT",
+        "NEXT",
+        "CRYPT_GEN_RANDOM",
+    ];
+    for t in ts {
+        if t.k == VARIABLE && t.s.starts_with("@@") {
+            return Some(t.s.clone());
+        }
+        if t.k == IDENT && WORDS.contains(&t.up().as_str()) {
+            return Some(t.up());
+        }
+    }
+    let user = ts.windows(4).any(|w| {
+        matches!(w[0].k, IDENT | QUOTED_IDENT)
+            && w[1].k == DOT
+            && matches!(w[2].k, IDENT | QUOTED_IDENT)
+            && w[3].k == L_PAREN
+    });
+    user.then(|| "a schema-qualified call (a user function)".to_string())
+}
+
 /// Whether the rows of a T-SQL procedure's statement reach the caller: a
 /// SELECT that assigns nothing and stores nothing (`select_rows`), or an
 /// INSERT, UPDATE or DELETE with OUTPUT but no INTO.
@@ -8598,6 +8803,103 @@ fn is_result_stmt(ts: &[T]) -> bool {
         Some("INSERT" | "UPDATE" | "DELETE") => output_rows(ts),
         _ => false,
     }
+}
+
+/// Whether a T-SQL procedure statement returns rows through a cursor: a
+/// SELECT that returns its rows (`select_rows`), or a WITH list in front of
+/// one.
+fn is_cursor_result(ts: &[T]) -> bool {
+    let s = sig(ts);
+    match s.first().map(|&i| ts[i].up()).as_deref() {
+        Some("SELECT") => select_rows(ts),
+        Some("WITH") => {
+            cte_list(ts).is_some_and(|(_, v)| ts[v].is("SELECT") && select_rows(&ts[v..]))
+        }
+        _ => false,
+    }
+}
+
+/// A plain SELECT with its `name = expr` select items written `expr AS
+/// name`: T-SQL reads `name = expr` at the start of a select item as a
+/// column alias, where PostgreSQL would read a comparison. Only the first
+/// SELECT of a statement without WITH, UNION, EXCEPT or INTERSECT; the
+/// engine compares every other form with the source as written.
+fn select_aliases(ts: &[T]) -> Vec<T> {
+    let s = sig(ts);
+    if !s.first().is_some_and(|&i| ts[i].is("SELECT"))
+        || ["UNION", "EXCEPT", "INTERSECT"]
+            .iter()
+            .any(|w| find_word(ts, 0, w).is_some())
+    {
+        return ts.to_vec();
+    }
+    let mut k = 1;
+    while s
+        .get(k)
+        .is_some_and(|&i| ts[i].is("ALL") || ts[i].is("DISTINCT"))
+    {
+        k += 1;
+    }
+    if s.get(k).is_some_and(|&i| ts[i].is("TOP")) {
+        k += 1;
+        if let Some(&i) = s.get(k).filter(|&&i| ts[i].k == L_PAREN) {
+            let close = matching(ts, i).unwrap_or(ts.len());
+            k = s.iter().position(|&j| j > close).unwrap_or(s.len());
+        } else {
+            k += 1;
+        }
+        while s
+            .get(k)
+            .is_some_and(|&i| ts[i].is("PERCENT") || ts[i].is("WITH") || ts[i].is("TIES"))
+        {
+            k += 1;
+        }
+    }
+    let Some(&start) = s.get(k) else {
+        return ts.to_vec();
+    };
+    let end = ["FROM", "WHERE", "GROUP", "HAVING", "ORDER", "FOR", "OPTION"]
+        .iter()
+        .filter_map(|w| find_word(ts, start, w))
+        .min()
+        .unwrap_or(ts.len());
+    let mut out: Vec<T> = ts[..start].to_vec();
+    let mut at = start;
+    let made = |k, s: &str, p| T::made(k, s, p, "tsql.stmt.result-set-cursor");
+    for (n, item) in split_commas(&ts[start..end]).iter().enumerate() {
+        let base = at;
+        at += item.len() + 1;
+        if n > 0 {
+            out.push(made(COMMA, ",", ts[base].pos.0));
+        }
+        let si: Vec<usize> = sig(item).into_iter().map(|i| i + base).collect();
+        match si.as_slice() {
+            [a, e, rest @ ..]
+                if !rest.is_empty()
+                    && matches!(ts[*a].k, IDENT | QUOTED_IDENT)
+                    && ts[*e].k == OP
+                    && ts[*e].s == "=" =>
+            {
+                let last = si[si.len() - 1];
+                let pos = ts[*a].pos.0;
+                if n > 0 {
+                    out.push(made(WHITESPACE, " ", pos));
+                }
+                out.extend(trimmed(&ts[e + 1..=last]).iter().cloned());
+                out.push(made(WHITESPACE, " ", pos));
+                out.push(made(IDENT, "AS", pos));
+                out.push(made(WHITESPACE, " ", pos));
+                out.push(ts[*a].clone());
+            }
+            _ => out.extend(item.iter().cloned()),
+        }
+    }
+    let spaced = |t: Option<&T>| t.is_some_and(|t| t.k == WHITESPACE);
+    if !spaced(out.last()) && !spaced(ts.get(end)) {
+        out.push(made(WHITESPACE, " ", ts.get(end).map_or(0, |t| t.pos.0)));
+    }
+    out.extend(ts[end..].iter().cloned());
+    out
 }
 
 /// The columns of a result set (`Cx::result_columns`).

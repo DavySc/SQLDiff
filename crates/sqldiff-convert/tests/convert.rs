@@ -233,7 +233,9 @@ fn error_checks_are_not_guessed() {
 
 #[test]
 fn procedures_cannot_return_result_sets() {
-    let src = "CREATE PROCEDURE p AS\nBEGIN\n  SELECT a FROM t;\nEND\n";
+    // A result set in a loop has no cursor either (the numbers would shift).
+    let src =
+        "CREATE PROCEDURE p AS\nBEGIN\n  WHILE 1 = 0\n  BEGIN\n    SELECT a FROM t;\n  END\nEND\n";
     let c = tsql(src);
     assert_eq!(unit(&c, src, "SELECT").status, Status::NotConverted);
 }
@@ -404,7 +406,7 @@ fn alter_procedure_notes_the_overload_risk() {
 #[test]
 fn result_set_check_is_structural() {
     // ' INTO ' in a literal must not make a result set look like an assignment.
-    let src = "CREATE PROCEDURE p AS\nBEGIN\n  SELECT 'x INTO y' AS a, ':=' AS b FROM t;\nEND\n";
+    let src = "CREATE PROCEDURE p AS\nBEGIN\n  IF 1 = 1\n    SELECT 'x INTO y' AS a, ':=' AS b FROM t;\nEND\n";
     let c = tsql(src);
     assert_eq!(
         unit(&c, src, "SELECT").status,
@@ -536,7 +538,7 @@ fn context_refusals_are_not_handed_to_the_idiom_rules() {
         ),
         // A result set in a procedure.
         (
-            "CREATE PROCEDURE p AS\nBEGIN\n  SELECT a FROM t;\nEND\n",
+            "CREATE PROCEDURE p AS\nBEGIN\n  IF 1 = 1\n    SELECT a FROM t;\nEND\n",
             "SELECT",
         ),
     ];
