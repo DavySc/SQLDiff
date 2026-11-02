@@ -474,6 +474,62 @@ fn exec_with_output_in_a_script_becomes_a_call_in_a_do_block() {
     );
 }
 
+#[test]
+fn bulk_insert_is_refused_without_a_leftover_statement() {
+    let src = "PRINT 'Loading';\nBULK INSERT [Sales].[Orders] FROM 'C:\\load\\o.csv'\nWITH (FIELDTERMINATOR = '+|', ROWTERMINATOR = '&|\\n', CODEPAGE = 'ACP', CHECK_CONSTRAINTS, TABLOCK)\nGO\n";
+    for c in [pg(src), db2(src)] {
+        assert_eq!(c.units.len(), 2, "{}", c.output);
+        assert_eq!(c.units[1].status, Status::NotConverted);
+        assert!(
+            c.units[1]
+                .notes
+                .iter()
+                .any(|n| n.text.starts_with("BULK INSERT")),
+            "{:?}",
+            c.units[1].notes
+        );
+        let live: Vec<&str> = c
+            .output
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect();
+        assert!(
+            !live
+                .iter()
+                .any(|l| l.to_ascii_uppercase().contains("INSERT")),
+            "{live:?}"
+        );
+    }
+}
+
+#[test]
+fn bulk_insert_as_an_if_or_while_body_is_never_live_sql() {
+    for src in [
+        "IF 1 = 1 BULK INSERT t FROM 'f'\nGO\n",
+        "IF 1 = 1 BULK INSERT t FROM 'f' ELSE PRINT 'x'\nGO\n",
+        "WHILE 1 = 1 BULK INSERT t FROM 'f'\nGO\n",
+    ] {
+        for c in [pg(src), db2(src)] {
+            let live: Vec<&str> = c
+                .output
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("--"))
+                .collect();
+            assert!(
+                !live
+                    .iter()
+                    .any(|l| l.to_ascii_uppercase().contains("INSERT")),
+                "{src}: {live:?}"
+            );
+            assert!(
+                c.units.iter().any(|u| u.status == Status::NotConverted),
+                "{src}: {:?}",
+                c.units.iter().map(|u| u.status).collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
 /// T-SQL drops the fraction of a number stored in an integer (eval/casts);
 /// PostgreSQL rounds it, so the conversion truncates where the value has one.
 #[test]

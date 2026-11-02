@@ -1382,3 +1382,17 @@ fn a_call_passes_a_scratch_variable_for_the_callees_return_code() {
         c.output
     );
 }
+
+/// Inside a trigger function a CALL passes the scratch variable too:
+/// `return_code => NULL` raises in PL/pgSQL ("argument is not writable").
+#[test]
+fn a_trigger_passes_a_scratch_variable_for_the_callees_return_code() {
+    let src = "CREATE TABLE dbo.T (a int)\nGO\nCREATE PROCEDURE dbo.Status @a int AS BEGIN RETURN 1; END\nGO\nCREATE TRIGGER dbo.TrgT ON dbo.T AFTER INSERT AS\nBEGIN\n  EXEC dbo.Status 5;\nEND\nGO\n";
+    let o = tsql(src).output;
+    assert!(
+        o.contains("CALL Status(5, return_code => rc_scratch);"),
+        "{o}"
+    );
+    assert!(o.contains("rc_scratch integer;"), "{o}");
+    assert!(!o.contains("return_code => NULL"), "{o}");
+}
