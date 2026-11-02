@@ -1017,7 +1017,13 @@ impl<'s> Ctx<'s> {
             Fam::Timestamp | Fam::TimestampTz => Class::Stamp,
             Fam::Interval => Class::Ivl,
             Fam::Time => return None,
-            Fam::Binary | Fam::Uuid | Fam::Geography | Fam::Text | Fam::NoCompare | Fam::Other => {
+            Fam::Binary
+            | Fam::Uuid
+            | Fam::Geography
+            | Fam::Text
+            | Fam::NoCompare
+            | Fam::Money
+            | Fam::Other => {
                 return None
             }
         })

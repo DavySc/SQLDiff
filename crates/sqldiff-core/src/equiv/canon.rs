@@ -326,6 +326,9 @@ enum Rule {
     Same,
     /// T-SQL drops the fraction first.
     Trunc,
+    /// Rounded half away from zero to a whole number: T-SQL money and
+    /// PostgreSQL numeric (1.5 → 2, -2.5 → -3).
+    RoundAway,
     /// Dialect-specific (or not checked).
     Dialect,
 }
@@ -370,6 +373,10 @@ pub struct Canon<'a> {
     /// PostgreSQL compared with T-SQL: quoted names may fold to lower case
     /// (see `stmt`).
     pub fold_quoted: bool,
+    /// The expression's value is stored in a column of the declared type
+    /// (a computed or generated column), so T-SQL's money range errors fall
+    /// under ASM-COLUMN-RANGE (see `money_arith`).
+    pub stored_values: bool,
     /// The dialect of the statements this one is compared with, when known:
     /// an unqualified PostgreSQL call may then be the conversion of a T-SQL
     /// `dbo` function (`user_fn`).
@@ -746,6 +753,7 @@ impl<'a> Canon<'a> {
             rec_bounds: Vec::new(),
             by_name: false,
             fold_quoted: false,
+            stored_values: false,
             other: None,
             names: Vec::new(),
             output: None,
@@ -1174,7 +1182,7 @@ impl<'a> Canon<'a> {
             // The engine does not know which type an `Other` is (BINARY(n),
             // IMAGE, MONEY, an alias type, …): the store may pad, cut off,
             // round or fail.
-            Fam::Other => false,
+            Fam::Other | Fam::Money => false,
             Fam::Date
             | Fam::Interval
             | Fam::Bool
@@ -2319,6 +2327,13 @@ impl<'a> Canon<'a> {
                 ),
                 to,
             ),
+            Rule::RoundAway => (
+                n(
+                    head,
+                    vec![Self::ty_term(&to), n("fn", vec![a("round-away"), v.0])],
+                ),
+                to,
+            ),
             Rule::Dialect => (
                 n(
                     "dcast",
@@ -2382,6 +2397,17 @@ impl<'a> Canon<'a> {
             };
         }
         match (src.fam, dst.fam) {
+            // T-SQL money converts to a whole number and to a decimal the
+            // way PostgreSQL numeric(19, 4) does: rounded half away from
+            // zero, an error when it does not fit (eval/builtins/
+            // 2026-11-02-money: toint, tobigint, todec, todec0, todec4).
+            (Money, Int) => Rule::RoundAway,
+            (Money, Exact) => Rule::Same,
+            (Money, Money) => Rule::Same,
+            (Money, _) | (_, Money) => Rule::Dialect,
+            // PostgreSQL numeric rounds half away from zero to a whole
+            // number (float rounds half to even and stays per dialect).
+            (Exact, Int) if self.d == Dialect::Postgres && !integral => Rule::RoundAway,
             // Out of range is an error on both sides.
             (Int, Int | Exact | Float) => Rule::Same,
             // Both round half away from zero (1.555 → 1.56, -2.5 → -3).
@@ -3671,6 +3697,16 @@ impl<'a> Canon<'a> {
                         Some(Ty::of(Fam::Bool)),
                     ));
                 }
+                // T-SQL converts money to a float it meets (to real, when
+                // that is the float): not the same comparison as numeric
+                // against double precision.
+                if any(&|t| t.fam == Fam::Money) && any(&|t| t.fam == Fam::Float) {
+                    let (x, y, op) = order_operands(op, lt, rt);
+                    return Ok((
+                        n("cmp-dialect", vec![self.dtag(), a(op), x, y]),
+                        Some(Ty::of(Fam::Bool)),
+                    ));
+                }
                 let string = any(&|t| t.is_string());
                 let known = lty.is_some() || rty.is_some();
                 if string && any(&|t| !t.is_string()) {
@@ -3784,6 +3820,16 @@ impl<'a> Canon<'a> {
                 }),
             )),
             "+" | "-" | "*" | "/" | "%" => {
+                // T-SQL money (see `Fam::Money`).
+                let (lty, rty) = match self.money_operands(op, &lt, lty, &rt, rty) {
+                    Ok(types) => types,
+                    Err(()) => {
+                        return Ok(self.money_arith(op, lt, lty, rt, rty));
+                    }
+                };
+                let any = |f: &dyn Fn(&Ty) -> bool| {
+                    lty.as_ref().is_some_and(f) || rty.as_ref().is_some_and(f)
+                };
                 // Only numbers add alike everywhere: T-SQL `+` concatenates
                 // binary strings, PostgreSQL has no bytea `+`.
                 if any(&|t| !t.is_numeric()) || lt.is("bytes") || rt.is("bytes") {
@@ -3887,6 +3933,97 @@ impl<'a> Canon<'a> {
                 .and_then(Term::atom)
                 .and_then(|x| x.parse::<i64>().ok())
                 .is_some_and(|x| x.abs() <= 1 << 24)
+    }
+
+    /// The operand types of an arithmetic operator when one is T-SQL money.
+    /// Money with a decimal is decimal arithmetic on a decimal(19, 4), the
+    /// result a decimal that no money range limits (SQL Server 2022:
+    /// money + decimal(9, 2) is decimal(20, 4), money * 2.5 decimal(22, 5)),
+    /// so the operands go on as exact numbers. `Err` for every other use of
+    /// money, which `money_arith` decides. Without money: unchanged.
+    fn money_operands(
+        &self,
+        _op: &str,
+        _lt: &Term,
+        lty: Option<Ty>,
+        _rt: &Term,
+        rty: Option<Ty>,
+    ) -> Result<(Option<Ty>, Option<Ty>), ()> {
+        let money = |t: &Option<Ty>| t.is_some_and(|t| t.fam == Fam::Money);
+        if !money(&lty) && !money(&rty) {
+            return Ok((lty, rty));
+        }
+        let known_dec = |t: &Option<Ty>| {
+            t.is_some_and(|t| t.fam == Fam::Exact && t.len.is_some() && t.scale.is_some())
+        };
+        let as_dec = |t: Option<Ty>| {
+            if money(&t) {
+                Some(Ty {
+                    fam: Fam::Exact,
+                    len: Some(19),
+                    scale: Some(4),
+                })
+            } else {
+                t
+            }
+        };
+        if (money(&lty) && known_dec(&rty)) || (known_dec(&lty) && money(&rty)) {
+            return Ok((as_dec(lty), as_dec(rty)));
+        }
+        Err(())
+    }
+
+    /// `+`, `-` and `*` where an operand is T-SQL money and the other money
+    /// or an integer: exact on both sides (SQL Server 2022 against
+    /// PostgreSQL numeric(19, 4), eval/builtins/2026-11-02-money: add, sub,
+    /// mulint, intmul, addint), except that SQL Server raises an error
+    /// outside the money range where numeric(19, 4) holds 10^15. That
+    /// difference is ASM-COLUMN-RANGE when the value is stored in a column
+    /// (`stored_values`); anywhere else the operation stays per dialect.
+    /// A money product or quotient is rounded to four decimals by SQL
+    /// Server and exact in PostgreSQL, a quotient of two money values keeps
+    /// four decimals where numeric division keeps more, and money with a
+    /// float or a string converts differently: all per dialect.
+    fn money_arith(
+        &mut self,
+        op: &str,
+        lt: Term,
+        lty: Option<Ty>,
+        rt: Term,
+        rty: Option<Ty>,
+    ) -> (Term, Option<Ty>) {
+        let is = |t: &Option<Ty>, f: Fam| t.is_some_and(|t| t.fam == f);
+        let int = |t: &Option<Ty>| t.is_some_and(|t| t.fam == Fam::Int && t.len != Some(1));
+        let (lm, rm) = (is(&lty, Fam::Money), is(&rty, Fam::Money));
+        let ok = self.stored_values
+            && self.d == Dialect::Tsql
+            && match op {
+                "+" | "-" => (lm || int(&lty)) && (rm || int(&rty)),
+                "*" => (lm && int(&rty)) || (int(&lty) && rm),
+                _ => false,
+            };
+        if !ok {
+            return (
+                n("arith", vec![self.dtag(), a(op), lt, rt]),
+                None,
+            );
+        }
+        self.assume(super::table::asm::COLUMN_RANGE);
+        let ty = Some(Ty {
+            fam: Fam::Money,
+            len: Some(19),
+            scale: Some(4),
+        });
+        let head = match op {
+            "+" => "add",
+            "-" => "sub",
+            _ => "mul",
+        };
+        let mut v = vec![lt, rt];
+        if head != "sub" {
+            v.sort();
+        }
+        (n(head, v), ty)
     }
 
     /// The type of an exact product of two exact numbers (integers or

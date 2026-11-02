@@ -1282,6 +1282,23 @@ fn same_stmt(
     na: &str,
     nb: &str,
 ) -> Same {
+    same_stmt_in(x, y, ua, ub, sa, sb, na, nb, false)
+}
+
+/// `same_stmt`; `stored` when the expressions' values are stored in a
+/// column (computed columns), see `Canon::stored_values`.
+#[allow(clippy::too_many_arguments)]
+fn same_stmt_in(
+    x: &[ast::Tok],
+    y: &[ast::Tok],
+    ua: &Unit,
+    ub: &Unit,
+    sa: &Schema,
+    sb: &Schema,
+    na: &str,
+    nb: &str,
+    stored: bool,
+) -> Same {
     let lowered = |toks: &[ast::Tok],
                    u: &Unit,
                    s: &Schema,
@@ -1290,6 +1307,7 @@ fn same_stmt(
         let (st, out) = ast::parse_stmt_output(toks, u.dialect)?;
         let mut c = Canon::new(u, s);
         c.fold_quoted = other.dialect == Dialect::Tsql;
+        c.stored_values = stored;
         c.other = Some(other.dialect);
         let t = match &out {
             Some(o) => c.output_stmt(&st, o)?,
@@ -2506,7 +2524,7 @@ fn table_pair(
                     v.extend(name.iter().cloned());
                     v
                 };
-                match same_stmt(
+                match same_stmt_in(
                     &select(&ea, &ta.name_toks),
                     &select(&eb, &tb.name_toks),
                     ua,
@@ -2515,6 +2533,7 @@ fn table_pair(
                     sb2,
                     &na,
                     &nb,
+                    true,
                 ) {
                     Same::Yes(xs) => xs.into_iter().for_each(|x| add(&mut asms, x)),
                     Same::No(class, rule, w) => {
