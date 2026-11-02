@@ -512,3 +512,26 @@ fn fractions_passed_to_int_parameters_and_returned_by_functions_are_truncated() 
     // The decimal function keeps its value.
     assert_eq!(o.matches("trunc(").count(), 3, "{o}");
 }
+
+/// The engine compares the truncating forms the converter now writes for
+/// INSERT … SELECT and UPDATE … FROM (a statement alone in its routine, so
+/// the transaction findings of two writes do not mix in).
+#[test]
+fn engine_accepts_truncation_in_insert_select_and_update_from() {
+    let tables = "CREATE TABLE dbo.Src(ID int NOT NULL PRIMARY KEY, Amt decimal(9,2) NOT NULL);\nCREATE TABLE dbo.Dst(ID int NOT NULL, Cnt int NOT NULL);\nGO\n";
+    for body in [
+        "INSERT INTO dbo.Dst(ID, Cnt) SELECT s.ID, s.Amt * 1.5 FROM dbo.Src s;",
+        "UPDATE d SET d.Cnt = s.Amt * 2 FROM dbo.Dst d JOIN dbo.Src s ON s.ID = d.ID;",
+    ] {
+        let src = format!("{tables}CREATE PROCEDURE dbo.P\nAS\nBEGIN\n    {body}\nEND;\nGO\n");
+        let c = pg(&src);
+        let u = unit(&c, &src, "CREATE PROCEDURE");
+        assert!(
+            u.status <= Status::Assumptions,
+            "{body}\n{:?}\n{}",
+            u.notes,
+            c.output
+        );
+        assert!(c.output.contains("trunc("), "{body}\n{}", c.output);
+    }
+}
