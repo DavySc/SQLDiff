@@ -207,21 +207,36 @@ fn input_the_engines_treat_differently_is_not_proven() {
     let shell = square(0.0, 0.0, 10.0, true);
     bad.push((
         "counter-clockwise hole",
-        format!("0x{}", poly_rings(&[shell.clone(), square(2.0, 2.0, 2.0, true)])),
+        format!(
+            "0x{}",
+            poly_rings(&[shell.clone(), square(2.0, 2.0, 2.0, true)])
+        ),
     ));
     bad.push((
         "clockwise shell with a clockwise hole",
-        format!("0x{}", poly_rings(&[square(0.0, 0.0, 10.0, false), square(2.0, 2.0, 2.0, false)])),
+        format!(
+            "0x{}",
+            poly_rings(&[square(0.0, 0.0, 10.0, false), square(2.0, 2.0, 2.0, false)])
+        ),
     ));
     bad.push((
         "hole outside the shell",
-        format!("0x{}", poly_rings(&[shell.clone(), square(20.0, 2.0, 2.0, false)])),
+        format!(
+            "0x{}",
+            poly_rings(&[shell.clone(), square(20.0, 2.0, 2.0, false)])
+        ),
     ));
     let bow = vec![(0.0, 0.0), (1.0, 1.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)];
     bad.push(("bow tie", format!("0x{}", poly(&bow))));
     // A hemisphere and a pole: too large for the smaller-side reading.
-    bad.push(("180 degrees wide", format!("0x{}", poly(&square(-90.0, 0.0, 180.0, true)))));
-    bad.push(("around the pole", format!("0x{}", poly(&square(0.0, 80.0, 20.0, true)))));
+    bad.push((
+        "180 degrees wide",
+        format!("0x{}", poly(&square(-90.0, 0.0, 180.0, true))),
+    ));
+    bad.push((
+        "around the pole",
+        format!("0x{}", poly(&square(0.0, 80.0, 20.0, true))),
+    ));
     // A variable the code never gives a value: NULL, or a parameter's value.
     bad.push(("no value", "@p".into()));
     for (what, arg) in bad {

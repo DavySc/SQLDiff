@@ -151,7 +151,9 @@ pub fn why_not(polys: &[Polygon]) -> Result<(), &'static str> {
         .flat_map(|p| p.iter().flatten())
         .map(|v| unit(v.0, v.1))
         .collect();
-    let sum = vs.iter().fold([0.0; 3], |s, v| [s[0] + v[0], s[1] + v[1], s[2] + v[2]]);
+    let sum = vs
+        .iter()
+        .fold([0.0; 3], |s, v| [s[0] + v[0], s[1] + v[1], s[2] + v[2]]);
     if norm(sum) < 1e-9 {
         return Err(concat!("line", line!()));
     }
@@ -159,7 +161,11 @@ pub fn why_not(polys: &[Polygon]) -> Result<(), &'static str> {
     if vs.iter().any(|v| dot(*v, c) < MIN_DOT) {
         return Err(concat!("line", line!()));
     }
-    let helper = if c[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] };
+    let helper = if c[2].abs() < 0.9 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
     let east = cross3(helper, c);
     let east = scale(east, 1.0 / norm(east));
     let north = cross3(c, east);
@@ -229,7 +235,11 @@ pub fn why_not(polys: &[Polygon]) -> Result<(), &'static str> {
                 && (y.index == x.index + 1 || (x.index == 0 && y.index + 1 == x.count));
             if adjacent {
                 // Edges that meet at a vertex must not fold back on each other.
-                let (first, second) = if y.index == x.index + 1 { (x, y) } else { (y, x) };
+                let (first, second) = if y.index == x.index + 1 {
+                    (x, y)
+                } else {
+                    (y, x)
+                };
                 let (d1, d2) = (sub(first.b, first.a), sub(second.b, second.a));
                 let sin = cross(d1, d2) / (len(d1) * len(d2));
                 let cos = (d1.0 * d2.0 + d1.1 * d2.1) / (len(d1) * len(d2));
@@ -281,9 +291,18 @@ mod tests {
         assert!(same_region(&[vec![sq(0.0, 0.0, 1.0, true)]]));
         assert!(!same_region(&[vec![sq(0.0, 0.0, 1.0, false)]]));
         // A clockwise hole in a counter-clockwise shell; the other way round.
-        assert!(same_region(&[vec![sq(0.0, 0.0, 10.0, true), sq(2.0, 2.0, 2.0, false)]]));
-        assert!(!same_region(&[vec![sq(0.0, 0.0, 10.0, true), sq(2.0, 2.0, 2.0, true)]]));
-        assert!(!same_region(&[vec![sq(0.0, 0.0, 10.0, false), sq(2.0, 2.0, 2.0, false)]]));
+        assert!(same_region(&[vec![
+            sq(0.0, 0.0, 10.0, true),
+            sq(2.0, 2.0, 2.0, false)
+        ]]));
+        assert!(!same_region(&[vec![
+            sq(0.0, 0.0, 10.0, true),
+            sq(2.0, 2.0, 2.0, true)
+        ]]));
+        assert!(!same_region(&[vec![
+            sq(0.0, 0.0, 10.0, false),
+            sq(2.0, 2.0, 2.0, false)
+        ]]));
     }
 
     #[test]
@@ -291,10 +310,22 @@ mod tests {
         // Bow tie, hole outside, overlapping polygons, a polygon in a polygon.
         let bow = vec![(0.0, 0.0), (1.0, 1.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)];
         assert!(!same_region(&[vec![bow]]));
-        assert!(!same_region(&[vec![sq(0.0, 0.0, 10.0, true), sq(20.0, 2.0, 2.0, false)]]));
-        assert!(!same_region(&[vec![sq(0.0, 0.0, 1.0, true)], vec![sq(0.5, 0.5, 1.0, true)]]));
-        assert!(!same_region(&[vec![sq(0.0, 0.0, 10.0, true)], vec![sq(2.0, 2.0, 1.0, true)]]));
-        assert!(same_region(&[vec![sq(0.0, 0.0, 1.0, true)], vec![sq(5.0, 5.0, 1.0, true)]]));
+        assert!(!same_region(&[vec![
+            sq(0.0, 0.0, 10.0, true),
+            sq(20.0, 2.0, 2.0, false)
+        ]]));
+        assert!(!same_region(&[
+            vec![sq(0.0, 0.0, 1.0, true)],
+            vec![sq(0.5, 0.5, 1.0, true)]
+        ]));
+        assert!(!same_region(&[
+            vec![sq(0.0, 0.0, 10.0, true)],
+            vec![sq(2.0, 2.0, 1.0, true)]
+        ]));
+        assert!(same_region(&[
+            vec![sq(0.0, 0.0, 1.0, true)],
+            vec![sq(5.0, 5.0, 1.0, true)]
+        ]));
         // Too large: a window of 180 degrees; a pole.
         assert!(!same_region(&[vec![sq(-90.0, 0.0, 180.0, true)]]));
         assert!(!same_region(&[vec![sq(0.0, 80.0, 20.0, true)]]));

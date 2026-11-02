@@ -424,7 +424,7 @@ mod tests {
             }
             // Wrong ring direction: SQL Server takes the other side.
             let wrong_side = ["cw_small", "cw_big", "hole_ccw", "ring_cw_hole_cw"];
-            assert_eq!(wrong_side.contains(&name) && read, false, "{name}");
+            assert!(!(wrong_side.contains(&name) && read), "{name}");
             assert!(name != "ccw" || read, "{name}");
             n += 1;
         }
