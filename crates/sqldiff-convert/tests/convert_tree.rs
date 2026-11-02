@@ -474,6 +474,62 @@ fn exec_with_output_in_a_script_becomes_a_call_in_a_do_block() {
     );
 }
 
+#[test]
+fn bulk_insert_is_refused_without_a_leftover_statement() {
+    let src = "PRINT 'Loading';\nBULK INSERT [Sales].[Orders] FROM 'C:\\load\\o.csv'\nWITH (FIELDTERMINATOR = '+|', ROWTERMINATOR = '&|\\n', CODEPAGE = 'ACP', CHECK_CONSTRAINTS, TABLOCK)\nGO\n";
+    for c in [pg(src), db2(src)] {
+        assert_eq!(c.units.len(), 2, "{}", c.output);
+        assert_eq!(c.units[1].status, Status::NotConverted);
+        assert!(
+            c.units[1]
+                .notes
+                .iter()
+                .any(|n| n.text.starts_with("BULK INSERT")),
+            "{:?}",
+            c.units[1].notes
+        );
+        let live: Vec<&str> = c
+            .output
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect();
+        assert!(
+            !live
+                .iter()
+                .any(|l| l.to_ascii_uppercase().contains("INSERT")),
+            "{live:?}"
+        );
+    }
+}
+
+#[test]
+fn bulk_insert_as_an_if_or_while_body_is_never_live_sql() {
+    for src in [
+        "IF 1 = 1 BULK INSERT t FROM 'f'\nGO\n",
+        "IF 1 = 1 BULK INSERT t FROM 'f' ELSE PRINT 'x'\nGO\n",
+        "WHILE 1 = 1 BULK INSERT t FROM 'f'\nGO\n",
+    ] {
+        for c in [pg(src), db2(src)] {
+            let live: Vec<&str> = c
+                .output
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("--"))
+                .collect();
+            assert!(
+                !live
+                    .iter()
+                    .any(|l| l.to_ascii_uppercase().contains("INSERT")),
+                "{src}: {live:?}"
+            );
+            assert!(
+                c.units.iter().any(|u| u.status == Status::NotConverted),
+                "{src}: {:?}",
+                c.units.iter().map(|u| u.status).collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
 /// T-SQL drops the fraction of a number stored in an integer (eval/casts);
 /// PostgreSQL rounds it, so the conversion truncates where the value has one.
 #[test]
@@ -502,4 +558,77 @@ fn fractions_stored_in_integers_are_truncated() {
     let d =
         db2("CREATE TABLE T(Pop bigint NULL);\nGO\nUPDATE T SET Pop = Pop * 1.04;\nGO\n").output;
     assert!(!d.to_ascii_lowercase().contains("trunc"), "{d}");
+}
+
+/// INSERT … SELECT and UPDATE … FROM store values in integer columns the same
+/// way as INSERT … VALUES and plain UPDATE: the fraction is dropped.
+#[test]
+fn fractions_stored_by_insert_select_and_update_from_are_truncated() {
+    let src = "CREATE TABLE dbo.Src(ID int NOT NULL PRIMARY KEY, Amt decimal(9,2) NOT NULL, Qty int NOT NULL);\nCREATE TABLE dbo.Dst(ID int NOT NULL, Cnt int NOT NULL, Big bigint NULL, Price decimal(9,2) NULL);\nGO\nCREATE PROCEDURE dbo.Fill @f decimal(5,2)\nAS\nBEGIN\n    INSERT INTO dbo.Dst(ID, Cnt, Big, Price) SELECT s.ID, s.Amt * 1.5, s.Qty * 2, s.Amt * 1.5 FROM dbo.Src s WHERE s.ID > 0;\n    INSERT INTO dbo.Dst(ID, Cnt) SELECT ID, Amt * @f AS c FROM dbo.Src;\n    UPDATE d SET d.Cnt = s.Amt * 2, d.Price = s.Amt * 2 FROM dbo.Dst d JOIN dbo.Src s ON s.ID = d.ID WHERE s.Qty > 0;\n    UPDATE dbo.Dst SET Cnt = s.Amt / 3 FROM dbo.Dst JOIN dbo.Src s ON s.ID = Dst.ID;\nEND;\nGO\n";
+    let o = pg(src).output;
+    for want in [
+        // Cnt takes a fraction; Big an integer product; Price is a decimal.
+        "SELECT s.ID, trunc(s.Amt * 1.5), s.Qty * 2, s.Amt * 1.5 FROM Src s",
+        "SELECT ID, trunc(Amt * p_f) AS c FROM Src",
+        "SET Cnt = trunc(s.Amt * 2), Price = s.Amt * 2",
+        "SET Cnt = trunc(s.Amt / 3)",
+    ] {
+        assert!(o.contains(want), "missing {want}\n{o}");
+    }
+}
+
+/// The rewrite must not change what the SELECT or UPDATE does with the
+/// unconverted value, nor guess a type it does not know.
+#[test]
+fn insert_select_keeps_shapes_it_cannot_truncate_safely() {
+    let src = "CREATE TABLE dbo.Src(ID int NOT NULL, Amt decimal(9,2) NOT NULL);\nCREATE TABLE dbo.Dst(ID int NOT NULL, Cnt int NOT NULL);\nGO\nCREATE PROCEDURE dbo.Fill\nAS\nBEGIN\n    INSERT INTO dbo.Dst(ID, Cnt) SELECT DISTINCT ID, Amt * 1.5 FROM dbo.Src;\n    INSERT INTO dbo.Dst(ID, Cnt) SELECT ID, Amt * 1.5 FROM dbo.Src ORDER BY Amt * 1.5;\n    INSERT INTO dbo.Dst(ID, Cnt) SELECT ID, Amt * 1.5 FROM dbo.Src UNION ALL SELECT ID, 1 FROM dbo.Src;\n    INSERT INTO dbo.Dst(ID, Cnt) SELECT ID, x.Amt * 1.5 FROM dbo.Nowhere x;\nEND;\nGO\n";
+    let o = pg(src).output;
+    assert!(!o.to_ascii_lowercase().contains("trunc"), "{o}");
+}
+
+/// A fraction passed to an integer parameter of a known procedure, or
+/// returned by an integer function, is truncated as T-SQL does.
+#[test]
+fn fractions_passed_to_int_parameters_and_returned_by_functions_are_truncated() {
+    let callee = "CREATE PROCEDURE dbo.Take @n int, @label varchar(10), @d decimal(9,2)\nAS\nBEGIN\n    SET NOCOUNT ON;\nEND;\nGO\n";
+    let caller = "CREATE PROCEDURE dbo.Give @f decimal(5,2), @i int\nAS\nBEGIN\n    EXEC dbo.Take @f * 2, 'a', @f * 2;\n    EXEC dbo.Take @n = @f / 3, @label = 'b', @d = @f / 3;\n    EXEC dbo.Take @i * 2, 'c', @i;\nEND;\nGO\n";
+    let func = "CREATE FUNCTION dbo.Half(@f decimal(9,2)) RETURNS int\nAS\nBEGIN\n    RETURN @f / 2;\nEND;\nGO\nCREATE FUNCTION dbo.Whole(@i int) RETURNS int\nAS\nBEGIN\n    RETURN @i * 2;\nEND;\nGO\nCREATE FUNCTION dbo.Exact(@f decimal(9,2)) RETURNS decimal(9,2)\nAS\nBEGIN\n    RETURN @f / 2;\nEND;\nGO\n";
+    let all = format!("{callee}{caller}{func}");
+    let cat = source_catalog(&[&all]);
+    let d = rewrite_in(&all, Dialect::Tsql, Dialect::Postgres, Some(&cat));
+    let o = sqldiff_convert::check(&all, d, &Options::default()).output;
+    for want in [
+        "CALL Take(trunc(p_f * 2), 'a', p_f * 2);",
+        "CALL Take(p_n => trunc(p_f / 3), p_label => 'b', p_d => p_f / 3);",
+        "CALL Take(p_i * 2, 'c', p_i);",
+        "RETURN trunc(p_f / 2);",
+        "RETURN p_i * 2;",
+    ] {
+        assert!(o.contains(want), "missing {want}\n{o}");
+    }
+    // The decimal function keeps its value.
+    assert_eq!(o.matches("trunc(").count(), 3, "{o}");
+}
+
+/// The engine compares the truncating forms the converter now writes for
+/// INSERT … SELECT and UPDATE … FROM (a statement alone in its routine, so
+/// the transaction findings of two writes do not mix in).
+#[test]
+fn engine_accepts_truncation_in_insert_select_and_update_from() {
+    let tables = "CREATE TABLE dbo.Src(ID int NOT NULL PRIMARY KEY, Amt decimal(9,2) NOT NULL);\nCREATE TABLE dbo.Dst(ID int NOT NULL, Cnt int NOT NULL);\nGO\n";
+    for body in [
+        "INSERT INTO dbo.Dst(ID, Cnt) SELECT s.ID, s.Amt * 1.5 FROM dbo.Src s;",
+        "UPDATE d SET d.Cnt = s.Amt * 2 FROM dbo.Dst d JOIN dbo.Src s ON s.ID = d.ID;",
+    ] {
+        let src = format!("{tables}CREATE PROCEDURE dbo.P\nAS\nBEGIN\n    {body}\nEND;\nGO\n");
+        let c = pg(&src);
+        let u = unit(&c, &src, "CREATE PROCEDURE");
+        assert!(
+            u.status <= Status::Assumptions,
+            "{body}\n{:?}\n{}",
+            u.notes,
+            c.output
+        );
+        assert!(c.output.contains("trunc("), "{body}\n{}", c.output);
+    }
 }
