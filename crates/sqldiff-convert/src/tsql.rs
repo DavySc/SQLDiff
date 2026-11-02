@@ -109,6 +109,7 @@ pub(crate) fn convert(
         in_table_check: false,
         table_items: Vec::new(),
         left_out_indexes: Vec::new(),
+        alias_types: HashMap::new(),
         update_ctes: Vec::new(),
         stmt_ctes: Vec::new(),
         stmt_insert: false,
@@ -182,6 +183,155 @@ struct Decl {
     lines: Vec<String>,
     notes: Vec<Note>,
     trace: Vec<crate::Step>,
+}
+
+/// PostgreSQL built-in type names (and their spellings) that an unqualified
+/// name finds in pg_catalog before any schema of the search path, the
+/// pseudo-types and the `serial` family the parser reads in a column
+/// definition (`x serial` is an auto-increment column, not a domain).
+const PG_TYPE_NAMES: &[&str] = &[
+    "_aclitem",
+    "aclitem",
+    "any",
+    "anyarray",
+    "anycompatible",
+    "anycompatiblearray",
+    "anycompatiblemultirange",
+    "anycompatiblenonarray",
+    "anycompatiblerange",
+    "anyelement",
+    "anyenum",
+    "anymultirange",
+    "anynonarray",
+    "anyrange",
+    "bigint",
+    "bigserial",
+    "bit",
+    "bool",
+    "boolean",
+    "box",
+    "bpchar",
+    "bytea",
+    "char",
+    "character",
+    "cid",
+    "cidr",
+    "circle",
+    "cstring",
+    "date",
+    "datemultirange",
+    "daterange",
+    "decimal",
+    "double",
+    "event_trigger",
+    "fdw_handler",
+    "float",
+    "float4",
+    "float8",
+    "gtsvector",
+    "index_am_handler",
+    "inet",
+    "int",
+    "int2",
+    "int4",
+    "int4multirange",
+    "int4range",
+    "int8",
+    "int8multirange",
+    "int8range",
+    "integer",
+    "internal",
+    "interval",
+    "json",
+    "jsonb",
+    "jsonpath",
+    "language_handler",
+    "line",
+    "lseg",
+    "macaddr",
+    "macaddr8",
+    "money",
+    "name",
+    "numeric",
+    "nummultirange",
+    "numrange",
+    "oid",
+    "opaque",
+    "path",
+    "pg_brin_bloom_summary",
+    "pg_brin_minmax_multi_summary",
+    "pg_ddl_command",
+    "pg_dependencies",
+    "pg_lsn",
+    "pg_mcv_list",
+    "pg_ndistinct",
+    "pg_node_tree",
+    "pg_snapshot",
+    "point",
+    "polygon",
+    "precision",
+    "real",
+    "record",
+    "refcursor",
+    "regclass",
+    "regcollation",
+    "regconfig",
+    "regdictionary",
+    "regnamespace",
+    "regoper",
+    "regoperator",
+    "regproc",
+    "regprocedure",
+    "regrole",
+    "regtype",
+    "serial",
+    "serial2",
+    "serial4",
+    "serial8",
+    "smallint",
+    "smallserial",
+    "table_am_handler",
+    "text",
+    "tid",
+    "time",
+    "timestamp",
+    "timestamptz",
+    "timetz",
+    "trigger",
+    "tsm_handler",
+    "tsmultirange",
+    "tsquery",
+    "tsrange",
+    "tstzmultirange",
+    "tstzrange",
+    "tsvector",
+    "txid_snapshot",
+    "unknown",
+    "uuid",
+    "varbit",
+    "varchar",
+    "void",
+    "xid",
+    "xid8",
+    "xml",
+];
+
+/// An alias type created in the file: the domain it became and what a
+/// column of it inherits.
+#[derive(Clone)]
+struct AliasType {
+    /// The domain name as written in the target.
+    domain: String,
+    /// `Some(true)` for `NOT NULL`, `Some(false)` for `NULL`.
+    not_null: Option<bool>,
+    string: bool,
+    numeric: bool,
+    /// The base type's class, as a column, variable or parameter of the
+    /// alias reads in expressions (a bit alias takes the bit rewrites).
+    dt: Dt,
+    /// The base type as written: converting it again at a use gives the
+    /// notes the base type carries (ASM-TINYINT, ASM-BIT-BOOLEAN, …).
+    base: Vec<T>,
 }
 
 struct Cx<'a> {
@@ -321,6 +471,9 @@ struct Cx<'a> {
     table_items: Vec<Vec<T>>,
     /// Indexes the conversion left out (columnstore), lower case.
     left_out_indexes: Vec<String>,
+    /// Alias types this file creates (`CREATE TYPE n FROM base`), by schema
+    /// and name (lower case, `dbo` for none).
+    alias_types: HashMap<(String, String), AliasType>,
     /// The CTEs of the `WITH … UPDATE … FROM` being converted (lower case),
     /// with the GROUP BY key their query returns (`group_key`), if any.
     update_ctes: Vec<(String, Option<Vec<String>>)>,
@@ -806,7 +959,7 @@ impl<'a> Cx<'a> {
                     name: pname.clone(),
                     string,
                     numeric,
-                    dt: Dt::of_tokens(&p[ty_at..ty_end]),
+                    dt: self.dt_tok(&p[ty_at..ty_end]),
                 },
             );
             let output = p.iter().any(|t| t.is("OUTPUT") || t.is("OUT"));
@@ -825,7 +978,7 @@ impl<'a> Cx<'a> {
                 let end = (eq + 1..p.len())
                     .find(|&j| p[j].is("OUTPUT") || p[j].is("OUT"))
                     .unwrap_or(p.len());
-                let v = if Dt::of_tokens(&p[ty_at..ty_end]) == Dt::Bit {
+                let v = if self.dt_tok(&p[ty_at..ty_end]) == Dt::Bit {
                     self.bit_store_text(&p[eq + 1..end])
                 } else {
                     self.expr(&p[eq + 1..end]).trim().to_string()
@@ -859,8 +1012,8 @@ impl<'a> Cx<'a> {
                 ));
             }
             let (ty, _, _) = self.ty(rt)?;
-            self.ret_bit = Dt::of_tokens(rt) == Dt::Bit;
-            self.ret_dt = Dt::of_tokens(rt);
+            self.ret_bit = self.dt_tok(rt) == Dt::Bit;
+            self.ret_dt = self.dt_tok(rt);
             returns = format!(" RETURNS {ty}");
             self.step_ts_with("tsql.routine.returns", &ts[ret..rend], ty);
         }
@@ -4009,7 +4162,7 @@ impl<'a> Cx<'a> {
         };
         let t = self.entry_table(&entry)?;
         let c = t.column(Dialect::Tsql, &Ident::plain(col))?;
-        Some(Dt::of(&c.data_type.base, &c.data_type.args))
+        Some(self.dt_cat(&c.data_type.base, &c.data_type.args))
     }
 
     /// The type of column `col` of the UPDATE target `table` when the
@@ -4039,7 +4192,7 @@ impl<'a> Cx<'a> {
         for e in aliased {
             let t = self.entry_table(e)?;
             let c = t.column(Dialect::Tsql, &Ident::plain(col.to_string()))?;
-            let dt = Dt::of(&c.data_type.base, &c.data_type.args);
+            let dt = self.dt_cat(&c.data_type.base, &c.data_type.args);
             if found.is_some_and(|(name, d)| name != t.name || d != dt) {
                 return None;
             }
@@ -4588,7 +4741,7 @@ impl<'a> Cx<'a> {
                     name: name.clone(),
                     string,
                     numeric,
-                    dt: Dt::of_tokens(&it[j..eq.unwrap_or(it.len())]),
+                    dt: self.dt_tok(&it[j..eq.unwrap_or(it.len())]),
                 },
             );
             let line = if self.db2() {
@@ -4599,7 +4752,7 @@ impl<'a> Cx<'a> {
             self.step_ts_with("tsql.decl.variable", it, line.clone());
             lines.push(line);
             if let Some(eq) = eq {
-                let dt = Dt::of_tokens(&it[j..eq]);
+                let dt = self.dt_tok(&it[j..eq]);
                 pending.push((name, it[eq + 1..].to_vec(), dt == Dt::Bit, dt));
             }
         }
@@ -5703,9 +5856,10 @@ impl<'a> Cx<'a> {
                     ));
                 };
                 passed.push(at);
-                bit_param = ps[at].data_type.base == "BIT" && !marked;
+                bit_param = self.dt_cat(&ps[at].data_type.base, &ps[at].data_type.args) == Dt::Bit
+                    && !marked;
                 if !marked {
-                    param_dt = Dt::of(&ps[at].data_type.base, &ps[at].data_type.args);
+                    param_dt = self.dt_cat(&ps[at].data_type.base, &ps[at].data_type.args);
                 }
                 let out_param = matches!(ps[at].mode, ParamMode::Out | ParamMode::InOut);
                 if out_param != marked {
@@ -5959,9 +6113,21 @@ impl<'a> Cx<'a> {
                             .filter_map(|item| {
                                 let s = sig(item);
                                 let (&n, &t) = (s.first()?, s.get(1)?);
-                                (!constraint_item(&item[n])
-                                    && tsql_unquote(&item[t].s).eq_ignore_ascii_case("bit"))
-                                .then(|| tsql_unquote(&item[n].s).to_ascii_lowercase())
+                                // The type name: `name` or `schema.name`.
+                                let mut ty_end = t;
+                                while item.get(ty_end + 1).is_some_and(|d| d.k == DOT)
+                                    && item
+                                        .get(ty_end + 2)
+                                        .is_some_and(|x| matches!(x.k, IDENT | QUOTED_IDENT))
+                                {
+                                    ty_end += 2;
+                                }
+                                let bit = tsql_unquote(&item[t].s).eq_ignore_ascii_case("bit")
+                                    || self
+                                        .alias_type(&item[t..=ty_end])
+                                        .is_some_and(|a| a.dt == Dt::Bit);
+                                (!constraint_item(&item[n]) && bit)
+                                    .then(|| tsql_unquote(&item[n].s).to_ascii_lowercase())
                             })
                             .collect()
                     })
@@ -5971,6 +6137,7 @@ impl<'a> Cx<'a> {
             "UNIQUE" | "INDEX" | "CLUSTERED" | "NONCLUSTERED" => self.create_index(ts, &w1),
             "SCHEMA" => self.create_schema(&ts),
             "SEQUENCE" => self.create_sequence(&ts, s[2..].to_vec()),
+            "TYPE" => self.create_alias_type(&ts),
             _ => {
                 let words: Vec<String> = s[1..].iter().take(2).map(|&i| ts[i].up()).collect();
                 let words: Vec<&str> = words.iter().map(String::as_str).collect();
@@ -6076,6 +6243,143 @@ impl<'a> Cx<'a> {
     /// `CREATE SCHEMA s [AUTHORIZATION owner]`. T-SQL's `dbo` is the
     /// database owner, a principal the target has no counterpart of by that
     /// name: the target schema goes to the user running the script.
+    /// `CREATE TYPE [schema.]name FROM base [NULL | NOT NULL]` → PostgreSQL
+    /// `CREATE DOMAIN name AS base`. A T-SQL alias type is its base type
+    /// under another name; the nullability it names applies to a column of
+    /// the type that spells none (`column_def`), not to the domain, since a
+    /// column (or variable) of the type can still be declared nullable.
+    fn create_alias_type(&mut self, ts: &[T]) -> R<String> {
+        if self.db2() {
+            return no("CREATE TYPE … FROM: Db2 for i has distinct types, which are not assignment-compatible with their source type as a T-SQL alias type is; no rule");
+        }
+        let s = sig(ts);
+        let mut k = 2;
+        let first = *s.get(k).ok_or(No("CREATE TYPE without a name".into()))?;
+        let mut parts = vec![tsql_unquote(&ts[first].s)];
+        k += 1;
+        while s.get(k).is_some_and(|&j| ts[j].k == DOT) {
+            let n = *s.get(k + 1).ok_or(No("unfinished type name".into()))?;
+            parts.push(tsql_unquote(&ts[n].s));
+            k += 2;
+        }
+        if parts.len() > 2 {
+            return no("CREATE TYPE with a name of more than two parts: no rule");
+        }
+        let Some(&from) = s.get(k).filter(|&&j| ts[j].is("FROM")) else {
+            return no(
+                "CREATE TYPE … AS TABLE / EXTERNAL NAME (a table type or a CLR type): no rule",
+            );
+        };
+        let mut body: Vec<T> = ts[from + 1..].to_vec();
+        while body.last().is_some_and(|t| !t.sig() || t.k == SEMICOLON) {
+            body.pop();
+        }
+        let bs = sig(&body);
+        let n = bs.len();
+        let not_null = match n.checked_sub(2).map(|i| (&body[bs[i]], &body[bs[n - 1]])) {
+            Some((a, b)) if a.is("NOT") && b.is("NULL") => {
+                body.truncate(bs[n - 2]);
+                Some(true)
+            }
+            _ if n >= 1 && body[bs[n - 1]].is("NULL") => {
+                body.truncate(bs[n - 1]);
+                Some(false)
+            }
+            _ => None,
+        };
+        let (base, string, numeric) = self.ty(&body)?;
+        let (schema, name) = match parts.as_slice() {
+            [n] => ("dbo".to_string(), n.clone()),
+            [s, n] => (s.to_ascii_lowercase(), n.clone()),
+            _ => unreachable!(),
+        };
+        let domain = if schema == "dbo" {
+            self.note(Status::Assumptions, "ASM-DBO-SCHEMA", "The dbo schema is dropped: objects are assumed to be found through search_path (usually the public schema).");
+            // pg_catalog is searched before the schema of an unqualified
+            // name, so a domain spelled like a built-in type would never be
+            // found. Quoted with a capital it is a different name.
+            let lower = name.to_ascii_lowercase();
+            if PG_TYPE_NAMES.contains(&lower.as_str()) {
+                if name == lower {
+                    return no(format!("CREATE TYPE {name}: a PostgreSQL domain named {name} is never found, since the built-in type of that name comes first on the search path; rename the type"));
+                }
+                format!("\"{}\"", name.replace('"', "\"\""))
+            } else {
+                quoted(&name)
+            }
+        } else {
+            format!("{}.{}", quoted(&schema), quoted(&name))
+        };
+        self.step_ts("tsql.type.alias-domain", ts);
+        self.alias_types.insert(
+            (schema, name.to_ascii_lowercase()),
+            AliasType {
+                domain: domain.clone(),
+                not_null,
+                string,
+                numeric,
+                dt: Dt::of_tokens(&body),
+                base: body.clone(),
+            },
+        );
+        Ok(format!("CREATE DOMAIN {domain} AS {base}"))
+    }
+
+    /// The alias type a type name (one or two parts, as tokens) names, if
+    /// this file created it.
+    fn alias_type(&self, ts: &[T]) -> Option<&AliasType> {
+        let words: Vec<String> = trimmed(ts)
+            .iter()
+            .filter(|t| matches!(t.k, IDENT | QUOTED_IDENT | DOT))
+            .map(|t| {
+                if t.k == DOT {
+                    ".".into()
+                } else {
+                    tsql_unquote(&t.s)
+                }
+            })
+            .collect();
+        let key = match words.as_slice() {
+            // An unqualified name that is a T-SQL built-in type is that type;
+            // an alias of the same name is reached as `dbo.Name` only.
+            [n] if KNOWN_TYPES.contains(&n.to_ascii_uppercase().as_str()) => return None,
+            [n] => ("dbo".to_string(), n.to_ascii_lowercase()),
+            [s, d, n] if d == "." => (s.to_ascii_lowercase(), n.to_ascii_lowercase()),
+            _ => return None,
+        };
+        // A parenthesised length means a built-in type, not an alias.
+        if trimmed(ts).iter().any(|t| t.k == L_PAREN) {
+            return None;
+        }
+        self.alias_types.get(&key)
+    }
+
+    /// The class of a type written as tokens: an alias type reads as its
+    /// base type.
+    fn dt_tok(&self, ts: &[T]) -> Dt {
+        self.alias_type(ts)
+            .map_or_else(|| Dt::of_tokens(ts), |a| a.dt)
+    }
+
+    /// The class of a catalog column type (`base` as the catalog spells it),
+    /// reading an alias type created in this file as its base type.
+    fn dt_cat(&self, base: &str, args: &[u32]) -> Dt {
+        if args.is_empty() {
+            let parts: Vec<String> = base.split('.').map(tsql_unquote).collect();
+            let key = match parts.as_slice() {
+                [n] if !KNOWN_TYPES.contains(&n.to_ascii_uppercase().as_str()) => {
+                    Some(("dbo".to_string(), n.to_ascii_lowercase()))
+                }
+                [s, n] => Some((s.to_ascii_lowercase(), n.to_ascii_lowercase())),
+                _ => None,
+            };
+            if let Some(a) = key.and_then(|k| self.alias_types.get(&k)) {
+                return a.dt;
+            }
+        }
+        Dt::of(base, args)
+    }
+
     fn create_schema(&mut self, ts: &[T]) -> R<String> {
         let s = sig(ts);
         let body: Vec<usize> = s
@@ -6851,8 +7155,21 @@ impl<'a> Cx<'a> {
             rest.push(t.clone());
             j += 1;
         }
+        // A column of an alias type that spells neither NULL nor NOT NULL
+        // takes the nullability the type was created with.
+        let inherited = self
+            .alias_type(&it[ty_at..=ty_end])
+            .and_then(|a| a.not_null);
+        let spells_null = {
+            let ds = crate::tok::depths(&rest);
+            let top: Vec<usize> = sig(&rest).into_iter().filter(|&k| ds[k] == 0).collect();
+            top.iter()
+                .enumerate()
+                .any(|(n, &k)| rest[k].is("NULL") && !(n > 0 && rest[top[n - 1]].is("DEFAULT")))
+        };
+        let inherit_not_null = inherited == Some(true) && !spells_null;
         // NOT NULL or a PRIMARY KEY of the column itself (not inside CHECK).
-        let not_null = pk_col || {
+        let not_null = pk_col || inherit_not_null || {
             let ds = crate::tok::depths(&rest);
             let top: Vec<usize> = sig(&rest).into_iter().filter(|&k| ds[k] == 0).collect();
             top.windows(2).any(|w| {
@@ -6869,12 +7186,20 @@ impl<'a> Cx<'a> {
             self.step_ts("tsql.table.primary-key-not-null", it);
             rest = format!("NOT NULL {}", rest.trim());
         }
+        if inherit_not_null {
+            self.step_ts("tsql.table.alias-not-null", it);
+            rest = format!("{} NOT NULL", rest.trim());
+        }
         if seq_default && !not_null {
             // A NULL written into the column stays NULL in T-SQL; the trigger
             // would replace it with the next value.
             return no(format!("column DEFAULT NEXT VALUE FOR on the nullable column {}: Db2 for i takes no NEXT VALUE in a default, and a trigger cannot tell a NULL written into the column from a column left out", name.trim()));
         }
-        if ty == "boolean" {
+        if ty == "boolean"
+            || self
+                .alias_type(&it[ty_at..=ty_end])
+                .is_some_and(|a| a.dt == Dt::Bit)
+        {
             let b = bits::bool_default(&rest);
             if b != rest {
                 self.step_ts("tsql.bit.boolean-default", it);
@@ -9240,6 +9565,13 @@ impl<'a> Cx<'a> {
         let Some(first) = ts.first() else {
             return no("missing type");
         };
+        if let Some(a) = self.alias_type(ts) {
+            let (domain, string, numeric, base) =
+                (a.domain.clone(), a.string, a.numeric, a.base.clone());
+            // The base type's own notes hold wherever the alias is used.
+            self.ty_map(&base)?;
+            return Ok((domain, string, numeric));
+        }
         if let Some(d) = next_sig(ts, 0).filter(|&d| ts[d].k == DOT) {
             // `sys.geography` is the built-in type; any other schema holds a
             // user-defined type, which has no rule.
@@ -12283,7 +12615,7 @@ impl Cx<'_> {
             }
             let t = self.entry_table(e)?;
             if let Some(c) = t.column(Dialect::Tsql, &Ident::plain(col.clone())) {
-                let dt = Dt::of(&c.data_type.base, &c.data_type.args);
+                let dt = self.dt_cat(&c.data_type.base, &c.data_type.args);
                 if found.is_some_and(|f| f != dt) {
                     return None;
                 }
@@ -12356,9 +12688,9 @@ impl Cx<'_> {
                 match (t.up().as_str(), a.len()) {
                     ("CAST", 1) => {
                         let at = crate::tok::find_word(a[0], 0, "AS")?;
-                        Some(Dt::of_tokens(&a[0][at + 1..]))
+                        Some(self.dt_tok(&a[0][at + 1..]))
                     }
-                    ("CONVERT", 2 | 3) => Some(Dt::of_tokens(a[0])),
+                    ("CONVERT", 2 | 3) => Some(self.dt_tok(a[0])),
                     ("DATEADD", 3) => Some(match self.expr_dt(a[2])? {
                         Dt::Text => Dt::DateTime,
                         d => d,

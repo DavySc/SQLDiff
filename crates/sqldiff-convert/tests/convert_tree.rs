@@ -475,6 +475,84 @@ fn exec_with_output_in_a_script_becomes_a_call_in_a_do_block() {
 }
 
 #[test]
+fn alias_types_become_domains() {
+    let src = "CREATE TYPE [AccountNumber] FROM nvarchar(15) NULL;\nGO\nCREATE TYPE [Flag] FROM bit NOT NULL;\nGO\nCREATE TYPE [Name] FROM nvarchar(50) NULL;\nGO\nCREATE TYPE [Sales].[Money Amt] FROM decimal(19, 4) NOT NULL;\nGO\nCREATE TABLE [dbo].[Thing](\n    [Name] [Name] NOT NULL,\n    [Alt] [Name] NULL,\n    [Active] [Flag] NOT NULL,\n    [Seen] [dbo].[Flag],\n    [Maybe] [Flag] NULL,\n    [Dflt] [Flag] DEFAULT NULL,\n    [Acct] [AccountNumber],\n    [Amt] [Sales].[Money Amt] DEFAULT 0\n);\nGO\n";
+    let c = pg(src);
+    let o = &c.output;
+    for want in [
+        "CREATE DOMAIN AccountNumber AS varchar(15);",
+        "CREATE DOMAIN Flag AS boolean;",
+        // A domain named like a built-in type is never found unquoted.
+        "CREATE DOMAIN \"Name\" AS varchar(50);",
+        "CREATE DOMAIN sales.\"Money Amt\" AS numeric(19, 4);",
+        "Name \"Name\" NOT NULL,",
+        "Alt \"Name\" NULL,",
+        "Maybe Flag NULL,",
+        // NOT NULL comes from the alias type only where the column says nothing.
+        "Seen Flag NOT NULL,",
+        "Dflt Flag DEFAULT NULL NOT NULL,",
+        "Acct AccountNumber,",
+        "Amt sales.\"Money Amt\" DEFAULT 0 NOT NULL",
+    ] {
+        assert!(o.contains(want), "missing {want}\n{o}");
+    }
+    // The nullability stays off the domain: a column can still say NULL.
+    assert!(!o.contains("DOMAIN Flag AS boolean NOT NULL"), "{o}");
+    // A name PostgreSQL's own type would win over cannot be a domain.
+    let lower = pg("CREATE TYPE [name] FROM nvarchar(50);\nGO\n");
+    assert_eq!(lower.units[0].status, Status::NotConverted);
+    // Db2 for i distinct types are not alias types.
+    assert_eq!(
+        db2("CREATE TYPE [Flag] FROM bit NOT NULL;\nGO\n").units[0].status,
+        Status::NotConverted
+    );
+    // A table type is not an alias type.
+    let t = pg("CREATE TYPE [dbo].[Ids] AS TABLE (Id int);\nGO\n");
+    assert_eq!(t.units[0].status, Status::NotConverted);
+}
+
+/// An alias type is its base type wherever it is used: a bit alias takes the
+/// bit literal rewrites, the base type's notes appear at the use, and a name
+/// that PostgreSQL reads in another way is not left unquoted.
+#[test]
+fn alias_types_behave_as_their_base_type() {
+    let src = "CREATE TYPE [Flag] FROM bit NOT NULL;\nGO\nCREATE TYPE [Small] FROM tinyint NULL;\nGO\nCREATE TYPE [Serial] FROM int NOT NULL;\nGO\nCREATE TYPE [Date] FROM varchar(10) NULL;\nGO\nCREATE TABLE dbo.T(Active Flag DEFAULT 1, S Small, N Serial);\nGO\nCREATE TABLE dbo.T2(D date, E dbo.Date);\nGO\nCREATE VIEW dbo.V AS SELECT Active FROM dbo.T WHERE Active = 1;\nGO\nCREATE PROCEDURE dbo.P @s Small, @f Flag = 1\nAS\nBEGIN\n    SELECT @s;\n    IF @f = 1 SELECT 1;\nEND;\nGO\n";
+    let c = pg(src);
+    let o = &c.output;
+    for want in [
+        // The column default and the view's comparison are boolean.
+        "Active Flag DEFAULT TRUE NOT NULL",
+        "WHERE Active = TRUE",
+        // `serial` would be an auto-increment column; `Serial` is quoted.
+        "CREATE DOMAIN \"Serial\" AS integer;",
+        "N \"Serial\" NOT NULL",
+        // A plain `date` column is the built-in type, `dbo.Date` the alias.
+        "D date",
+        "E \"Date\"",
+    ] {
+        assert!(o.contains(want), "missing {want}\n{o}");
+    }
+    // The procedure's header carries the notes of the base types.
+    let u = unit(&c, src, "CREATE PROCEDURE dbo.P");
+    let notes: String = u.notes.iter().map(|n| format!("{} ", n.text)).collect();
+    assert!(notes.to_ascii_lowercase().contains("tinyint"), "{notes}");
+}
+
+/// A column of an integer alias type takes the integer truncation: T-SQL
+/// drops the fraction, PostgreSQL would round into the domain.
+#[test]
+fn integer_alias_columns_are_truncated() {
+    let src = "CREATE TYPE [Qty] FROM int NOT NULL;\nGO\nCREATE TABLE dbo.S(Id int NOT NULL PRIMARY KEY, Q Qty);\nGO\nCREATE TABLE dbo.S2(Id int NOT NULL PRIMARY KEY, Q2 decimal(9,2) NOT NULL);\nGO\nCREATE PROCEDURE dbo.Up\nAS\nBEGIN\n    UPDATE dbo.S SET Q = Q * 1.5 WHERE Id = 1;\n    UPDATE s SET Q = s2.Q2 FROM dbo.S s JOIN dbo.S2 s2 ON s2.Id = s.Id;\nEND;\nGO\n";
+    let o = pg(src).output;
+    for want in [
+        "SET Q = trunc(Q * 1.5) WHERE Id = 1;",
+        "SET Q = trunc(s2.Q2) FROM S2 s2",
+    ] {
+        assert!(o.contains(want), "missing {want}\n{o}");
+    }
+}
+
+#[test]
 fn bulk_insert_is_refused_without_a_leftover_statement() {
     let src = "PRINT 'Loading';\nBULK INSERT [Sales].[Orders] FROM 'C:\\load\\o.csv'\nWITH (FIELDTERMINATOR = '+|', ROWTERMINATOR = '&|\\n', CODEPAGE = 'ACP', CHECK_CONSTRAINTS, TABLOCK)\nGO\n";
     for c in [pg(src), db2(src)] {
