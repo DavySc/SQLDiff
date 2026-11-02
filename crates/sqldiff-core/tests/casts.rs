@@ -9,15 +9,18 @@ use sqldiff_core::{diff, Artifact, Dialect, Options, Report, Verdict};
 const MS_DDL: &str = "CREATE TABLE dbo.M (Id int NOT NULL PRIMARY KEY, D decimal(10,2) NULL,
   D0 decimal(10,0) NULL, D1 decimal(1,1) NULL, F float NULL, R real NULL, S varchar(20) NULL,
   C char(5) NULL, T datetime2(3) NULL, Dt datetime NULL, Tm time(3) NULL, Q int NULL, B bigint NULL,
-  Ti tinyint NULL, Big decimal(38,10) NULL, Day date NULL);";
+  Ti tinyint NULL, Big decimal(38,10) NULL, Day date NULL);
+CREATE TABLE dbo.N (Id int NOT NULL PRIMARY KEY, D int NULL);";
 const PG_DDL: &str = "CREATE TABLE M (Id integer NOT NULL PRIMARY KEY, D decimal(10,2) NULL,
   D0 decimal(10,0) NULL, D1 decimal(1,1) NULL, F double precision NULL, R real NULL,
   S varchar(20) NULL, C char(5) NULL, T timestamp(3) NULL, Dt timestamp(3) NULL, Tm time(3) NULL,
-  Q integer NULL, B bigint NULL, Ti smallint NULL, Big decimal(38,10) NULL, Day date NULL);";
+  Q integer NULL, B bigint NULL, Ti smallint NULL, Big decimal(38,10) NULL, Day date NULL);
+CREATE TABLE N (Id integer NOT NULL PRIMARY KEY, D integer NULL);";
 const DB2_DDL: &str = "CREATE TABLE M (Id INTEGER NOT NULL PRIMARY KEY, D DECIMAL(10,2),
   D0 DECIMAL(10,0), D1 DECIMAL(1,1), F DOUBLE, R REAL, S VARCHAR(20), C CHAR(5),
   T TIMESTAMP(3), Dt TIMESTAMP(3), Tm TIME, Q INTEGER, B BIGINT, Ti SMALLINT,
-  Big DECIMAL(38,10), Day DATE);";
+  Big DECIMAL(38,10), Day DATE);
+CREATE TABLE N (Id INTEGER NOT NULL PRIMARY KEY, D INTEGER);";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Want {
@@ -178,6 +181,45 @@ fn implicit_conversion_to_integer() {
         (
             "!UPDATE dbo.M SET D = D0 WHERE Id = 1;",
             "!UPDATE M SET D = D0 WHERE Id = 1;",
+            Eq,
+        ),
+        // The same value read through a derived table keeps its type: a
+        // decimal stored in an integer column still loses its fraction in
+        // T-SQL and is rounded in PostgreSQL (no ASM-UNTYPED-STORE).
+        (
+            "!UPDATE dbo.M SET Q = (SELECT MAX(x.D) FROM (SELECT D FROM dbo.M) x) WHERE Id = 1;",
+            "!UPDATE M SET Q = (SELECT MAX(x.D) FROM (SELECT D FROM M) x) WHERE Id = 1;",
+            Diff("equiv.cast-rounding"),
+        ),
+        (
+            "!UPDATE dbo.M SET Q = (SELECT MAX(x.d2) FROM (SELECT D AS d2 FROM dbo.M) x) WHERE Id = 1;",
+            "!UPDATE M SET Q = (SELECT MAX(x.d2) FROM (SELECT D AS d2 FROM M) x) WHERE Id = 1;",
+            Diff("equiv.cast-rounding"),
+        ),
+        (
+            "!UPDATE dbo.M SET Q = (SELECT MAX(x.D) FROM (SELECT D FROM dbo.M) x) WHERE Id = 1;",
+            "!UPDATE M SET Q = (SELECT MAX(x.D) FROM (SELECT trunc(D) AS D FROM M) x) WHERE Id = 1;",
+            Unknown,
+        ),
+        // A subquery's derived table `x` does not change the types of the
+        // outer derived table `x` (decimal outside, integer inside: the sum
+        // is a decimal stored in an integer).
+        (
+            "!UPDATE dbo.M SET Q = (SELECT COALESCE((SELECT MAX(x.D) FROM (SELECT D FROM dbo.N) x), 0) + MAX(x.D) FROM (SELECT D FROM dbo.M) x) WHERE Id = 1;",
+            "!UPDATE M SET Q = (SELECT COALESCE((SELECT MAX(x.D) FROM (SELECT D FROM N) x), 0) + MAX(x.D) FROM (SELECT D FROM M) x) WHERE Id = 1;",
+            Diff("equiv.cast-rounding"),
+        ),
+        // The reverse: integer outside, decimal inside, but the inner one is
+        // only counted, so everything stored is an integer.
+        (
+            "!UPDATE dbo.M SET Q = (SELECT (SELECT COUNT(*) FROM (SELECT D FROM dbo.M) x) + MAX(x.D) FROM (SELECT D FROM dbo.N) x) WHERE Id = 1;",
+            "!UPDATE M SET Q = (SELECT (SELECT COUNT(*) FROM (SELECT D FROM M) x) + MAX(x.D) FROM (SELECT D FROM N) x) WHERE Id = 1;",
+            Eq,
+        ),
+        // An integer read through a derived table is still an integer.
+        (
+            "!UPDATE dbo.M SET Q = (SELECT MAX(x.Q) FROM (SELECT Q FROM dbo.M) x) WHERE Id = 1;",
+            "!UPDATE M SET Q = (SELECT MAX(x.Q) FROM (SELECT Q FROM M) x) WHERE Id = 1;",
             Eq,
         ),
         // char(5) 'a' stored in varchar(20): SQL Server keeps 'a    ',

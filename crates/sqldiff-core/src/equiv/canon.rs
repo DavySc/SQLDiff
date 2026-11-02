@@ -4675,14 +4675,18 @@ impl<'a> Canon<'a> {
                 self.scopes = saved;
                 let (mut parts, items) = q?;
                 let key = alias.clone().map(|x| lc(&x)).unwrap_or_default();
-                // The bit and boolean columns, by the name the item gives them.
+                // The typed columns, by the name the item gives them: a column
+                // read through a derived table has the type of the item (a
+                // decimal read through `(SELECT Amt FROM t) x` is still a
+                // decimal, whose fraction an integer store drops). An item of
+                // unknown type stays unknown.
                 if query.set_ops.is_empty() && query.items.len() == items.len() {
                     let bits: Vec<(String, Ty)> = query
                         .items
                         .iter()
                         .zip(&items)
                         .filter_map(|(it, (_, ty))| {
-                            let ty = ty.filter(|_| self.is_bit(ty) || self.is_bool(ty))?;
+                            let ty = (*ty)?;
                             let name = match (&it.alias, &it.expr) {
                                 (Some(a), _) => a.clone(),
                                 (None, Expr::Name(p)) => p.last()?.clone(),
@@ -4691,9 +4695,15 @@ impl<'a> Canon<'a> {
                             Some((lc(name.trim_matches(['[', ']', '"'])), ty))
                         })
                         .collect();
-                    if !bits.is_empty() {
+                    // Replaces what an earlier derived table of the same alias
+                    // left, also when this one has no typed column.
+                    if bits.is_empty() {
+                        self.sub_bits.remove(&format!("sub:{key}"));
+                    } else {
                         self.sub_bits.insert(format!("sub:{key}"), bits);
                     }
+                } else {
+                    self.sub_bits.remove(&format!("sub:{key}"));
                 }
                 let unique = sqldiff_syntax::abstract_syntax::group_key(query)
                     .map(|k| k.iter().map(|c| lc(c)).collect());
@@ -4898,7 +4908,12 @@ impl<'a> Canon<'a> {
             return Err("SELECT INTO here is not supported".into());
         }
         self.scopes.push(Vec::new());
+        // The derived tables this query binds (their column types) end with
+        // it: a subquery's `(SELECT …) x` must not leave its types under the
+        // alias of an outer `x`.
+        let derived_types = self.sub_bits.clone();
         let r = self.query_inner(s, ctx);
+        self.sub_bits = derived_types;
         self.scopes.pop();
         r
     }
