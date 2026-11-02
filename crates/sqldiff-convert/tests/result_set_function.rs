@@ -182,7 +182,8 @@ fn other_result_sets_stay_refused_with_the_reason() {
         "CREATE PROCEDURE dbo.p @ItemID int, @n int OUTPUT\nAS\nBEGIN\n    SELECT ItemID FROM dbo.Item;\nEND;\n",
     );
     assert!(
-        c.output.contains("it has OUTPUT parameters"),
+        c.output
+            .contains("INOUT p_n integer, INOUT result_set_1 refcursor DEFAULT NULL"),
         "{}",
         c.output
     );
