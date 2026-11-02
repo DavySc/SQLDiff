@@ -144,6 +144,31 @@ pub(super) fn pairs(
     if outside {
         return None;
     }
+    let (functions, triggers) = match pg_side(b, top_nodes(b)) {
+        Ok(x) => x,
+        Err(why) => return fail(out, &place(a, r), why),
+    };
+    pairs_for(a, b, sa, sb, r, functions, triggers, out)
+}
+
+/// The per-event pairs of the T-SQL trigger `r` of side A against the
+/// functions and triggers of side B that implement it.
+#[allow(clippy::too_many_arguments)]
+fn pairs_for(
+    a: &Analyzed,
+    b: &Analyzed,
+    sa: &Schema,
+    sb: &Schema,
+    r: &SyntaxNode,
+    functions: Functions,
+    triggers: Vec<PgTrigger>,
+    out: &mut Outcome,
+) -> Option<Vec<Pair>> {
+    let header: Vec<Tok> = cst::header_tokens(r)
+        .iter()
+        .map(Tok::from_syntax)
+        .filter(|t| t.kind != K::Semi)
+        .collect();
     let at = place(a, r);
     let (table, events, replication) = match tsql_header(&header) {
         Ok(x) => x,
@@ -151,10 +176,6 @@ pub(super) fn pairs(
     };
     let Some(body) = r.children().find(|c| c.kind() == SyntaxKind::ROUTINE_BODY) else {
         return fail(out, &at, "the trigger has no body".into());
-    };
-    let (functions, triggers) = match pg_side(b) {
-        Ok(x) => x,
-        Err(why) => return fail(out, &at, why),
     };
     if triggers.len() != events.len() || functions.len() != events.len() {
         return fail(out, &at, format!(
@@ -277,6 +298,144 @@ pub(super) fn pairs(
     Some(pairs)
 }
 
+/// T-SQL triggers inside an artifact that holds more than they do (other
+/// routines, tables, script statements), with what side B wrote for them.
+pub(super) struct Embedded {
+    pub pairs: Vec<Pair>,
+    /// Byte ranges of the triggers of side A and of the functions and
+    /// triggers of side B that `pairs` covers: the rest of the artifacts is
+    /// compared without them.
+    pub blank_a: Vec<(usize, usize)>,
+    pub blank_b: Vec<(usize, usize)>,
+}
+
+/// Each T-SQL AFTER trigger of side A is paired with the PostgreSQL
+/// statement triggers of side B on its table for its events, and with their
+/// functions. A trigger whose header is not understood stays in the artifact
+/// (and is reported there). Nothing is paired when two triggers of A claim
+/// the same trigger or function of B: the artifacts are then compared as a
+/// whole.
+pub(super) fn embedded(
+    a: &Analyzed,
+    b: &Analyzed,
+    sa: &Schema,
+    sb: &Schema,
+    out: &mut Outcome,
+) -> Option<Embedded> {
+    if a.dialect() != Dialect::Tsql || b.dialect() != Dialect::Postgres {
+        return None;
+    }
+    let routines: Vec<SyntaxNode> = a
+        .root
+        .descendants()
+        .filter(|n| n.kind() == SyntaxKind::ROUTINE)
+        .collect();
+    let mut claimed: Vec<(SyntaxNode, Vec<Event>, Vec<String>)> = Vec::new();
+    for r in &routines {
+        let header: Vec<Tok> = cst::header_tokens(r)
+            .iter()
+            .map(Tok::from_syntax)
+            .filter(|t| t.kind != K::Semi)
+            .collect();
+        if !header.iter().take(4).any(|t| t.up == "TRIGGER") {
+            continue;
+        }
+        if let Ok((table, events, _)) = tsql_header(&header) {
+            claimed.push((r.clone(), events, table));
+        }
+    }
+    if claimed.is_empty() {
+        return None;
+    }
+    // Side B's trigger functions and AFTER statement triggers, wherever they
+    // stand among the other statements.
+    let mut fns: Functions = Vec::new();
+    let mut trs: Vec<PgTrigger> = Vec::new();
+    for n in top_nodes(b) {
+        let h: Vec<Tok> = if n.kind() == SyntaxKind::ROUTINE {
+            cst::header_tokens(&n)
+                .iter()
+                .map(Tok::from_syntax)
+                .filter(|t| t.kind != K::Semi)
+                .collect()
+        } else {
+            tokens(&n)
+        };
+        match n.kind() {
+            SyntaxKind::ROUTINE => {
+                if let Some(name) = pg_function(&h) {
+                    fns.push((name, n));
+                }
+            }
+            SyntaxKind::STATEMENT => {
+                if let Some(t) = pg_trigger(&h, n.clone()) {
+                    trs.push(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Which triggers of B each trigger of A claims.
+    let mut owner: Vec<Option<usize>> = vec![None; trs.len()];
+    for (i, (_, events, table)) in claimed.iter().enumerate() {
+        for (j, t) in trs.iter().enumerate() {
+            if events.contains(&t.event) && same_table(table, &t.table) {
+                if owner[j].is_some() {
+                    return None;
+                }
+                owner[j] = Some(i);
+            }
+        }
+    }
+    let mut fowner: Vec<Option<usize>> = vec![None; fns.len()];
+    for (j, t) in trs.iter().enumerate() {
+        let Some(i) = owner[j] else { continue };
+        for (k, (name, _)) in fns.iter().enumerate() {
+            if same_name(name, &t.function) {
+                match fowner[k] {
+                    Some(o) if o != i => return None,
+                    _ => fowner[k] = Some(i),
+                }
+            }
+        }
+    }
+    let range = |n: &SyntaxNode| {
+        let r = n.text_range();
+        (usize::from(r.start()), usize::from(r.end()))
+    };
+    let mut e = Embedded {
+        pairs: Vec::new(),
+        blank_a: Vec::new(),
+        blank_b: Vec::new(),
+    };
+    let mut trs: Vec<Option<PgTrigger>> = trs.into_iter().map(Some).collect();
+    for (i, (r, _, _)) in claimed.iter().enumerate() {
+        let mut mine_t = Vec::new();
+        for (j, t) in trs.iter_mut().enumerate() {
+            if owner[j] == Some(i) {
+                mine_t.extend(t.take());
+            }
+        }
+        let mine_f: Functions = fns
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| fowner[*k] == Some(i))
+            .map(|(_, f)| f.clone())
+            .collect();
+        for t in &mine_t {
+            e.blank_b.push(range(&t.node));
+        }
+        for (_, f) in &mine_f {
+            e.blank_b.push(range(f));
+        }
+        e.blank_a.push(range(r));
+        if let Some(p) = pairs_for(a, b, sa, sb, r, mine_f, mine_t, out) {
+            e.pairs.extend(p);
+        }
+    }
+    Some(e)
+}
+
 /// Side B's trigger functions when side A is one T-SQL trigger and side B
 /// holds several functions: each runs the trigger's statements for one
 /// event, so writes are paired function by function.
@@ -393,18 +552,25 @@ fn tsql_header(t: &[Tok]) -> Result<(Vec<String>, Vec<Event>, bool), String> {
 
 type Functions = Vec<(Vec<String>, SyntaxNode)>;
 
+/// The statements and routines at the top of an artifact, batches opened.
+fn top_nodes(b: &Analyzed) -> Vec<SyntaxNode> {
+    cst::structural_children(&b.root)
+        .into_iter()
+        .flat_map(|n| {
+            if n.kind() == SyntaxKind::BATCH {
+                cst::structural_children(&n)
+            } else {
+                vec![n]
+            }
+        })
+        .collect()
+}
+
 /// Side B's trigger functions and triggers; every top-level statement must
 /// be one of them.
-fn pg_side(b: &Analyzed) -> Result<(Functions, Vec<PgTrigger>), String> {
+fn pg_side(b: &Analyzed, top: Vec<SyntaxNode>) -> Result<(Functions, Vec<PgTrigger>), String> {
     let mut functions = Vec::new();
     let mut triggers = Vec::new();
-    let top = cst::structural_children(&b.root).into_iter().flat_map(|n| {
-        if n.kind() == SyntaxKind::BATCH {
-            cst::structural_children(&n)
-        } else {
-            vec![n]
-        }
-    });
     for n in top {
         match n.kind() {
             SyntaxKind::ROUTINE => {

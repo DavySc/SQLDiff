@@ -322,6 +322,12 @@ fn no<T>(reason: impl Into<String>) -> R<T> {
     Err(No(reason.into()))
 }
 
+/// A refusal for a SQL Server-only feature the target has no counterpart
+/// for (`impossible`): still not converted, reported in its own bucket.
+fn impossible<T>(x: crate::impossible::Feature, why: impl AsRef<str>) -> R<T> {
+    no(crate::impossible::reason(x, why.as_ref()))
+}
+
 impl<'a> Cx<'a> {
     fn db2(&self) -> bool {
         self.to == Dialect::Db2i
@@ -2163,7 +2169,7 @@ impl<'a> Cx<'a> {
                 self.step_ts("tsql.stmt.truncate", &ts);
                 format!("{} RESTART IDENTITY", self.expr(&Self::body_toks(&ts)).trim_end())
             }
-            "USE" => return no(self.pick(
+            "USE" => return impossible(crate::impossible::DATABASE_LEVEL, self.pick(
                 "USE: connect to the other database instead; PostgreSQL cannot switch databases in a session",
                 "USE: Db2 for i has one database per system; use SET SCHEMA or qualify names with the library",
             )),
@@ -2171,7 +2177,7 @@ impl<'a> Cx<'a> {
                 "WAITFOR: PostgreSQL's pg_sleep waits a number of seconds; WAITFOR DELAY takes a time of day as text or datetime and WAITFOR TIME a clock time; no checked rule for converting the value",
                 "WAITFOR: Db2 for i SQL has no statement that waits; no rule",
             )),
-            "BEGIN" if w(1) == "ATOMIC" => return no("BEGIN ATOMIC WITH (…): the body of a natively compiled module (In-Memory OLTP), with its own isolation level and language; no rule (convert it as an ordinary body after review)"),
+            "BEGIN" if w(1) == "ATOMIC" => return impossible(crate::impossible::IN_MEMORY_OLTP, "BEGIN ATOMIC WITH (…): the body of a natively compiled module, with its own isolation level and language; the target has no native compilation (convert it as an ordinary body by hand)"),
             "ALTER" if w(1) == "ROLE" && matches!(w(3).as_str(), "ADD" | "DROP") => return no(self.pick(
                 "ALTER ROLE … ADD/DROP MEMBER: PostgreSQL's forms are GRANT role TO member and REVOKE role FROM member, but the role and the database user it names map to PostgreSQL roles only by a decision about logins and users, which has no rule",
                 "ALTER ROLE … ADD/DROP MEMBER: Db2 for i has no database roles; grant to group profiles instead; no rule",
@@ -2180,6 +2186,10 @@ impl<'a> Cx<'a> {
                 "ALTER INDEX (REBUILD, REORGANIZE, DISABLE, SET …): maintenance with no exact PostgreSQL counterpart (REINDEX rebuilds, nothing disables an index); no rule",
                 "ALTER INDEX: maintenance with no exact Db2 for i counterpart; no rule",
             )),
+            "ALTER" if crate::impossible::of_ddl(&[w(1).as_str(), w(2).as_str()]).is_some() => {
+                let x = crate::impossible::of_ddl(&[w(1).as_str(), w(2).as_str()]).unwrap();
+                return impossible(x, format!("ALTER {} {}: SQL Server only; {} has nothing to convert it to", w(1), w(2), self.to.display_name()));
+            }
             "REVERT" => return no("REVERT ends an EXECUTE AS context, which is not converted; no rule"),
             _ => return no("no rule for this statement yet"),
         };
@@ -4339,7 +4349,7 @@ impl<'a> Cx<'a> {
                     && w[6] == "CONTAINS"
                     && matches!(w[7].as_str(), "MEMORY_OPTIMIZED_DATA" | "FILESTREAM")));
         if !storage {
-            return no(self.pick(
+            return impossible(crate::impossible::DATABASE_LEVEL, self.pick(
                 "ALTER DATABASE: database options and files are server configuration with no one-to-one PostgreSQL statement (ALTER DATABASE … SET, postgresql.conf); not converted",
                 "ALTER DATABASE: database options and files are server configuration with no Db2 for i statement; not converted",
             ));
@@ -5181,7 +5191,21 @@ impl<'a> Cx<'a> {
             "UNIQUE" | "INDEX" | "CLUSTERED" | "NONCLUSTERED" => self.create_index(ts, &w1),
             "SCHEMA" => self.create_schema(&ts),
             "SEQUENCE" => self.create_sequence(&ts, s[2..].to_vec()),
-            _ => no(format!("CREATE {w1}: no rule yet")),
+            _ => {
+                let words: Vec<String> = s[1..].iter().take(2).map(|&i| ts[i].up()).collect();
+                let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                match crate::impossible::of_ddl(&words) {
+                    Some(x) => impossible(
+                        x,
+                        format!(
+                            "CREATE {}: SQL Server only; {} has nothing to convert it to",
+                            words.join(" "),
+                            self.to.display_name()
+                        ),
+                    ),
+                    None => no(format!("CREATE {w1}: no rule yet")),
+                }
+            }
         }
     }
 
@@ -5193,11 +5217,16 @@ impl<'a> Cx<'a> {
             .take_while(|t| !t.is("INDEX"))
             .find(|t| t.is("COLUMNSTORE") || t.is("XML") || t.is("SPATIAL"))
         {
-            return no(format!(
+            let why = format!(
                 "{} index: {} has no counterpart; create a plain index (or none) after review",
                 t.up(),
                 self.to.display_name()
-            ));
+            );
+            return if t.is("COLUMNSTORE") {
+                impossible(crate::impossible::COLUMNSTORE, why)
+            } else {
+                no(why)
+            };
         }
         let ts = self.strip_partition_scheme(&ts);
         let ts = self.strip_storage(&ts)?;
@@ -8103,6 +8132,7 @@ impl<'a> Cx<'a> {
         } else {
             format!("sys.{name}: {}", sys_catalog_refusal(&name))
         };
+        let text = crate::impossible::reason(crate::impossible::INSTANCE_METADATA, &text);
         self.note(Status::NotConverted, METADATA, &text);
     }
 
@@ -8137,6 +8167,15 @@ impl<'a> Cx<'a> {
                 METADATA
             } else {
                 "tsql.builtin"
+            };
+            // SQL Server's own metadata and hashes have no target
+            // counterpart; every other built-in only lacks a rule.
+            let text = if server_metadata(&up) {
+                crate::impossible::reason(crate::impossible::INSTANCE_METADATA, &text)
+            } else if matches!(up.as_str(), "CHECKSUM" | "BINARY_CHECKSUM") {
+                crate::impossible::reason(crate::impossible::HASH_FUNCTIONS, &text)
+            } else {
+                text
             };
             self.note(Status::NotConverted, rule, &text);
         }
@@ -8284,7 +8323,8 @@ impl<'a> Cx<'a> {
                 self.note(Status::Assumptions, "ASM-POSTGIS-GEOGRAPHY", "GEOGRAPHY becomes PostGIS geography (no type modifier, so each value keeps its own SRID, as in SQL Server): the database has the postgis extension and its types are on the search path. A value is carried as it is; SQL Server's geography methods (STDistance, Lat, …) and PostGIS's functions differ, so every spatial expression is converted and checked on its own, and clients read PostGIS's formats.");
                 ("geography".into(), false, false)
             }
-            "SQL_VARIANT" | "HIERARCHYID" | "GEOMETRY" | "CURSOR" | "TABLE" => return no(format!("type {up} has no PostgreSQL equivalent rule yet")),
+            "HIERARCHYID" => return impossible(crate::impossible::HIERARCHYID, "type HIERARCHYID: its values, ordering and methods (GetAncestor, IsDescendantOf, …) have no PostgreSQL counterpart (ltree is a different path type)"),
+            "SQL_VARIANT" | "GEOMETRY" | "CURSOR" | "TABLE" => return no(format!("type {up} has no PostgreSQL equivalent rule yet")),
             _ => {
                 self.note(Status::Assumptions, "ASM-USER-TYPE", "A type without a rule was kept as written: it must exist in PostgreSQL under that name.");
                 let t: String = ts.iter().map(|t| t.s.clone()).collect();
@@ -8388,7 +8428,8 @@ impl<'a> Cx<'a> {
             }
             "XML" => other("XML".into()),
             "ROWVERSION" | "TIMESTAMP" => return no("ROWVERSION/TIMESTAMP: use a row change timestamp column (TIMESTAMP GENERATED ALWAYS FOR EACH ROW ON UPDATE AS ROW CHANGE TIMESTAMP)"),
-            "SQL_VARIANT" | "HIERARCHYID" | "GEOGRAPHY" | "GEOMETRY" | "CURSOR" | "TABLE" => return no(format!("type {up} has no Db2 for i equivalent rule yet")),
+            "HIERARCHYID" => return impossible(crate::impossible::HIERARCHYID, "type HIERARCHYID: its values, ordering and methods (GetAncestor, IsDescendantOf, …) have no Db2 for i counterpart"),
+            "SQL_VARIANT" | "GEOGRAPHY" | "GEOMETRY" | "CURSOR" | "TABLE" => return no(format!("type {up} has no Db2 for i equivalent rule yet")),
             _ => {
                 self.note(Status::Assumptions, "ASM-USER-TYPE", "A type without a rule was kept as written: it must exist in Db2 for i under that name.");
                 let t: String = ts.iter().map(|t| t.s.clone()).collect();
@@ -10213,7 +10254,7 @@ fn memory_optimized(opts: &[&[T]]) -> R<bool> {
     }
     match value("DURABILITY").as_deref() {
         None | Some("SCHEMA_AND_DATA") => Ok(true),
-        Some(d) => no(format!("table option DURABILITY = {d}: SQL Server keeps none of the table's rows across a restart; a plain table keeps them. No rule yet")),
+        Some(d) => impossible(crate::impossible::IN_MEMORY_OLTP, format!("table option DURABILITY = {d}: SQL Server keeps none of the table's rows across a restart; a plain table keeps them")),
     }
 }
 
