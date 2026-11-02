@@ -145,7 +145,8 @@ fn pg_computed_columns_without_an_exact_rule_stay_refused() {
         "(json_value([ch],N'$.Tags'))",
         "(json_value(upper([a]),N'$.Tags'))",
         "(json_value([a],N'$.Tags',1))",
-        "([n]*(2))",
+        "([n]/(2))",
+        "([a]*(2))",
         "(case when [a] IS NULL then CONVERT([bit],(2)) else CONVERT([bit],(1)) end)",
         "(case when [a] IS NULL then CONVERT([int],(0)) else CONVERT([int],(1)) end)",
         "(case when [a] = N'x' then CONVERT([bit],(0)) else CONVERT([bit],(1)) end)",
@@ -460,4 +461,61 @@ fn pg_try_convert_and_isjson_without_a_rule_stay_refused() {
     // ISJSON outside a CHECK constraint keeps its refusal.
     let c = pg("SELECT ISJSON(N'{}');\n");
     assert_eq!(c.units[0].status, Status::NotConverted, "{}", c.output);
+}
+
+/// Arithmetic computed columns over integer and decimal columns, with or
+/// without parentheses after AS, become STORED columns of the type SQL
+/// Server derives (eval/builtins/2026-11-02-o/computed-types-tsql.out), and
+/// the engine proves them.
+#[test]
+fn pg_computed_arithmetic_has_the_derived_type() {
+    let src = "CREATE TABLE dbo.Line (\n    Rec decimal(8,2) NOT NULL,\n    Rej decimal(8,2) NOT NULL,\n    Stocked AS ISNULL(Rec - Rej, 0.00),\n    Ord int NOT NULL,\n    Scr smallint NOT NULL,\n    Net AS ISNULL(Ord - Scr, 0),\n    Plain AS Ord + Scr * 2,\n    Big bigint NOT NULL,\n    Wide AS (Big * Ord) PERSISTED NOT NULL,\n    Small AS (Scr + Scr),\n    Mixed AS (Rec + Ord)\n);\n";
+    let c = pg(src);
+    for want in [
+        "Stocked numeric(9, 2) GENERATED ALWAYS AS (COALESCE(Rec - Rej, 0.00)) STORED,",
+        "Net integer GENERATED ALWAYS AS (COALESCE(Ord - Scr, 0)) STORED,",
+        "Plain integer GENERATED ALWAYS AS (Ord + Scr * 2) STORED,",
+        "Wide bigint GENERATED ALWAYS AS (Big * Ord) STORED NOT NULL,",
+        "Small smallint GENERATED ALWAYS AS (Scr + Scr) STORED,",
+        "Mixed numeric(13, 2) GENERATED ALWAYS AS (Rec + Ord) STORED",
+    ] {
+        assert!(c.output.contains(want), "{want}\n{}", c.output);
+    }
+    assert_eq!(
+        c.units[0].checked,
+        Status::Converted,
+        "{:#?}",
+        c.units[0].notes
+    );
+    assert!(
+        matches!(c.units[0].status, Status::Converted | Status::Assumptions),
+        "{:#?}",
+        c.units[0].notes
+    );
+    assert!(has(&c, "ASM-COMPUTED-STORED"));
+}
+
+/// What the rule does not read stays refused: money (no expression-engine
+/// type yet), tinyint, decimal literals, a decimal product past 38 digits,
+/// division, and an ISNULL fallback that does not fit.
+#[test]
+fn pg_computed_arithmetic_refusals() {
+    for col in [
+        "Total AS (M * 2)",
+        "Total AS (T + T)",
+        "Total AS (D * 1.5)",
+        "Total AS (W * W)",
+        "Total AS (I / 2)",
+        "Total AS ISNULL(I - I, 3000000000)",
+        "Total AS ISNULL(S - S, 40000)",
+    ] {
+        let src = format!("CREATE TABLE dbo.T (\n    M money NOT NULL,\n    T tinyint NOT NULL,\n    D decimal(9,2) NOT NULL,\n    W decimal(30,5) NOT NULL,\n    I int NOT NULL,\n    S smallint NOT NULL,\n    {col}\n);\n");
+        let c = pg(&src);
+        assert_eq!(
+            c.units[0].status,
+            Status::NotConverted,
+            "{col}\n{}",
+            c.output
+        );
+    }
 }

@@ -367,11 +367,15 @@ fn what_the_model_does_not_read_stays_unknown() {
             "collation",
         ),
         (
-            replace(ORDERS_T, "Note NVARCHAR(200) NULL", "Note AS (Amount * 2)"),
+            replace(
+                ORDERS_T,
+                "Note NVARCHAR(200) NULL",
+                "Note AS (Amount * 2.5)",
+            ),
             replace(
                 ORDERS_P,
                 "Note varchar(200) NULL",
-                "Note numeric GENERATED ALWAYS AS (Amount * 2) STORED",
+                "Note numeric GENERATED ALWAYS AS (Amount * 2.5) STORED",
             ),
             "computed column",
         ),
@@ -481,6 +485,52 @@ fn a_default_the_column_converts_is_not_compared() {
         equal(
             &format!("CREATE TABLE dbo.D (id INT NOT NULL PRIMARY KEY, {t});"),
             &format!("CREATE TABLE D (id integer NOT NULL PRIMARY KEY, {p});"),
+        );
+    }
+}
+
+/// Arithmetic computed columns over integer and decimal columns: the type
+/// SQL Server derives is compared with the generated column's declared
+/// type (eval/builtins/2026-11-02-o/computed-types-tsql.out), with or
+/// without parentheses after AS.
+#[test]
+fn arithmetic_computed_columns_take_the_derived_type() {
+    let t = |col: &str| {
+        format!("CREATE TABLE L (A DECIMAL(8,2) NOT NULL, B DECIMAL(8,2) NOT NULL, I INT NOT NULL, S SMALLINT NOT NULL, {col});")
+    };
+    let p = |ty: &str, e: &str| {
+        format!("CREATE TABLE l (a numeric(8,2) NOT NULL, b numeric(8,2) NOT NULL, i integer NOT NULL, s smallint NOT NULL, c {ty} GENERATED ALWAYS AS ({e}) STORED);")
+    };
+    // decimal(8,2) - decimal(8,2) is decimal(9,2); smallint * smallint stays smallint.
+    for (c, ty, e) in [
+        ("C AS A - B", "numeric(9,2)", "a - b"),
+        ("C AS (A - B)", "numeric(9,2)", "a - b"),
+        (
+            "C AS ISNULL(A - B, 0.00)",
+            "numeric(9,2)",
+            "COALESCE(a - b, 0.00)",
+        ),
+        ("C AS (S * S)", "smallint", "s * s"),
+        ("C AS (I - S)", "integer", "i - s"),
+        ("C AS (A + I)", "numeric(13,2)", "a + i"),
+    ] {
+        let r = run(&t(c), &p(ty, e));
+        assert!(
+            matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{c}: {:#?} {:#?}",
+            r.findings,
+            r.unknown_reasons
+        );
+    }
+    // A wrong declared type is a difference, not an equal.
+    for (c, ty, e) in [
+        ("C AS A - B", "numeric(8,2)", "a - b"),
+        ("C AS (I - S)", "smallint", "i - s"),
+    ] {
+        let r = run(&t(c), &p(ty, e));
+        assert!(
+            !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{c} as {ty}"
         );
     }
 }

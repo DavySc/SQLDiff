@@ -970,9 +970,43 @@ fn column(ts: &[Tok], d: Dialect, t: &mut Table) -> R<()> {
 fn computed_column(ts: &[Tok], d: Dialect, t: &mut Table) -> R<()> {
     let name = name_of(&ts[0]).ok_or_else(|| format!("the column item `{}`", text(ts)))?;
     let what = |s: &str| format!("column {}: {s}", name.text);
-    if d != Dialect::Tsql || !ts.get(2).is_some_and(|t| t.kind == K::LParen) {
+    if d != Dialect::Tsql || ts.len() < 3 {
         return Err(what("a computed column"));
     }
+    // `AS (expr)`, or `AS expr` (the parentheses are optional in T-SQL),
+    // which runs to PERSISTED or the end of the column and is read as
+    // `AS (expr)`.
+    let owned;
+    let ts = if ts[2].kind == K::LParen {
+        ts
+    } else {
+        let mut depth = 0i32;
+        let mut stop = ts.len();
+        for (k, t) in ts.iter().enumerate().skip(2) {
+            match t.kind {
+                K::LParen => depth += 1,
+                K::RParen => depth -= 1,
+                _ if depth == 0 && t.up == "PERSISTED" => {
+                    stop = k;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let paren = |kind, text: &str| Tok {
+            kind,
+            text: text.to_string(),
+            up: text.to_string(),
+            off: ts[2].off,
+        };
+        let mut v = ts[..2].to_vec();
+        v.push(paren(K::LParen, "("));
+        v.extend(ts[2..stop].iter().cloned());
+        v.push(paren(K::RParen, ")"));
+        v.extend(ts[stop..].iter().cloned());
+        owned = v;
+        &owned[..]
+    };
     let end = close(ts, 2)?;
     let words: Vec<&str> = ts[end + 1..].iter().map(|t| t.up.as_str()).collect();
     let null = match words.as_slice() {
@@ -1027,6 +1061,15 @@ fn computed_types(t: &mut Table) -> R<()> {
         let mut e = &e[..];
         while e.len() > 2 && e[0].kind == K::LParen && close(e, 0)? == e.len() - 1 {
             e = &e[1..e.len() - 1];
+        }
+        // Arithmetic over the table's integer, money and decimal columns,
+        // perhaps inside ISNULL(…, number): the type SQL Server derives
+        // (eval/builtins/2026-11-02-o/computed-types-tsql.out).
+        if let Some(ty) = arith_computed(t, e) {
+            let (ty, ty_text) = ty;
+            t.columns[k].ty = ty;
+            t.columns[k].ty_text = ty_text;
+            continue;
         }
         let call = e.len() > 3
             && e[0].kind == K::Word
@@ -1117,6 +1160,134 @@ fn computed_types(t: &mut Table) -> R<()> {
         t.columns[k].ty_text = ty_text;
     }
     Ok(())
+}
+
+/// The numeric types an arithmetic computed column is read over.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ar {
+    Int(u8),
+    Dec(u32, u32),
+}
+
+impl Ar {
+    fn as_dec(self) -> Option<(u32, u32)> {
+        match self {
+            Ar::Int(16) => Some((5, 0)),
+            Ar::Int(32) => Some((10, 0)),
+            Ar::Int(_) => Some((19, 0)),
+            Ar::Dec(p, s) => Some((p, s)),
+        }
+    }
+
+    /// The type of `a op b` (`mul` for `*`) by SQL Server's rules; `None`
+    /// where they are not read here (decimal digits beyond 38).
+    fn combine(a: Ar, b: Ar, mul: bool) -> Option<Ar> {
+        match (a, b) {
+            (Ar::Int(x), Ar::Int(y)) => Some(Ar::Int(x.max(y))),
+            _ => {
+                let ((p1, s1), (p2, s2)) = (a.as_dec()?, b.as_dec()?);
+                let (p, s) = if mul {
+                    (p1 + p2 + 1, s1 + s2)
+                } else {
+                    let s = s1.max(s2);
+                    ((p1 - s1).max(p2 - s2) + s + 1, s)
+                };
+                (p <= 38).then_some(Ar::Dec(p, s))
+            }
+        }
+    }
+
+    fn ty(self) -> (Ty, String) {
+        match self {
+            Ar::Int(w) => (
+                Ty::Int(w),
+                match w {
+                    16 => "smallint",
+                    32 => "int",
+                    _ => "bigint",
+                }
+                .into(),
+            ),
+            Ar::Dec(p, s) => (Ty::Dec(Some((p, s))), format!("decimal({p}, {s})")),
+        }
+    }
+}
+
+/// `[ISNULL(] a op b … [, number)]` over the table's smallint, int, bigint
+/// and decimal columns and int literals, with `+`, `-`, `*` and
+/// parentheses: its type, as `Ty` and as written.
+fn arith_computed(t: &Table, e: &[Tok]) -> Option<(Ty, String)> {
+    let col = |tok: &Tok| -> Option<Ar> {
+        let n = name_of(tok)?;
+        let c = t
+            .columns
+            .iter()
+            .find(|c| c.computed.is_none() && c.name.text.eq_ignore_ascii_case(&n.text))?;
+        match c.ty {
+            Ty::Int(w @ (16 | 32 | 64)) => Some(Ar::Int(w)),
+            Ty::Dec(Some((p, s))) => Some(Ar::Dec(p, s)),
+            _ => None,
+        }
+    };
+    fn sum(e: &[Tok], i: usize, col: &dyn Fn(&Tok) -> Option<Ar>) -> Option<(Ar, usize)> {
+        let (mut ty, mut i) = product(e, i, col)?;
+        while e
+            .get(i)
+            .is_some_and(|t| t.kind == K::Op && matches!(t.text.as_str(), "+" | "-"))
+        {
+            let (rhs, n) = product(e, i + 1, col)?;
+            ty = Ar::combine(ty, rhs, false)?;
+            i = n;
+        }
+        Some((ty, i))
+    }
+    fn product(e: &[Tok], i: usize, col: &dyn Fn(&Tok) -> Option<Ar>) -> Option<(Ar, usize)> {
+        let (mut ty, mut i) = atom(e, i, col)?;
+        while e.get(i).is_some_and(|t| t.kind == K::Op && t.text == "*") {
+            let (rhs, n) = atom(e, i + 1, col)?;
+            ty = Ar::combine(ty, rhs, true)?;
+            i = n;
+        }
+        Some((ty, i))
+    }
+    fn atom(e: &[Tok], i: usize, col: &dyn Fn(&Tok) -> Option<Ar>) -> Option<(Ar, usize)> {
+        let t = e.get(i)?;
+        match t.kind {
+            K::Num => {
+                let v: i64 = t.text.parse().ok()?;
+                (0..=i64::from(i32::MAX))
+                    .contains(&v)
+                    .then_some((Ar::Int(32), i + 1))
+            }
+            K::Word | K::Quoted => Some((col(t)?, i + 1)),
+            K::LParen => {
+                let (ty, n) = sum(e, i + 1, col)?;
+                (e.get(n)?.kind == K::RParen).then_some((ty, n + 1))
+            }
+            _ => None,
+        }
+    }
+    let whole = |e: &[Tok]| -> Option<Ar> {
+        let (ty, n) = sum(e, 0, &col)?;
+        (n == e.len()).then_some(ty)
+    };
+    // ISNULL(arithmetic, number): the type of the first argument.
+    if e.len() > 3
+        && e[0].up == "ISNULL"
+        && e[1].kind == K::LParen
+        && close(e, 1).ok()? == e.len() - 1
+    {
+        let args = split(&e[2..e.len() - 1]);
+        let [body, [fb]] = args.as_slice() else {
+            return None;
+        };
+        if fb.kind != K::Num {
+            return None;
+        }
+        return whole(body).map(Ar::ty);
+    }
+    // Arithmetic, not a bare column or number.
+    (e.len() >= 3).then(|| whole(e)).flatten().map(Ar::ty)
 }
 
 fn arg(ty: &ast::Type, i: usize) -> R<Option<u32>> {
