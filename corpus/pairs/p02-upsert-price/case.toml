@@ -3,7 +3,8 @@ title = "Single-row upsert: MERGE with HOLDLOCK, ON CONFLICT, Db2 MERGE"
 refs = ["design §7 upserts and MERGE", "design §8 lift upsert"]
 tags = ["upsert", "concurrency", "idiom"]
 description = """
-Three spellings of the canonical upsert node. All use a per-statement time source.
+Three spellings of the canonical upsert node. T-SQL and Db2 for i use a per-statement
+time source; PostgreSQL's statement_timestamp() inside a routine is the CALL's start.
 The T-SQL MERGE is race-free only because of HOLDLOCK; ON CONFLICT relies on the
 primary key on item_price.item_id.
 """
@@ -23,10 +24,11 @@ file = "db2i.sql"
 [[expect]]
 a = "tsql"
 b = "pg"
-verdict = "equal-under-assumptions"
-assumptions = ["callers hold the privileges themselves (no T-SQL ownership chain needed)", "unquoted names name the same objects after case folding", "unqualified names, dbo and public resolve to the same schema"]
-classes = ["structural"]
-discharged = ["item_price.item_id is the primary key (catalog)"]
+verdict = "different"
+classes = ["semantic"]
+witnesses = [
+  "updated_at: T-SQL stores the MERGE statement's start (SYSDATETIME()); PostgreSQL fixes statement_timestamp() per client message, so inside the procedure it is the CALL's start, not the INSERT's.",
+]
 
 [[expect]]
 a = "tsql"
@@ -39,7 +41,8 @@ facts = ["V3"]
 [[expect]]
 a = "pg"
 b = "db2i"
-verdict = "equal-under-assumptions"
-classes = ["structural"]
-assumptions = ["Db2 for i MERGE does not raise a duplicate key when two sessions insert the same key concurrently"]
-facts = ["V3"]
+verdict = "different"
+classes = ["semantic"]
+witnesses = [
+  "updated_at: Db2 for i CURRENT TIMESTAMP is the MERGE statement's start; PostgreSQL's statement_timestamp() inside the procedure is the CALL's start.",
+]
