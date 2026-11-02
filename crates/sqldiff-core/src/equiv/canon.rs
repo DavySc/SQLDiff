@@ -5134,22 +5134,32 @@ impl<'a> Canon<'a> {
     /// The condition of an IF or WHILE, evaluated once each time it is
     /// tested.
     pub fn condition(&mut self, e: &Expr) -> R<Term> {
-        self.seen_tables.clear();
-        self.single_row = true;
-        Ok(self.cond(e)?.0)
+        self.folded(|c| {
+            c.seen_tables.clear();
+            c.single_row = true;
+            Ok(c.cond(e)?.0)
+        })
     }
 
-    /// Lowers a statement. A PostgreSQL statement with quoted names that
-    /// keep capitals is lowered twice: once as written, recording its
-    /// names, and, when `fold_check` allows, again with those names folded.
+    /// Lowers a statement (see `folded`).
     pub fn stmt(&mut self, s: &Stmt) -> R<Term> {
+        self.folded(|c| c.stmt_unfolded(s))
+    }
+
+    /// Runs one lowering of a statement or condition. A PostgreSQL one with
+    /// quoted names that keep capitals is lowered twice: once as written,
+    /// recording its names, and, when `fold_check` allows, again with those
+    /// names folded to meet the T-SQL names they were converted from. Every
+    /// entry point that lowers names from a PostgreSQL unit goes through
+    /// here (an `IF` condition names columns and tables like a statement).
+    fn folded<T>(&mut self, mut lower: impl FnMut(&mut Self) -> R<T>) -> R<T> {
         let nested = FOLDING.with(|f| !matches!(*f.borrow(), Folding::Off));
         if self.d != Dialect::Postgres || !self.fold_quoted || nested {
-            return self.stmt_unfolded(s);
+            return lower(self);
         }
         let saved = self.clone();
         let guard = FoldingGuard::set(Folding::Record(BTreeMap::new()));
-        let t = self.stmt_unfolded(s);
+        let t = lower(self);
         let Folding::Record(seen) = guard.take() else {
             return t;
         };
@@ -5162,7 +5172,7 @@ impl<'a> Canon<'a> {
         }
         *self = saved;
         let _guard = FoldingGuard::set(Folding::Fold);
-        self.stmt_unfolded(s)
+        lower(self)
     }
 
     /// Lowers a statement that returns the rows it changed (T-SQL OUTPUT,
