@@ -46,6 +46,31 @@ mod rules {
     pub use sqldiff_core::rules::rule::{RuleSet, Status};
 }
 
+/// The rule id of the per-statement exception blocks.
+/// The PostgreSQL conditions of the errors that end a T-SQL batch (the
+/// profile's batch-abort rows: conversion, lock, name resolution, cancel),
+/// which an exception block of [`CONTINUE_RULE`] re-raises.
+const CONTINUE_RERAISE: &str = "invalid_text_representation OR invalid_datetime_format OR datetime_field_overflow OR deadlock_detected OR serialization_failure OR lock_not_available OR undefined_table OR undefined_column OR undefined_function OR raise_exception OR query_canceled";
+
+pub(crate) const CONTINUE_RULE: &str = "tsql.txn.continue";
+
+thread_local! {
+    static NO_CONTINUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the exception blocks of [`continuation_points`] switched off.
+pub(crate) fn without_continuation<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            NO_CONTINUE.with(|c| c.set(false));
+        }
+    }
+    NO_CONTINUE.with(|c| c.set(true));
+    let _reset = Reset;
+    f()
+}
+
 pub(crate) fn convert(
     root: &SyntaxNode,
     src: &str,
@@ -88,6 +113,10 @@ pub(crate) fn convert(
         txn_control: false,
         wrapper: None,
         autocommit: Vec::new(),
+        cont: Vec::new(),
+        cont_used: false,
+        no_cont: NO_CONTINUE.with(|c| c.get()),
+        refusals: 0,
         decls: Vec::new(),
         rc_scratch: false,
         context: false,
@@ -419,6 +448,16 @@ struct Cx<'a> {
     /// (autocommit outside an explicit transaction, [`autocommit_points`]);
     /// a COMMIT follows each of them.
     autocommit: Vec<usize>,
+    /// PostgreSQL: a body without `SET XACT_ABORT ON` goes on after a failing
+    /// statement ([`continuation_points`]): where each statement that can
+    /// fail starts, and whether a COMMIT follows it.
+    cont: Vec<(usize, bool)>,
+    /// A statement of the unit was wrapped in an exception block, and the
+    /// statements refused so far: with a refusal the plan is dropped (the
+    /// stand-in for the refused statement stops the procedure).
+    cont_used: bool,
+    no_cont: bool,
+    refusals: usize,
     decls: Vec<Decl>,
     /// A CALL passed `RC_SCRATCH`: the DECLARE section declares it.
     rc_scratch: bool,
@@ -629,6 +668,7 @@ impl<'a> Cx<'a> {
     }
 
     fn refuse(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize, reason: &str) {
+        self.refusals += 1;
         let mut text = self.commented(n, reason);
         if self.mode != Mode::Top {
             // Inside a routine or block the rest still runs: stop there
@@ -712,6 +752,7 @@ impl<'a> Cx<'a> {
         self.dynamic_from.clear();
         self.wrapper = None;
         self.autocommit.clear();
+        self.cont.clear();
     }
 
     fn do_block(&mut self, out: &mut Out, b: &SyntaxNode) {
@@ -778,7 +819,26 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// A routine whose statements are wrapped in exception blocks
+    /// ([`continuation_points`]) is converted again without them when any
+    /// of its statements is refused: the stand-in for a refused statement
+    /// stops the procedure, where T-SQL goes on.
     fn routine(&mut self, out: &mut Out, r: &SyntaxNode) {
+        let (text, units) = (out.text.len(), out.units.len());
+        self.cont_used = false;
+        self.refusals = 0;
+        self.routine_once(out, r);
+        if self.cont_used && self.refusals > 0 {
+            out.text.truncate(text);
+            out.units.truncate(units);
+            let keep = self.no_cont;
+            self.no_cont = true;
+            self.routine_once(out, r);
+            self.no_cont = keep;
+        }
+    }
+
+    fn routine_once(&mut self, out: &mut Out, r: &SyntaxNode) {
         let ts = tokens(r);
         let s = sig(&ts);
         let words: Vec<String> = s.iter().take(4).map(|&i| ts[i].up()).collect();
@@ -1032,6 +1092,9 @@ impl<'a> Cx<'a> {
             // A SECURITY DEFINER procedure may not commit.
             if self.wrapper.is_none() && !owner {
                 self.autocommit = autocommit_points(&body).unwrap_or_default();
+                if self.autocommit.is_empty() && !self.no_cont {
+                    self.cont = continuation_points(&body).unwrap_or_default();
+                }
             }
             let planned = self.rows_plan(&body, has_output);
             match &planned {
@@ -1523,6 +1586,7 @@ impl<'a> Cx<'a> {
                     Ok(text) => {
                         self.dynamic_text(n);
                         let text = self.autocommit_after(n, text);
+                        let text = self.continue_after(n, text);
                         return self.emit(out, Self::range(n), indent, &text);
                     }
                     Err(No(reason)) => reason,
@@ -4596,6 +4660,9 @@ impl<'a> Cx<'a> {
                 self.note(Status::Assumptions, "ASM-XACT-ABORT", "PostgreSQL always aborts the transaction on an error, which matches XACT_ABORT ON for the statements that follow.");
                 Ok("-- SET XACT_ABORT ON: PostgreSQL always behaves this way".into())
             }
+            ("XACT_ABORT", "OFF") if !self.cont.is_empty() => {
+                Ok("-- SET XACT_ABORT OFF: the statements that can fail below each get their own exception block, as T-SQL goes on after a failing statement".into())
+            }
             ("XACT_ABORT", _) => no("XACT_ABORT OFF: PostgreSQL cannot continue a transaction after an error; use BEGIN … EXCEPTION blocks around the statements that may fail"),
             ("ANSI_NULLS" | "QUOTED_IDENTIFIER" | "ANSI_PADDING" | "ANSI_WARNINGS" | "ARITHABORT" | "CONCAT_NULL_YIELDS_NULL", "ON") => {
                 Ok(format!("-- SET {opt} ON: PostgreSQL always behaves this way"))
@@ -5132,6 +5199,43 @@ impl<'a> Cx<'a> {
         self.note(Status::Assumptions, "ASM-NO-CALLER-TXN", "T-SQL commits this statement on its own (no transaction is open), so a COMMIT follows it: a later failure leaves it durable on both sides. That holds when the procedure is CALLed outside a transaction block (autocommit); inside a caller's transaction T-SQL leaves it to the caller, where PostgreSQL refuses the COMMIT.");
         self.txn_control = true;
         format!("{text}\nCOMMIT;")
+    }
+
+    /// A statement of a body that goes on after it fails (T-SQL without
+    /// `SET XACT_ABORT ON`, [`continuation_points`]): its own exception block
+    /// that reports the error as a warning and goes on, and a COMMIT after
+    /// it where T-SQL commits the statement on its own. T-SQL goes on after
+    /// every statement error except the ones that end the batch (conversion,
+    /// deadlock and lock, missing objects, THROW/RAISERROR, cancel), so the
+    /// block re-raises those ([`CONTINUE_RERAISE`], which mirror the
+    /// profile's batch-abort rows) and reports every other error
+    /// (`WHEN OTHERS`; `eval/xact-abort/`, SQL Server 2022).
+    fn continue_after(&mut self, n: &SyntaxNode, text: String) -> String {
+        let at = tokens(n).iter().find(|t| t.sig()).map(|t| t.pos.0);
+        if self.db2() || !matches!(self.mode, Mode::Proc | Mode::Do) {
+            return text;
+        }
+        let Some(&(_, commit)) = at.and_then(|a| self.cont.iter().find(|(p, _)| *p == a)) else {
+            return text;
+        };
+        self.cont_used = true;
+        self.step_node(CONTINUE_RULE, n);
+        self.note(Status::Assumptions, "ASM-ERROR-CONTINUES-WARNING", "T-SQL reports a failing statement's error to the caller and goes on with the next statement; here the statement's exception block reports it as a warning and the procedure goes on. Callers that read the error (a failed call, an error message) see a warning instead.");
+        let mut o = String::from("-- T-SQL (XACT_ABORT OFF): if this statement fails, the error is reported and the next statement runs, except for the errors that end the T-SQL batch (conversion, lock, missing object), which stop the procedure here too\nBEGIN\n");
+        for l in text.lines() {
+            o.push_str("  ");
+            o.push_str(l);
+            o.push('\n');
+        }
+        o.push_str(&format!(
+            "EXCEPTION WHEN {CONTINUE_RERAISE} THEN\n  RAISE;\nWHEN OTHERS THEN\n  RAISE WARNING '%', SQLERRM;\nEND;"
+        ));
+        if commit {
+            self.note(Status::Assumptions, "ASM-NO-CALLER-TXN", "T-SQL commits this statement on its own (no transaction is open), so a COMMIT follows it: a later failure leaves it durable on both sides. That holds when the procedure is CALLed outside a transaction block (autocommit); inside a caller's transaction T-SQL leaves it to the caller, where PostgreSQL refuses the COMMIT.");
+            self.txn_control = true;
+            o.push_str("\nCOMMIT;");
+        }
+        o
     }
 
     /// `ALTER DATABASE name ADD FILEGROUP fg [CONTAINS MEMORY_OPTIMIZED_DATA |
@@ -10397,6 +10501,121 @@ fn autocommit_points(body: &SyntaxNode) -> Option<Vec<usize>> {
     let mut depth = 0;
     walk(body, &mut depth, false, &mut w)?;
     (depth == 0 && w.commits >= 2 && !w.points.is_empty()).then_some(w.points)
+}
+
+/// Where a T-SQL body without `SET XACT_ABORT ON` goes on after a statement
+/// fails, for a PostgreSQL procedure or DO block, which stops at the first
+/// error: the start of every statement that can fail and then be skipped
+/// (each gets its own exception block), and whether a COMMIT follows it
+/// (the statement writes or calls, and no explicit transaction is open, so
+/// T-SQL commits it on its own).
+///
+/// Only bodies whose error path is known: a flat statement list (BEGIN … END
+/// blocks flattened) with no IF, loop, TRY/CATCH, explicit transaction,
+/// cursor, GOTO, EXEC, RAISERROR/THROW, `@@ERROR`, XACT_STATE or isolation level,
+/// and no `XACT_ABORT ON`. The statements that cannot fail are declarations
+/// with a constant initializer, session SETs, `SET @v = constant` and PRINT;
+/// a result set (SELECT without INTO or assignment) is refused. At least
+/// two statements are wrapped and one of them commits, else nothing runs
+/// after a failure and the plain conversion is equal. Checked on SQL Server
+/// 2022 and PostgreSQL 18: `eval/xact-abort/`.
+fn continuation_points(body: &SyntaxNode) -> Option<Vec<(usize, bool)>> {
+    let all: Vec<T> = tokens(body).into_iter().filter(|t| t.sig()).collect();
+    let banned = all.iter().any(|t| {
+        [
+            "ROLLBACK",
+            "COMMIT",
+            "SAVE",
+            "TRAN",
+            "TRANSACTION",
+            "XACT_STATE",
+            "RAISERROR",
+            "THROW",
+            "CURSOR",
+            "GOTO",
+            "IMPLICIT_TRANSACTIONS",
+            "ISOLATION",
+            "TRY",
+            "WAITFOR",
+            // A call's own COMMIT cannot run inside the subtransaction of
+            // an exception block (2D000), and dynamic SQL has no probed
+            // error continuation.
+            "EXEC",
+            "EXECUTE",
+        ]
+        .iter()
+        .any(|w| t.is(w))
+            || t.s.eq_ignore_ascii_case("@@TRANCOUNT")
+            || t.s.eq_ignore_ascii_case("@@ERROR")
+    }) || all
+        .windows(2)
+        .any(|w| w[0].is("XACT_ABORT") && w[1].is("ON"))
+        || body
+            .descendants()
+            .any(|d| matches!(d.kind(), TRY_CATCH | IF_STMT | LOOP_STMT));
+    if banned {
+        return None;
+    }
+    fn flat(n: &SyntaxNode, out: &mut Vec<SyntaxNode>) -> Option<()> {
+        for c in n.children() {
+            if c.kind() == BLOCK || c.kind().is_container() {
+                flat(&c, out)?;
+            } else if c.kind() == STATEMENT {
+                out.push(c);
+            } else if c.kind().is_unit() {
+                return None;
+            }
+        }
+        Some(())
+    }
+    let mut units = Vec::new();
+    flat(body, &mut units)?;
+    let mut points = Vec::new();
+    let (mut wraps, mut commits) = (0, 0);
+    for c in &units {
+        let toks: Vec<T> = tokens(c)
+            .into_iter()
+            .filter(|t| t.sig() && t.k != SEMICOLON)
+            .collect();
+        let w0 = toks.first()?.up();
+        let at = toks.first()?.pos.0;
+        // A single token (literal, variable, NULL) cannot fail.
+        let constant = |from: usize| toks.len() == from + 1;
+        match w0.as_str() {
+            "PRINT" | "SET"
+                if w0 == "PRINT" || toks.get(1).is_some_and(|t| !t.s.starts_with('@')) => {}
+            "SET" if toks.len() >= 4 && constant(3) => {}
+            "DECLARE" => {
+                // `DECLARE @v type [= constant]`, a table variable, or an
+                // initializer made of one token.
+                let eq = toks.iter().position(|t| t.s == "=");
+                if let Some(e) = eq {
+                    if !constant(e + 1) {
+                        return None;
+                    }
+                }
+            }
+            "SELECT"
+                if !toks.iter().any(|t| t.is("INTO"))
+                    && !toks.get(1).is_some_and(|t| t.s.starts_with('@')) =>
+            {
+                return None;
+            }
+            // A bare RETURN as the last statement ends the body anyway.
+            "RETURN" if toks.len() == 1 && std::ptr::eq(c, units.last()?) => {}
+            "RETURN" | "BREAK" | "CONTINUE" => return None,
+            "SET" | "SELECT" => {
+                points.push((at, false));
+                wraps += 1;
+            }
+            _ => {
+                points.push((at, true));
+                wraps += 1;
+                commits += 1;
+            }
+        }
+    }
+    (wraps >= 2 && commits >= 1).then_some(points)
 }
 
 /// The `BEGIN TRAN` and `COMMIT` (where each starts) of a body whose durable

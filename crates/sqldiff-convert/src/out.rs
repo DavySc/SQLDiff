@@ -14,7 +14,7 @@ pub(crate) struct RawUnit {
     pub written: Option<crate::Written>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Out {
     pub text: String,
     pub units: Vec<RawUnit>,

@@ -12,9 +12,9 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 |---|---|---|
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 57 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 21 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 109 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 110 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 30 |
-| | Total | 217 |
+| | Total | 218 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -114,6 +114,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-DEFAULT-SCHEMA` | Unqualified names, T-SQL dbo and PostgreSQL public resolve to the same schema on both sides. | `deployment` | The default schema in effect on both sides. (fact key `default_schema`) | `sqldiff-convert/src/lib.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-DROP-NO-DEPENDENTS` | No view, routine or other object depends on a dropped object, and a dropped routine's name is not overloaded: PostgreSQL refuses such a DROP, SQL Server drops a table or view under a view that is not schema-bound. | `catalog` | The target catalog's dependencies (pg_depend) on the object are only those dropped with it, and its routine name has one signature. | `sqldiff-core/src/equiv/ddl.rs` |
 | `ASM-END-OF-TIME` | T-SQL's end of time 9999-12-31 23:59:59.9999999, written for PostgreSQL as 23:59:59.999999, is only an open-end sentinel: compared with values converted by the same rule, and data moved from SQL Server truncates its 7th digit rather than rounding it to 10000-01-01. | `deployment` | The value is used only as an open-end sentinel, and data was moved with the 7th digit truncated. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
+| `ASM-ERROR-CONTINUES-WARNING` | A statement error after which T-SQL reports it and goes on (XACT_ABORT OFF: a constraint violation, divide by zero or overflow, string truncation) is reported as a warning here, and the procedure goes on with the next statement. Callers that read the error itself (a failed call, an error message) see a warning instead. Conversion errors and the other errors that stop the T-SQL batch stop the procedure here too (eval/xact-abort/). | `deployment` | How callers learn of a failed statement. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/ir/behaviour.rs`<br>`sqldiff-core/src/ir/interp.rs` |
 | `ASM-EXACTLY-ONE-ROW` | The query returns exactly one row: with none, T-SQL keeps the variable and PostgreSQL sets it to NULL. | `deployment` | The data: a row always exists for the predicate (a unique key alone gives at most one). | `sqldiff-core/profiles/rules/tsql-pg.rules` |
 | `ASM-EXTPROP-COMMENT` | Whoever reads the T-SQL extended property reads the target's comment instead (one unnamed comment per object). | `deployment` | The tools that read the property. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/call.rs` |
 | `ASM-FACT-*` | A vendor fact holds as tabled in the dialect profile (named by its number, e.g. ASM-FACT-V2). | `nothing` | The vendor fact checked on a real system (docs/vendor-facts-verification.md). | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-convert/src/tsql/paging.rs`<br>`sqldiff-core/src/equiv/literal.rs`<br>`sqldiff-core/src/ir/interp.rs` |

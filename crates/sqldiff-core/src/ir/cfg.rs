@@ -73,6 +73,11 @@ pub enum Action {
     Reraise {
         form: &'static str,
     },
+    /// `RAISE WARNING` in an exception handler: the handler reports the
+    /// error it caught as a warning and the routine goes on. The error
+    /// message reaches the caller as T-SQL's statement-level error does
+    /// (`ASM-ERROR-CONTINUES-WARNING`).
+    Report,
     Call(String),
     /// Something the model cannot follow (GOTO, unparsed text).
     Opaque(String),
@@ -1298,6 +1303,13 @@ impl Lowerer {
             _ => match w(0).as_str() {
                 "GOTO" => Action::Opaque("GOTO".into()),
                 "RAISERROR" => self.raise_action(toks),
+                "RAISE"
+                    if w(1) == "WARNING"
+                        && n.ancestors()
+                            .any(|a| a.kind() == SyntaxKind::EXCEPTION_HANDLER) =>
+                {
+                    Action::Report
+                }
                 _ => Action::None,
             },
         };

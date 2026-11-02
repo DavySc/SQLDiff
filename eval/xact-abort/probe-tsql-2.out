@@ -1,0 +1,12 @@
+Msg 512, Level 16, State 1, Server 546a2e6bfd03, Procedure dbo.c2, Line 5
+Subquery returned more than 1 value. This is not permitted when the subquery follows =, !=, <, <= , >, >= or when the subquery is used as an expression.
+The statement has been terminated.
+Msg 512, Level 16, State 1, Server 546a2e6bfd03, Procedure dbo.c2, Line 6
+Subquery returned more than 1 value. This is not permitted when the subquery follows =, !=, <, <= , >, >= or when the subquery is used as an expression.
+case_name steps
+--------- -----
+subq-assign 1,2
+subq-update 1,2
+  n
+- -
+u1.n 0

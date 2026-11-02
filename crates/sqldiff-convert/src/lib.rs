@@ -268,6 +268,10 @@ pub struct Draft {
     from: Dialect,
     to: Dialect,
     raw: out::Out,
+    /// The conversion without the per-statement exception blocks
+    /// (`tsql.txn.continue`), when the draft has them: [`check`] keeps the
+    /// one the engine proves better, so the blocks never make a unit worse.
+    plain: Option<Box<Draft>>,
 }
 
 impl Draft {
@@ -390,13 +394,34 @@ pub(crate) fn rewrite_in_tree(
             &own
         }
     };
-    let raw = guarded(&root, text, || match (from, to) {
-        (Dialect::Tsql, Dialect::Postgres | Dialect::Db2i) => {
-            tsql::convert(&root, text, to, source, claims)
-        }
-        _ => no_rules(&root, text, from, to),
-    });
-    Draft { from, to, raw }
+    let run = || {
+        guarded(&root, text, || match (from, to) {
+            (Dialect::Tsql, Dialect::Postgres | Dialect::Db2i) => {
+                tsql::convert(&root, text, to, source, claims)
+            }
+            _ => no_rules(&root, text, from, to),
+        })
+    };
+    let raw = run();
+    let plain = raw
+        .units
+        .iter()
+        .any(|u| u.trace.iter().any(|s| s.rule == tsql::CONTINUE_RULE))
+        .then(|| {
+            let raw = tsql::without_continuation(run);
+            Box::new(Draft {
+                from,
+                to,
+                raw,
+                plain: None,
+            })
+        });
+    Draft {
+        from,
+        to,
+        raw,
+        plain,
+    }
 }
 
 /// Runs the rules over one file. A panic in them must not take the other files
@@ -456,7 +481,33 @@ pub fn undecided(f: &sqldiff_core::Finding) -> bool {
 /// Check a draft: diff the input against the output, check the output on
 /// its own, and give every unit the worst of its rule notes and findings.
 pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
-    let Draft { from, to, raw } = draft;
+    let mut draft = draft;
+    let Some(plain) = draft.plain.take() else {
+        return check_one(input, draft, opts);
+    };
+    let blocks = check_one(input, draft, opts);
+    let without = check_one(input, *plain, opts);
+    // Never the version the engine has shown wrong over the one it cannot
+    // yet prove: fewer units with a difference found first, then fewer units
+    // open. (Both versions are the same code to run; only what the engine
+    // can tie down differs, and a difference it found in the plain version,
+    // T-SQL going on where PostgreSQL stops, is gone from the blocks.)
+    let score = |c: &Conversion| {
+        let open = |keep: fn(Status) -> bool| c.units.iter().filter(|u| keep(u.status)).count();
+        (
+            open(|s| s == Status::Differs),
+            open(|s| !matches!(s, Status::Converted | Status::Assumptions)),
+        )
+    };
+    if score(&blocks) < score(&without) {
+        blocks
+    } else {
+        without
+    }
+}
+
+fn check_one(input: &str, draft: Draft, opts: &Options) -> Conversion {
+    let Draft { from, to, raw, .. } = draft;
     let a = Artifact::new("input.sql", from, input);
     let b = Artifact::new("converted.sql", to, raw.text.as_str());
     // The engine pairs statements through the units' trace: an input

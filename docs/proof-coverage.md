@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 194 | 35 (18%) | 6 (3%) | 153 (79%) |
+| `converter` | 195 | 35 (18%) | 6 (3%) | 154 (79%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 223 | 38 (17%) | 8 (4%) | 177 (79%) |
+| **All** | 224 | 38 (17%) | 8 (4%) | 178 (79%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -229,6 +229,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.txn.autocommit` | `converter` | lemma: `Sqldiff.Mirror/C4 errors and transactions/Transactions, PL/pgSQL` | the COMMIT added after a statement T-SQL commits on its own (ASM-NO-CALLER-TXN); the Lean rule names this id | `sqldiff-convert/src/tsql.rs` |
 | `tsql.txn.begin` | `converter` | lemma: `Sqldiff.Mirror/C4 errors and transactions/Transactions, T-SQL` | as a bracket with its COMMIT in a procedure under SET XACT_ABORT ON, outside TRY, IF, WHILE and nested blocks (ASM-NO-CALLER-TXN, ASM-TSQL-DOOMED-TXN); elsewhere engine | `sqldiff-convert/src/tsql.rs` |
 | `tsql.txn.commit` | `converter` | lemma: `Sqldiff.Mirror/C4 errors and transactions/Transactions, T-SQL` | as the end of a bracket (see tsql.txn.begin), the PL/pgSQL COMMIT under 'Transactions, PL/pgSQL'; elsewhere engine | `sqldiff-convert/src/tsql.rs` |
+| `tsql.txn.continue` | `converter` | engine | an exception block per statement that can fail plus the autocommit COMMIT, for a body that goes on after an error (no XACT_ABORT ON); the behaviour model compares the error path per failing statement (ASM-ERROR-CONTINUES-WARNING, ASM-NO-CALLER-TXN) | `sqldiff-convert/src/tsql.rs` |
 | `tsql.txn.rollback` | `converter` | engine | a ROLLBACK is outside the C4 spec except inside idiom.rollback-rethrow | `sqldiff-convert/src/tsql.rs` |
 | `tsql.txn.rollback-savepoint` | `converter` | axiom: V14 | the note names V14 (ASM-FACT-V14) on every target; the fact is about Db2 for i commitment control | `sqldiff-convert/src/tsql.rs` |
 | `tsql.txn.save` | `converter` | axiom: V14 | the note names V14 (ASM-FACT-V14) on every target; the fact is about Db2 for i commitment control | `sqldiff-convert/src/tsql.rs` |

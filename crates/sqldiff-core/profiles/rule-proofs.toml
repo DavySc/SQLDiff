@@ -1350,6 +1350,13 @@ note = "as the end of a bracket (see tsql.txn.begin), the PL/pgSQL COMMIT under 
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.txn.continue"
+kind = "converter"
+proof = "engine"
+note = "an exception block per statement that can fail plus the autocommit COMMIT, for a body that goes on after an error (no XACT_ABORT ON); the behaviour model compares the error path per failing statement (ASM-ERROR-CONTINUES-WARNING, ASM-NO-CALLER-TXN)"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
 id = "tsql.txn.rollback"
 kind = "converter"
 proof = "engine"

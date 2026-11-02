@@ -389,7 +389,10 @@ pub fn rewrite_template_with(
     let harness = match kind.harness(&stand.stem, parameters) {
         Some((pre, neutral, post)) if from == Dialect::Tsql => {
             let marker = format!("/*{}hb*/", stand.stem);
-            let base = rewrite_in(&format!("{pre}{neutral}{post}"), from, to, source);
+            // A fragment's statements are the template's, not a whole routine's: no error continuation.
+            let base = crate::tsql::without_continuation(|| {
+                rewrite_in(&format!("{pre}{neutral}{post}"), from, to, source)
+            });
             let base = base.output();
             let around = base.find(&marker).and_then(|m| {
                 let m = m + marker.len();
@@ -425,7 +428,7 @@ pub fn rewrite_template_with(
         }
         _ => None,
     };
-    let draft = rewrite_in(&frag.text, from, to, source);
+    let draft = crate::tsql::without_continuation(|| rewrite_in(&frag.text, from, to, source));
     TemplateDraft {
         frag,
         draft,
