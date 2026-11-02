@@ -156,9 +156,10 @@ fn routine_key(r: &SyntaxNode, d: Dialect) -> Option<(&'static str, (Option<Stri
 }
 
 /// Splits side A's segments into those the trace links to output and the
-/// plain ones it links to no segment of side B: every anchor that starts in
-/// such a segment wrote only text outside B's segments (comments). A segment
-/// with no anchor in it is kept: the trace says nothing about it.
+/// ones it links to no segment of side B (a refused routine, block or
+/// statement): every anchor that starts in such a segment wrote only text
+/// outside B's segments (comments). A segment with no anchor in it is kept:
+/// the trace says nothing about it.
 fn written(
     sa: Vec<Segment>,
     sb: &[Segment],
@@ -185,7 +186,7 @@ fn written(
         let reaches = inside
             .iter()
             .any(|x| targets.iter().any(|&(c, d)| x.b.0 < d && c < x.b.1));
-        if g.block || g.routine || inside.is_empty() || reaches {
+        if inside.is_empty() || reaches {
             kept.push(g);
         } else {
             left.push(g);

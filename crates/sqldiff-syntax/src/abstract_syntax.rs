@@ -82,6 +82,11 @@ pub enum Expr {
     Num(String),
     /// String literal value (quotes removed, `''` unescaped).
     Str(String),
+    /// Db2 for i binary constant `BX'…'`: the hex digits, lower case.
+    Bytes(String),
+    /// Db2 for i labeled duration on an operand that is not a plain number
+    /// (`v_delay SECONDS`, `(a + b) DAYS`): the operand and the singular unit.
+    Duration(Box<Expr>, String),
     Null,
     Star(Option<String>),
     Call(Box<Call>),
@@ -937,10 +942,55 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
             self.i += 1;
-            let r = self.add_operand()?;
+            let r = match self.labeled_duration() {
+                Some(d) => d,
+                None => {
+                    let operand = self.add_operand()?;
+                    self.duration_of(operand)
+                }
+            };
             l = Expr::Bin(op, Box::new(l), Box::new(r));
         }
         Ok(l)
+    }
+
+    /// Db2 for i labeled duration after `+` or `-`: a whole number and a
+    /// unit keyword, singular or plural (`d + 3 DAYS`). Read as one opaque
+    /// term, so it is only ever equal to the same duration.
+    fn labeled_duration(&mut self) -> Option<Expr> {
+        if self.d != Dialect::Db2i {
+            return None;
+        }
+        let num = self.peek()?;
+        if num.kind != K::Num {
+            return None;
+        }
+        let n: u64 = num.text.parse().ok()?;
+        let unit = self.peek_at(1)?;
+        if unit.kind != K::Word {
+            return None;
+        }
+        let singular = duration_unit(&unit.up)?;
+        self.i += 2;
+        Some(Expr::Special(format!("{n} {singular}")))
+    }
+
+    /// Wraps an operand in the labeled duration that follows it, if any.
+    fn duration_of(&mut self, operand: Expr) -> Expr {
+        if self.d != Dialect::Db2i {
+            return operand;
+        }
+        let Some(unit) = self.peek() else {
+            return operand;
+        };
+        if unit.kind != K::Word {
+            return operand;
+        }
+        let Some(singular) = duration_unit(&unit.up) else {
+            return operand;
+        };
+        self.i += 1;
+        Expr::Duration(Box::new(operand), singular.into())
     }
 
     /// An operand of `+` and `-`. T-SQL ranks unary `+` and `-` with them,
@@ -1037,6 +1087,9 @@ impl<'a> Parser<'a> {
                     );
                 }
                 self.i += 1;
+                if self.d == Dialect::Db2i && t.text.to_ascii_uppercase().starts_with("BX'") {
+                    return Ok(Expr::Bytes(binary_value(&t.text)?));
+                }
                 Ok(Expr::Str(string_value(&t.text)?))
             }
             K::Var => {
@@ -2811,6 +2864,36 @@ pub fn quoted_name(raw: &str, d: Dialect) -> String {
     }
 }
 
+/// The singular unit of a Db2 for i labeled duration keyword, singular or
+/// plural (`DAYS` and `DAY` are the same unit).
+fn duration_unit(up: &str) -> Option<&'static str> {
+    Some(match up {
+        "YEAR" | "YEARS" => "YEAR",
+        "MONTH" | "MONTHS" => "MONTH",
+        "DAY" | "DAYS" => "DAY",
+        "HOUR" | "HOURS" => "HOUR",
+        "MINUTE" | "MINUTES" => "MINUTE",
+        "SECOND" | "SECONDS" => "SECOND",
+        "MICROSECOND" | "MICROSECONDS" => "MICROSECOND",
+        _ => return None,
+    })
+}
+
+/// Value of a Db2 for i `BX'…'` binary constant: its hex digits, lower case.
+/// The digits come in pairs (one byte each), so an odd count is refused.
+pub fn binary_value(raw: &str) -> PResult<String> {
+    let q = raw.find('\'').ok_or("bad binary literal")?;
+    let body = raw[q + 1..]
+        .strip_suffix('\'')
+        .ok_or("unterminated binary literal")?;
+    // A zero-digit BX'' is not confirmed as valid Db2 for i, so it is refused:
+    // equal to T-SQL 0x would be a claim the reader cannot back.
+    if body.is_empty() || body.len() % 2 != 0 || !body.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("BX'…' needs a non-empty even number of hex digits".into());
+    }
+    Ok(body.to_ascii_lowercase())
+}
+
 /// Value of a string literal token; rejects prefixes other than N.
 pub fn string_value(raw: &str) -> PResult<String> {
     let q = raw.find('\'').ok_or("bad string literal")?;
@@ -2993,6 +3076,101 @@ mod tests {
         ));
         assert!(matches!(e("[SYSTEM_USER]", Dialect::Tsql), Expr::Name(_)));
         assert!(matches!(e("current_role", Dialect::Tsql), Expr::Name(_)));
+    }
+
+    #[test]
+    fn db2_binary_constants_and_labeled_durations() {
+        let e = |src: &str, d: Dialect| {
+            let toks = tokens(&crate::parse(&format!("SELECT {src}"), d).syntax());
+            let mut p = Parser::new(&toks[1..], d);
+            p.expr()
+        };
+        // BX'…' is a binary constant: hex digits in pairs, read lower case.
+        assert_eq!(e("BX'0ABC'", Dialect::Db2i), Ok(Expr::Bytes("0abc".into())));
+        assert_eq!(e("bx'FF'", Dialect::Db2i), Ok(Expr::Bytes("ff".into())));
+        // An empty BX'' is not confirmed valid Db2 for i: refused, not read as b"".
+        assert!(e("BX''", Dialect::Db2i).is_err());
+        // Odd digit count, non-hex digits and a missing close are refused.
+        assert!(e("BX'ABC'", Dialect::Db2i).is_err());
+        assert!(e("BX'GG'", Dialect::Db2i).is_err());
+        assert!(e("BX'0A", Dialect::Db2i).is_err());
+        // Other Db2 prefixes stay unsupported, and BX is not a T-SQL prefix.
+        assert!(e("X'0A'", Dialect::Db2i).is_err());
+        assert!(!matches!(e("BX'0A'", Dialect::Tsql), Ok(Expr::Bytes(_))));
+        // A labeled duration after + or -: singular and plural are one term.
+        let dur = |n: &str, u: &str| Expr::Special(format!("{n} {u}"));
+        assert_eq!(
+            e("d + 3 DAYS", Dialect::Db2i),
+            Ok(Expr::Bin(
+                "+".into(),
+                Box::new(Expr::Name(vec!["d".into()])),
+                Box::new(dur("3", "DAY"))
+            ))
+        );
+        assert_eq!(
+            e("d - 1 month", Dialect::Db2i),
+            Ok(Expr::Bin(
+                "-".into(),
+                Box::new(Expr::Name(vec!["d".into()])),
+                Box::new(dur("1", "MONTH"))
+            ))
+        );
+        for (u, want) in [
+            ("HOURS", "HOUR"),
+            ("MINUTE", "MINUTE"),
+            ("SECONDS", "SECOND"),
+            ("YEARS", "YEAR"),
+            ("MICROSECONDS", "MICROSECOND"),
+        ] {
+            assert_eq!(
+                e(&format!("d + 2 {u}"), Dialect::Db2i),
+                Ok(Expr::Bin(
+                    "+".into(),
+                    Box::new(Expr::Name(vec!["d".into()])),
+                    Box::new(dur("2", want))
+                ))
+            );
+        }
+        // Chains keep going after the duration.
+        assert!(e("d + 1 DAYS + 2", Dialect::Db2i).is_ok());
+        // A variable or a parenthesised operand takes the duration too, and
+        // binds tighter than the operator: `t + v SECONDS` is `t + (v SECONDS)`.
+        let name = |n: &str| Expr::Name(vec![n.into()]);
+        assert_eq!(
+            e("t + v SECONDS", Dialect::Db2i),
+            Ok(Expr::Bin(
+                "+".into(),
+                Box::new(name("t")),
+                Box::new(Expr::Duration(Box::new(name("v")), "SECOND".into()))
+            ))
+        );
+        assert_eq!(
+            e("t + (a - b) DAY", Dialect::Db2i),
+            Ok(Expr::Bin(
+                "+".into(),
+                Box::new(name("t")),
+                Box::new(Expr::Duration(
+                    Box::new(Expr::Bin(
+                        "-".into(),
+                        Box::new(name("a")),
+                        Box::new(name("b"))
+                    )),
+                    "DAY".into()
+                ))
+            ))
+        );
+        // Outside Db2 for i, or without a unit, a number is still a number.
+        assert!(
+            !matches!(e("d + 3 DAYS", Dialect::Tsql), Ok(Expr::Bin(_, _, r)) if matches!(r.as_ref(), Expr::Special(_)))
+        );
+        assert_eq!(
+            e("d + 3", Dialect::Db2i),
+            Ok(Expr::Bin(
+                "+".into(),
+                Box::new(Expr::Name(vec!["d".into()])),
+                Box::new(Expr::Num("3".into()))
+            ))
+        );
     }
 
     #[test]
