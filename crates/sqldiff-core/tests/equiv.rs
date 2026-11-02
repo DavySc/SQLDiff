@@ -1453,3 +1453,62 @@ fn fresh_random_values_are_equal_under_an_assumption() {
     assert!(not_equal(&r), "{:?}", r.findings);
     assert!(!assumption_ids(&r).contains(&"ASM-RANDOM-FRESH"));
 }
+
+/// Other shapes of the fresh draws (`ASM-RANDOM-FRESH`): one RAND() assigned
+/// is compared, two RAND() draws in one statement are not, and two NEWID() draws in one procedure pair
+/// with two gen_random_uuid() draws in the same order.
+#[test]
+fn fresh_draws_pair_in_source_order() {
+    let ts_rand = "CREATE PROCEDURE dbo.roll @R float OUTPUT AS
+                   BEGIN
+                     SET @R = RAND();
+                   END";
+    let pg_rand = "CREATE PROCEDURE roll(INOUT p_r double precision DEFAULT NULL)
+                   LANGUAGE plpgsql AS $$
+                   BEGIN
+                     p_r := random();
+                   END; $$;";
+    let r = run(ts_rand, T, pg_rand, P, false);
+    assert!(
+        matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.findings
+    );
+    assert!(assumption_ids(&r).contains(&"ASM-RANDOM-FRESH"));
+
+    // Two RAND() draws in one statement are not compared (the second draw
+    // has no counterpart the engine can pair).
+    let ts_two_rand = "CREATE PROCEDURE dbo.roll2 @R float OUTPUT AS
+                       BEGIN
+                         SET @R = RAND() + RAND();
+                       END";
+    let pg_two_rand = "CREATE PROCEDURE roll2(INOUT p_r double precision DEFAULT NULL)
+                       LANGUAGE plpgsql AS $$
+                       BEGIN
+                         p_r := random() + random();
+                       END; $$;";
+    let r = run(ts_two_rand, T, pg_two_rand, P, false);
+    assert!(not_equal(&r), "{:?}", r.findings);
+
+    let ts_two =
+        "CREATE PROCEDURE dbo.two_tokens @A uniqueidentifier OUTPUT, @B uniqueidentifier OUTPUT AS
+                  BEGIN
+                    SET XACT_ABORT ON;
+                    SET @A = NEWID();
+                    SET @B = NEWID();
+                  END";
+    let pg_two =
+        "CREATE PROCEDURE two_tokens(INOUT p_a uuid DEFAULT NULL, INOUT p_b uuid DEFAULT NULL)
+                      LANGUAGE plpgsql AS $$
+                      BEGIN
+                        p_a := gen_random_uuid();
+                        p_b := gen_random_uuid();
+                      END; $$;";
+    let r = run(ts_two, T, pg_two, P, false);
+    assert!(
+        matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.findings
+    );
+    assert!(assumption_ids(&r).contains(&"ASM-RANDOM-FRESH"));
+}
