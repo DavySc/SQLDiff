@@ -251,6 +251,11 @@ pub struct Routine {
     pub params: Vec<Param>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub returns: Option<DataType>,
+    /// A T-SQL procedure whose body has a `RETURN expression`: its status is
+    /// not always 0, so the conversion gives it a last `INOUT return_code`.
+    /// Only read from T-SQL DDL.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub returns_status: bool,
 }
 
 impl Routine {
