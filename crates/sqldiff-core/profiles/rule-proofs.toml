@@ -1190,6 +1190,12 @@ proof = "engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.assign.int-trunc"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
 id = "tsql.table.primary-key-not-null"
 kind = "converter"
 proof = "engine"
