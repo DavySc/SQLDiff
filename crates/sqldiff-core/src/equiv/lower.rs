@@ -1321,6 +1321,17 @@ fn unit(c: &SyntaxNode, u: &mut Unit) {
         | SyntaxKind::ROUTINE_BODY
         | SyntaxKind::TRY_BLOCK => walk(c, u),
         SyntaxKind::BLOCK if assign_loop(c, u) => {}
+        SyntaxKind::BLOCK if u.catch_branches && warning_wrapper(c) => {
+            // The statement stands where it stands in the T-SQL routine,
+            // which goes on after its error: the behaviour model compares
+            // the error path (`catches`), exactly, per failing statement.
+            u.catches = true;
+            for n in cst::structural_children(c) {
+                if n.kind() != SyntaxKind::EXCEPTION_SECTION {
+                    unit(&n, u);
+                }
+            }
+        }
         SyntaxKind::BLOCK if u.catch_branches && others_handler(c).is_some() => try_block(c, u),
         SyntaxKind::BLOCK => {
             let w = cst::first_words(c, 2);
@@ -1446,6 +1457,44 @@ fn try_catch(c: &SyntaxNode, u: &mut Unit) {
     mark_at(u, CtlKind::Try, t, c);
     walk(t, u);
     catch_body(c, k, k, &cst::structural_children(t), u);
+}
+
+/// A PL/pgSQL block that is one statement with an EXCEPTION section whose
+/// only handler reports the error as a warning (`RAISE WARNING …`) and goes
+/// on: the conversion of a T-SQL statement after whose error T-SQL goes on
+/// (`ASM-ERROR-CONTINUES-WARNING`). Which errors it catches is the
+/// behaviour model's to compare with T-SQL's.
+fn warning_wrapper(block: &SyntaxNode) -> bool {
+    let kids = cst::structural_children(block);
+    let [stmt, sec] = kids.as_slice() else {
+        return false;
+    };
+    if !matches!(stmt.kind(), SyntaxKind::STATEMENT | SyntaxKind::BLOCK)
+        || sec.kind() != SyntaxKind::EXCEPTION_SECTION
+    {
+        return false;
+    }
+    let hs: Vec<SyntaxNode> = sec.children().collect();
+    let [h] = hs.as_slice() else {
+        return false;
+    };
+    let parts: Vec<SyntaxNode> = h.children().collect();
+    let [cond, body] = parts.as_slice() else {
+        return false;
+    };
+    if h.kind() != SyntaxKind::EXCEPTION_HANDLER
+        || cond.kind() != SyntaxKind::CONDITION
+        || body.kind() != SyntaxKind::BRANCH
+    {
+        return false;
+    }
+    let units = cst::structural_children(body);
+    let [r] = units.as_slice() else {
+        return false;
+    };
+    r.kind() == SyntaxKind::STATEMENT
+        && cst::first_words(r, 2) == ["RAISE", "WARNING"]
+        && !tokens(cond).iter().any(|t| t.up == "OTHERS")
 }
 
 /// The `WHEN OTHERS THEN` body of a PL/pgSQL block's EXCEPTION section when

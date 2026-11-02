@@ -930,6 +930,10 @@ impl Interp<'_> {
                 st.assumptions.insert("ASM-CALLEES-NO-TXN-CONTROL".into());
             }
             Action::Opaque(what) => st.imprecise.push(format!("{what} is not modelled")),
+            Action::Report => {
+                st.raised = true;
+                st.assumptions.insert("ASM-ERROR-CONTINUES-WARNING".into());
+            }
             Action::None => {}
         }
         // Temporary objects read before this statement writes.

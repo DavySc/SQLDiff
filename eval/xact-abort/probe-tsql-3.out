@@ -1,0 +1,14 @@
+Msg 245, Level 16, State 1, Server 546a2e6bfd03, Procedure dbo.c3, Line 6
+Conversion failed when converting the varchar value 'abc' to data type int.
+Msg 8114, Level 16, State 5, Server 546a2e6bfd03, Procedure dbo.c3, Line 7
+Error converting data type varchar to numeric.
+Msg 241, Level 16, State 1, Server 546a2e6bfd03, Procedure dbo.c3, Line 8
+Conversion failed when converting date and/or time from character string.
+Msg 242, Level 16, State 3, Server 546a2e6bfd03, Procedure dbo.c3, Line 9
+The conversion of a varchar data type to a smalldatetime data type resulted in an out-of-range value.
+case_name steps
+--------- -----
+241 1
+242 1,2
+245 1
+8114 1

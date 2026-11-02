@@ -742,6 +742,13 @@ fact = "How callers call the routine."
 sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs", "sqldiff-core/src/ir/behaviour.rs", "sqldiff-core/src/ir/interp.rs"]
 
 [[assumption]]
+id = "ASM-ERROR-CONTINUES-WARNING"
+statement = "A statement error after which T-SQL reports it and goes on (XACT_ABORT OFF: a constraint violation, divide by zero or overflow, string truncation) is reported as a warning here, and the procedure goes on with the next statement. Callers that read the error itself (a failed call, an error message) see a warning instead, and the routines called go on after their own statement errors the same way. Conversion errors and the other errors that stop the T-SQL batch stop the procedure here too (eval/xact-abort/)."
+discharge = "deployment"
+fact = "How callers learn of a failed statement, and that the routines called are converted the same way."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/ir/behaviour.rs", "sqldiff-core/src/ir/interp.rs"]
+
+[[assumption]]
 id = "ASM-TSQL-DYNAMIC-SESSION-OPTIONS"
 statement = "The session runs dynamic SQL with ANSI_NULLS and QUOTED_IDENTIFIER ON (the defaults): a T-SQL dynamic batch takes them from the session, not from the procedure that runs it."
 discharge = "deployment"

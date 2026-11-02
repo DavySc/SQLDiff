@@ -389,20 +389,38 @@ fn an_agent_writes_a_unit_and_it_is_checked_and_waits_for_a_person() {
     ]);
     result(&r[0]);
     let output = std::fs::read_to_string(out.join(caller)).unwrap();
-    let (n, line) = output
-        .lines()
-        .enumerate()
-        .find(|(_, l)| l.trim_start().starts_with("UPDATE"))
+    // The UPDATE is one unit with its exception block and COMMIT
+    // (`tsql.txn.continue`): the item starts at the block's first line.
+    let lines: Vec<&str> = output.lines().collect();
+    let up = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("UPDATE"))
         .unwrap();
     let item = result(&r[1])["items"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|i| i["path"] == caller && i["out_line"] == n as u64 + 1)
-        .unwrap_or_else(|| panic!("no item for line {} in {:#}", n + 1, result(&r[1])))
+        .filter(|i| i["path"] == caller && i["src_line"] == 5)
+        .min_by_key(|i| i["out_line"].as_u64().unwrap().abs_diff(up as u64 + 1))
+        .unwrap_or_else(|| panic!("no item for the UPDATE in {:#}", result(&r[1])))
         .clone();
+    let start = item["out_line"].as_u64().unwrap() as usize - 1;
+    let end = lines[up..]
+        .iter()
+        .position(|l| l.trim() == "COMMIT;")
+        .map_or(up, |k| up + k);
     // Same rows, written differently; `by` from the caller is ignored.
-    let text = format!("{} WHERE 1 = 1;", line.trim_end().trim_end_matches(';'));
+    let text = lines[start..=end]
+        .iter()
+        .map(|l| {
+            if l.trim_start().starts_with("UPDATE") {
+                format!("{} WHERE 1 = 1;", l.trim_end().trim_end_matches(';'))
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let args = json!({
         "src": src, "to": "postgres", "out": out, "path": caller,
         "unit": item["unit"], "text": text, "reason": "a test", "by": "human",

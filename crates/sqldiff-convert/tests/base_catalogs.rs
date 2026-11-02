@@ -535,29 +535,32 @@ fn a_catalog_only_procedure_changes_the_rules_and_the_ledger_follows_its_content
             .iter()
             .chain(&f.converted_units)
             .find(|x| x.id == u.id)
-            .unwrap_or_else(|| panic!("{} in {}", u.id, serde_json::to_string_pretty(f).unwrap()));
-        let d = x.review.as_ref().unwrap().decisions[0].clone();
-        (d, g)
+            .map(|x| x.review.as_ref().unwrap().decisions[0].clone());
+        (x, g)
     };
     let (d, g) = decision(&a);
+    let d = d.expect("the unit is there");
     assert!(d.current, "{d:?}");
     assert!(!g.counts.contains_key("outdated"), "{g:#?}");
     // The same contents with Windows line endings keep it.
     fx.write("base/procs.sql", &NEXT_LINE.replace('\n', "\r\n"));
-    assert!(decision(&a).0.current);
+    assert!(decision(&a).0.unwrap().current);
     // Other contents outdate it, and so does converting without catalogs.
     fx.write(
         "base/procs.sql",
         &NEXT_LINE.replace("COUNT(*) + 1", "COUNT(*) + 2"),
     );
     let (d, g) = decision(&a);
+    let d = d.expect("the unit is there");
     assert!(!d.current);
     assert_eq!(d.why_not.as_deref(), Some(CATALOGS_CHANGED));
     assert!(g.counts.get("outdated").is_some_and(|n| *n > 0), "{g:#?}");
     fx.write("base/procs.sql", NEXT_LINE);
-    assert!(decision(&a).0.current);
+    assert!(decision(&a).0.unwrap().current);
     // Without the catalogs the file converts differently too.
-    assert!(!decision(&fx.args(&[])).0.current);
+    // (Its statements are wrapped differently without the callee, so the unit
+    // may be gone altogether; either way the decision no longer applies.)
+    assert!(decision(&fx.args(&[])).0.is_none_or(|d| !d.current));
 }
 
 #[test]

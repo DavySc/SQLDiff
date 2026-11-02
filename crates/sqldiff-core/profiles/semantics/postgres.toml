@@ -9,10 +9,10 @@ class = "error"
 codes = ["23*"]
 [error_kinds.conversion]
 class = "error"
-codes = ["22P02", "22007", "22008", "22003"]
+codes = ["22P02", "22007", "22008"]
 [error_kinds.arithmetic]
 class = "error"
-codes = ["22012"]
+codes = ["22012", "22003"]
 [error_kinds.cardinality]
 class = "error"
 codes = ["21000", "P0003"]
@@ -49,7 +49,8 @@ EXCLUSION_VIOLATION = ["constraint"]
 INVALID_TEXT_REPRESENTATION = ["conversion"]
 DATA_EXCEPTION = ["conversion", "arithmetic"]
 DIVISION_BY_ZERO = ["arithmetic"]
-NUMERIC_VALUE_OUT_OF_RANGE = ["conversion"]
+NUMERIC_VALUE_OUT_OF_RANGE = ["arithmetic"]
+STRING_DATA_RIGHT_TRUNCATION = ["other"]
 NO_DATA_FOUND = ["not_found"]
 TOO_MANY_ROWS = ["cardinality"]
 CARDINALITY_VIOLATION = ["cardinality"]
