@@ -6,7 +6,7 @@
 
 use sqldiff_convert::convert;
 use sqldiff_core::equiv::Anchor;
-use sqldiff_core::{diff, Artifact, Dialect, Options, Verdict};
+use sqldiff_core::{diff, Artifact, Dialect, Options};
 
 const INPUT: &str = "CREATE TRIGGER dbo.ddl1 ON DATABASE FOR DDL_DATABASE_LEVEL_EVENTS AS
 BEGIN
