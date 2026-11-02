@@ -2322,11 +2322,16 @@ impl<'a> Cx<'a> {
                     .vars
                     .get(&t[0].s.trim_start_matches('@').to_ascii_lowercase())
                     .is_some_and(|v| v.dt == Dt::Bit);
-                exprs.push(if bit {
+                let tdt = self
+                    .vars
+                    .get(&t[0].s.trim_start_matches('@').to_ascii_lowercase())
+                    .map_or(Dt::Other, |v| v.dt);
+                let e = if bit {
                     self.bit_store_text(&t[eq + 1..])
                 } else {
                     self.expr(&t[eq + 1..]).trim().to_string()
-                });
+                };
+                exprs.push(self.store_int(tdt, &t[eq + 1..], e));
             }
             // Without FROM the list runs to the end of the statement, so a
             // clause there would end up inside the last expression.
@@ -2854,7 +2859,8 @@ impl<'a> Cx<'a> {
     }
 
     fn dml_once(&mut self, ts: &[T]) -> R<String> {
-        let mut ts = Self::body_toks(ts);
+        let ts = Self::body_toks(ts);
+        let mut ts = self.int_stores(ts);
         // A closing `OPTION (MAXRECURSION n)`: the recursion limit of the
         // statement's CTEs, which ASM-CTE-MAXRECURSION states. Dropped as
         // in a SELECT; other hints stay as written.
@@ -3736,6 +3742,222 @@ impl<'a> Cx<'a> {
         Some(n)
     }
 
+    /// The text of a value stored in an integer target: T-SQL drops a
+    /// number's fraction on assignment (eval/casts: also on INSERT, UPDATE,
+    /// SET and parameters), PostgreSQL rounds it, so a value known to have
+    /// a fraction is wrapped in `trunc()`. A value of unknown type is left
+    /// as it is (the engine compares it). Db2 for i is not changed here.
+    fn store_int(&mut self, target: Dt, value: &[T], converted: String) -> String {
+        if self.db2() || !matches!(target, Dt::Int | Dt::BigInt) {
+            return converted;
+        }
+        if self.expr_dt(value) != Some(Dt::Fraction) {
+            return converted;
+        }
+        self.step_ts("tsql.assign.int-trunc", value);
+        format!("trunc({converted})")
+    }
+
+    /// The type of column `col` of the catalog table named by `table`.
+    fn target_col_dt(&self, table: &[T], col: &str) -> Option<Dt> {
+        use sqldiff_core::catalog::Ident;
+        let parts: Vec<String> = table
+            .iter()
+            .filter(|t| matches!(t.k, IDENT | QUOTED_IDENT))
+            .map(|t| tsql_unquote(&t.s).to_ascii_lowercase())
+            .collect();
+        if parts.is_empty() || parts.len() > 2 {
+            return None;
+        }
+        let entry = ScopeEntry {
+            name: parts,
+            alias: None,
+            named: true,
+        };
+        let t = self.entry_table(&entry)?;
+        let c = t.column(Dialect::Tsql, &Ident::plain(col))?;
+        Some(Dt::of(&c.data_type.base, &c.data_type.args))
+    }
+
+    /// Wraps `value` (tokens) as `trunc(value)` tokens.
+    fn wrap_trunc(value: &[T]) -> Vec<T> {
+        let at = value.iter().find(|t| t.sig()).map_or(0, |t| t.pos.0);
+        let rule = "tsql.assign.int-trunc";
+        let mut out = vec![
+            T::made(IDENT, "trunc", at, rule),
+            T::made(L_PAREN, "(", at, rule),
+        ];
+        out.extend(value.iter().cloned());
+        out.push(T::made(R_PAREN, ")", at, rule));
+        out
+    }
+
+    /// Plain `UPDATE t SET c = v` and `INSERT INTO t (c) VALUES (v)`: a
+    /// value with a fraction stored in an integer column is truncated
+    /// (`store_int`). Other shapes are returned as they are.
+    fn int_stores(&mut self, ts: Vec<T>) -> Vec<T> {
+        if self.db2() {
+            return ts;
+        }
+        let s = sig(&ts);
+        let ds = crate::tok::depths(&ts);
+        let top =
+            |ts: &[T], w: &str, from: usize| (from..ts.len()).find(|&j| ds[j] == 0 && ts[j].is(w));
+        let Some(&first) = s.first() else { return ts };
+        let at = |v: &[T]| {
+            v.iter()
+                .find(|t| t.sig())
+                .map_or(ts[first].pos.0, |t| t.pos.0)
+        };
+        if ts[first].is("UPDATE") {
+            let (Some(set), None) = (top(&ts, "SET", 0), top(&ts, "FROM", 0)) else {
+                return ts;
+            };
+            if top(&ts, "OUTPUT", 0).is_some() {
+                return ts;
+            }
+            let table = &ts[first + 1..set];
+            let end = top(&ts, "WHERE", set).unwrap_or(ts.len());
+            let mut out = ts[..=set].to_vec();
+            let mut changed = false;
+            for (k, item) in split_commas(&ts[set + 1..end]).into_iter().enumerate() {
+                if k > 0 {
+                    out.push(T::made(
+                        COMMA,
+                        ",",
+                        item.first().map_or(0, |t| t.pos.0),
+                        "tsql.assign.int-trunc",
+                    ));
+                }
+                let it = sig(item);
+                let eq = it.iter().position(|&j| item[j].k == OP && item[j].s == "=");
+                match eq {
+                    Some(e) if e >= 1 => {
+                        let col = &item[it[e - 1]];
+                        let dt = (it[..e]
+                            .iter()
+                            .all(|&j| matches!(item[j].k, IDENT | QUOTED_IDENT | DOT)))
+                        .then(|| self.target_col_dt(table, &tsql_unquote(&col.s)))
+                        .flatten();
+                        let value = &item[it[e] + 1..];
+                        match dt {
+                            Some(d)
+                                if matches!(d, Dt::Int | Dt::BigInt)
+                                    && self.expr_dt(value) == Some(Dt::Fraction) =>
+                            {
+                                self.step_ts("tsql.assign.int-trunc", value);
+                                out.extend(item[..=it[e]].iter().cloned());
+                                out.push(T::made(
+                                    WHITESPACE,
+                                    " ",
+                                    at(value),
+                                    "tsql.assign.int-trunc",
+                                ));
+                                out.extend(Self::wrap_trunc(trimmed(value)));
+                                // What followed the value (a space before WHERE).
+                                let tail = value.iter().rposition(|t| t.sig()).map_or(0, |p| p + 1);
+                                out.extend(value[tail..].iter().cloned());
+                                changed = true;
+                            }
+                            _ => out.extend(item.iter().cloned()),
+                        }
+                    }
+                    _ => out.extend(item.iter().cloned()),
+                }
+            }
+            if !changed {
+                return ts;
+            }
+            out.extend(ts[end..].iter().cloned());
+            return out;
+        }
+        if ts[first].is("INSERT") {
+            let Some(&n1) = s.get(1) else { return ts };
+            let name_at = if ts[n1].is("INTO") {
+                s.get(2).copied()
+            } else {
+                Some(n1)
+            };
+            let Some(name_at) = name_at else { return ts };
+            let Some(open) = (name_at..ts.len()).find(|&j| ts[j].k == L_PAREN) else {
+                return ts;
+            };
+            let Some(close) = matching(&ts, open) else {
+                return ts;
+            };
+            let Some(values) = next_sig(&ts, close).filter(|&j| ts[j].is("VALUES")) else {
+                return ts;
+            };
+            let table = &ts[name_at..open];
+            if table
+                .iter()
+                .any(|t| t.sig() && !matches!(t.k, IDENT | QUOTED_IDENT | DOT))
+            {
+                return ts;
+            }
+            // Per column: does it take a truncated value?
+            let cols: Vec<Option<Dt>> = split_commas(&ts[open + 1..close])
+                .iter()
+                .map(|c| {
+                    let c = trimmed(c);
+                    match c {
+                        [t] if matches!(t.k, IDENT | QUOTED_IDENT) => {
+                            self.target_col_dt(table, &tsql_unquote(&t.s))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+            if !cols.iter().any(|d| matches!(d, Some(Dt::Int | Dt::BigInt))) {
+                return ts;
+            }
+            let mut out = ts[..=values].to_vec();
+            let mut changed = false;
+            let mut i = values + 1;
+            while i < ts.len() {
+                let t = &ts[i];
+                if t.k == L_PAREN {
+                    let Some(r) = matching(&ts, i) else { return ts };
+                    let items = split_commas(&ts[i + 1..r]);
+                    if items.len() != cols.len() {
+                        return ts;
+                    }
+                    out.push(t.clone());
+                    for (k, item) in items.iter().enumerate() {
+                        if k > 0 {
+                            out.push(T::made(
+                                COMMA,
+                                ",",
+                                item.first().map_or(0, |t| t.pos.0),
+                                "tsql.assign.int-trunc",
+                            ));
+                        }
+                        let v = trimmed(item);
+                        if matches!(cols[k], Some(Dt::Int | Dt::BigInt))
+                            && self.expr_dt(v) == Some(Dt::Fraction)
+                        {
+                            self.step_ts("tsql.assign.int-trunc", v);
+                            out.push(T::made(WHITESPACE, " ", at(v), "tsql.assign.int-trunc"));
+                            out.extend(Self::wrap_trunc(v));
+                            changed = true;
+                        } else {
+                            out.extend(item.iter().cloned());
+                        }
+                    }
+                    out.push(ts[r].clone());
+                    i = r + 1;
+                } else if t.k == COMMA || !t.sig() {
+                    out.push(t.clone());
+                    i += 1;
+                } else {
+                    return ts;
+                }
+            }
+            return if changed { out } else { ts };
+        }
+        ts
+    }
+
     fn set(&mut self, ts: &[T]) -> R<String> {
         let ts = Self::body_toks(ts);
         let s = sig(&ts);
@@ -3762,12 +3984,24 @@ impl<'a> Cx<'a> {
             } else {
                 self.expr(&ts[value..]).trim().to_string()
             };
+            // `SET @i = @x * 1.5` into an integer: T-SQL truncates.
+            let fraction = self.expr_dt(&ts[value..]) == Some(Dt::Fraction);
+            let rhs = if op.s == "=" {
+                self.store_int(dt, &ts[value..], rhs)
+            } else {
+                rhs
+            };
             self.step_ts_with("tsql.stmt.set-variable", &ts, op.s.clone());
             // `SET @b += 0x…` on a VARBINARY variable appends bytes.
             let bin_concat =
                 op.s == "+=" && self.is_varbinary_var(&a.s) && self.binary_chain(&ts[value..]);
             if bin_concat {
                 self.binary_concat_note(std::slice::from_ref(op));
+            }
+            let compound_trunc =
+                op.s != "=" && fraction && !self.db2() && matches!(dt, Dt::Int | Dt::BigInt);
+            if compound_trunc {
+                self.step_ts("tsql.assign.int-trunc", &ts[value..]);
             }
             let assign = |v: String| {
                 if self.db2() {
@@ -3784,7 +4018,13 @@ impl<'a> Cx<'a> {
                     } else {
                         op.s[..1].to_string()
                     };
-                    Ok(assign(format!("{target} {o} {rhs}")))
+                    let whole = format!("{target} {o} {rhs}");
+                    let whole = if compound_trunc {
+                        format!("trunc({whole})")
+                    } else {
+                        whole
+                    };
+                    Ok(assign(whole))
                 }
                 _ => no("compound assignment operator"),
             };
@@ -3980,7 +4220,8 @@ impl<'a> Cx<'a> {
                 } else if *bit {
                     self.bit_store_text(init)
                 } else {
-                    self.expr(init).trim().to_string()
+                    let e = self.expr(init).trim().to_string();
+                    self.store_int(*dt, init, e)
                 };
                 self.step_ts_with("tsql.decl.init", init, name.clone());
                 if db2 {
@@ -11114,7 +11355,52 @@ impl Cx<'_> {
                     _ => None,
                 }
             }
-            _ => self.column_dt(ts),
+            _ => self.arith_dt(ts).or_else(|| self.column_dt(ts)),
+        }
+    }
+
+    /// The type of `a op b op c …` with `op` one of `+ - * / %` at the top
+    /// level, when every operand is a number: a fraction if any operand is
+    /// one (decimal, float or a literal with a point), else bigint or int
+    /// (int `/` int stays an int in T-SQL). Money mixed with anything but
+    /// integers, strings, dates and unknown operands give `None`.
+    fn arith_dt(&self, ts: &[T]) -> Option<Dt> {
+        let ts = trimmed(ts);
+        let ds = crate::tok::depths(ts);
+        let mut parts: Vec<&[T]> = Vec::new();
+        let (mut start, mut prev_op) = (0, true);
+        for (i, t) in ts.iter().enumerate() {
+            if !t.sig() {
+                continue;
+            }
+            let op = ds[i] == 0 && t.k == OP && matches!(t.s.as_str(), "+" | "-" | "*" | "/" | "%");
+            if op && !prev_op {
+                parts.push(&ts[start..i]);
+                start = i + 1;
+                prev_op = true;
+            } else {
+                prev_op = op;
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        parts.push(&ts[start..]);
+        let (mut fraction, mut money, mut big) = (false, false, false);
+        for p in parts {
+            match self.expr_dt(p)? {
+                Dt::Int => {}
+                Dt::BigInt => big = true,
+                Dt::Fraction => fraction = true,
+                Dt::Money => money = true,
+                _ => return None,
+            }
+        }
+        match (fraction, money) {
+            (true, false) => Some(Dt::Fraction),
+            (false, true) => Some(Dt::Money),
+            (false, false) => Some(if big { Dt::BigInt } else { Dt::Int }),
+            (true, true) => None,
         }
     }
 
