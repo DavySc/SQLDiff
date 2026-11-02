@@ -4991,6 +4991,7 @@ impl<'a> Cx<'a> {
             vars: vars.clone(),
             stat,
             local,
+            declare_at: Self::range(n),
             open_at: Self::range(open),
             fetch_at: vec![Self::range(first), Self::range(last)],
             loop_at: Self::range(lp),
@@ -5008,6 +5009,32 @@ impl<'a> Cx<'a> {
             .values()
             .find(|p| p.as_ref().is_ok_and(|p| p.loop_at == at))
             .cloned()
+    }
+
+    /// The steps from index `before` on convert the cursor's query, which
+    /// the DECLARE wrote and the OPEN converts: they lie in the DECLARE, not
+    /// in the OPEN's unit, so they move to the DECLARE's unit (to the OPEN's
+    /// place when that unit is gone).
+    fn query_steps_to_declare(&mut self, before: usize, plan: &CursorPlan) {
+        let moved: Vec<crate::Step> = self.trace.drain(before..).collect();
+        let (a, b) = plan.declare_at;
+        for mut st in moved {
+            if st.start < a || st.end > b {
+                (st.start, st.end) = plan.open_at;
+            }
+            match self.decls.iter_mut().find(|d| d.src == plan.declare_at) {
+                Some(d) if st.start >= a && st.end <= b => {
+                    if !d.trace.contains(&st) {
+                        d.trace.push(st);
+                    }
+                }
+                _ => {
+                    if !self.trace.contains(&st) {
+                        self.trace.push(st);
+                    }
+                }
+            }
+        }
     }
 
     /// PostgreSQL: OPEN, FETCH, CLOSE and DEALLOCATE of a converted cursor
@@ -5033,8 +5060,10 @@ impl<'a> Cx<'a> {
         match first {
             "OPEN" if at == plan.open_at => {
                 let outer = std::mem::replace(&mut self.scope, scope_of(&plan.query));
+                let before = self.trace.len();
                 let q = self.select(&plan.query);
                 self.scope = outer;
+                self.query_steps_to_declare(before, &plan);
                 let (q, assigns) = q?;
                 if assigns {
                     return no("cursor query that assigns variables");
@@ -11287,6 +11316,8 @@ struct CursorPlan {
     stat: bool,
     /// LOCAL: T-SQL frees it when the routine ends.
     local: bool,
+    /// The DECLARE statement: the steps that convert `query` belong to it.
+    declare_at: (usize, usize),
     open_at: (usize, usize),
     /// The FETCH before the loop and the one that ends its body.
     fetch_at: Vec<(usize, usize)>,
