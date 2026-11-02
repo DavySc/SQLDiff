@@ -353,7 +353,7 @@ function itemRow(it, group) {
   // What else is open or wrong on it, else why it is here.
   const rest = causes(it).filter((c) => c !== group);
   const what = it.kind === "unit" ? (group === undefined ? causes(it).join(", ") : rest.length ? `also ${rest.join(", ")}` : "") : group === undefined || !rest.length ? it.reason : rest.join(", ");
-  return `<div class="row${S.sel === it.key ? " sel" : ""}" data-key="${esc(it.key)}" role="option">${box}<span class="dot s-${k}" style="background:var(--s-${k})" title="${esc(statusLabel(it.status))}"></span><span class="p" title="${esc(it.path + at)}">${pathHtml(it.path, at)}${flags.join("")}</span>${what ? `<span class="r" title="${esc(it.reason)}">${esc(what)}</span>` : ""}</div>`;
+  return `<div class="row${S.sel === it.key ? " sel" : ""}" data-key="${esc(it.key)}" role="option">${box}<span class="dot s-${k}" style="background:var(--s-${k})" title="${esc(it.impossible ? "not converted: impossible to convert automatically (" + it.impossible + ")" : statusLabel(it.status))}"></span><span class="p" title="${esc(it.path + at)}">${pathHtml(it.path, at)}${flags.join("")}</span>${what ? `<span class="r" title="${esc(it.reason)}">${esc(what)}</span>` : ""}</div>`;
 }
 
 // Why an item is listed, as group keys: what is open on it, else what no
@@ -362,6 +362,7 @@ function itemRow(it, group) {
 // blocker only, the root (a statement not converted is also not compared).
 function causes(it) {
   if (it.kind !== "unit") return it.rules.length ? [...new Set(it.rules)] : [KIND_LABEL[it.kind] || it.kind];
+  if (it.impossible) return ["impossible to convert automatically: " + it.impossible];
   if (it.tier <= 2) return it.blocking && it.blocking.length ? [...new Set(it.blocking)] : [it.tier === 1 ? "rejected in review" : statusLabel(it.status)];
   if (it.tier === 3) return ["written by an agent"];
   if (it.tier === 6) return ["nothing found, not proven"];

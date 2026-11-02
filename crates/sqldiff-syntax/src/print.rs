@@ -56,6 +56,7 @@ fn atom(e: &Expr) -> bool {
         Expr::Name(_)
         | Expr::Var(_)
         | Expr::Str(_)
+        | Expr::Bytes(_)
         | Expr::Null
         | Expr::Star(_)
         | Expr::Call(_)
@@ -163,6 +164,8 @@ impl P {
                 }
             }
             Expr::Str(s) => format!("'{}'", s.replace('\'', "''")),
+            Expr::Bytes(h) => format!("BX'{h}'"),
+            Expr::Duration(x, unit) => format!("{} {unit}", self.operand(x)?),
             Expr::Null => "NULL".into(),
             Expr::Star(None) => "*".into(),
             Expr::Star(Some(q)) => {
