@@ -2886,8 +2886,10 @@ pub fn binary_value(raw: &str) -> PResult<String> {
     let body = raw[q + 1..]
         .strip_suffix('\'')
         .ok_or("unterminated binary literal")?;
-    if body.len() % 2 != 0 || !body.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("BX'…' needs an even number of hex digits".into());
+    // A zero-digit BX'' is not confirmed as valid Db2 for i, so it is refused:
+    // equal to T-SQL 0x would be a claim the reader cannot back.
+    if body.is_empty() || body.len() % 2 != 0 || !body.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("BX'…' needs a non-empty even number of hex digits".into());
     }
     Ok(body.to_ascii_lowercase())
 }
@@ -3086,7 +3088,8 @@ mod tests {
         // BX'…' is a binary constant: hex digits in pairs, read lower case.
         assert_eq!(e("BX'0ABC'", Dialect::Db2i), Ok(Expr::Bytes("0abc".into())));
         assert_eq!(e("bx'FF'", Dialect::Db2i), Ok(Expr::Bytes("ff".into())));
-        assert_eq!(e("BX''", Dialect::Db2i), Ok(Expr::Bytes(String::new())));
+        // An empty BX'' is not confirmed valid Db2 for i: refused, not read as b"".
+        assert!(e("BX''", Dialect::Db2i).is_err());
         // Odd digit count, non-hex digits and a missing close are refused.
         assert!(e("BX'ABC'", Dialect::Db2i).is_err());
         assert!(e("BX'GG'", Dialect::Db2i).is_err());
