@@ -199,6 +199,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.table.column-default` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.column-option-dropped` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.columnstore` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.table.computed-arith` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.computed-column` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.computed-concat` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.computed-iso126` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |

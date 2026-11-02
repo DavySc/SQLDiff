@@ -6347,10 +6347,51 @@ impl<'a> Cx<'a> {
             "computed column: use GENERATED ALWAYS AS (…) STORED after checking the expression";
         let s = sig(it);
         let name = self.expr(&it[s[0]..=s[0]]);
-        let open = next_sig(it, as_at)
-            .filter(|&p| it[p].k == L_PAREN)
-            .ok_or(No(REASON.into()))?;
-        let close = matching(it, open).ok_or(No("unbalanced computed column".into()))?;
+        let first = next_sig(it, as_at).ok_or(No(REASON.into()))?;
+        // `AS expr`: the parentheses are optional in T-SQL; the expression
+        // runs to PERSISTED or the end of the column. Read as `AS (expr)`.
+        let bare;
+        // `AS (a + 1) * b` starts with a parenthesis too: the parenthesised
+        // form ends at the matching one, followed by nothing or PERSISTED.
+        let wrapped = it[first].k == L_PAREN
+            && matching(it, first)
+                .is_some_and(|c| next_sig(it, c).map_or(true, |n| it[n].is("PERSISTED")));
+        let (it, open, close) = if wrapped {
+            let close = matching(it, first).ok_or(No("unbalanced computed column".into()))?;
+            (it, first, close)
+        } else {
+            let mut end = it.len();
+            let mut depth = 0i32;
+            for (k, t) in it.iter().enumerate().skip(first) {
+                match t.k {
+                    L_PAREN => depth += 1,
+                    R_PAREN => depth -= 1,
+                    _ if depth == 0 && t.is("PERSISTED") => {
+                        end = k;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let mut v: Vec<T> = it[..as_at + 1].to_vec();
+            v.push(T::made(
+                L_PAREN,
+                "(",
+                it[as_at].pos.0,
+                "tsql.table.computed-arith",
+            ));
+            v.extend(it[as_at + 1..end].iter().cloned());
+            v.push(T::made(
+                R_PAREN,
+                ")",
+                it[as_at].pos.0,
+                "tsql.table.computed-arith",
+            ));
+            let close = v.len() - 1;
+            v.extend(it[end..].iter().cloned());
+            bare = v;
+            (&bare[..], as_at + 1, close)
+        };
         // After the expression: PERSISTED, then NULL or NOT NULL, and nothing else.
         let after: Vec<&T> = sig(&it[close + 1..])
             .into_iter()
@@ -6381,6 +6422,18 @@ impl<'a> Cx<'a> {
                 "{} {ty} GENERATED ALWAYS AS ({expr}) STORED{}",
                 name.trim(),
                 if not_null { " NOT NULL" } else { "" }
+            ));
+        }
+        if let Some((ty, expr, isnull)) = self.computed_arith(e, it[as_at].pos.0, persisted)? {
+            self.step_ts("tsql.table.computed-arith", &it[as_at..]);
+            self.note(Status::Assumptions, "ASM-COMPUTED-STORED", &format!(
+                "The computed column {0} (arithmetic over columns of the table) becomes a STORED generated column of the type SQL Server derives for it. T-SQL computes a column that is not PERSISTED when the row is read, PostgreSQL when the row is written; integer arithmetic is converted only for PERSISTED columns (SQL Server then raises an overflow error when the row is written, as PostgreSQL does), and decimal arithmetic within 38 digits cannot overflow. Both refuse a value written into it. Not the same: an INSERT without a column list skips the column in T-SQL but not in PostgreSQL (the engine compares no such INSERT), and PostgreSQL accepts the keyword DEFAULT for it.",
+                name.trim(),
+            ));
+            return Ok(format!(
+                "{} {ty} GENERATED ALWAYS AS ({expr}) STORED{}",
+                name.trim(),
+                if not_null || isnull { " NOT NULL" } else { "" }
             ));
         }
         if let Some((ty, expr, json)) = self.computed_iso126(e, it[as_at].pos.0)? {
@@ -6561,6 +6614,165 @@ impl<'a> Cx<'a> {
         ];
         let (ty, _, _) = self.ty(&ty)?;
         Ok(Some((ty, parts.join(" || "))))
+    }
+
+    /// The type words and arguments of a column of the table being
+    /// created, lower-cased (`["decimal", "(", "9", ",", "2", ")"]`).
+    fn column_type_words(&self, t: &T) -> Option<Vec<String>> {
+        let key = tsql_unquote(&t.s).to_ascii_lowercase();
+        let item = self.table_items.iter().find(|item| {
+            let s = sig(item);
+            s.first().is_some_and(|&f| {
+                tsql_unquote(&item[f].s).to_ascii_lowercase() == key && !constraint_item(&item[f])
+            })
+        })?;
+        let s = sig(item);
+        let mut words = vec![tsql_unquote(&item[*s.get(1)?].s).to_ascii_lowercase()];
+        if s.get(2).is_some_and(|&n| item[n].k == L_PAREN) {
+            for &k in &s[2..] {
+                words.push(item[k].s.to_ascii_lowercase());
+                if item[k].k == R_PAREN {
+                    break;
+                }
+            }
+        }
+        Some(words)
+    }
+
+    /// The type of a column of the table being created, when it is an
+    /// integer, `money` or `decimal(p, s)` column.
+    fn column_arith(&self, t: &T) -> Option<Arith> {
+        let w = self.column_type_words(t)?;
+        let w: Vec<&str> = w.iter().map(String::as_str).collect();
+        match w.as_slice() {
+            ["smallint"] => Some(Arith::Int(16)),
+            ["int"] | ["integer"] => Some(Arith::Int(32)),
+            ["bigint"] => Some(Arith::Int(64)),
+            ["decimal" | "numeric", "(", p, ",", s, ")"] => {
+                Some(Arith::Dec(p.parse().ok()?, s.parse().ok()?))
+            }
+            _ => None,
+        }
+    }
+
+    /// The type SQL Server gives an arithmetic computed column (checked in
+    /// `sys.columns`, eval/builtins/2026-11-02-o/computed-types-tsql.out), for
+    /// `+`, `-` and `*` over smallint, int, bigint and decimal columns of the
+    /// table and int literals: the same type for equal integer types, the
+    /// wider integer for different ones, decimal(p, s) by the documented
+    /// rule when it stays within 38 digits. `None` for anything else: money
+    /// (the expression engine has no money type yet), tinyint (T-SQL's
+    /// overflows at 255, PostgreSQL has no such type) and decimal literals.
+    fn arith_type(&self, e: &[T], persisted: bool) -> Option<Arith> {
+        let s = sig(e);
+        let (ty, used) = self.arith_sum(e, &s, 0)?;
+        // Integer arithmetic raises its overflow error when SQL Server
+        // reads a column that is not PERSISTED, but when PostgreSQL's
+        // STORED column is written: only a PERSISTED column converts
+        // (decimal arithmetic within 38 digits cannot overflow).
+        (used == s.len()
+            && !matches!(ty, Arith::Lit(_))
+            && (persisted || !matches!(ty, Arith::Int(_))))
+        .then_some(ty)
+    }
+
+    fn arith_sum(&self, e: &[T], s: &[usize], mut i: usize) -> Option<(Arith, usize)> {
+        let (mut ty, n) = self.arith_product(e, s, i)?;
+        i = n;
+        while i < s.len() && e[s[i]].k == OP && matches!(e[s[i]].s.as_str(), "+" | "-") {
+            let (rhs, n) = self.arith_product(e, s, i + 1)?;
+            ty = Arith::combine(ty, rhs, false)?;
+            i = n;
+        }
+        Some((ty, i))
+    }
+
+    fn arith_product(&self, e: &[T], s: &[usize], mut i: usize) -> Option<(Arith, usize)> {
+        let (mut ty, n) = self.arith_atom(e, s, i)?;
+        i = n;
+        while i < s.len() && e[s[i]].k == OP && e[s[i]].s == "*" {
+            let (rhs, n) = self.arith_atom(e, s, i + 1)?;
+            ty = Arith::combine(ty, rhs, true)?;
+            i = n;
+        }
+        Some((ty, i))
+    }
+
+    fn arith_atom(&self, e: &[T], s: &[usize], i: usize) -> Option<(Arith, usize)> {
+        let t = &e[*s.get(i)?];
+        match t.k {
+            NUMBER => {
+                let v: i64 = t.s.parse().ok()?;
+                (0..=i64::from(i32::MAX))
+                    .contains(&v)
+                    .then(|| (Arith::Lit(v.to_string().len() as u32), i + 1))
+            }
+            IDENT | QUOTED_IDENT if !t.s.starts_with('@') => Some((self.column_arith(t)?, i + 1)),
+            L_PAREN => {
+                let (ty, n) = self.arith_sum(e, s, i + 1)?;
+                (e[*s.get(n)?].k == R_PAREN).then_some((ty, n + 1))
+            }
+            _ => None,
+        }
+    }
+
+    /// `[ISNULL(] arithmetic [, literal)]` over the table's columns: the
+    /// PostgreSQL type and expression of the generated column, and whether
+    /// ISNULL made it NOT NULL (ASM-ISNULL-TYPE: the fallback fits the type
+    /// of the first argument, which is checked here).
+    fn computed_arith(
+        &mut self,
+        e: &[T],
+        at: usize,
+        persisted: bool,
+    ) -> R<Option<(String, String, bool)>> {
+        let es = sig(e);
+        let isnull = es.len() >= 3
+            && e[es[0]].is("ISNULL")
+            && e[es[1]].k == L_PAREN
+            && matching(e, es[1]) == Some(*es.last().unwrap());
+        let (body, fallback) = if isnull {
+            let args = split_commas(&e[es[1] + 1..*es.last().unwrap()]);
+            if args.len() != 2 {
+                return Ok(None);
+            }
+            (args[0], Some(args[1]))
+        } else {
+            (e, None)
+        };
+        let Some(ty) = self.arith_type(body, persisted) else {
+            return Ok(None);
+        };
+        // The expression must do arithmetic, not name one column.
+        if sig(body).len() < 3 && !isnull {
+            return Ok(None);
+        }
+        let mut expr = self.expr(body).trim().to_string();
+        if let Some(fb) = fallback {
+            let fb = trimmed(fb);
+            let fit = match (sig(fb).as_slice(), ty) {
+                ([k], _) if fb[*k].k == NUMBER => ty.holds(&fb[*k].s),
+                _ => false,
+            };
+            if !fit {
+                return no("computed column: the ISNULL fallback is not a number that fits the type of the first argument");
+            }
+            self.note(Status::Assumptions, "ASM-ISNULL-TYPE", "The ISNULL fallback fits the type of the first argument (ISNULL converts to it, COALESCE takes the wider type).");
+            expr = format!("COALESCE({expr}, {})", self.expr(fb).trim());
+        }
+        let made = |k, s: &str| T::made(k, s, at, "tsql.table.computed-arith");
+        let mut tt = vec![made(IDENT, ty.type_name())];
+        if let Arith::Dec(p, s) = ty {
+            tt.extend([
+                made(L_PAREN, "("),
+                made(NUMBER, &p.to_string()),
+                made(COMMA, ","),
+                made(NUMBER, &s.to_string()),
+                made(R_PAREN, ")"),
+            ]);
+        }
+        let (pg, _, _) = self.ty(&tt)?;
+        Ok(Some((pg, expr, isnull)))
     }
 
     /// A varying-string column of the table being created:
@@ -10252,6 +10464,86 @@ fn simple_operand(ts: &[T]) -> bool {
         _ => false,
     }) && !s.is_empty()
         && s.len() % 2 == 1
+}
+
+/// The numeric types an arithmetic computed column is read over.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Arith {
+    /// smallint, int or bigint, by bit width.
+    Int(u8),
+    Dec(u32, u32),
+    /// A bare int literal of this many digits (parenthesised or not): next
+    /// to a decimal it is a decimal(digits, 0), not an int; next to an int
+    /// it is an int (SQL Server 2022, sys.columns).
+    Lit(u32),
+}
+
+impl Arith {
+    fn type_name(self) -> &'static str {
+        match self {
+            Arith::Int(16) => "smallint",
+            Arith::Int(32) => "int",
+            Arith::Int(_) => "bigint",
+            Arith::Dec(..) => "decimal",
+            Arith::Lit(_) => "int",
+        }
+    }
+
+    /// An integer type as the decimal SQL Server converts it to.
+    fn as_dec(self) -> Option<(u32, u32)> {
+        match self {
+            Arith::Int(16) => Some((5, 0)),
+            Arith::Int(32) => Some((10, 0)),
+            Arith::Int(_) => Some((19, 0)),
+            Arith::Dec(p, s) => Some((p, s)),
+            Arith::Lit(d) => Some((d, 0)),
+        }
+    }
+
+    /// The type of `a op b`; `mul` for `*`. `None` where this rule does not
+    /// read it.
+    fn combine(a: Arith, b: Arith, mul: bool) -> Option<Arith> {
+        use Arith::*;
+        match (a, b) {
+            (Lit(_), Lit(_)) => Some(Int(32)),
+            (Lit(_), Int(w)) | (Int(w), Lit(_)) => Some(Int(w.max(32))),
+            (Int(x), Int(y)) => Some(Int(x.max(y))),
+            _ => {
+                let ((p1, s1), (p2, s2)) = (a.as_dec()?, b.as_dec()?);
+                let (p, s) = if mul {
+                    (p1 + p2 + 1, s1 + s2)
+                } else {
+                    let s = s1.max(s2);
+                    ((p1 - s1).max(p2 - s2) + s + 1, s)
+                };
+                (p <= 38).then_some(Dec(p, s))
+            }
+        }
+    }
+
+    /// Whether an unsigned number written as `text` is stored in this
+    /// type without rounding or overflow.
+    fn holds(self, text: &str) -> bool {
+        let (int, frac) = text.split_once('.').unwrap_or((text, ""));
+        if !int.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        let int = int.trim_start_matches('0');
+        match self {
+            Arith::Int(w) => {
+                frac.is_empty()
+                    && int.len() <= 10
+                    && int.parse::<u64>().unwrap_or(0)
+                        <= match w {
+                            16 => 32767,
+                            32 => 2_147_483_647,
+                            _ => 9_223_372_036_854_775_807,
+                        }
+            }
+            Arith::Dec(p, s) => frac.len() as u32 <= s && int.len() as u32 <= p - s,
+            Arith::Lit(_) => false,
+        }
+    }
 }
 
 /// The PostgreSQL to_char format that prints what CONVERT(varchar, x, style)
