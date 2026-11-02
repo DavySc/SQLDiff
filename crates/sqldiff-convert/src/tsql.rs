@@ -5018,21 +5018,18 @@ impl<'a> Cx<'a> {
     fn query_steps_to_declare(&mut self, before: usize, plan: &CursorPlan) {
         let moved: Vec<crate::Step> = self.trace.drain(before..).collect();
         let (a, b) = plan.declare_at;
+        let decl = self.decls.iter().position(|d| d.src == plan.declare_at);
         for mut st in moved {
-            if st.start < a || st.end > b {
-                (st.start, st.end) = plan.open_at;
-            }
-            match self.decls.iter_mut().find(|d| d.src == plan.declare_at) {
-                Some(d) if st.start >= a && st.end <= b => {
-                    if !d.trace.contains(&st) {
-                        d.trace.push(st);
-                    }
-                }
+            let in_decl = st.start >= a && st.end <= b;
+            let target = match decl {
+                Some(i) if in_decl => &mut self.decls[i].trace,
                 _ => {
-                    if !self.trace.contains(&st) {
-                        self.trace.push(st);
-                    }
+                    (st.start, st.end) = plan.open_at;
+                    &mut self.trace
                 }
+            };
+            if !target.contains(&st) {
+                target.push(st);
             }
         }
     }
@@ -5063,10 +5060,17 @@ impl<'a> Cx<'a> {
                 let before = self.trace.len();
                 let q = self.select(&plan.query);
                 self.scope = outer;
-                self.query_steps_to_declare(before, &plan);
                 let (q, assigns) = q?;
                 if assigns {
                     return no("cursor query that assigns variables");
+                }
+                // Only a converted OPEN moves the query's steps: a refused
+                // one (a note says the query is not converted) leaves the
+                // DECLARE's unit as it was and keeps none of them.
+                if self.blocked().is_some() {
+                    self.trace.truncate(before);
+                } else {
+                    self.query_steps_to_declare(before, &plan);
                 }
                 if !plan.stat {
                     self.note(Status::Assumptions, "ASM-CURSOR-SNAPSHOT", "No other session changes the tables the cursor reads while the loop runs: a T-SQL cursor that is not STATIC may see such changes, a PostgreSQL cursor reads the rows as of OPEN.");
