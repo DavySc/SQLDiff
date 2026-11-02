@@ -1160,6 +1160,12 @@ proof = "engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.table.computed-arith"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
 id = "tsql.table.computed-concat"
 kind = "converter"
 proof = "engine"
@@ -1185,6 +1191,12 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
 id = "tsql.table.inline-index"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.assign.int-trunc"
 kind = "converter"
 proof = "engine"
 sites = ["sqldiff-convert/src/tsql.rs"]

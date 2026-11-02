@@ -378,11 +378,15 @@ fn what_the_model_does_not_read_stays_unknown() {
             "collation",
         ),
         (
-            replace(ORDERS_T, "Note NVARCHAR(200) NULL", "Note AS (Amount * 2)"),
+            replace(
+                ORDERS_T,
+                "Note NVARCHAR(200) NULL",
+                "Note AS (Amount * 2.5)",
+            ),
             replace(
                 ORDERS_P,
                 "Note varchar(200) NULL",
-                "Note numeric GENERATED ALWAYS AS (Amount * 2) STORED",
+                "Note numeric GENERATED ALWAYS AS (Amount * 2.5) STORED",
             ),
             "computed column",
         ),
@@ -493,5 +497,56 @@ fn a_default_the_column_converts_is_not_compared() {
             &format!("CREATE TABLE dbo.D (id INT NOT NULL PRIMARY KEY, {t});"),
             &format!("CREATE TABLE D (id integer NOT NULL PRIMARY KEY, {p});"),
         );
+    }
+}
+
+/// Arithmetic computed columns over integer and decimal columns: the type
+/// SQL Server derives is compared with the generated column's declared
+/// type (eval/builtins/2026-11-02-o/computed-types-tsql.out, and
+/// eval/pr-review/2026-11-02-pr254 for literals next to decimals).
+#[test]
+fn arithmetic_computed_columns_take_the_derived_type() {
+    let t = |col: &str| {
+        format!("CREATE TABLE L (A DECIMAL(5,1) NOT NULL, B DECIMAL(8,2) NOT NULL, I INT NOT NULL, S SMALLINT NOT NULL, {col});")
+    };
+    let p = |ty: &str, e: &str, nn: &str| {
+        format!("CREATE TABLE l (a numeric(5,1) NOT NULL, b numeric(8,2) NOT NULL, i integer NOT NULL, s smallint NOT NULL, c {ty} GENERATED ALWAYS AS ({e}) STORED{nn});")
+    };
+    let equal = |r: &sqldiff_core::Report| {
+        matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions)
+    };
+    for (c, ty, e, nn) in [
+        ("C AS A + 1", "numeric(6,1)", "a + 1", ""),
+        ("C AS A * 2", "numeric(7,1)", "a * 2", ""),
+        ("C AS (S + 1) * A", "numeric(16,1)", "(s + 1) * a", ""),
+        ("C AS (1 + 2) * A", "numeric(16,1)", "(1 + 2) * a", ""),
+        ("C AS A * (2)", "numeric(7,1)", "a * (2)", ""),
+        ("C AS B - A", "numeric(10,2)", "b - a", ""),
+        ("C AS (I + A)", "numeric(16,1)", "i + a", ""),
+        (
+            "C AS ISNULL(B - B, 0.00)",
+            "numeric(9,2)",
+            "COALESCE(b - b, 0.00)",
+            " NOT NULL",
+        ),
+        ("C AS (S * S) PERSISTED", "smallint", "s * s", ""),
+        ("C AS (I - S) PERSISTED", "integer", "i - s", ""),
+    ] {
+        let r = run(&t(c), &p(ty, e, nn));
+        assert!(equal(&r), "{c}: {:#?} {:#?}", r.findings, r.unknown_reasons);
+    }
+    // The literal is decimal(digits, 0) next to a decimal: A + 1 is
+    // decimal(6,1), so numeric(5,1) cannot hold it (a wider column is the
+    // accepted ASM-COLUMN-RANGE reading, a narrower one a difference).
+    let r = run(&t("C AS A + 1"), &p("numeric(5,1)", "a + 1", ""));
+    assert!(!equal(&r));
+    // A narrower type is a difference.
+    let r = run(&t("C AS (I - S) PERSISTED"), &p("smallint", "i - s", ""));
+    assert!(!equal(&r));
+    // Integer arithmetic in a column that is not PERSISTED is not read:
+    // SQL Server fails when it is read, PostgreSQL when the row is written.
+    for c in ["C AS (I * I)", "C AS (S * S)", "C AS S + 1"] {
+        let r = run(&t(c), &p("integer", "i * i", ""));
+        assert!(!equal(&r), "{c}");
     }
 }

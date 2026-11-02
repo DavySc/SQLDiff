@@ -451,4 +451,33 @@ fn a_trailing_comma_in_the_column_list_is_dropped() {
         pg("CREATE TABLE [dbo].[C](\n    [ID] int NOT NULL,,\n);\nGO\n").units[0].status,
         Status::NotConverted
     );
+
+/// T-SQL drops the fraction of a number stored in an integer (eval/casts);
+/// PostgreSQL rounds it, so the conversion truncates where the value has one.
+#[test]
+fn fractions_stored_in_integers_are_truncated() {
+    let src = "CREATE TABLE dbo.Cities(CityID int NOT NULL, Pop bigint NULL, Cnt int NOT NULL, Price money NULL);\nGO\nCREATE PROCEDURE dbo.Grow @f decimal(5,2), @i int\nAS\nBEGIN\n    DECLARE @n int = @f * 2;\n    DECLARE @b bigint = 5;\n    UPDATE dbo.Cities SET Pop = Pop * 1.04, Cnt = @i * 2, Price = Pop * 1.5 WHERE CityID = 1;\n    SET @n = @f * 3;\n    SET @n += @f;\n    SET @b = @b * 2;\n    SET @b = (@b + 1) / 2;\n    SELECT @n = Pop * 0.5 FROM dbo.Cities WHERE CityID = 1;\n    INSERT INTO dbo.Cities(CityID, Pop, Cnt) VALUES (2, @f * 100, @i * 2), (3, 7, @i * 1.5);\n    UPDATE dbo.Cities SET Cnt = CAST(Pop * 1.04 AS int) WHERE CityID = 1;\nEND;\nGO\n";
+    let o = pg(src).output;
+    for want in [
+        "v_n integer := trunc(p_f * 2);",
+        "UPDATE Cities SET Pop = trunc(Pop * 1.04), Cnt = p_i * 2, Price = Pop * 1.5 WHERE CityID = 1;",
+        "v_n := trunc(p_f * 3);",
+        "v_n := trunc(v_n + p_f);",
+        "v_b := v_b * 2;",
+        "v_b := (v_b + 1) / 2;",
+        "SELECT trunc(Pop * 0.5) AS sqldiff_c1",
+        "VALUES (2, trunc(p_f * 100), p_i * 2), (3, 7, trunc(p_i * 1.5));",
+        "SET Cnt = CAST(trunc(Pop * 1.04) AS integer)",
+    ] {
+        // DECLARE initialisers are hoisted; only check the ones present.
+        if want.starts_with("v_n integer") {
+            assert!(o.contains("v_n := trunc(p_f * 2);"), "{o}");
+            continue;
+        }
+        assert!(o.contains(want), "missing {want}\n{o}");
+    }
+    // Db2 for i is left as it was: no checked rule for its assignment.
+    let d =
+        db2("CREATE TABLE T(Pop bigint NULL);\nGO\nUPDATE T SET Pop = Pop * 1.04;\nGO\n").output;
+    assert!(!d.to_ascii_lowercase().contains("trunc"), "{d}");
 }
