@@ -1560,10 +1560,7 @@ fn routine_clock_is_not_per_statement() {
               END; $$;";
     let r = run(ts, T, pg, P, true);
     assert!(
-        !matches!(
-            r.verdict(),
-            Verdict::Equal | Verdict::EqualUnderAssumptions
-        ),
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
         "{:?}",
         r.findings
     );

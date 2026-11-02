@@ -3258,9 +3258,7 @@ impl<'a> Canon<'a> {
             // PostgreSQL fixes statement_timestamp() per client message, so inside a
             // routine every statement of one CALL reads the call's start: never the
             // per-statement time T-SQL's SYSDATETIME() gives.
-            (Dialect::Postgres, "statement_timestamp", 0)
-                if self.unit.kind != UnitKind::Script =>
-            {
+            (Dialect::Postgres, "statement_timestamp", 0) if self.unit.kind != UnitKind::Script => {
                 self.time("call")
             }
             (Dialect::Postgres, "statement_timestamp", 0) => self.time("stmt"),
