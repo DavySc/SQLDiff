@@ -1550,6 +1550,10 @@ impl<'a> Canon<'a> {
                 )
             }
             Expr::Num(s) => self.num_lit(s),
+            // Db2 for i `BX'…'` is the same bytes as T-SQL `0x…` above.
+            Expr::Bytes(h) => (n("bytes", vec![a(h.clone())]), None),
+            // Not modelled: a duration is refused, never read as the number.
+            Expr::Duration(..) => return Err("a labeled duration is not modelled".into()),
             Expr::Str(s) => (
                 n("str", vec![a(s.clone())]),
                 Some(Ty {
