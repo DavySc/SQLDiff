@@ -937,7 +937,7 @@ id = "ASM-RETURN-CODE"
 statement = "Callers read a PostgreSQL procedure's return code from its return_code INOUT parameter."
 discharge = "deployment"
 fact = "How callers read the return code."
-sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/call.rs"]
 
 [[assumption]]
 id = "ASM-RETURN-LENGTHS"
