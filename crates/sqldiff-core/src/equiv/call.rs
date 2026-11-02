@@ -1371,6 +1371,55 @@ fn narrower_string(p: &Ty, v: &Ty) -> bool {
     }
 }
 
+/// Whether the PL/pgSQL local `name` is an integer that the routine (or DO
+/// block) only declares and passes as `return_code => name`: nothing reads
+/// it, so the status the callee sets reaches nobody, as in T-SQL.
+fn unread_scratch(u: &Unit, name: &str) -> Result<(), String> {
+    let local = u
+        .locals
+        .iter()
+        .rev()
+        .find(|l| l.name == name)
+        .ok_or_else(|| format!("{name} is not a local variable"))?;
+    let ty = local.decl.as_ref().map(|t| pg_base(&t.name));
+    if ty.as_deref() != Some("int4") {
+        return Err(format!("{name} is not an integer variable"));
+    }
+    let scope = local
+        .node
+        .ancestors()
+        .find(|a| a.kind() == sqldiff_syntax::SyntaxKind::ROUTINE)
+        .or_else(|| local.node.ancestors().last())
+        .ok_or_else(|| "the variable's scope is not known".to_string())?;
+    let toks: Vec<String> = scope
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| !t.kind().is_trivia())
+        .map(|t| t.text().to_ascii_lowercase())
+        .collect();
+    let mut declared = 0;
+    for (i, t) in toks.iter().enumerate() {
+        if t != name {
+            continue;
+        }
+        let passed = (i >= 2 && toks[i - 2] == "return_code" && toks[i - 1] == "=>")
+            || (i >= 3 && toks[i - 3] == "return_code" && toks[i - 2] == "=" && toks[i - 1] == ">");
+        let decl = toks
+            .get(i + 1)
+            .is_some_and(|n| n == "integer" || n == "int")
+            && toks.get(i + 2).is_some_and(|n| n == ";");
+        if decl {
+            declared += 1;
+        } else if !passed {
+            return Err(format!("{name} is used for something besides return_code"));
+        }
+    }
+    if declared != 1 {
+        return Err(format!("{name} is not declared exactly once"));
+    }
+    Ok(())
+}
+
 /// A PostgreSQL value of type `v` passes to a parameter of type `p`
 /// unchanged: an implicit cast that keeps the value (the parameter's own
 /// length, precision and scale are ignored).
@@ -1518,10 +1567,10 @@ fn calls(x: &Call, t: &Side, y: &Call, p: &Side) -> R<Verdict> {
         asms.push(asm::make(asm::DEFAULT_SCHEMA));
     }
     // The conversion of a procedure that returns a status adds a last
-    // `INOUT return_code integer DEFAULT NULL` (ASM-RETURN-CODE). A call
-    // that does not read the status (no `@rc =`, which is not compared at
-    // all) leaves it to its default on both sides, and the status the
-    // procedure sets is then read by nobody.
+    // `INOUT return_code integer DEFAULT NULL` (ASM-RETURN-CODE). A PL/pgSQL
+    // CALL cannot leave an INOUT parameter out ("argument is not writable"),
+    // so a call that does not read the status (no `@rc =`, which is not
+    // compared at all) passes a variable nobody reads, `return_code => v`.
     let extra_return_code = rp.params.len() == rt.params.len() + 1
         && rp.params.last().is_some_and(|q| {
             q.name == "return_code"
@@ -1532,16 +1581,6 @@ fn calls(x: &Call, t: &Side, y: &Call, p: &Side) -> R<Verdict> {
                     .is_some_and(|d| d.trim().eq_ignore_ascii_case("null"))
         });
     if extra_return_code {
-        if y.args
-            .iter()
-            .any(|a| a.name.as_deref() == Some("return_code"))
-            || y.args.len() > rt.params.len()
-        {
-            return Err(format!(
-                "{} passes the return_code parameter, which T-SQL's status does not correspond to",
-                p.name
-            ));
-        }
         // A top-level CALL returns its INOUT parameters, return_code
         // included, to the client as a row; T-SQL's EXEC returns no row.
         if p.unit.kind == super::lower::UnitKind::Script && !p.in_do {
@@ -1550,6 +1589,29 @@ fn calls(x: &Call, t: &Side, y: &Call, p: &Side) -> R<Verdict> {
                 rp.display()
             ));
         }
+        let mut given = y
+            .args
+            .iter()
+            .filter(|a| a.name.as_deref() == Some("return_code"));
+        let (Some(arg), None) = (given.next(), given.next()) else {
+            return Err(format!(
+                "{}: the call leaves out the INOUT parameter return_code, which a CALL inside PL/pgSQL cannot do (\"argument is not writable\"); it must pass a variable",
+                p.name
+            ));
+        };
+        let [v] = arg.value.as_slice() else {
+            return Err(format!(
+                "{}: return_code receives something other than a variable",
+                p.name
+            ));
+        };
+        let name = name_of(v).and_then(|n| key(&n, p.d).ok()).ok_or_else(|| {
+            format!(
+                "{}: return_code receives something other than a variable",
+                p.name
+            )
+        })?;
+        unread_scratch(p.unit, &name).map_err(|why| format!("{}: {why}", p.name))?;
         asms.push(asm::make(asms::RETURN_CODE));
     } else if rt.params.len() != rp.params.len() {
         return Err(format!(
