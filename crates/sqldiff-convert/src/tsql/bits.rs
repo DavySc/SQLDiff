@@ -813,14 +813,17 @@ impl Cx<'_> {
     fn bits_possible(&self) -> bool {
         !self.bit_cols.is_empty()
             || self.vars.values().any(|v| v.dt == Dt::Bit)
-            || self
-                .own_tables
-                .iter()
-                .any(|t| t.columns.iter().any(|c| self.dt_cat(&c.data_type.base, &c.data_type.args) == Dt::Bit))
-            || self.type_catalog().is_some_and(|c| {
-                c.tables
+            || self.own_tables.iter().any(|t| {
+                t.columns
                     .iter()
-                    .any(|t| t.columns.iter().any(|c| self.dt_cat(&c.data_type.base, &c.data_type.args) == Dt::Bit))
+                    .any(|c| self.dt_cat(&c.data_type.base, &c.data_type.args) == Dt::Bit)
+            })
+            || self.type_catalog().is_some_and(|c| {
+                c.tables.iter().any(|t| {
+                    t.columns
+                        .iter()
+                        .any(|c| self.dt_cat(&c.data_type.base, &c.data_type.args) == Dt::Bit)
+                })
             })
     }
 

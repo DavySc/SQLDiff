@@ -5620,7 +5620,9 @@ impl<'a> Cx<'a> {
                                     ty_end += 2;
                                 }
                                 let bit = tsql_unquote(&item[t].s).eq_ignore_ascii_case("bit")
-                                    || self.alias_type(&item[t..=ty_end]).is_some_and(|a| a.dt == Dt::Bit);
+                                    || self
+                                        .alias_type(&item[t..=ty_end])
+                                        .is_some_and(|a| a.dt == Dt::Bit);
                                 (!constraint_item(&item[n]) && bit)
                                     .then(|| tsql_unquote(&item[n].s).to_ascii_lowercase())
                             })
@@ -5852,7 +5854,8 @@ impl<'a> Cx<'a> {
     /// The class of a type written as tokens: an alias type reads as its
     /// base type.
     fn dt_tok(&self, ts: &[T]) -> Dt {
-        self.alias_type(ts).map_or_else(|| Dt::of_tokens(ts), |a| a.dt)
+        self.alias_type(ts)
+            .map_or_else(|| Dt::of_tokens(ts), |a| a.dt)
     }
 
     /// The class of a catalog column type (`base` as the catalog spells it),
@@ -6675,7 +6678,11 @@ impl<'a> Cx<'a> {
             // would replace it with the next value.
             return no(format!("column DEFAULT NEXT VALUE FOR on the nullable column {}: Db2 for i takes no NEXT VALUE in a default, and a trigger cannot tell a NULL written into the column from a column left out", name.trim()));
         }
-        if ty == "boolean" || self.alias_type(&it[ty_at..=ty_end]).is_some_and(|a| a.dt == Dt::Bit) {
+        if ty == "boolean"
+            || self
+                .alias_type(&it[ty_at..=ty_end])
+                .is_some_and(|a| a.dt == Dt::Bit)
+        {
             let b = bits::bool_default(&rest);
             if b != rest {
                 self.step_ts("tsql.bit.boolean-default", it);
