@@ -35,7 +35,7 @@ pub const VARIABLE_RANGE: (&str, &str) = (
 
 pub const VARIABLE_LENGTH: (&str, &str) = (
     "ASM-VARIABLE-LENGTH",
-    "Strings assigned to a T-SQL variable fit its declared length: SQL Server cuts a longer string off silently, PostgreSQL raises an error",
+    "Strings assigned to a T-SQL variable fit its declared length, whether by SET, SELECT or the copy back of a procedure's OUTPUT parameter: SQL Server cuts a longer string off silently, PostgreSQL raises an error",
 );
 
 /// The segments of two scripts, lowered and paired in order. `None` when an

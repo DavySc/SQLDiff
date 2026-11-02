@@ -574,9 +574,7 @@ fn a_traced_call_keeps_its_place_among_the_paired_statements() {
 /// same call.
 #[test]
 fn an_ignored_status_is_the_converters_return_code() {
-    let cat_t = format!(
-        "{CAT_T}\nGO\nCREATE PROCEDURE dbo.Status @a int AS BEGIN RETURN 1; END;"
-    );
+    let cat_t = format!("{CAT_T}\nGO\nCREATE PROCEDURE dbo.Status @a int AS BEGIN RETURN 1; END;");
     let cat_p = |tail: &str| {
         format!(
             "{CAT_P}\nCREATE PROCEDURE Status(p_a integer{tail}) LANGUAGE plpgsql AS $$ BEGIN return_code := 1; END $$;"
@@ -616,4 +614,34 @@ fn an_ignored_status_is_the_converters_return_code() {
         &opts(&cat_t, &good),
         "as a row",
     );
+}
+
+/// An OUTPUT value copied back into a shorter string variable: SQL Server
+/// cuts it off, PostgreSQL raises; equal only under ASM-VARIABLE-LENGTH.
+#[test]
+fn output_into_a_shorter_string_variable() {
+    let t = |ty: &str| {
+        format!("CREATE PROCEDURE dbo.Caller @n nvarchar(50)\nAS\nBEGIN\n    DECLARE @s {ty};\n    EXEC dbo.Fetch 1, @s OUTPUT;\nEND;")
+    };
+    let p = |ty: &str| {
+        format!("CREATE PROCEDURE Caller(p_n varchar(50))\nLANGUAGE plpgsql\nAS $$\nDECLARE\n  v_s {ty};\nBEGIN\n  CALL Fetch(1, v_s);\nEND;\n$$;")
+    };
+    // Fetch's Name is OUT in the PostgreSQL catalog; use INOUT here.
+    let cat_p = CAT_P.replace(
+        "CREATE PROCEDURE Fetch(p_id integer, OUT p_name varchar(50))",
+        "CREATE PROCEDURE Fetch(p_id integer, INOUT p_name varchar(50))",
+    );
+    let o = opts(CAT_T, &cat_p);
+    let r = run_with(&t("nvarchar(30)"), &p("varchar(30)"), &o);
+    assert!(
+        !r.unknown_reasons.iter().any(|x| x.contains("call")),
+        "{:?}",
+        r.unknown_reasons
+    );
+    assert!(asms(&r).contains(&"ASM-VARIABLE-LENGTH"), "{:?}", asms(&r));
+    // Same width: no assumption needed.
+    let r = run_with(&t("nvarchar(50)"), &p("varchar(50)"), &o);
+    assert!(!asms(&r).contains(&"ASM-VARIABLE-LENGTH"), "{:?}", asms(&r));
+    // A non-national variable cannot hold what nvarchar holds: not this.
+    unknown_with(&t("varchar(30)"), &p("varchar(30)"), &o, "copy back");
 }

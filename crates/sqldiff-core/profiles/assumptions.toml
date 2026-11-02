@@ -930,7 +930,7 @@ id = "ASM-RETURN-CODE"
 statement = "Callers read a PostgreSQL procedure's return code from its return_code INOUT parameter."
 discharge = "deployment"
 fact = "How callers read the return code."
-sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/call.rs"]
 
 [[assumption]]
 id = "ASM-RETURN-LENGTHS"
@@ -1478,9 +1478,9 @@ sites = ["sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-VARIABLE-LENGTH"
-statement = "Strings assigned to a T-SQL variable fit its declared length (SQL Server cuts them off, PostgreSQL raises)."
+statement = "Strings assigned to a T-SQL variable fit its declared length, whether by SET, SELECT or the copy back of a procedure's OUTPUT parameter (SQL Server cuts them off, PostgreSQL raises)."
 discharge = "deployment"
-fact = "The data assigned to the variable."
+fact = "The data assigned to the variable, including what a called procedure gives back through an OUTPUT parameter."
 sites = ["sqldiff-core/src/equiv/script.rs"]
 
 [[assumption]]
