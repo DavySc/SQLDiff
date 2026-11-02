@@ -421,6 +421,22 @@ fn extended_properties_become_comments() {
     equal(schema, "COMMENT ON SCHEMA Sales IS 'Sales data';");
 }
 
+/// A bracketed identifier is the name string, positional or named, for
+/// any schema, table, view or column name (spaces included).
+#[test]
+fn extended_properties_with_bracketed_names() {
+    let t = "EXECUTE [sys].[sp_addextendedproperty] N'Description', N'Kept things', N'SCHEMA', [dbo], N'TABLE', [Things], N'COLUMN', [Qty];";
+    equal(t, "COMMENT ON COLUMN public.Things.qty IS 'Kept things';");
+    let named = "EXEC sys.sp_addextendedproperty @name = N'Description', @value = N'Kept things', @level0type = N'SCHEMA', @level0name = [dbo], @level1type = N'VIEW', @level1name = [ThingNames];";
+    equal(named, "COMMENT ON VIEW public.ThingNames IS 'Kept things';");
+    // Another column is a different comment target.
+    unknown(
+        t,
+        "COMMENT ON COLUMN public.Things.name IS 'Kept things';",
+        "no counterpart",
+    );
+}
+
 #[test]
 fn comment_near_misses() {
     let table = "@level1type = N'TABLE', @level1name = N'Things'";

@@ -5087,6 +5087,18 @@ impl<'a> Cx<'a> {
                 [t] if t.k == STRING => {
                     val.insert(key, t.clone());
                 }
+                // A bracketed identifier is the name string: the same
+                // text as the string literal of its unbracketed name.
+                [t] if t.k == QUOTED_IDENT
+                    && t.s.starts_with('[')
+                    && key.starts_with("level")
+                    && key.ends_with("name") =>
+                {
+                    let mut t = t.clone();
+                    t.k = STRING;
+                    t.s = format!("N'{}'", tsql_unquote(&t.s).replace('\'', "''"));
+                    val.insert(key, t);
+                }
                 [t] if t.is("NULL") => {}
                 _ => return no("sp_addextendedproperty with a non-literal argument: no rule yet"),
             }
@@ -5099,14 +5111,32 @@ impl<'a> Cx<'a> {
             .ok_or(No("sp_addextendedproperty without a value".into()))?
             .clone();
         let target = match (kind("level0type"), kind("level1type"), kind("level2type")) {
+            (Some(s), None, None)
+                if s == "SCHEMA"
+                    && text("level0name").is_some_and(|n| n.eq_ignore_ascii_case("dbo")) =>
+            {
+                return no("sp_addextendedproperty on the dbo schema: the conversion drops dbo, so there is no schema to comment on")
+            }
             (Some(s), None, None) if s == "SCHEMA" => {
                 format!("SCHEMA {}", ident("level0name").unwrap_or_default())
             }
             (Some(s), Some(o), l2) if s == "SCHEMA" => {
                 let schema = ident("level0name")
                     .ok_or(No("sp_addextendedproperty without a schema name".into()))?;
+                // `dbo` is dropped as everywhere else (ASM-DBO-SCHEMA).
+                let dbo = text("level0name").is_some_and(|n| n.eq_ignore_ascii_case("dbo"));
+                let prefix = if dbo {
+                    let text = self.pick(
+                        "The dbo schema is dropped: objects are assumed to be found through search_path (usually the public schema).",
+                        "The dbo schema is dropped: objects are assumed to be found through the default schema (CURRENT SCHEMA, or the library list with system naming).",
+                    ).to_string();
+                    self.note(Status::Assumptions, "ASM-DBO-SCHEMA", &text);
+                    String::new()
+                } else {
+                    format!("{schema}.")
+                };
                 let obj = format!(
-                    "{schema}.{}",
+                    "{prefix}{}",
                     ident("level1name")
                         .ok_or(No("sp_addextendedproperty without an object name".into()))?
                 );
@@ -5127,7 +5157,7 @@ impl<'a> Cx<'a> {
                         ))
                     }
                     ("TABLE", Some("INDEX"), Some(i)) if !self.db2() => {
-                        format!("INDEX {schema}.{i}")
+                        format!("INDEX {prefix}{i}")
                     }
                     ("TABLE", Some("CONSTRAINT"), Some(c)) if !self.db2() => {
                         format!("CONSTRAINT {c} ON {obj}")

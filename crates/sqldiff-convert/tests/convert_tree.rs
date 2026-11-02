@@ -101,6 +101,47 @@ fn leftover_source_syntax_found_by_the_output_check_gates_the_unit() {
 }
 
 #[test]
+fn extended_properties_with_bracketed_arguments() {
+    let src = "CREATE SCHEMA [Hr Dept];\nGO\nCREATE TABLE [Hr Dept].[Staff List]([Staff Id] int NOT NULL);\nGO\nEXECUTE [sys].[sp_addextendedproperty] N'MS_Description', N'Who works here', N'SCHEMA', [Hr Dept], N'TABLE', [Staff List], N'COLUMN', [Staff Id];\nGO\nEXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'It''s staff', @level0type = N'SCHEMA', @level0name = [Hr Dept], @level1type = N'TABLE', @level1name = [Staff List];\nGO\n";
+    let c = pg(src);
+    assert!(
+        c.output.contains(
+            "COMMENT ON COLUMN \"Hr Dept\".\"Staff List\".\"Staff Id\" IS 'Who works here';"
+        ),
+        "{}",
+        c.output
+    );
+    assert!(
+        c.output
+            .contains("COMMENT ON TABLE \"Hr Dept\".\"Staff List\" IS 'It''s staff';"),
+        "{}",
+        c.output
+    );
+    for u in c.units.iter().skip(2) {
+        assert_eq!(rules_only(u), Status::Assumptions, "{:?}", u.notes);
+        assert!(has_rule(u, "ASM-EXTPROP-COMMENT"));
+    }
+    // A bracketed identifier is only a name string where a name goes.
+    let v = "EXEC sys.sp_addextendedproperty @name = N'D', @value = [x], @level0type = N'SCHEMA', @level0name = N'S';\n";
+    assert_eq!(pg(v).units[0].status, Status::NotConverted);
+}
+
+#[test]
+fn extended_properties_in_dbo_drop_the_schema() {
+    let src = "EXEC sys.sp_addextendedproperty N'D', N'Build', N'SCHEMA', [dbo], N'TABLE', [Version Info], N'COLUMN', [Version No];\nGO\n";
+    let c = pg(src);
+    assert!(
+        c.output
+            .contains("COMMENT ON COLUMN \"Version Info\".\"Version No\" IS 'Build';"),
+        "{}",
+        c.output
+    );
+    assert!(has_rule(&c.units[0], "ASM-DBO-SCHEMA"));
+    let s = "EXEC sys.sp_addextendedproperty N'D', N'Build', N'SCHEMA', [dbo];\nGO\n";
+    assert_eq!(pg(s).units[0].status, Status::NotConverted);
+}
+
+#[test]
 fn extended_properties_become_comments() {
     let src = "EXECUTE sp_addextendedproperty @name = N'Description', @value = N'It''s a table', @level0type = N'SCHEMA', @level0name = N'Sales', @level1type = N'TABLE', @level1name = N'Orders';\nGO\nEXEC sys.sp_addextendedproperty N'Description', N'Key', N'SCHEMA', N'Sales', N'TABLE', N'Orders', N'COLUMN', N'OrderID';\nGO\n";
     let c = pg(src);

@@ -444,7 +444,8 @@ fn pg_comment(ts: &[Tok]) -> R<Comment> {
     })
 }
 
-/// `sp_addextendedproperty` with string literal arguments.
+/// `sp_addextendedproperty` with string literal arguments, or bracketed
+/// identifiers (read as the name they spell).
 fn extended_property(rest: &[Tok]) -> R<Comment> {
     const NAMES: [&str; 8] = [
         "@name",
@@ -484,6 +485,15 @@ fn extended_property(rest: &[Tok]) -> R<Comment> {
             [t] if t.kind == K::Str => {
                 let narrow = !t.text.starts_with(['N', 'n']);
                 val.insert(key, (string_value(&t.text)?, narrow));
+            }
+            // A bracketed identifier is the name string (AdventureWorks
+            // writes `N'SCHEMA', [Person], N'TABLE', [Address]`).
+            [t] if t.kind == K::Quoted
+                && t.text.starts_with('[')
+                && key.ends_with("name")
+                && key.starts_with("@level") =>
+            {
+                val.insert(key, (cst::unquote(&t.text), false));
             }
             [t] if word(Some(t), "NULL") || word(Some(t), "DEFAULT") => {}
             _ => return Err(format!("{key} is not a string literal")),

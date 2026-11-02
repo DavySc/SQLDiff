@@ -1240,8 +1240,21 @@ fn only_comments_after(side: &Analyzed, node: &SyntaxNode) -> bool {
         })
         .all(|n| {
             n.kind() == sqldiff_syntax::SyntaxKind::STATEMENT
-                && lower::is_comment(&n, side.dialect())
+                && (lower::is_comment(&n, side.dialect()) || leaves_objects_alone(&n))
         })
+}
+
+/// A statement that cannot create, change, drop or rename a table, view,
+/// routine, column or schema, whatever its operands: a session `SET`, a
+/// T-SQL `ALTER DATABASE … SET`/`MODIFY`/`ADD` of database options and
+/// files (it holds no schema object DDL), `USE`.
+fn leaves_objects_alone(n: &SyntaxNode) -> bool {
+    let w = cst::first_words(n, 3);
+    let w: Vec<&str> = w.iter().map(String::as_str).collect();
+    matches!(
+        w.as_slice(),
+        ["USE", ..] | ["SET", ..] | ["ALTER", "DATABASE", ..]
+    )
 }
 
 /// A token made up for a statement built around a table's parts.
