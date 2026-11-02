@@ -5180,6 +5180,7 @@ impl<'a> Cx<'a> {
             }
             "UNIQUE" | "INDEX" | "CLUSTERED" | "NONCLUSTERED" => self.create_index(ts, &w1),
             "SCHEMA" => self.create_schema(&ts),
+            "ROLE" => self.create_role(&ts),
             "SEQUENCE" => self.create_sequence(&ts, s[2..].to_vec()),
             _ => no(format!("CREATE {w1}: no rule yet")),
         }
@@ -5267,6 +5268,30 @@ impl<'a> Cx<'a> {
     /// `CREATE SCHEMA s [AUTHORIZATION owner]`. T-SQL's `dbo` is the
     /// database owner, a principal the target has no counterpart of by that
     /// name: the target schema goes to the user running the script.
+    /// `CREATE ROLE name` becomes `CREATE ROLE name NOLOGIN`: a PostgreSQL
+    /// role has no login of its own unless it is given one (ASM-ROLE-NOLOGIN).
+    /// Options (LOGIN, AUTHORIZATION, …) have no rule yet.
+    fn create_role(&mut self, ts: &[T]) -> R<String> {
+        if self.db2() {
+            return no("CREATE ROLE: Db2 for i has no database roles; no rule");
+        }
+        let s = sig(ts);
+        let body: Vec<usize> = s
+            .iter()
+            .copied()
+            .filter(|&j| ts[j].k != SEMICOLON)
+            .collect();
+        match body.as_slice() {
+            [_, _, name] => {
+                let text = "CREATE ROLE becomes CREATE ROLE … NOLOGIN: the PostgreSQL role has no login, as the SQL Server database role has none, and no other role of that name exists on the target cluster (PostgreSQL roles are cluster-wide).";
+                self.note(Status::Assumptions, "ASM-ROLE-NOLOGIN", text);
+                self.step_ts("tsql.stmt.create-role", &ts[..=*name]);
+                Ok(format!("{} NOLOGIN", self.expr(&ts[..=*name])))
+            }
+            _ => no("CREATE ROLE with options: no rule yet"),
+        }
+    }
+
     fn create_schema(&mut self, ts: &[T]) -> R<String> {
         let s = sig(ts);
         let body: Vec<usize> = s

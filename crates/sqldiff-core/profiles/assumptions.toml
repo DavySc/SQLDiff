@@ -897,6 +897,13 @@ fact = "The converted statement draws the value once (a variable)."
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-ROLE-NOLOGIN"
+statement = "A T-SQL database role is the PostgreSQL role of the same name created NOLOGIN: the role has no login of its own, and no other PostgreSQL role of that name exists on the target cluster."
+discharge = "deployment"
+fact = "The target cluster has no other role of that name (PostgreSQL roles are cluster-wide), and the T-SQL role has no login of its own."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/ddl.rs"]
+
+[[assumption]]
 id = "ASM-RANDOM-FRESH"
 statement = "NEWID() and gen_random_uuid() are the same, and RAND() and random() (both without a seed) are the same: each evaluation draws a fresh value from the same range, and a RAND() is compared only in a statement that evaluates it once."
 discharge = "nothing"

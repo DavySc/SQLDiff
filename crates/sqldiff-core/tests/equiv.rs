@@ -1540,3 +1540,25 @@ fn fresh_draws_pair_in_source_order() {
     );
     assert!(assumption_ids(&r).contains(&"ASM-RANDOM-FRESH"));
 }
+
+/// `CREATE ROLE name` (T-SQL) is equal to `CREATE ROLE name NOLOGIN`
+/// (PostgreSQL, the converted form) under `ASM-ROLE-NOLOGIN`. A PostgreSQL role
+/// that can log in, or a different name, is not equal.
+#[test]
+fn database_roles_are_nologin_roles() {
+    let ts = "CREATE ROLE report_readers;";
+    let r = run(ts, T, "CREATE ROLE report_readers NOLOGIN;", P, false);
+    assert!(
+        matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.findings
+    );
+    assert!(assumption_ids(&r).contains(&"ASM-ROLE-NOLOGIN"));
+
+    let r = run(ts, T, "CREATE ROLE report_readers LOGIN;", P, false);
+    assert!(not_equal(&r), "{:?}", r.findings);
+    assert!(!assumption_ids(&r).contains(&"ASM-ROLE-NOLOGIN"));
+
+    let r = run(ts, T, "CREATE ROLE report_writers NOLOGIN;", P, false);
+    assert!(not_equal(&r), "{:?}", r.findings);
+}
