@@ -5340,7 +5340,7 @@ impl<'a> Cx<'a> {
         // PL/pgSQL CALL cannot leave it out: "argument is not writable"), so
         // pass a variable nobody reads; a top-level CALL takes NULL.
         if !self.db2() && self.callee_returns_status(&raw_name) {
-            let target = if matches!(self.mode, Mode::Proc | Mode::Do) {
+            let target = if matches!(self.mode, Mode::Proc | Mode::Do | Mode::Func) {
                 self.rc_scratch = true;
                 RC_SCRATCH
             } else {
