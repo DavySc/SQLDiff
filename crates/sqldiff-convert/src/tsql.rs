@@ -87,6 +87,7 @@ pub(crate) fn convert(
         wrapper: None,
         autocommit: Vec::new(),
         decls: Vec::new(),
+        rc_scratch: false,
         context: false,
         dynamic: Vec::new(),
         dynamic_from: Vec::new(),
@@ -168,6 +169,9 @@ struct Var {
     /// The T-SQL type, for DATEADD.
     dt: Dt,
 }
+
+/// The variable a CALL passes for a callee's `return_code` it does not read.
+const RC_SCRATCH: &str = "rc_scratch";
 
 /// A hoisted declaration: the DECLARE statement's span and the lines it adds.
 struct Decl {
@@ -257,6 +261,8 @@ struct Cx<'a> {
     /// a COMMIT follows each of them.
     autocommit: Vec<usize>,
     decls: Vec<Decl>,
+    /// A CALL passed `RC_SCRATCH`: the DECLARE section declares it.
+    rc_scratch: bool,
     /// The unit being converted was refused because of where it stands, not
     /// for want of a rule: the idiom rules, which see statements out of
     /// context, must not take it either.
@@ -516,6 +522,7 @@ impl<'a> Cx<'a> {
     fn reset(&mut self) {
         self.vars.clear();
         self.decls.clear();
+        self.rc_scratch = false;
         self.cursors.clear();
         self.loops.clear();
         self.labels = 0;
@@ -585,12 +592,15 @@ impl<'a> Cx<'a> {
             }
             return;
         }
-        if self.decls.is_empty() {
+        if self.decls.is_empty() && !self.rc_scratch {
             return;
         }
         out.push("DECLARE\n");
         for d in std::mem::take(&mut self.decls) {
             out.unit(d.src, INDENT, &d.lines.join("\n"), d.notes, d.trace);
+        }
+        if std::mem::take(&mut self.rc_scratch) {
+            out.lines(INDENT, &format!("{RC_SCRATCH} integer;"));
         }
     }
 
@@ -3709,6 +3719,22 @@ impl<'a> Cx<'a> {
             .any(|k| !k.is_empty() && k.iter().all(|c| cols.contains(&c.to_ascii_lowercase())))
     }
 
+    /// Whether the table is in the catalog and none of `cols` is in any of
+    /// its keys or indexes.
+    fn has_no_indexed_column(&self, name: &[String], cols: &[String]) -> bool {
+        let Some(t) = self.catalog_table(name) else {
+            return false;
+        };
+        t.keys
+            .iter()
+            .map(|k| &k.columns)
+            .chain(t.indexes.iter().map(|i| &i.columns))
+            .all(|k| {
+                !k.iter()
+                    .any(|c| cols.iter().any(|x| x.eq_ignore_ascii_case(c)))
+            })
+    }
+
     fn catalog_table(&self, name: &[String]) -> Option<&sqldiff_core::catalog::Table> {
         use sqldiff_core::catalog::{table_position, Ident};
         let cat = self.type_catalog()?;
@@ -4728,7 +4754,9 @@ impl<'a> Cx<'a> {
     /// (so the variables are not read after the loop before they are set
     /// again). A cursor that is not STATIC may see the loop's own writes in
     /// T-SQL; a PostgreSQL cursor reads the rows as of OPEN, so the loop must
-    /// not write the tables the cursor reads or call procedures.
+    /// not write the tables the cursor reads or call procedures, except for
+    /// changes of the row just fetched by its unique key
+    /// (`equiv::cursor::keyed_writes`, keys checked against the catalog).
     fn cursor_plan(&self, ts: &[T], n: &SyntaxNode) -> Result<CursorPlan, String> {
         let s = sig(ts);
         let raw = tsql_unquote(&ts[s[1]].s);
@@ -4905,6 +4933,7 @@ impl<'a> Cx<'a> {
         }
         if !stat {
             let reads = table_names(&query);
+            let mut conflicts: Vec<(SyntaxNode, String)> = Vec::new();
             for d in body.descendants().filter(|d| d.kind() == STATEMENT) {
                 let w = sig_words(&d);
                 match w.first().map(String::as_str) {
@@ -4914,10 +4943,44 @@ impl<'a> Cx<'a> {
                     Some("INSERT" | "UPDATE" | "DELETE" | "MERGE" | "WITH") => {
                         let names = written_tables(&tokens(&d));
                         if let Some(t) = reads.iter().find(|t| names.contains(t)) {
-                            return Err(format!("the cursor loop writes {t}, which the cursor reads: a T-SQL cursor that is not STATIC may see the change, a PostgreSQL cursor reads the rows as of OPEN; declare it STATIC to convert it"));
+                            conflicts.push((d.clone(), t.clone()));
                         }
                     }
                     _ => {}
+                }
+            }
+            // Allowed only where every such write changes the row just
+            // fetched and no other (`keyed_writes`), on unique keys the
+            // catalog shows.
+            if let Some((_, t)) = conflicts.first() {
+                let refuse = |why: String| {
+                    format!("the cursor loop writes {t}, which the cursor reads: a T-SQL cursor that is not STATIC may see the change, a PostgreSQL cursor reads the rows as of OPEN; declare it STATIC to convert it ({why})")
+                };
+                let Some(Ok((_, _, _, q))) = sqldiff_core::equiv::cursor::tsql_declaration(n)
+                else {
+                    return Err(refuse("the cursor declaration was not read".into()));
+                };
+                let nodes: Vec<&SyntaxNode> = conflicts.iter().map(|(x, _)| x).collect();
+                let targets: Vec<String> = vars.iter().map(|v| format!("@{v}")).collect();
+                let reqs =
+                    sqldiff_core::equiv::cursor::keyed_writes(&q, &nodes, &body, last, &targets)
+                        .map_err(refuse)?;
+                for r in &reqs {
+                    use sqldiff_core::equiv::cursor::KeyKind;
+                    let (ok, need) = match r.kind {
+                        KeyKind::Unique => (self.has_unique_key(&r.table, &r.cols), "unique on"),
+                        KeyKind::Unindexed => (
+                            self.has_no_indexed_column(&r.table, &r.cols),
+                            "free of a key or index on",
+                        ),
+                    };
+                    if !ok {
+                        return Err(refuse(format!(
+                            "the source catalog does not show {} {need} ({})",
+                            r.table.join("."),
+                            r.cols.join(", ")
+                        )));
+                    }
                 }
             }
         }
@@ -5273,6 +5336,18 @@ impl<'a> Cx<'a> {
                 ));
             }
         }
+        // A callee that returns a status got a last INOUT return_code (a
+        // PL/pgSQL CALL cannot leave it out: "argument is not writable"), so
+        // pass a variable nobody reads; a top-level CALL takes NULL.
+        if !self.db2() && self.callee_returns_status(&raw_name) {
+            let target = if matches!(self.mode, Mode::Proc | Mode::Do | Mode::Func) {
+                self.rc_scratch = true;
+                RC_SCRATCH
+            } else {
+                "NULL"
+            };
+            args.push(format!("return_code => {target}"));
+        }
         self.step_ts("tsql.stmt.exec", &ts);
         Ok(format!("CALL {name}({})", args.join(", ")))
     }
@@ -5280,7 +5355,21 @@ impl<'a> Cx<'a> {
     /// The procedure `name` (as written, possibly qualified) in the source
     /// catalog, when exactly one matches. `dbo` and no schema are the same.
     fn callee(&self, name: &str) -> Option<&'a sqldiff_core::catalog::Routine> {
-        let cat = self.catalog?;
+        Self::routine_in(self.catalog?, name)
+    }
+
+    /// Whether the procedure `name` returns a status: it gets a `return_code`.
+    /// Known from the tree's catalog, or else from this input's own routines.
+    fn callee_returns_status(&self, name: &str) -> bool {
+        self.type_catalog()
+            .and_then(|c| Self::routine_in(c, name))
+            .is_some_and(|r| r.returns_status)
+    }
+
+    fn routine_in<'c>(
+        cat: &'c sqldiff_core::catalog::Catalog,
+        name: &str,
+    ) -> Option<&'c sqldiff_core::catalog::Routine> {
         let parts: Vec<String> = name.split('.').map(tsql_unquote).collect();
         let (schema, proc) = match parts.as_slice() {
             [p] => (None, p.clone()),
@@ -5338,6 +5427,18 @@ impl<'a> Cx<'a> {
                 [t] if t.k == STRING => {
                     val.insert(key, t.clone());
                 }
+                // A bracketed identifier is the name string: the same
+                // text as the string literal of its unbracketed name.
+                [t] if t.k == QUOTED_IDENT
+                    && t.s.starts_with('[')
+                    && key.starts_with("level")
+                    && key.ends_with("name") =>
+                {
+                    let mut t = t.clone();
+                    t.k = STRING;
+                    t.s = format!("N'{}'", tsql_unquote(&t.s).replace('\'', "''"));
+                    val.insert(key, t);
+                }
                 [t] if t.is("NULL") => {}
                 _ => return no("sp_addextendedproperty with a non-literal argument: no rule yet"),
             }
@@ -5350,14 +5451,32 @@ impl<'a> Cx<'a> {
             .ok_or(No("sp_addextendedproperty without a value".into()))?
             .clone();
         let target = match (kind("level0type"), kind("level1type"), kind("level2type")) {
+            (Some(s), None, None)
+                if s == "SCHEMA"
+                    && text("level0name").is_some_and(|n| n.eq_ignore_ascii_case("dbo")) =>
+            {
+                return no("sp_addextendedproperty on the dbo schema: the conversion drops dbo, so there is no schema to comment on")
+            }
             (Some(s), None, None) if s == "SCHEMA" => {
                 format!("SCHEMA {}", ident("level0name").unwrap_or_default())
             }
             (Some(s), Some(o), l2) if s == "SCHEMA" => {
                 let schema = ident("level0name")
                     .ok_or(No("sp_addextendedproperty without a schema name".into()))?;
+                // `dbo` is dropped as everywhere else (ASM-DBO-SCHEMA).
+                let dbo = text("level0name").is_some_and(|n| n.eq_ignore_ascii_case("dbo"));
+                let prefix = if dbo {
+                    let text = self.pick(
+                        "The dbo schema is dropped: objects are assumed to be found through search_path (usually the public schema).",
+                        "The dbo schema is dropped: objects are assumed to be found through the default schema (CURRENT SCHEMA, or the library list with system naming).",
+                    ).to_string();
+                    self.note(Status::Assumptions, "ASM-DBO-SCHEMA", &text);
+                    String::new()
+                } else {
+                    format!("{schema}.")
+                };
                 let obj = format!(
-                    "{schema}.{}",
+                    "{prefix}{}",
                     ident("level1name")
                         .ok_or(No("sp_addextendedproperty without an object name".into()))?
                 );
@@ -5378,7 +5497,7 @@ impl<'a> Cx<'a> {
                         ))
                     }
                     ("TABLE", Some("INDEX"), Some(i)) if !self.db2() => {
-                        format!("INDEX {schema}.{i}")
+                        format!("INDEX {prefix}{i}")
                     }
                     ("TABLE", Some("CONSTRAINT"), Some(c)) if !self.db2() => {
                         format!("CONSTRAINT {c} ON {obj}")

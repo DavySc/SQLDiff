@@ -1691,12 +1691,19 @@ impl<'a> Binder<'a> {
             if item.is_empty() {
                 continue;
             }
+            // A lone bracketed identifier is the name string, never a column
+            // (`EXEC sp_addextendedproperty …, N'SCHEMA', [Person]`).
+            let name_string = |v: &[Tok]| matches!(v, [x] if x.kind == SyntaxKind::QUOTED_IDENT && x.text.starts_with('['));
             if item.len() >= 2 && item[0].is(SyntaxKind::VARIABLE) && item[1].is_op("=") {
                 args.push(CallArg::Named(item[0].text.clone()));
-                self.analyze(&item[2..], stmt);
+                if !name_string(&item[2..]) {
+                    self.analyze(&item[2..], stmt);
+                }
             } else {
                 args.push(CallArg::Positional);
-                self.analyze(&item, stmt);
+                if !name_string(&item) {
+                    self.analyze(&item, stmt);
+                }
             }
         }
         args
