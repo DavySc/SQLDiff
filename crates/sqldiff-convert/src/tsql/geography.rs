@@ -96,6 +96,77 @@ impl Cx<'_> {
     }
 }
 
+impl Cx<'_> {
+    /// T-SQL `geography::Method(args)` at `ts[i]`, a static method of a CLR
+    /// type (also `geometry::` and `hierarchyid::`): the text it becomes and
+    /// the index after its closing parenthesis. Two methods have a rule for
+    /// PostgreSQL, both only with SRID 4326:
+    ///
+    /// - `geography::STGeomFromWKB(wkb, 4326)` becomes
+    ///   `ST_GeomFromWKB(wkb, 4326)::geography`;
+    /// - `geography::Point(lat, lon, 4326)` becomes
+    ///   `ST_SetSRID(ST_MakePoint(lon, lat), 4326)::geography` (PostGIS takes
+    ///   the longitude first).
+    ///
+    /// The conversion is exact only for a constant both engines read alike
+    /// (`sqldiff_core::equiv::geography`): SQL Server raises on a latitude
+    /// beyond ±90, NaN or trailing bytes where PostGIS moves the value into
+    /// range or accepts it, so the engine shows these equal only for such
+    /// constants and every other call stays unproven. Every other static
+    /// method, and every method on Db2 for i, is refused with the method
+    /// named instead of leaving `type::Method` in the output.
+    pub(super) fn geography_static(&mut self, ts: &[T], i: usize) -> Option<(String, usize)> {
+        if !(ts[i].k == IDENT
+            && ["GEOGRAPHY", "GEOMETRY", "HIERARCHYID"]
+                .iter()
+                .any(|t| ts[i].is(t)))
+        {
+            return None;
+        }
+        let colons = next_sig(ts, i).filter(|&c| ts[c].k == OP && ts[c].s == "::")?;
+        let method = next_sig(ts, colons).filter(|&m| ts[m].k == IDENT)?;
+        let open = next_sig(ts, method).filter(|&o| ts[o].k == L_PAREN)?;
+        let close = matching(ts, open)?;
+        let ty = ts[i].s.to_ascii_lowercase();
+        let name = ts[method].s.to_ascii_lowercase();
+        let args = split_commas(&ts[open + 1..close]);
+        let is_srid =
+            |a: &[T]| matches!(sig(a).as_slice(), [k] if a[*k].k == NUMBER && a[*k].s == "4326");
+        let text = match (self.to, ty.as_str(), name.as_str(), args.len()) {
+            (Dialect::Postgres, "geography", "stgeomfromwkb", 2) if is_srid(args[1]) => {
+                let wkb = self.expr(args[0]).trim().to_string();
+                self.step_ts("tsql.geography.from-wkb", &ts[i..=close]);
+                format!("ST_GeomFromWKB({wkb}, 4326)::geography")
+            }
+            (Dialect::Postgres, "geography", "point", 3) if is_srid(args[2]) => {
+                let lat = self.expr(args[0]).trim().to_string();
+                let lon = self.expr(args[1]).trim().to_string();
+                self.step_ts("tsql.geography.point", &ts[i..=close]);
+                format!("ST_SetSRID(ST_MakePoint({lon}, {lat}), 4326)::geography")
+            }
+            _ => {
+                let why = if self.db2() {
+                    format!("{ty}::{} is a SQL Server CLR type method; Db2 for i has no spatial type in this conversion.", ts[method].s)
+                } else if matches!(name.as_str(), "stgeomfromwkb" | "point") && ty == "geography" {
+                    format!("geography::{} is converted only with the SRID 4326 written as a number: PostGIS reads other SRIDs through its own table, which was not checked.", ts[method].s)
+                } else {
+                    format!("{ty}::{} is a SQL Server CLR type method; no rule yet (PostGIS functions differ in validation and argument order, so each method needs its own checked rule).", ts[method].s)
+                };
+                self.note(Status::NotConverted, "tsql.geography.static-method", &why);
+                return Some((self.source(&ts[i..=close]), close + 1));
+            }
+        };
+        if !self.db2() {
+            self.note(
+                Status::Assumptions,
+                "ASM-POSTGIS-GEOGRAPHY",
+                "GEOGRAPHY becomes PostGIS geography: the database has the postgis extension and its types are on the search path.",
+            );
+        }
+        Some((text, close + 1))
+    }
+}
+
 /// A catalog type that is SQL Server's geography (`[sys].[geography]` too).
 fn is_geography(base: &str) -> bool {
     let b = base.replace(['[', ']'], "").replace(" . ", ".");

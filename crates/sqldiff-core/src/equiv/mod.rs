@@ -17,6 +17,8 @@ pub mod dynamic;
 pub mod edit;
 pub mod eval;
 pub mod geography;
+mod geography_area;
+mod known_bytes;
 pub mod like;
 pub mod literal;
 pub mod lower;
@@ -107,6 +109,7 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Ite
         }
         let Some((at, s)) = stmts.next() else { break };
         c.reset();
+        c.known_bytes = known_wkb_args(unit, s);
         let mut nodes = vec![s.node.clone()];
         let res = match (&s.msg, &s.ast) {
             // A statement of a cursor loop.
@@ -169,6 +172,41 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Ite
     }
     c.reset();
     c.lift(out)
+}
+
+/// The binary variables a statement passes to a geography-from-WKB call, with
+/// the bytes the code before the statement fixes them to
+/// ([`known_bytes::before`]); the others are left out.
+fn known_wkb_args(unit: &Unit, s: &lower::LStmt) -> Vec<(String, String)> {
+    let mentions_wkb = s
+        .toks
+        .iter()
+        .any(|t| matches!(t.up.as_str(), "STGEOMFROMWKB" | "ST_GEOMFROMWKB"));
+    if !mentions_wkb {
+        return Vec::new();
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    for t in &s.toks {
+        let name = match (unit.dialect, t.kind) {
+            (Dialect::Tsql, ast::K::Var) if !t.text.starts_with("@@") => t.text[1..].to_lowercase(),
+            (Dialect::Postgres, ast::K::Word)
+                if unit
+                    .locals
+                    .iter()
+                    .any(|l| l.name.eq_ignore_ascii_case(&t.text)) =>
+            {
+                t.text.to_lowercase()
+            }
+            _ => continue,
+        };
+        if out.iter().any(|(n, _)| *n == name) {
+            continue;
+        }
+        if let Ok(hex) = known_bytes::before(&s.node, &name, unit.dialect) {
+            out.push((name, hex));
+        }
+    }
+    out
 }
 
 /// The item of an IF or loop marker (`lower::CtlKind`): `ctl-if(cond)`,

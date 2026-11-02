@@ -392,6 +392,10 @@ pub struct Canon<'a> {
     /// PostgreSQL compared with T-SQL: quoted names may fold to lower case
     /// (see `stmt`).
     pub fold_quoted: bool,
+    /// Binary variables the statement passes to a geography-from-WKB call
+    /// with the bytes the code before it fixes them to (lower-case name,
+    /// lower-case hex): see `known_bytes`.
+    pub known_bytes: Vec<(String, String)>,
     /// The expression's value is stored in a column of the declared type
     /// (a computed or generated column), so T-SQL's money range errors fall
     /// under ASM-COLUMN-RANGE (see `money_arith`).
@@ -772,6 +776,7 @@ impl<'a> Canon<'a> {
             rec_bounds: Vec::new(),
             by_name: false,
             fold_quoted: false,
+            known_bytes: Vec::new(),
             stored_values: false,
             other: None,
             names: Vec::new(),
@@ -807,6 +812,104 @@ impl<'a> Canon<'a> {
             (Dialect::Postgres, "str") => g::from_ewkb(&g::unhex(text)?),
             _ => None,
         }
+    }
+
+    /// The constant term of a geography point: its coordinates as bits.
+    fn geog_term(p: &super::geography::Point) -> Term {
+        let bits = |f: Option<f64>| a(f.map_or("-".into(), |f| format!("{:016x}", f.to_bits())));
+        n(
+            "geog",
+            vec![
+                a(p.srid.to_string()),
+                bits(Some(p.x)),
+                bits(Some(p.y)),
+                bits(p.z),
+                bits(p.m),
+            ],
+        )
+    }
+
+    /// The geography calls with a constant value: T-SQL
+    /// `geography::STGeomFromWKB(wkb, 4326)` and `geography::Point(lat, lon,
+    /// 4326)` against PostGIS `ST_GeomFromWKB(wkb, 4326)` and
+    /// `ST_SetSRID(ST_MakePoint(lon, lat), 4326)`, which the cast to
+    /// geography then completes. Equal only where the arguments are
+    /// constants both engines read to the same value
+    /// ([`super::geography::wkb`]); every other call keeps its dialect's
+    /// marker, because SQL Server raises on input PostGIS moves into range
+    /// or accepts (latitude beyond ±90, NaN, trailing bytes).
+    fn geography_call(&mut self, c: &Call, name: &str) -> R<Option<(Term, Option<Ty>)>> {
+        use super::geography as g;
+        let tsql_wkb = self.d == Dialect::Tsql && name == "geography::stgeomfromwkb";
+        let tsql_point = self.d == Dialect::Tsql && name == "geography::point";
+        let pg_wkb = self.d == Dialect::Postgres && name == "st_geomfromwkb";
+        let pg_srid = self.d == Dialect::Postgres && name == "st_setsrid";
+        if c.name.len() != 1 || !(tsql_wkb || tsql_point || pg_wkb || pg_srid) {
+            return Ok(None);
+        }
+        let srid_4326 = |e: Option<&Expr>| matches!(e, Some(Expr::Num(s)) if s == "4326");
+        let value: Option<Term> = if tsql_wkb || pg_wkb {
+            let known = |x: &Expr| -> Option<Term> {
+                let v = match x {
+                    Expr::Var(v) => v.trim_start_matches('@').to_lowercase(),
+                    Expr::Name(p) if p.len() == 1 => p[0].to_lowercase(),
+                    _ => return None,
+                };
+                let (_, hex) = self.known_bytes.iter().find(|(k, _)| *k == v)?;
+                Some(n("bytes", vec![a(hex.clone())]))
+            };
+            let (bytes, _) = match c.args.first() {
+                Some(x) if c.args.len() == 2 && srid_4326(c.args.get(1)) => match known(x) {
+                    Some(t) => (t, None),
+                    None => self.expr(x)?,
+                },
+                _ => (n("none", vec![]), None),
+            };
+            match (bytes.kid(0).and_then(Term::atom), bytes.is("bytes")) {
+                (Some(h), true) => match g::unhex(h).and_then(|b| g::wkb(&b)) {
+                    Some(g::Wkb::Point(p)) => Some(Self::geog_term(&p)),
+                    Some(g::Wkb::Shape(h)) => Some(n("geog-wkb", vec![a(h)])),
+                    None => None,
+                },
+                _ => None,
+            }
+        } else if tsql_point {
+            // Point(lat, lon, srid)
+            match c.args.as_slice() {
+                [la, lo, sr] if srid_4326(Some(sr)) => {
+                    g::point_of(la, lo).map(|p| Self::geog_term(&p))
+                }
+                _ => None,
+            }
+        } else if pg_srid {
+            // ST_SetSRID(ST_MakePoint(lon, lat), 4326)
+            match c.args.as_slice() {
+                [Expr::Call(mk), sr]
+                    if srid_4326(Some(sr))
+                        && mk.name.len() == 1
+                        && lc(&mk.name[0]) == "st_makepoint"
+                        && mk.args.len() == 2 =>
+                {
+                    g::point_of(&mk.args[1], &mk.args[0]).map(|p| Self::geog_term(&p))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(v) = value {
+            return Ok(Some(if self.d == Dialect::Tsql {
+                (v, Some(Ty::of(Fam::Geography)))
+            } else {
+                (n("geom-of", vec![v]), None)
+            }));
+        }
+        let mut args = vec![self.dtag(), a(name)];
+        for x in &c.args {
+            args.push(self.expr(x)?.0);
+        }
+        let ty = (self.d == Dialect::Tsql).then(|| Ty::of(Fam::Geography));
+        Ok(Some((n("dfn", args), ty)))
     }
 
     /// SQL Server cannot compare geography, text, ntext, image or xml values
@@ -2283,21 +2386,14 @@ impl<'a> Canon<'a> {
             // A point constant both read alike: SQL Server's binary form,
             // PostGIS's hex EWKB text (super::geography has the runs).
             if let Some(p) = self.geog_point(&v.0) {
-                let bits =
-                    |f: Option<f64>| a(f.map_or("-".into(), |f| format!("{:016x}", f.to_bits())));
-                return (
-                    n(
-                        "geog",
-                        vec![
-                            a(p.srid.to_string()),
-                            bits(Some(p.x)),
-                            bits(Some(p.y)),
-                            bits(p.z),
-                            bits(p.m),
-                        ],
-                    ),
-                    to,
-                );
+                return (Self::geog_term(&p), to);
+            }
+            // PostGIS `ST_GeomFromWKB(…)::geography`, already read as the
+            // value both dialects keep (see `geography_call`).
+            if v.0.is("geom-of") {
+                if let Some(inner) = v.0.kid(0) {
+                    return (inner.clone(), to);
+                }
             }
             return (
                 n(
@@ -2605,6 +2701,9 @@ impl<'a> Canon<'a> {
             }
         }
         let name = lc(c.name.last().map(String::as_str).unwrap_or(""));
+        if let Some(t) = self.geography_call(c, &name)? {
+            return Ok(t);
+        }
         // A qualified name is a user function, even `dbo.max`: T-SQL calls a
         // built-in unqualified only.
         if c.name.len() > 1 {
@@ -3948,6 +4047,22 @@ impl<'a> Canon<'a> {
             return (n("dfn", vec![a("tsql"), a("+"), lt, rt]), None);
         }
         let len = if self.d == Dialect::Tsql { len } else { None };
+        // Two constants join into one: a geography built from a long binary
+        // assembled in pieces (`SET @b += 0x…`) is then read as a whole.
+        if let (true, Some(l), Some(r)) = (
+            lt.is("bytes") && rt.is("bytes"),
+            lt.kid(0).and_then(Term::atom),
+            rt.kid(0).and_then(Term::atom),
+        ) {
+            return (
+                n("bytes", vec![a(format!("{l}{r}"))]),
+                Some(Ty {
+                    fam: Fam::Binary,
+                    len,
+                    scale: None,
+                }),
+            );
+        }
         (
             n("concat-bin", vec![lt, rt]),
             Some(Ty {

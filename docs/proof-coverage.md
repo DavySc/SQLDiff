@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 191 | 35 (18%) | 6 (3%) | 150 (79%) |
+| `converter` | 194 | 35 (18%) | 6 (3%) | 153 (79%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 220 | 38 (17%) | 8 (4%) | 174 (79%) |
+| **All** | 223 | 38 (17%) | 8 (4%) | 177 (79%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -133,7 +133,10 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.func.isnull` | `converter` | lemma: `Sqldiff.Mirror/C2a operators/ISNULL` | int arguments (C2a), or a string variable or parameter with a fallback that fits it (C2b strings/ISNULL); other types engine (ASM-ISNULL-TYPE) | `sqldiff-convert/src/tsql.rs` |
 | `tsql.func.len` | `converter` | lemma: `Sqldiff.Mirror/C2b strings/LEN` | `LEN(x)` against `length(rtrim(x))` on a string variable, parameter or literal of the slice (ASM-TSQL-LEN-BMP) | `sqldiff-convert/src/tsql.rs` |
 | `tsql.func.string_agg` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.geography.from-wkb` | `converter` | engine | geography::STGeomFromWKB(wkb, 4326) to ST_GeomFromWKB(wkb, 4326)::geography; the engine shows it equal for a constant WKB both engines read alike (equiv/geography.rs, eval/geography/2026-11-02) | `sqldiff-convert/src/tsql/geography.rs` |
+| `tsql.geography.point` | `converter` | engine | geography::Point(lat, lon, 4326) to ST_SetSRID(ST_MakePoint(lon, lat), 4326)::geography for decimal literal coordinates inside ±90 / ±180 | `sqldiff-convert/src/tsql/geography.rs` |
 | `tsql.geography.point-constant` | `converter` | engine | SQL Server point bytes to PostGIS EWKB; eval/geography shows the doubles bit-identical | `sqldiff-convert/src/tsql/geography.rs` |
+| `tsql.geography.static-method` | `converter` | engine | a CLR static method with no checked rule (and any on Db2 for i) is refused with the method named; no type::Method text reaches the output | `sqldiff-convert/src/tsql/geography.rs` |
 | `tsql.global-temp` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.index.clustered` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.index.nulls-not-distinct` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |

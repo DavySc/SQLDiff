@@ -1048,6 +1048,22 @@ impl<'a> Parser<'a> {
     fn postfix(&mut self) -> PResult<Expr> {
         let mut e = self.primary()?;
         loop {
+            // T-SQL `geography::Point(…)`: a static method of a CLR type, read
+            // as a call named `geography::Point`. Only the call form is read.
+            if let (Dialect::Tsql, Expr::Name(n)) = (self.d, &e) {
+                if let [ty] = n.as_slice() {
+                    if self.is_op("::")
+                        && self.peek_at(1).is_some_and(|t| t.kind == K::Word)
+                        && self.is_kind_at(2, K::LParen)
+                    {
+                        let ty = ty.clone();
+                        self.i += 1;
+                        let method = self.any_ident()?;
+                        e = self.call(vec![format!("{ty}::{method}")])?;
+                        continue;
+                    }
+                }
+            }
             if self.eat_op("::") {
                 let ty = self.ty()?;
                 e = Expr::Cast(Box::new(e), ty);
