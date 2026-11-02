@@ -1,0 +1,6 @@
+probe visited
+----- -------
+key-moved 1,2,3,101,102,103,
+probe visited
+----- -------
+non-key 1,2,3,

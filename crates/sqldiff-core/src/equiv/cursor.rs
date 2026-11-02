@@ -82,6 +82,20 @@ pub struct KeyReq {
     pub table: Vec<String>,
     /// Column names, lower case.
     pub cols: Vec<String>,
+    /// What the catalog must show of `cols`.
+    pub kind: KeyKind,
+}
+
+/// What a `KeyReq` asks of the catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum KeyKind {
+    /// Some unique key (primary key, UNIQUE constraint or unique index) has
+    /// all its columns among `cols`.
+    Unique,
+    /// None of `cols` is in any key or index of the table: a write that
+    /// sets such a column can move the row in the index a cursor scans, and
+    /// a cursor that is not STATIC then meets the row again.
+    Unindexed,
 }
 
 /// A statement of a cursor loop, compared as `Canon::cursor_op` says.
@@ -833,7 +847,7 @@ pub fn keyed_writes(
             }
         }
     }
-    reqs.sort_by(|a, b| (&a.table, &a.cols).cmp(&(&b.table, &b.cols)));
+    reqs.sort_by(|a, b| (&a.table, &a.cols, a.kind).cmp(&(&b.table, &b.cols, b.kind)));
     reqs.dedup();
     Ok(reqs)
 }
@@ -1030,7 +1044,11 @@ fn scan_query(q: &[Tok], targets: &[String]) -> Result<Scan, String> {
         }
         cols.sort();
         cols.dedup();
-        joins.push(KeyReq { table: jt, cols });
+        joins.push(KeyReq {
+            table: jt,
+            cols,
+            kind: KeyKind::Unique,
+        });
         seen.push(jname);
     }
     if q.get(i).is_some_and(|t| {
@@ -1072,6 +1090,7 @@ fn scan_query(q: &[Tok], targets: &[String]) -> Result<Scan, String> {
 }
 
 fn keyed_write(x: &SyntaxNode, sc: &Scan) -> Result<(Vec<KeyReq>, Vec<String>), String> {
+    let mut set_cols: Vec<String> = Vec::new();
     let ts = words(x);
     let w0 = ts.first().map(|t| t.up.as_str()).unwrap_or("");
     let upd = w0 == "UPDATE";
@@ -1130,6 +1149,9 @@ fn keyed_write(x: &SyntaxNode, sc: &Scan) -> Result<(Vec<KeyReq>, Vec<String>), 
                 }
                 _ => {}
             }
+            if item_start && d == 0 && t.kind == K::Var {
+                return Err("the write assigns a variable (UPDATE … SET @v = …)".into());
+            }
             if item_start && d == 0 && matches!(t.kind, K::Word | K::Quoted) {
                 let c = lc(t);
                 if sc.outside.contains(&c) {
@@ -1137,6 +1159,7 @@ fn keyed_write(x: &SyntaxNode, sc: &Scan) -> Result<(Vec<KeyReq>, Vec<String>), 
                         "the write sets {c}, which the cursor query uses outside its select list"
                     ));
                 }
+                set_cols.push(c);
             }
             // `t.col = …`: the column follows the dot.
             item_start = t.kind == K::Dot;
@@ -1197,11 +1220,19 @@ fn keyed_write(x: &SyntaxNode, sc: &Scan) -> Result<(Vec<KeyReq>, Vec<String>), 
     }
     cols.sort();
     cols.dedup();
-    Ok((
-        vec![KeyReq {
+    let mut reqs = vec![KeyReq {
+        table: sc.base.clone(),
+        cols,
+        kind: KeyKind::Unique,
+    }];
+    if !set_cols.is_empty() {
+        set_cols.sort();
+        set_cols.dedup();
+        reqs.push(KeyReq {
             table: sc.base.clone(),
-            cols,
-        }],
-        vars,
-    ))
+            cols: set_cols,
+            kind: KeyKind::Unindexed,
+        });
+    }
+    Ok((reqs, vars))
 }

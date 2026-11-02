@@ -3693,6 +3693,22 @@ impl<'a> Cx<'a> {
             .any(|k| !k.is_empty() && k.iter().all(|c| cols.contains(&c.to_ascii_lowercase())))
     }
 
+    /// Whether the table is in the catalog and none of `cols` is in any of
+    /// its keys or indexes.
+    fn has_no_indexed_column(&self, name: &[String], cols: &[String]) -> bool {
+        let Some(t) = self.catalog_table(name) else {
+            return false;
+        };
+        t.keys
+            .iter()
+            .map(|k| &k.columns)
+            .chain(t.indexes.iter().map(|i| &i.columns))
+            .all(|k| {
+                !k.iter()
+                    .any(|c| cols.iter().any(|x| x.eq_ignore_ascii_case(c)))
+            })
+    }
+
     fn catalog_table(&self, name: &[String]) -> Option<&sqldiff_core::catalog::Table> {
         use sqldiff_core::catalog::{table_position, Ident};
         let cat = self.type_catalog()?;
@@ -4689,9 +4705,17 @@ impl<'a> Cx<'a> {
                     sqldiff_core::equiv::cursor::keyed_writes(&q, &nodes, &body, last, &targets)
                         .map_err(refuse)?;
                 for r in &reqs {
-                    if !self.has_unique_key(&r.table, &r.cols) {
+                    use sqldiff_core::equiv::cursor::KeyKind;
+                    let (ok, need) = match r.kind {
+                        KeyKind::Unique => (self.has_unique_key(&r.table, &r.cols), "unique on"),
+                        KeyKind::Unindexed => (
+                            self.has_no_indexed_column(&r.table, &r.cols),
+                            "free of a key or index on",
+                        ),
+                    };
+                    if !ok {
                         return Err(refuse(format!(
-                            "the source catalog does not show {} unique on ({})",
+                            "the source catalog does not show {} {need} ({})",
                             r.table.join("."),
                             r.cols.join(", ")
                         )));

@@ -412,6 +412,37 @@ fn a_cursor_that_is_not_static_sees_the_loops_writes() {
         "UPDATE t SET id = id + 100 WHERE id = v_id;",
         "writes t, which the cursor reads",
     );
+    // The write moves the row in the index the cursor scans although the
+    // query names the column only in its select list (no ORDER BY): a
+    // dynamic cursor meets the moved row again.
+    let unordered = |upd_t: &str, upd_p: &str| {
+        (
+            t(
+                "  DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT id, v FROM dbo.t;",
+                &write.replace("UPDATE dbo.t SET v = 0 WHERE id = @id;", upd_t),
+            ),
+            p(
+                "  OPEN cur_c FOR SELECT id, v FROM t;",
+                &write_p.replace("UPDATE t SET v = 0 WHERE id = v_id;", upd_p),
+            ),
+        )
+    };
+    let (a, b) = unordered(
+        "UPDATE dbo.t SET id = id + 100 WHERE id = @id;",
+        "UPDATE t SET id = id + 100 WHERE id = v_id;",
+    );
+    not_equal(&a, &b);
+    let (a, b) = unordered(
+        "UPDATE dbo.t SET v = 0 WHERE id = @id;",
+        "UPDATE t SET v = 0 WHERE id = v_id;",
+    );
+    equal(&a, &b);
+    // Assigning a variable in the UPDATE changes it besides the FETCH.
+    let (a, b) = unordered(
+        "UPDATE dbo.t SET @id = 7, v = 0 WHERE id = @id;",
+        "UPDATE t SET v = 0 WHERE id = v_id;",
+    );
+    refused(&a, &b, "assigns a variable");
     // The key variable changes before the write.
     miss(
         "SET @id = @id + 1; UPDATE dbo.t SET v = 0 WHERE id = @id;",

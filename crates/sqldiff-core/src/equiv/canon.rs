@@ -5689,6 +5689,27 @@ impl<'a> Canon<'a> {
         t.is_some_and(|t| t.is_unique(cols))
     }
 
+    /// Whether the catalog shows the table (name parts as written) and none
+    /// of `cols` in any of its keys or indexes.
+    fn schema_unindexed(&self, table: &[String], cols: &[String]) -> bool {
+        use crate::catalog::{Ident, Lookup};
+        let Some(view) = self.schema.catalog() else {
+            return false;
+        };
+        let parts: Vec<Ident> = table.iter().map(|p| Ident::plain(p.clone())).collect();
+        let Lookup::Found(t) = view.table(&parts) else {
+            return false;
+        };
+        t.keys
+            .iter()
+            .map(|k| &k.columns)
+            .chain(t.indexes.iter().map(|i| &i.columns))
+            .all(|k| {
+                !k.iter()
+                    .any(|c| cols.iter().any(|x| x.eq_ignore_ascii_case(c)))
+            })
+    }
+
     /// A statement of a cursor loop (`cursor.rs`): `cursor-open(key, q)`
     /// with the query as a list of values per row and its ORDER BY,
     /// `cursor-fetch(key, assign…)` with each target set to its column as an
@@ -5704,9 +5725,18 @@ impl<'a> Canon<'a> {
                 keyed,
             } => {
                 for r in keyed {
-                    if !self.schema_unique(&r.table, &r.cols) {
+                    let (ok, need) = match r.kind {
+                        super::cursor::KeyKind::Unique => {
+                            (self.schema_unique(&r.table, &r.cols), "being unique on")
+                        }
+                        super::cursor::KeyKind::Unindexed => (
+                            self.schema_unindexed(&r.table, &r.cols),
+                            "having none of these columns in a key or index:",
+                        ),
+                    };
+                    if !ok {
                         let why = format!(
-                            "a cursor loop's write relies on {} being unique on ({}), which the catalog does not show",
+                            "a cursor loop's write relies on {} {need} ({}), which the catalog does not show",
                             r.table.join("."),
                             r.cols.join(", ")
                         );

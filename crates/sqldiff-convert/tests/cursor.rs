@@ -158,6 +158,33 @@ fn shapes_that_mean_something_else_stay_refused() {
             "{set}: {text}"
         );
     }
+    // Without an ORDER BY the query does not name the key, yet a dynamic
+    // cursor scanning the key's index meets a row whose key was changed
+    // again; and an UPDATE that assigns a variable changes it besides the
+    // FETCH.
+    let unordered = |set: &str| {
+        body(
+            "  DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT id, v FROM dbo.t;",
+            &LOOP.replace("INSERT INTO dbo.log (id, v) VALUES (@id, @v);", set),
+        )
+    };
+    for (set, why) in [
+        (
+            "UPDATE dbo.t SET id = id + 100 WHERE id = @id;",
+            "free of a key or index on",
+        ),
+        (
+            "UPDATE dbo.t SET @id = 7, v = 0 WHERE id = @id;",
+            "assigns a variable",
+        ),
+    ] {
+        let c = pg(&unordered(set));
+        let u = at(&c, 9)[0];
+        assert_eq!(u.status, Status::NotConverted, "{set}\n{}", c.output);
+        assert!(u.notes[0].text.contains(why), "{set}: {}", u.notes[0].text);
+    }
+    let c = pg(&unordered("UPDATE dbo.t SET v = 0 WHERE id = @id;"));
+    assert!(c.output.contains("WHILE FOUND LOOP"), "{}", c.output);
     let c = pg(&upd("UPDATE dbo.t SET v = 0 WHERE id = @id;"));
     assert!(
         c.output.contains("UPDATE t SET v = 0 WHERE id = v_id;"),
