@@ -1549,7 +1549,7 @@ pub struct TyCmp {
 pub mod asm {
     pub const COLUMN_RANGE: (&str, &str) = (
         "ASM-COLUMN-RANGE",
-        "Stored values stay within what both sides' column types accept: a converted column that accepts more (larger numbers, longer strings, wider date ranges, NaN and infinity, 24:00:00) lets a write succeed that the original rejects",
+        "Stored values, and the money intermediates that compute them, stay within what both sides' column types accept: a converted column that accepts more (larger numbers, longer strings, wider date ranges, NaN and infinity, 24:00:00) lets a write succeed that the original rejects",
     );
     pub const TSQL_CODE_PAGE: (&str, &str) = (
         "ASM-TSQL-CODE-PAGE",

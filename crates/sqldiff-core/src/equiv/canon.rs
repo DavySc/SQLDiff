@@ -323,10 +323,11 @@ impl How {
 
 /// Whether a chain of money operations is read (`a + b - c`). SQL Server
 /// raises an error when an intermediate money value leaves its range where
-/// the final value is inside it, and numeric(19, 4) does not, which
-/// ASM-COLUMN-RANGE as worded (the stored value) does not cover. Off until
-/// the owner decides on its wording; `sqldiff-convert` follows this switch.
-pub const MONEY_CHAINS: bool = false;
+/// the final value is inside it, and numeric(19, 4) does not; ASM-COLUMN-RANGE
+/// covers it since the owner approved its wording to include "the money
+/// intermediates that compute" the stored values (2026-11-02).
+/// `sqldiff-convert` follows this switch.
+pub const MONEY_CHAINS: bool = true;
 
 /// A term made by arithmetic (an intermediate result, not a column).
 fn chained(t: &Term) -> bool {

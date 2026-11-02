@@ -658,11 +658,8 @@ fn pg_computed_money_refusals() {
         // A bigint is converted to money first and may not fit.
         "C AS A + Big PERSISTED",
         "C AS Big * A PERSISTED",
-        // An intermediate money value may leave the money range
-        // (MONEY_CHAINS): only one operation over money is read.
-        "C AS A + B - A PERSISTED",
-        "C AS A + B + Q PERSISTED",
-        "C AS (A + B) * Q PERSISTED",
+        // A product inside a chain is still a rounded money product.
+        "C AS A + B * B PERSISTED",
         "C AS A * B PERSISTED",
         "C AS A / Q PERSISTED",
         "C AS A / B PERSISTED",

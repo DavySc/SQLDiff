@@ -113,6 +113,10 @@ fn money_computed_columns_with_exact_arithmetic() {
         ("C AS A * Q PERSISTED", "A * Q"),
         ("C AS Q * A PERSISTED", "Q * A"),
         ("C AS (A + B) PERSISTED", "A + B"),
+        // Chains (ASM-COLUMN-RANGE covers the intermediates).
+        ("C AS A + B - Q PERSISTED", "A + B - Q"),
+        ("C AS A + B + A PERSISTED", "A + B + A"),
+        ("C AS (A + B) * Q PERSISTED", "(A + B) * Q"),
     ] {
         assert!(table_equal(a, &g(b)), "{a} vs {b}");
     }
@@ -125,9 +129,9 @@ fn money_computed_columns_with_exact_arithmetic() {
         ("C AS A * B PERSISTED", "A * B"),
         // A bigint is converted to money first and may not fit.
         ("C AS A + Big PERSISTED", "A + Big"),
-        // A chain: an intermediate may leave the money range.
-        ("C AS A + B - Q PERSISTED", "A + B - Q"),
-        ("C AS A + B + A PERSISTED", "A + B + A"),
+        // A chain with a product of money is still rounded.
+        ("C AS A + B * B PERSISTED", "A + B * B"),
+        ("C AS A + B - Q PERSISTED", "A + B + Q"),
         ("C AS A / Q PERSISTED", "A / Q"),
     ] {
         assert!(!table_equal(a, &g(b)), "{a} vs {b}");
