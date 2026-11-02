@@ -326,9 +326,11 @@ enum Rule {
     Same,
     /// T-SQL drops the fraction first.
     Trunc,
-    /// Rounded half away from zero to a whole number: T-SQL money and
-    /// PostgreSQL numeric (1.5 → 2, -2.5 → -3).
-    RoundAway,
+    /// T-SQL money to a whole number: rounded half away from zero, like
+    /// PostgreSQL numeric(19, 4) (1.5 → 2, -2.5 → -3). It is written as the
+    /// PostgreSQL conversion of that numeric, so the two sides meet in one
+    /// term and every other pairing keeps its existing classification.
+    MoneyAsNumeric,
     /// Dialect-specific (or not checked).
     Dialect,
 }
@@ -2331,10 +2333,20 @@ impl<'a> Canon<'a> {
                 ),
                 to,
             ),
-            Rule::RoundAway => (
+            Rule::MoneyAsNumeric => (
                 n(
-                    head,
-                    vec![Self::ty_term(&to), n("fn", vec![a("round-away"), v.0])],
+                    "dcast",
+                    vec![
+                        a(Dialect::Postgres.id()),
+                        a(how.name()),
+                        Self::ty_term(&to),
+                        Self::ty_term(&Some(Ty {
+                            fam: Fam::Exact,
+                            len: Some(19),
+                            scale: Some(4),
+                        })),
+                        v.0,
+                    ],
                 ),
                 to,
             ),
@@ -2405,13 +2417,10 @@ impl<'a> Canon<'a> {
             // way PostgreSQL numeric(19, 4) does: rounded half away from
             // zero, an error when it does not fit (eval/builtins/
             // 2026-11-02-money: toint, tobigint, todec, todec0, todec4).
-            (Money, Int) => Rule::RoundAway,
+            (Money, Int) => Rule::MoneyAsNumeric,
             (Money, Exact) => Rule::Same,
             (Money, Money) => Rule::Same,
             (Money, _) | (_, Money) => Rule::Dialect,
-            // PostgreSQL numeric rounds half away from zero to a whole
-            // number (float rounds half to even and stays per dialect).
-            (Exact, Int) if self.d == Dialect::Postgres && !integral => Rule::RoundAway,
             // Out of range is an error on both sides.
             (Int, Int | Exact | Float) => Rule::Same,
             // Both round half away from zero (1.555 → 1.56, -2.5 → -3).
@@ -3996,10 +4005,7 @@ impl<'a> Canon<'a> {
                 _ => false,
             };
         if !ok {
-            return (
-                n("arith", vec![self.dtag(), a(op), lt, rt]),
-                None,
-            );
+            return (n("arith", vec![self.dtag(), a(op), lt, rt]), None);
         }
         self.assume(super::table::asm::COLUMN_RANGE);
         let ty = Some(Ty {

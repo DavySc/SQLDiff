@@ -1023,9 +1023,7 @@ impl<'s> Ctx<'s> {
             | Fam::Text
             | Fam::NoCompare
             | Fam::Money
-            | Fam::Other => {
-                return None
-            }
+            | Fam::Other => return None,
         })
     }
 
