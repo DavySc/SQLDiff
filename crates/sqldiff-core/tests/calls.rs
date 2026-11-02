@@ -568,3 +568,52 @@ fn a_traced_call_keeps_its_place_among_the_paired_statements() {
     assert_ne!(r.verdict(), Verdict::Equal);
     assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
 }
+
+/// A converted procedure that returns a status gets a last `INOUT
+/// return_code integer DEFAULT NULL`; a call that ignores the status is the
+/// same call.
+#[test]
+fn an_ignored_status_is_the_converters_return_code() {
+    let cat_t = format!(
+        "{CAT_T}\nGO\nCREATE PROCEDURE dbo.Status @a int AS BEGIN RETURN 1; END;"
+    );
+    let cat_p = |tail: &str| {
+        format!(
+            "{CAT_P}\nCREATE PROCEDURE Status(p_a integer{tail}) LANGUAGE plpgsql AS $$ BEGIN return_code := 1; END $$;"
+        )
+    };
+    let good = cat_p(", INOUT return_code integer DEFAULT NULL");
+    let t = caller_t("EXEC dbo.Status 5;");
+    let p = caller_p("CALL Status(5);");
+    let r = run_with(&t, &p, &opts(&cat_t, &good));
+    assert!(
+        !r.unknown_reasons.iter().any(|x| x.contains("call")),
+        "{:?}",
+        r.unknown_reasons
+    );
+    assert!(asms(&r).contains(&"ASM-RETURN-CODE"), "{:?}", asms(&r));
+    // The extra parameter must be the converter's: INOUT, defaulted to NULL.
+    for tail in [
+        ", INOUT return_code integer",
+        ", INOUT return_code integer DEFAULT 0",
+        ", OUT return_code integer",
+        ", INOUT status integer DEFAULT NULL",
+        ", extra integer DEFAULT NULL",
+    ] {
+        unknown_with(&t, &p, &opts(&cat_t, &cat_p(tail)), "parameter(s)");
+    }
+    // The call must not pass it.
+    unknown_with(
+        &t,
+        &caller_p("CALL Status(5, v_newid);"),
+        &opts(&cat_t, &good),
+        "return_code",
+    );
+    // A call outside PL/pgSQL returns the INOUT value to the client as a row.
+    unknown_with(
+        "EXEC dbo.Status 5;",
+        "CALL Status(5);",
+        &opts(&cat_t, &good),
+        "as a row",
+    );
+}
