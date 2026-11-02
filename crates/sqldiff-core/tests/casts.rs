@@ -385,7 +385,8 @@ const TIMES: &[(&str, &str, Want)] = &[
     ("CAST(T AS datetime2(3))", "CAST(T AS timestamp(3))", Eq),
     // datetime counts 1/300 s.
     ("CAST(T AS datetime)", "CAST(T AS timestamp(3))", Unknown),
-    ("CAST(T AS datetime2)", "CAST(T AS timestamp)", Unknown),
+    // T has 3 fraction digits: datetime2(7) and timestamp(6) hold it exactly.
+    ("CAST(T AS datetime2)", "CAST(T AS timestamp)", Eq),
 ];
 
 #[test]
