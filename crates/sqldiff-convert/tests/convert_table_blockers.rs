@@ -268,8 +268,10 @@ fn pg_geography_becomes_postgis_geography() {
         "{:?}",
         c.units[0].notes
     );
-    // Spatial expressions keep no rule; Db2 for i keeps refusing the type.
-    let point = "DECLARE @p geography = geography::Point(1, 2, 4326);\n";
+    // Spatial expressions without a rule (geography::Point and STGeomFromWKB
+    // have one, `geography_wkb.rs`) stay refused; Db2 for i keeps refusing
+    // the type.
+    let point = "DECLARE @p geography = geography::STGeomFromText('POINT(2 1)', 4326);\n";
     assert!(
         pg(point).units.iter().any(|u| u.status >= Status::Unproven),
         "{}",
