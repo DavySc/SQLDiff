@@ -5175,6 +5175,7 @@ impl<'a> Cx<'a> {
             vars: vars.clone(),
             stat,
             local,
+            declare_at: Self::range(n),
             open_at: Self::range(open),
             fetch_at: vec![Self::range(first), Self::range(last)],
             loop_at: Self::range(lp),
@@ -5192,6 +5193,29 @@ impl<'a> Cx<'a> {
             .values()
             .find(|p| p.as_ref().is_ok_and(|p| p.loop_at == at))
             .cloned()
+    }
+
+    /// The steps from index `before` on convert the cursor's query, which
+    /// the DECLARE wrote and the OPEN converts: they lie in the DECLARE, not
+    /// in the OPEN's unit, so they move to the DECLARE's unit (to the OPEN's
+    /// place when that unit is gone).
+    fn query_steps_to_declare(&mut self, before: usize, plan: &CursorPlan) {
+        let moved: Vec<crate::Step> = self.trace.drain(before..).collect();
+        let (a, b) = plan.declare_at;
+        let decl = self.decls.iter().position(|d| d.src == plan.declare_at);
+        for mut st in moved {
+            let in_decl = st.start >= a && st.end <= b;
+            let target = match decl {
+                Some(i) if in_decl => &mut self.decls[i].trace,
+                _ => {
+                    (st.start, st.end) = plan.open_at;
+                    &mut self.trace
+                }
+            };
+            if !target.contains(&st) {
+                target.push(st);
+            }
+        }
     }
 
     /// PostgreSQL: OPEN, FETCH, CLOSE and DEALLOCATE of a converted cursor
@@ -5217,11 +5241,20 @@ impl<'a> Cx<'a> {
         match first {
             "OPEN" if at == plan.open_at => {
                 let outer = std::mem::replace(&mut self.scope, scope_of(&plan.query));
+                let before = self.trace.len();
                 let q = self.select(&plan.query);
                 self.scope = outer;
                 let (q, assigns) = q?;
                 if assigns {
                     return no("cursor query that assigns variables");
+                }
+                // Only a converted OPEN moves the query's steps: a refused
+                // one (a note says the query is not converted) leaves the
+                // DECLARE's unit as it was and keeps none of them.
+                if self.blocked().is_some() {
+                    self.trace.truncate(before);
+                } else {
+                    self.query_steps_to_declare(before, &plan);
                 }
                 if !plan.stat {
                     self.note(Status::Assumptions, "ASM-CURSOR-SNAPSHOT", "No other session changes the tables the cursor reads while the loop runs: a T-SQL cursor that is not STATIC may see such changes, a PostgreSQL cursor reads the rows as of OPEN.");
@@ -11477,6 +11510,8 @@ struct CursorPlan {
     stat: bool,
     /// LOCAL: T-SQL frees it when the routine ends.
     local: bool,
+    /// The DECLARE statement: the steps that convert `query` belong to it.
+    declare_at: (usize, usize),
     open_at: (usize, usize),
     /// The FETCH before the loop and the one that ends its body.
     fetch_at: Vec<(usize, usize)>,

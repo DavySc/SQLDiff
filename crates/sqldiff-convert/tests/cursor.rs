@@ -241,6 +241,34 @@ fn a_static_cursor_may_write_what_it_reads() {
     assert_ne!(at(&c, 9)[0].status, Status::NotConverted);
 }
 
+/// The steps that convert the cursor's query belong to the DECLARE's unit
+/// when the OPEN is converted, and to nobody when the OPEN is refused.
+#[test]
+fn the_querys_steps_go_to_the_declare_only_when_the_open_converts() {
+    let step = "tsql.expr.dbo-schema";
+    let has = |c: &Conversion| {
+        at(c, 9)
+            .iter()
+            .any(|u| u.trace.iter().any(|s| s.rule == step))
+    };
+    let c = pg(&body(DECL, LOOP));
+    assert!(c.output.contains("OPEN cur_c FOR"), "{}", c.output);
+    assert!(has(&c), "{:#?}", at(&c, 9)[0].trace);
+    for u in &c.units {
+        for s in &u.trace {
+            assert!(u.src.start <= s.start && s.end <= u.src.end, "{s:?}");
+        }
+    }
+    // DIFFERENCE is not converted: the OPEN is refused, and the DECLARE's
+    // unit keeps no step for a query that was not converted.
+    let c = pg(&body(
+        "  DECLARE c CURSOR LOCAL STATIC FOR SELECT id, DIFFERENCE(CAST(v AS nvarchar(10)), N'x') FROM dbo.t ORDER BY id;",
+        LOOP,
+    ));
+    assert!(!c.output.contains("OPEN cur_c FOR"), "{}", c.output);
+    assert!(!has(&c), "{:#?}", at(&c, 9)[0].trace);
+}
+
 #[test]
 fn db2_keeps_cursors_refused() {
     let c = convert_to(&body(DECL, LOOP), Dialect::Db2i);
