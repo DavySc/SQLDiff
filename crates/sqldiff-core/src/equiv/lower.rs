@@ -2521,6 +2521,7 @@ fn cursor_stmt(c: &SyntaxNode, u: &mut Unit) -> bool {
             key,
             query: l.query.clone(),
             tsql: (d == Dialect::Tsql).then_some((l.stat, l.local)),
+            keyed: l.keyed.clone(),
         }
     } else if l.fetches.contains(c) {
         let targets = l

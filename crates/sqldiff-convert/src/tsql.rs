@@ -99,6 +99,7 @@ pub(crate) fn convert(
         bit_outer: None,
         bit_aliases: Vec::new(),
         ret_bit: false,
+        ret_dt: Dt::Other,
         view_query: false,
         trigger: None,
         seq_defaults: Vec::new(),
@@ -293,6 +294,9 @@ struct Cx<'a> {
     bit_aliases: Vec<String>,
     /// The function being converted returns BIT.
     ret_bit: bool,
+    /// The type of the function being converted, when it is an integer
+    /// (`Dt::Other` otherwise): a RETURNed fraction is truncated.
+    ret_dt: Dt,
     /// The query of a view is being converted: its ORDER BY does not order
     /// the view's rows.
     view_query: bool,
@@ -693,6 +697,7 @@ impl<'a> Cx<'a> {
         self.routine_parts = sqldiff_syntax::ast::routine_name_parts(r);
         self.rolls_back = pg_rolls_back(r);
         self.ret_bit = false;
+        self.ret_dt = Dt::Other;
         self.return_code = false;
         self.rows_fn = false;
         self.results.clear();
@@ -836,6 +841,7 @@ impl<'a> Cx<'a> {
             }
             let (ty, _, _) = self.ty(rt)?;
             self.ret_bit = Dt::of_tokens(rt) == Dt::Bit;
+            self.ret_dt = Dt::of_tokens(rt);
             returns = format!(" RETURNS {ty}");
             self.step_ts_with("tsql.routine.returns", &ts[ret..rend], ty);
         }
@@ -2195,6 +2201,10 @@ impl<'a> Cx<'a> {
             "ALTER" if w(1) == "INDEX" => return no(self.pick(
                 "ALTER INDEX (REBUILD, REORGANIZE, DISABLE, SET …): maintenance with no exact PostgreSQL counterpart (REINDEX rebuilds, nothing disables an index); no rule",
                 "ALTER INDEX: maintenance with no exact Db2 for i counterpart; no rule",
+            )),
+            "BULK" if w(1) == "INSERT" => return no(self.pick(
+                "BULK INSERT: reads a file on the SQL Server host with its own field and row terminators, code page and format options; PostgreSQL's COPY has different file rules (single-character delimiters, one encoding), so there is no checked rule",
+                "BULK INSERT: reads a file on the SQL Server host; Db2 for i has no statement with the same file rules; no rule",
             )),
             "ALTER" if crate::impossible::of_ddl(&[w(1).as_str(), w(2).as_str()]).is_some() => {
                 let x = crate::impossible::of_ddl(&[w(1).as_str(), w(2).as_str()]).unwrap();
@@ -3719,6 +3729,22 @@ impl<'a> Cx<'a> {
             .any(|k| !k.is_empty() && k.iter().all(|c| cols.contains(&c.to_ascii_lowercase())))
     }
 
+    /// Whether the table is in the catalog and none of `cols` is in any of
+    /// its keys or indexes.
+    fn has_no_indexed_column(&self, name: &[String], cols: &[String]) -> bool {
+        let Some(t) = self.catalog_table(name) else {
+            return false;
+        };
+        t.keys
+            .iter()
+            .map(|k| &k.columns)
+            .chain(t.indexes.iter().map(|i| &i.columns))
+            .all(|k| {
+                !k.iter()
+                    .any(|c| cols.iter().any(|x| x.eq_ignore_ascii_case(c)))
+            })
+    }
+
     fn catalog_table(&self, name: &[String]) -> Option<&sqldiff_core::catalog::Table> {
         use sqldiff_core::catalog::{table_position, Ident};
         let cat = self.type_catalog()?;
@@ -3789,6 +3815,42 @@ impl<'a> Cx<'a> {
         Some(Dt::of(&c.data_type.base, &c.data_type.args))
     }
 
+    /// The type of column `col` of the UPDATE target `table` when the
+    /// statement has a FROM: the target is an alias of a FROM item (the
+    /// alias wins, as in T-SQL) or the table itself. `None` unless the
+    /// statement's scope names exactly one table for it and knows its columns.
+    fn scope_col_dt(&self, table: &[T], col: &str) -> Option<Dt> {
+        use sqldiff_core::catalog::Ident;
+        let names: Vec<String> = table
+            .iter()
+            .filter(|t| matches!(t.k, IDENT | QUOTED_IDENT))
+            .map(|t| tsql_unquote(&t.s).to_ascii_lowercase())
+            .collect();
+        let [n] = names.as_slice() else {
+            return self.target_col_dt(table, col);
+        };
+        let scope = self.scope.as_ref()?;
+        let aliased: Vec<&ScopeEntry> = scope
+            .entries
+            .iter()
+            .filter(|e| e.alias.as_deref() == Some(n.as_str()))
+            .collect();
+        if aliased.is_empty() {
+            return self.target_col_dt(table, col);
+        }
+        let mut found: Option<(&str, Dt)> = None;
+        for e in aliased {
+            let t = self.entry_table(e)?;
+            let c = t.column(Dialect::Tsql, &Ident::plain(col.to_string()))?;
+            let dt = Dt::of(&c.data_type.base, &c.data_type.args);
+            if found.is_some_and(|(name, d)| name != t.name || d != dt) {
+                return None;
+            }
+            found = Some((t.name.as_str(), dt));
+        }
+        found.map(|(_, d)| d)
+    }
+
     /// Wraps `value` (tokens) as `trunc(value)` tokens.
     fn wrap_trunc(value: &[T]) -> Vec<T> {
         let at = value.iter().find(|t| t.sig()).map_or(0, |t| t.pos.0);
@@ -3820,14 +3882,21 @@ impl<'a> Cx<'a> {
                 .map_or(ts[first].pos.0, |t| t.pos.0)
         };
         if ts[first].is("UPDATE") {
-            let (Some(set), None) = (top(&ts, "SET", 0), top(&ts, "FROM", 0)) else {
+            let Some(set) = top(&ts, "SET", 0) else {
                 return ts;
             };
             if top(&ts, "OUTPUT", 0).is_some() {
                 return ts;
             }
             let table = &ts[first + 1..set];
-            let end = top(&ts, "WHERE", set).unwrap_or(ts.len());
+            // `UPDATE x SET … FROM t x JOIN u …`: the SET list ends at the
+            // FROM, and the target `x` may be an alias (`scope_col_dt`).
+            let joined = top(&ts, "FROM", set);
+            let end = [joined, top(&ts, "WHERE", set)]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(ts.len());
             let mut out = ts[..=set].to_vec();
             let mut changed = false;
             for (k, item) in split_commas(&ts[set + 1..end]).into_iter().enumerate() {
@@ -3847,7 +3916,14 @@ impl<'a> Cx<'a> {
                         let dt = (it[..e]
                             .iter()
                             .all(|&j| matches!(item[j].k, IDENT | QUOTED_IDENT | DOT)))
-                        .then(|| self.target_col_dt(table, &tsql_unquote(&col.s)))
+                        .then(|| {
+                            let c = tsql_unquote(&col.s);
+                            if joined.is_some() {
+                                self.scope_col_dt(table, &c)
+                            } else {
+                                self.target_col_dt(table, &c)
+                            }
+                        })
                         .flatten();
                         let value = &item[it[e] + 1..];
                         match dt {
@@ -3895,10 +3971,13 @@ impl<'a> Cx<'a> {
             let Some(close) = matching(&ts, open) else {
                 return ts;
             };
+            let table = &ts[name_at..open];
+            if let Some(sel) = next_sig(&ts, close).filter(|&j| ts[j].is("SELECT")) {
+                return self.int_stores_select(ts, name_at, open, close, sel);
+            }
             let Some(values) = next_sig(&ts, close).filter(|&j| ts[j].is("VALUES")) else {
                 return ts;
             };
-            let table = &ts[name_at..open];
             if table
                 .iter()
                 .any(|t| t.sig() && !matches!(t.k, IDENT | QUOTED_IDENT | DOT))
@@ -3966,6 +4045,122 @@ impl<'a> Cx<'a> {
             return if changed { out } else { ts };
         }
         ts
+    }
+
+    /// `INSERT INTO t (a, b) SELECT x, y FROM …`: the select-list item for a
+    /// column of integer type that has a fraction is truncated, as in
+    /// `int_stores`. T-SQL converts each row's value when it stores it, so
+    /// the rewrite must not change what the SELECT does with the unconverted
+    /// value: any DISTINCT, TOP, set operator, ORDER BY, INTO or OFFSET at the
+    /// top level of the SELECT, or an item with a top-level `AS` alias that
+    /// ORDER BY or GROUP BY could name, leaves the statement as it is.
+    fn int_stores_select(
+        &mut self,
+        ts: Vec<T>,
+        name_at: usize,
+        open: usize,
+        close: usize,
+        sel: usize,
+    ) -> Vec<T> {
+        let table = &ts[name_at..open];
+        if table
+            .iter()
+            .any(|t| t.sig() && !matches!(t.k, IDENT | QUOTED_IDENT | DOT))
+        {
+            return ts;
+        }
+        let ds = crate::tok::depths(&ts);
+        let top_words = |from: usize, ws: &[&str]| {
+            (from..ts.len()).any(|j| ds[j] == 0 && ws.iter().any(|w| ts[j].is(w)))
+        };
+        if top_words(
+            sel,
+            &[
+                "DISTINCT",
+                "TOP",
+                "UNION",
+                "EXCEPT",
+                "INTERSECT",
+                "ORDER",
+                "INTO",
+                "OFFSET",
+                "FOR",
+            ],
+        ) {
+            return ts;
+        }
+        let cols: Vec<Option<Dt>> = split_commas(&ts[open + 1..close])
+            .iter()
+            .map(|c| match trimmed(c) {
+                [t] if matches!(t.k, IDENT | QUOTED_IDENT) => {
+                    self.target_col_dt(table, &tsql_unquote(&t.s))
+                }
+                _ => None,
+            })
+            .collect();
+        if !cols.iter().any(|d| matches!(d, Some(Dt::Int | Dt::BigInt))) {
+            return ts;
+        }
+        let end = (sel + 1..ts.len())
+            .find(|&j| {
+                ds[j] == 0
+                    && ["FROM", "WHERE", "GROUP", "HAVING", "OPTION"]
+                        .iter()
+                        .any(|w| ts[j].is(w))
+            })
+            .unwrap_or(ts.len());
+        let items = split_commas(&ts[sel + 1..end]);
+        if items.len() != cols.len() {
+            return ts;
+        }
+        let mut out = ts[..=sel].to_vec();
+        let mut changed = false;
+        for (k, item) in items.iter().enumerate() {
+            if k > 0 {
+                out.push(T::made(
+                    COMMA,
+                    ",",
+                    item.first().map_or(0, |t| t.pos.0),
+                    "tsql.assign.int-trunc",
+                ));
+            }
+            let v = trimmed(item);
+            let aliased = crate::tok::find_word(v, 0, "AS");
+            let (expr, alias) = match aliased {
+                Some(a) => (trimmed(&v[..a]), &v[a..]),
+                None => (v, &v[v.len()..]),
+            };
+            if matches!(cols[k], Some(Dt::Int | Dt::BigInt))
+                && !expr.is_empty()
+                && self.expr_dt(expr) == Some(Dt::Fraction)
+            {
+                self.step_ts("tsql.assign.int-trunc", expr);
+                // The leading space of the item, then trunc(expr) and the alias.
+                let lead = item.len() - item.iter().skip_while(|t| !t.sig()).count();
+                out.extend(item[..lead].iter().cloned());
+                out.extend(Self::wrap_trunc(expr));
+                if !alias.is_empty() {
+                    out.push(T::made(
+                        WHITESPACE,
+                        " ",
+                        expr.iter().find(|t| t.sig()).map_or(0, |t| t.pos.0),
+                        "tsql.assign.int-trunc",
+                    ));
+                    out.extend(alias.iter().cloned());
+                }
+                let tail = item.iter().rposition(|t| t.sig()).map_or(0, |p| p + 1);
+                out.extend(item[tail..].iter().cloned());
+                changed = true;
+            } else {
+                out.extend(item.iter().cloned());
+            }
+        }
+        out.extend(ts[end..].iter().cloned());
+        if changed {
+            out
+        } else {
+            ts
+        }
     }
 
     fn set(&mut self, ts: &[T]) -> R<String> {
@@ -4346,7 +4541,12 @@ impl<'a> Cx<'a> {
             if self.mode == Mode::Func && self.ret_bit {
                 self.bit_store_text(&ts[j..])
             } else {
-                self.expr(&ts[j..]).trim().to_string()
+                let v = self.expr(&ts[j..]).trim().to_string();
+                if self.mode == Mode::Func && self.trigger.is_none() {
+                    self.store_int(self.ret_dt, &ts[j..], v)
+                } else {
+                    v
+                }
             }
         });
         match (self.mode, val) {
@@ -4738,7 +4938,9 @@ impl<'a> Cx<'a> {
     /// (so the variables are not read after the loop before they are set
     /// again). A cursor that is not STATIC may see the loop's own writes in
     /// T-SQL; a PostgreSQL cursor reads the rows as of OPEN, so the loop must
-    /// not write the tables the cursor reads or call procedures.
+    /// not write the tables the cursor reads or call procedures, except for
+    /// changes of the row just fetched by its unique key
+    /// (`equiv::cursor::keyed_writes`, keys checked against the catalog).
     fn cursor_plan(&self, ts: &[T], n: &SyntaxNode) -> Result<CursorPlan, String> {
         let s = sig(ts);
         let raw = tsql_unquote(&ts[s[1]].s);
@@ -4915,6 +5117,7 @@ impl<'a> Cx<'a> {
         }
         if !stat {
             let reads = table_names(&query);
+            let mut conflicts: Vec<(SyntaxNode, String)> = Vec::new();
             for d in body.descendants().filter(|d| d.kind() == STATEMENT) {
                 let w = sig_words(&d);
                 match w.first().map(String::as_str) {
@@ -4924,10 +5127,44 @@ impl<'a> Cx<'a> {
                     Some("INSERT" | "UPDATE" | "DELETE" | "MERGE" | "WITH") => {
                         let names = written_tables(&tokens(&d));
                         if let Some(t) = reads.iter().find(|t| names.contains(t)) {
-                            return Err(format!("the cursor loop writes {t}, which the cursor reads: a T-SQL cursor that is not STATIC may see the change, a PostgreSQL cursor reads the rows as of OPEN; declare it STATIC to convert it"));
+                            conflicts.push((d.clone(), t.clone()));
                         }
                     }
                     _ => {}
+                }
+            }
+            // Allowed only where every such write changes the row just
+            // fetched and no other (`keyed_writes`), on unique keys the
+            // catalog shows.
+            if let Some((_, t)) = conflicts.first() {
+                let refuse = |why: String| {
+                    format!("the cursor loop writes {t}, which the cursor reads: a T-SQL cursor that is not STATIC may see the change, a PostgreSQL cursor reads the rows as of OPEN; declare it STATIC to convert it ({why})")
+                };
+                let Some(Ok((_, _, _, q))) = sqldiff_core::equiv::cursor::tsql_declaration(n)
+                else {
+                    return Err(refuse("the cursor declaration was not read".into()));
+                };
+                let nodes: Vec<&SyntaxNode> = conflicts.iter().map(|(x, _)| x).collect();
+                let targets: Vec<String> = vars.iter().map(|v| format!("@{v}")).collect();
+                let reqs =
+                    sqldiff_core::equiv::cursor::keyed_writes(&q, &nodes, &body, last, &targets)
+                        .map_err(refuse)?;
+                for r in &reqs {
+                    use sqldiff_core::equiv::cursor::KeyKind;
+                    let (ok, need) = match r.kind {
+                        KeyKind::Unique => (self.has_unique_key(&r.table, &r.cols), "unique on"),
+                        KeyKind::Unindexed => (
+                            self.has_no_indexed_column(&r.table, &r.cols),
+                            "free of a key or index on",
+                        ),
+                    };
+                    if !ok {
+                        return Err(refuse(format!(
+                            "the source catalog does not show {} {need} ({})",
+                            r.table.join("."),
+                            r.cols.join(", ")
+                        )));
+                    }
                 }
             }
         }
@@ -5222,6 +5459,7 @@ impl<'a> Cx<'a> {
             };
             // The parameter this argument binds to, when the callee is known.
             let mut bit_param = false;
+            let mut param_dt = Dt::Other;
             if let Some(ps) = params {
                 let at = if named {
                     ps.iter().position(|p| p.name.eq_ignore_ascii_case(&a[0].s))
@@ -5236,6 +5474,9 @@ impl<'a> Cx<'a> {
                 };
                 passed.push(at);
                 bit_param = ps[at].data_type.base == "BIT" && !marked;
+                if !marked {
+                    param_dt = Dt::of(&ps[at].data_type.base, &ps[at].data_type.args);
+                }
                 let out_param = matches!(ps[at].mode, ParamMode::Out | ParamMode::InOut);
                 if out_param != marked {
                     return no(if out_param {
@@ -5262,7 +5503,8 @@ impl<'a> Cx<'a> {
                 let v = if bit_param {
                     self.bit_store_text(value)
                 } else {
-                    self.expr(value).trim().to_string()
+                    let v = self.expr(value).trim().to_string();
+                    self.store_int(param_dt, value, v)
                 };
                 let arg = format!("p_{}", snake(&a[0].s[1..]));
                 self.step_ts_with("tsql.exec.named-argument", a, arg.clone());
@@ -5270,7 +5512,8 @@ impl<'a> Cx<'a> {
             } else if bit_param {
                 args.push(self.bit_store_text(value));
             } else {
-                args.push(self.expr(value).trim().to_string());
+                let v = self.expr(value).trim().to_string();
+                args.push(self.store_int(param_dt, value, v));
             }
         }
         if let Some(ps) = params {
@@ -5287,7 +5530,7 @@ impl<'a> Cx<'a> {
         // PL/pgSQL CALL cannot leave it out: "argument is not writable"), so
         // pass a variable nobody reads; a top-level CALL takes NULL.
         if !self.db2() && self.callee_returns_status(&raw_name) {
-            let target = if matches!(self.mode, Mode::Proc | Mode::Do) {
+            let target = if matches!(self.mode, Mode::Proc | Mode::Do | Mode::Func) {
                 self.rc_scratch = true;
                 RC_SCRATCH
             } else {
@@ -5374,6 +5617,18 @@ impl<'a> Cx<'a> {
                 [t] if t.k == STRING => {
                     val.insert(key, t.clone());
                 }
+                // A bracketed identifier is the name string: the same
+                // text as the string literal of its unbracketed name.
+                [t] if t.k == QUOTED_IDENT
+                    && t.s.starts_with('[')
+                    && key.starts_with("level")
+                    && key.ends_with("name") =>
+                {
+                    let mut t = t.clone();
+                    t.k = STRING;
+                    t.s = format!("N'{}'", tsql_unquote(&t.s).replace('\'', "''"));
+                    val.insert(key, t);
+                }
                 [t] if t.is("NULL") => {}
                 _ => return no("sp_addextendedproperty with a non-literal argument: no rule yet"),
             }
@@ -5386,14 +5641,32 @@ impl<'a> Cx<'a> {
             .ok_or(No("sp_addextendedproperty without a value".into()))?
             .clone();
         let target = match (kind("level0type"), kind("level1type"), kind("level2type")) {
+            (Some(s), None, None)
+                if s == "SCHEMA"
+                    && text("level0name").is_some_and(|n| n.eq_ignore_ascii_case("dbo")) =>
+            {
+                return no("sp_addextendedproperty on the dbo schema: the conversion drops dbo, so there is no schema to comment on")
+            }
             (Some(s), None, None) if s == "SCHEMA" => {
                 format!("SCHEMA {}", ident("level0name").unwrap_or_default())
             }
             (Some(s), Some(o), l2) if s == "SCHEMA" => {
                 let schema = ident("level0name")
                     .ok_or(No("sp_addextendedproperty without a schema name".into()))?;
+                // `dbo` is dropped as everywhere else (ASM-DBO-SCHEMA).
+                let dbo = text("level0name").is_some_and(|n| n.eq_ignore_ascii_case("dbo"));
+                let prefix = if dbo {
+                    let text = self.pick(
+                        "The dbo schema is dropped: objects are assumed to be found through search_path (usually the public schema).",
+                        "The dbo schema is dropped: objects are assumed to be found through the default schema (CURRENT SCHEMA, or the library list with system naming).",
+                    ).to_string();
+                    self.note(Status::Assumptions, "ASM-DBO-SCHEMA", &text);
+                    String::new()
+                } else {
+                    format!("{schema}.")
+                };
                 let obj = format!(
-                    "{schema}.{}",
+                    "{prefix}{}",
                     ident("level1name")
                         .ok_or(No("sp_addextendedproperty without an object name".into()))?
                 );
@@ -5414,7 +5687,7 @@ impl<'a> Cx<'a> {
                         ))
                     }
                     ("TABLE", Some("INDEX"), Some(i)) if !self.db2() => {
-                        format!("INDEX {schema}.{i}")
+                        format!("INDEX {prefix}{i}")
                     }
                     ("TABLE", Some("CONSTRAINT"), Some(c)) if !self.db2() => {
                         format!("CONSTRAINT {c} ON {obj}")

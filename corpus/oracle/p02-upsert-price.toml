@@ -1,5 +1,7 @@
 case = "p02-upsert-price"
 pairs = [["tsql", "pg"]]
+reproducible = false
+why = "the difference is in updated_at: T-SQL SYSDATETIME() is the MERGE statement's start, PostgreSQL statement_timestamp() inside the procedure is the CALL's start, and timestamps are not compared"
 observe = ["item_price(item_id, unit_price)"]
 faults = ["item_price"]
 seed = """

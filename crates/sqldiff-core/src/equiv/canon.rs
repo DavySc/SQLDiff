@@ -3255,6 +3255,12 @@ impl<'a> Canon<'a> {
             }
             (Dialect::Tsql, "sysdatetime", 0) => self.time("stmt"),
             (Dialect::Tsql, "getdate", 0) => self.time("stmt-datetime"),
+            // PostgreSQL fixes statement_timestamp() per client message, so inside a
+            // routine every statement of one CALL reads the call's start: never the
+            // per-statement time T-SQL's SYSDATETIME() gives.
+            (Dialect::Postgres, "statement_timestamp", 0) if self.unit.kind != UnitKind::Script => {
+                self.time("call")
+            }
             (Dialect::Postgres, "statement_timestamp", 0) => self.time("stmt"),
             (Dialect::Postgres, "now" | "transaction_timestamp", 0) => self.time("txn"),
             (Dialect::Postgres, "clock_timestamp", 0) => self.time("clock"),
@@ -5742,6 +5748,43 @@ impl<'a> Canon<'a> {
         Ok(n(if m.error { "raise-error" } else { "message" }, parts))
     }
 
+    /// Whether the catalog shows the table (name parts as written) unique on
+    /// a key all of whose columns are among `cols`.
+    fn schema_unique(&self, table: &[String], cols: &[String]) -> bool {
+        let Some(last) = table.last() else {
+            return false;
+        };
+        let t = if table.len() >= 2 {
+            let sch = table[table.len() - 2].as_str();
+            let sch = (!matches!(sch, "dbo" | "public")).then_some(sch);
+            self.schema.table_exact(sch, last)
+        } else {
+            self.schema.table(last)
+        };
+        t.is_some_and(|t| t.is_unique(cols))
+    }
+
+    /// Whether the catalog shows the table (name parts as written) and none
+    /// of `cols` in any of its keys or indexes.
+    fn schema_unindexed(&self, table: &[String], cols: &[String]) -> bool {
+        use crate::catalog::{Ident, Lookup};
+        let Some(view) = self.schema.catalog() else {
+            return false;
+        };
+        let parts: Vec<Ident> = table.iter().map(|p| Ident::plain(p.clone())).collect();
+        let Lookup::Found(t) = view.table(&parts) else {
+            return false;
+        };
+        t.keys
+            .iter()
+            .map(|k| &k.columns)
+            .chain(t.indexes.iter().map(|i| &i.columns))
+            .all(|k| {
+                !k.iter()
+                    .any(|c| cols.iter().any(|x| x.eq_ignore_ascii_case(c)))
+            })
+    }
+
     /// A statement of a cursor loop (`cursor.rs`): `cursor-open(key, q)`
     /// with the query as a list of values per row and its ORDER BY,
     /// `cursor-fetch(key, assign…)` with each target set to its column as an
@@ -5750,7 +5793,32 @@ impl<'a> Canon<'a> {
     pub fn cursor_op(&mut self, op: &super::cursor::CursorOp) -> R<Term> {
         use super::cursor::CursorOp;
         match op {
-            CursorOp::Open { key, query, tsql } => {
+            CursorOp::Open {
+                key,
+                query,
+                tsql,
+                keyed,
+            } => {
+                for r in keyed {
+                    let (ok, need) = match r.kind {
+                        super::cursor::KeyKind::Unique => {
+                            (self.schema_unique(&r.table, &r.cols), "being unique on")
+                        }
+                        super::cursor::KeyKind::Unindexed => (
+                            self.schema_unindexed(&r.table, &r.cols),
+                            "having none of these columns in a key or index:",
+                        ),
+                    };
+                    if !ok {
+                        let why = format!(
+                            "a cursor loop's write relies on {} {need} ({}), which the catalog does not show",
+                            r.table.join("."),
+                            r.cols.join(", ")
+                        );
+                        self.cursor_failed.insert(key.clone(), why.clone());
+                        return Err(why);
+                    }
+                }
                 let read = query
                     .as_ref()
                     .map_err(Clone::clone)
