@@ -451,6 +451,7 @@ fn a_trailing_comma_in_the_column_list_is_dropped() {
         pg("CREATE TABLE [dbo].[C](\n    [ID] int NOT NULL,,\n);\nGO\n").units[0].status,
         Status::NotConverted
     );
+}
 
 /// T-SQL drops the fraction of a number stored in an integer (eval/casts);
 /// PostgreSQL rounds it, so the conversion truncates where the value has one.
