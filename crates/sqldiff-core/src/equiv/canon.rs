@@ -114,6 +114,10 @@ pub mod asm {
         "ASM-TSQL-PLUS-IS-CONCAT",
         "Operands of T-SQL `+` next to a string literal are character strings, so `+` concatenates",
     );
+    pub const RANDOM_FRESH: (&str, &str) = (
+        "ASM-RANDOM-FRESH",
+        "NEWID() and gen_random_uuid() are the same, and RAND() and random() (both without a seed) are the same: each evaluation draws a fresh value from the same range (a uniqueidentifier or uuid, a float in [0, 1)), and a RAND() is compared only in a statement that evaluates it once (T-SQL draws it once per statement, PostgreSQL's random() once per row)",
+    );
     pub const SYSDATETIME: (&str, &str) = (
         "ASM-TSQL-SYSDATETIME-PER-STATEMENT",
         "SYSDATETIME() is evaluated once per statement (observed SQL Server behaviour, not documented; fact V20)",
@@ -350,6 +354,10 @@ pub struct Canon<'a> {
     pub discharged: Vec<String>,
     /// The statement being lowered evaluates its expressions for one row.
     single_row: bool,
+    /// Random draws (`RAND()`, `random()`) lowered in the statement so far.
+    rand_seen: usize,
+    /// Random draws lowered in the unit so far, numbered (see `fresh`).
+    fresh_seq: usize,
     seen_tables: HashMap<String, usize>,
     /// PostgreSQL `EXCLUDED.c` while lowering ON CONFLICT DO UPDATE.
     excluded: Option<Vec<(String, Term, Option<Ty>)>>,
@@ -724,6 +732,8 @@ impl<'a> Canon<'a> {
             asm: Vec::new(),
             discharged: Vec::new(),
             single_row: false,
+            rand_seen: 0,
+            fresh_seq: 0,
             seen_tables: HashMap::new(),
             excluded: None,
             sub_bits: HashMap::new(),
@@ -747,6 +757,8 @@ impl<'a> Canon<'a> {
         self.asm.clear();
         self.discharged.clear();
         self.single_row = false;
+        self.rand_seen = 0;
+        self.fresh_seq = 0;
         self.seen_tables.clear();
         self.excluded = None;
         self.names.clear();
@@ -1978,6 +1990,26 @@ impl<'a> Canon<'a> {
                 )
             }
         })
+    }
+
+    /// Whether a random draw may be compared here: a procedure or a script
+    /// runs its statements once. A function, a view or a trigger may run
+    /// the same draw in another statement or for another caller, which the
+    /// draw's own numbering does not show, so it stays not compared.
+    fn fresh_allowed(&self) -> bool {
+        matches!(self.unit.kind, UnitKind::Proc | UnitKind::Script)
+    }
+
+    /// A fresh random value (`ASM-RANDOM-FRESH`). Each draw is numbered in
+    /// the order the unit lowers it, so a draw never equals another draw of
+    /// the same side, and the two sides' draws pair in source order.
+    fn fresh(&mut self, fam: Fam, kind: &str) -> (Term, Option<Ty>) {
+        self.fresh_seq += 1;
+        self.assume(asm::RANDOM_FRESH);
+        (
+            n("fresh", vec![a(kind), a(self.fresh_seq.to_string())]),
+            Some(Ty::of(fam)),
+        )
     }
 
     fn time(&mut self, kind: &str) -> (Term, Option<Ty>) {
@@ -3216,6 +3248,19 @@ impl<'a> Canon<'a> {
                 }
                 _ => portable(&name, args, first_ty),
             },
+            (Dialect::Tsql, "newid", 0) | (Dialect::Postgres, "gen_random_uuid", 0)
+                if self.fresh_allowed() =>
+            {
+                self.fresh(Fam::Uuid, "uuid")
+            }
+            // RAND() draws once per statement in T-SQL and random() once per
+            // row: only a statement that evaluates it once, and holds one draw.
+            (Dialect::Tsql, "rand", 0) | (Dialect::Postgres, "random", 0)
+                if self.fresh_allowed() && self.single_row && self.rand_seen == 0 =>
+            {
+                self.rand_seen += 1;
+                self.fresh(Fam::Float, "float")
+            }
             (Dialect::Tsql, "sysdatetime", 0) => self.time("stmt"),
             (Dialect::Tsql, "getdate", 0) => self.time("stmt-datetime"),
             (Dialect::Postgres, "statement_timestamp", 0) => self.time("stmt"),
@@ -5135,6 +5180,7 @@ impl<'a> Canon<'a> {
     /// tested.
     pub fn condition(&mut self, e: &Expr) -> R<Term> {
         self.seen_tables.clear();
+        self.rand_seen = 0;
         self.single_row = true;
         Ok(self.cond(e)?.0)
     }
@@ -5402,6 +5448,7 @@ impl<'a> Canon<'a> {
             return self.output_unfolded(s, &o);
         }
         self.seen_tables.clear();
+        self.rand_seen = 0;
         self.single_row = false;
         match s {
             Stmt::Select(sel) if !sel.ctes.is_empty() => {

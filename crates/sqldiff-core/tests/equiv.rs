@@ -1417,3 +1417,39 @@ fn a_qualified_call_is_a_user_function_not_the_built_in() {
     );
     assert!(not_equal(&r), "{:?} {:?}", r.verdict(), r.findings);
 }
+
+/// NEWID() and gen_random_uuid() draw a fresh value from one range
+/// (`ASM-RANDOM-FRESH`): one draw per side is equal under that assumption.
+/// A RAND() in a statement that reads many rows is not compared, because
+/// T-SQL draws it once per statement and PostgreSQL's random() once per row.
+#[test]
+fn fresh_random_values_are_equal_under_an_assumption() {
+    let ts = "CREATE PROCEDURE dbo.new_token @Token uniqueidentifier OUTPUT AS
+              BEGIN
+                SET @Token = NEWID();
+              END";
+    let pg = "CREATE PROCEDURE new_token(INOUT p_token uuid DEFAULT NULL)
+              LANGUAGE plpgsql AS $$
+              BEGIN
+                p_token := gen_random_uuid();
+              END; $$;";
+    let r = run(ts, T, pg, P, false);
+    assert!(
+        matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.findings
+    );
+    assert!(assumption_ids(&r).contains(&"ASM-RANDOM-FRESH"));
+
+    let ts_rows = "CREATE PROCEDURE dbo.roll AS
+                   BEGIN
+                     SELECT name, RAND() AS r FROM dbo.item;
+                   END";
+    let pg_rows = "CREATE PROCEDURE roll()
+                   LANGUAGE sql AS $$
+                     SELECT name, random() AS r FROM item;
+                   $$;";
+    let r = run(ts_rows, T, pg_rows, P, true);
+    assert!(not_equal(&r), "{:?}", r.findings);
+    assert!(!assumption_ids(&r).contains(&"ASM-RANDOM-FRESH"));
+}
