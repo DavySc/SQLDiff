@@ -2055,6 +2055,21 @@ impl<'a> Binder<'a> {
             self.add_ref(kind, display, span, stmt, Resolution::Assumed(id));
             return;
         }
+        // The PostGIS functions the geography conversion writes
+        // (`tsql/geography.rs`): extension functions, present where postgis is.
+        if d == Dialect::Postgres
+            && style == CallStyle::Function
+            && parts.len() == 1
+            && ["st_geomfromwkb", "st_setsrid", "st_makepoint"]
+                .contains(&word.to_lowercase().as_str())
+        {
+            let id = self.assume(
+                "ASM-POSTGIS-GEOGRAPHY".to_string(),
+                format!("Function `{display}` is PostGIS's: the postgis extension is installed and on the search path"),
+            );
+            self.add_ref(kind, display, span, stmt, Resolution::Assumed(id));
+            return;
+        }
         if view.routines_authoritative(rkind) {
             let what = if style == CallStyle::Function {
                 "function"
