@@ -6648,6 +6648,7 @@ impl<'a> Cx<'a> {
             ["smallint"] => Some(Arith::Int(16)),
             ["int"] | ["integer"] => Some(Arith::Int(32)),
             ["bigint"] => Some(Arith::Int(64)),
+            ["money"] => Some(Arith::Money),
             ["decimal" | "numeric", "(", p, ",", s, ")"] => {
                 Some(Arith::Dec(p.parse().ok()?, s.parse().ok()?))
             }
@@ -6660,8 +6661,9 @@ impl<'a> Cx<'a> {
     /// `+`, `-` and `*` over smallint, int, bigint and decimal columns of the
     /// table and int literals: the same type for equal integer types, the
     /// wider integer for different ones, decimal(p, s) by the documented
-    /// rule when it stays within 38 digits. `None` for anything else: money
-    /// (the expression engine has no money type yet), tinyint (T-SQL's
+    /// rule when it stays within 38 digits; money with money or an integer is
+    /// money, with a decimal a decimal. `None` for anything else: a product
+    /// of two money values, smallmoney, tinyint (T-SQL's
     /// overflows at 255, PostgreSQL has no such type) and decimal literals.
     fn arith_type(&self, e: &[T], persisted: bool) -> Option<Arith> {
         let s = sig(e);
@@ -6672,7 +6674,7 @@ impl<'a> Cx<'a> {
         // (decimal arithmetic within 38 digits cannot overflow).
         (used == s.len()
             && !matches!(ty, Arith::Lit(_))
-            && (persisted || !matches!(ty, Arith::Int(_))))
+            && (persisted || !matches!(ty, Arith::Int(_) | Arith::Money)))
         .then_some(ty)
     }
 
@@ -10476,6 +10478,11 @@ enum Arith {
     /// to a decimal it is a decimal(digits, 0), not an int; next to an int
     /// it is an int (SQL Server 2022, sys.columns).
     Lit(u32),
+    /// `money`: exact like a decimal(19, 4); a sum, a difference or a product
+    /// with an integer stays money, with a decimal it is decimal arithmetic
+    /// on a decimal(19, 4), and a product of two money values (rounded to
+    /// four decimals by SQL Server, not by numeric) is not read.
+    Money,
 }
 
 impl Arith {
@@ -10486,6 +10493,7 @@ impl Arith {
             Arith::Int(_) => "bigint",
             Arith::Dec(..) => "decimal",
             Arith::Lit(_) => "int",
+            Arith::Money => "money",
         }
     }
 
@@ -10497,6 +10505,7 @@ impl Arith {
             Arith::Int(_) => Some((19, 0)),
             Arith::Dec(p, s) => Some((p, s)),
             Arith::Lit(d) => Some((d, 0)),
+            Arith::Money => Some((19, 4)),
         }
     }
 
@@ -10506,6 +10515,8 @@ impl Arith {
         use Arith::*;
         match (a, b) {
             (Lit(_), Lit(_)) => Some(Int(32)),
+            (Money, Money) => (!mul).then_some(Money),
+            (Money, Int(_) | Lit(_)) | (Int(_) | Lit(_), Money) => Some(Money),
             (Lit(_), Int(w)) | (Int(w), Lit(_)) => Some(Int(w.max(32))),
             (Int(x), Int(y)) => Some(Int(x.max(y))),
             _ => {
@@ -10542,6 +10553,7 @@ impl Arith {
             }
             Arith::Dec(p, s) => frac.len() as u32 <= s && int.len() as u32 <= p - s,
             Arith::Lit(_) => false,
+            Arith::Money => frac.len() <= 4 && int.len() <= 15,
         }
     }
 }

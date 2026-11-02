@@ -34,7 +34,6 @@ fn equal(a: &str, b: &str) -> bool {
     matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions)
 }
 
-#[allow(dead_code)]
 fn table_equal(col_a: &str, col_b: &str) -> bool {
     let r = diff(
         &Artifact::new(
@@ -100,4 +99,29 @@ fn money_with_a_decimal_is_decimal_arithmetic() {
     assert!(equal("Price + Rate", "Price + Rate"));
     assert!(equal("Price * Rate", "Price * Rate"));
     assert!(equal("Price < Fee", "Price < Fee"));
+}
+
+#[test]
+fn money_computed_columns_with_exact_arithmetic() {
+    let g = |e: &str| format!("C numeric(19,4) GENERATED ALWAYS AS ({e}) STORED");
+    for (a, b) in [
+        ("C AS A + B PERSISTED", "A + B"),
+        ("C AS A - B PERSISTED", "A - B"),
+        ("C AS A * Q PERSISTED", "A * Q"),
+        ("C AS Q * A PERSISTED", "Q * A"),
+        ("C AS (A + B) PERSISTED", "A + B"),
+    ] {
+        assert!(table_equal(a, &g(b)), "{a} vs {b}");
+    }
+    // The wrong operation, a different operand, and the rounded product or
+    // quotient of money are never proven.
+    for (a, b) in [
+        ("C AS A + B PERSISTED", "A - B"),
+        ("C AS A - B PERSISTED", "B - A"),
+        ("C AS A * Q PERSISTED", "A * Q + 1"),
+        ("C AS A * B PERSISTED", "A * B"),
+        ("C AS A / Q PERSISTED", "A / Q"),
+    ] {
+        assert!(!table_equal(a, &g(b)), "{a} vs {b}");
+    }
 }

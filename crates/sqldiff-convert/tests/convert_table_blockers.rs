@@ -588,3 +588,87 @@ fn pg_computed_arithmetic_refusals() {
         );
     }
 }
+
+fn money_table(col: &str) -> String {
+    format!("CREATE TABLE dbo.P (\n    A money NOT NULL,\n    B money NOT NULL,\n    Q int NOT NULL,\n    Sm smallint NOT NULL,\n    R decimal(9,2) NOT NULL,\n    Sx smallmoney NOT NULL,\n    {col}\n);\n")
+}
+
+/// Money columns: a sum, a difference or a product with an integer is money
+/// again (numeric(19, 4)), money with a decimal is a decimal, and the engine
+/// proves each one (sys.columns on SQL Server 2022,
+/// eval/builtins/2026-11-02-o/computed-types-tsql.out and
+/// eval/builtins/2026-11-02-money). Money arithmetic raises its overflow
+/// error when SQL Server reads a column that is not PERSISTED, so only
+/// PERSISTED columns convert.
+#[test]
+fn pg_computed_money_arithmetic() {
+    for (col, want) in [
+        (
+            "C AS A + B PERSISTED",
+            "C numeric(19,4) GENERATED ALWAYS AS (A + B) STORED",
+        ),
+        (
+            "C AS (A - B) PERSISTED NOT NULL",
+            "C numeric(19,4) GENERATED ALWAYS AS (A - B) STORED NOT NULL",
+        ),
+        (
+            "C AS Sm * A PERSISTED",
+            "C numeric(19,4) GENERATED ALWAYS AS (Sm * A) STORED",
+        ),
+        (
+            "C AS A * Q PERSISTED",
+            "C numeric(19,4) GENERATED ALWAYS AS (A * Q) STORED",
+        ),
+        (
+            "C AS A - 1 PERSISTED",
+            "C numeric(19,4) GENERATED ALWAYS AS (A - 1) STORED",
+        ),
+        (
+            "C AS ISNULL(Q * A, 0) PERSISTED",
+            "C numeric(19,4) GENERATED ALWAYS AS (COALESCE(Q * A, 0)) STORED NOT NULL",
+        ),
+        (
+            "C AS A + R",
+            "C numeric(20, 4) GENERATED ALWAYS AS (A + R) STORED",
+        ),
+        (
+            "C AS R * A",
+            "C numeric(29, 6) GENERATED ALWAYS AS (R * A) STORED",
+        ),
+    ] {
+        let c = pg(&money_table(col));
+        assert!(c.output.contains(want), "{col}\n{want}\n{}", c.output);
+        assert_eq!(
+            c.units[0].checked,
+            Status::Converted,
+            "{col}: {:#?}",
+            c.units[0].notes
+        );
+        assert!(has(&c, "ASM-COMPUTED-STORED"));
+    }
+}
+
+/// Money uses SQL Server rounds or reads differently stay refused: a product
+/// or quotient of money, smallmoney, a column that is not PERSISTED, a float
+/// or a string operand.
+#[test]
+fn pg_computed_money_refusals() {
+    for col in [
+        "C AS A + B",
+        "C AS A * B PERSISTED",
+        "C AS A / Q PERSISTED",
+        "C AS A / B PERSISTED",
+        "C AS Sx + Sx PERSISTED",
+        "C AS A + Sx PERSISTED",
+        "C AS A * 2.5 PERSISTED",
+        "C AS ISNULL(A + B, 0.00001) PERSISTED",
+    ] {
+        let c = pg(&money_table(col));
+        assert_eq!(
+            c.units[0].status,
+            Status::NotConverted,
+            "{col}\n{}",
+            c.output
+        );
+    }
+}

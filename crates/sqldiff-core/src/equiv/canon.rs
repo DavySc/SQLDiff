@@ -1151,6 +1151,10 @@ impl<'a> Canon<'a> {
 
     /// Whether a value of type `src` is stored in `dst` unchanged.
     fn fits(&self, dst: &Ty, src: &Ty) -> bool {
+        // An int (up to 32 bits) is inside the money range; a bigint is not.
+        if dst.fam == Fam::Money && src.fam == Fam::Int {
+            return src.len.is_some_and(|l| l <= 32);
+        }
         if dst.fam != src.fam {
             // PostgreSQL drops the trailing blanks of a CHAR value converted
             // to varchar or text ('a  ' becomes 'a'); SQL Server keeps them.
@@ -1184,7 +1188,9 @@ impl<'a> Canon<'a> {
             // The engine does not know which type an `Other` is (BINARY(n),
             // IMAGE, MONEY, an alias type, …): the store may pad, cut off,
             // round or fail.
-            Fam::Other | Fam::Money => false,
+            Fam::Other => false,
+            // Money against money: the same decimal(19, 4).
+            Fam::Money => true,
             Fam::Date
             | Fam::Interval
             | Fam::Bool
