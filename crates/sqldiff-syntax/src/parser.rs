@@ -1053,7 +1053,14 @@ impl<'a> Parser<'a> {
                 if w == "END" || w == "ELSE" {
                     break;
                 }
-                if tsql_starts_statement(&w, &head, &prev_word, prev_kind, &seen) {
+                if tsql_starts_statement(
+                    &w,
+                    &head,
+                    &prev_word,
+                    prev_kind,
+                    &seen,
+                    self.nth_kw(1, "INSERT"),
+                ) {
                     self.builder.token(INFERRED_TERMINATOR.into(), "");
                     break;
                 }
@@ -1139,8 +1146,10 @@ fn tsql_starts_statement(
     prev_word: &str,
     prev_kind: Option<SyntaxKind>,
     seen: &HashSet<String>,
+    next_is_insert: bool,
 ) -> bool {
-    if !TSQL_STARTERS.contains(&w) {
+    // `BULK INSERT` starts a statement; a lone `BULK` is an ordinary word.
+    if !(TSQL_STARTERS.contains(&w) || w == "BULK" && next_is_insert) {
         return false;
     }
     if matches!(prev_kind, Some(COMMA | L_PAREN | DOT)) || TSQL_CONTINUE_AFTER.contains(&prev_word)
@@ -1158,6 +1167,8 @@ fn tsql_starts_statement(
             !(head == "INSERT" && !seen_any(&["SELECT", "VALUES", "EXEC", "EXECUTE"])
                 || head == "WITH" && !seen_any(DML))
         }
+        // `BULK INSERT t FROM 'file' WITH (…)` is one statement.
+        "INSERT" if head == "BULK" && prev_word == "BULK" => false,
         "INSERT" | "UPDATE" | "DELETE" | "MERGE" => !(head == "WITH" && !seen_any(DML)),
         "SET" => {
             !(head == "UPDATE" && !seen.contains("SET") || prev_word == "UPDATE" || head == "ALTER")
@@ -1189,6 +1200,25 @@ mod tests {
                 (n.kind(), words.join(" "))
             })
             .collect()
+    }
+
+    #[test]
+    fn bulk_insert_is_one_statement() {
+        let text = "PRINT 'x'\nBULK INSERT [a].[b] FROM 'f.csv'\nWITH (FIELDTERMINATOR = ',', TABLOCK)\nSELECT 1\nGO\nBULK INSERT t FROM 'g.csv';\nINSERT INTO t SELECT 1;";
+        let words: Vec<String> = units(text, Dialect::Tsql)
+            .into_iter()
+            .map(|(_, w)| w)
+            .collect();
+        assert_eq!(
+            words,
+            [
+                "PRINT 'X'",
+                "BULK INSERT",
+                "SELECT 1",
+                "BULK INSERT",
+                "INSERT INTO"
+            ]
+        );
     }
 
     #[test]

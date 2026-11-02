@@ -432,3 +432,31 @@ fn exec_with_output_in_a_script_becomes_a_call_in_a_do_block() {
         c.output
     );
 }
+
+#[test]
+fn bulk_insert_is_refused_without_a_leftover_statement() {
+    let src = "PRINT 'Loading';\nBULK INSERT [Sales].[Orders] FROM 'C:\\load\\o.csv'\nWITH (FIELDTERMINATOR = '+|', ROWTERMINATOR = '&|\\n', CODEPAGE = 'ACP', CHECK_CONSTRAINTS, TABLOCK)\nGO\n";
+    for c in [pg(src), db2(src)] {
+        assert_eq!(c.units.len(), 2, "{}", c.output);
+        assert_eq!(c.units[1].status, Status::NotConverted);
+        assert!(
+            c.units[1]
+                .notes
+                .iter()
+                .any(|n| n.text.starts_with("BULK INSERT")),
+            "{:?}",
+            c.units[1].notes
+        );
+        let live: Vec<&str> = c
+            .output
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect();
+        assert!(
+            !live
+                .iter()
+                .any(|l| l.to_ascii_uppercase().contains("INSERT")),
+            "{live:?}"
+        );
+    }
+}
