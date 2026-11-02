@@ -339,6 +339,7 @@ impl Catalog {
                     })
                     .collect(),
                 returns: r.returns.as_deref().map(DataType::parse_str),
+                returns_status: false,
             })
             .collect();
         core::Catalog {
