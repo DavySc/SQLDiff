@@ -12,9 +12,9 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 |---|---|---|
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 57 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 21 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 108 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 109 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 30 |
-| | Total | 216 |
+| | Total | 217 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -175,6 +175,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-RETURN-CODE` | Callers read a PostgreSQL procedure's return code from its return_code INOUT parameter. | `deployment` | How callers read the return code. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/call.rs` |
 | `ASM-RETURN-LENGTHS` | Returned values fit the shorter of the two sides' declared return types. | `catalog` | The types of the returned expressions. | `sqldiff-core/src/equiv/mod.rs` |
 | `ASM-RETURN-STATUS` | Callers read a Db2 for i procedure's return status with GET DIAGNOSTICS DB2_RETURN_STATUS (or the driver's return value). | `deployment` | How callers read the return status. | `sqldiff-convert/src/tsql.rs` |
+| `ASM-ROLE-NOLOGIN` | A T-SQL database role is the PostgreSQL role of the same name created NOLOGIN: the role has no login of its own, and no other PostgreSQL role of that name exists on the target cluster. | `deployment` | The target cluster has no other role of that name (PostgreSQL roles are cluster-wide), and the T-SQL role has no login of its own. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/ddl.rs` |
 | `ASM-ROUTINE-LABEL` | A routine's STABLE, IMMUTABLE or DETERMINISTIC label is truthful. | `catalog` | The routine's body in the catalog. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-ROUTINE-REPLACE` | CREATE OR REPLACE replaces the existing routine (its parameter list is unchanged); otherwise the old one stays beside it. | `catalog` | The existing routine's signature on the target. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-ROW-*` | A row of the dialect's semantic profile holds as tabled (the rest of the id is the row). | `nothing` | The profile row checked against the engine (eval/ probes). | `sqldiff-core/src/ir/interp.rs` |

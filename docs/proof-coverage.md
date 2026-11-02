@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 188 | 35 (19%) | 6 (3%) | 147 (78%) |
+| `converter` | 191 | 35 (18%) | 6 (3%) | 150 (79%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 217 | 38 (18%) | 8 (4%) | 171 (79%) |
+| **All** | 220 | 38 (17%) | 8 (4%) | 174 (79%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -177,6 +177,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.sqlcmd-include` | `converter` | engine |  | `sqldiff-convert/src/lib.rs`<br>`sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.break` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.continue` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.stmt.create-role` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.drop-trigger` | `converter` | engine |  | `sqldiff-convert/src/tsql/trigger.rs` |
 | `tsql.stmt.dynamic-known-text` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.dynamic-parameters` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |

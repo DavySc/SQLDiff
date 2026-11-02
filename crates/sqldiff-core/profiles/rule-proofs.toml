@@ -942,6 +942,12 @@ proof = "engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.stmt.create-role"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
 id = "tsql.schema.authorization-dbo"
 kind = "converter"
 proof = "engine"
