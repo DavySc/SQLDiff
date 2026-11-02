@@ -729,10 +729,10 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
 id = "ASM-POSTGIS-GEOGRAPHY"
-statement = "PostgreSQL: the postgis extension is installed and its types are on the search path; a T-SQL GEOGRAPHY value is carried unchanged as a PostGIS geography (spatial methods are converted, or refused, on their own)."
+statement = "PostgreSQL: the postgis extension is installed and its types and functions (ST_GeomFromWKB, ST_SetSRID, ST_MakePoint, which the geography conversion writes) are on the search path; a T-SQL GEOGRAPHY value is carried unchanged as a PostGIS geography (spatial methods are converted, or refused, on their own)."
 discharge = "deployment"
 fact = "The target database has CREATE EXTENSION postgis."
-sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-convert/src/tsql/geography.rs", "sqldiff-core/src/bind/mod.rs"]
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-convert/src/tsql/geography.rs", "sqldiff-core/src/bind/mod.rs", "sqldiff-core/src/bind/query.rs"]
 
 [[assumption]]
 id = "ASM-NO-CALLER-TXN"
