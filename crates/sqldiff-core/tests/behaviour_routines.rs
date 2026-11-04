@@ -128,3 +128,34 @@ fn routines_meet_by_name_when_their_order_differs() {
         same.findings
     );
 }
+
+/// A routine of more statements than the step budget: the statements past
+/// it are not compared, and say so one by one.
+#[test]
+fn statements_past_the_step_budget_are_not_proven() {
+    let body: String = (0..4300).map(|_| "  SET @i = @i + 1;\n").collect();
+    let proc =
+        format!("CREATE PROCEDURE dbo.long_one AS\nBEGIN\n  DECLARE @i int = 0;\n{body}END\nGO\n");
+    let r = run(&proc, &proc);
+    let budget: Vec<_> = r
+        .findings
+        .iter()
+        .filter(|f| f.rule == "equiv.budget")
+        .collect();
+    assert!(!budget.is_empty(), "no equiv.budget finding");
+    assert!(budget.iter().all(|f| f.verdict == Verdict::Unknown));
+    // The first statements ran; the last did not.
+    let lines: Vec<usize> = budget
+        .iter()
+        .filter_map(|f| f.a.as_ref().map(|l| l.start_line))
+        .collect();
+    assert!(
+        lines.contains(&(4300 + 3)),
+        "last statement missing: {lines:?}"
+    );
+    assert!(!lines.contains(&5), "first statements wrongly flagged");
+    assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
+    // A short routine has none.
+    let short = run(SECOND, SECOND);
+    assert!(!short.findings.iter().any(|f| f.rule == "equiv.budget"));
+}
