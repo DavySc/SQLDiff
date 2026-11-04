@@ -110,6 +110,7 @@ impl Cx<'_> {
         // The column list: PERIOD out, period columns rewritten.
         let mut period = None;
         let mut gen: Vec<(String, bool, u32)> = Vec::new();
+        let mut any_hidden = false;
         let mut items: Vec<Vec<T>> = Vec::new();
         for item in split_commas(&ts[open + 1..close]) {
             let s = sig(item);
@@ -131,7 +132,8 @@ impl Cx<'_> {
                 continue;
             }
             match row_generated(item)? {
-                Some((at, len, is_start)) => {
+                Some((at, len, is_start, hidden)) => {
+                    any_hidden |= hidden;
                     let col = tsql_unquote(&item[s[0]].s);
                     let digits = period_digits(item, &s)?;
                     let words: Vec<&T> = s.iter().map(|&j| &item[j]).collect();
@@ -179,6 +181,13 @@ impl Cx<'_> {
             return no("period columns of different types: no rule yet");
         }
 
+        if any_hidden {
+            self.note(
+                Status::Assumptions,
+                "ASM-HIDDEN-PERIOD-COLUMN",
+                &format!("The period columns {start} and {end} are HIDDEN in T-SQL: SELECT * and an INSERT without a column list leave them out. PostgreSQL has no hidden columns, so the converted table returns them from SELECT * and an INSERT without a column list may leave them out (they have a default); code that reads or writes the table that way must name its columns."),
+            );
+        }
         let mut out: Vec<T> = ts[..=open].to_vec();
         for (n, it) in items.into_iter().enumerate() {
             if n > 0 {
@@ -604,9 +613,10 @@ fn versioning_option(opt: &[T], allow_retention: bool) -> R<(Vec<T>, Option<Stri
     history.map(|h| (h, retention)).ok_or(No("SYSTEM_VERSIONING = ON without HISTORY_TABLE: SQL Server creates a history table with a generated name (MSSQL_TemporalHistoryFor_…); name one to convert".into()))
 }
 
-/// `GENERATED ALWAYS AS ROW START|END` in a column item: its token span and
-/// whether it is the start. HIDDEN is refused.
-fn row_generated(item: &[T]) -> R<Option<(usize, usize, bool)>> {
+/// `GENERATED ALWAYS AS ROW START|END [HIDDEN]` in a column item: its token
+/// span (HIDDEN included), whether it is the start and whether it is HIDDEN.
+/// The caller records ASM-HIDDEN-PERIOD-COLUMN for a hidden column.
+fn row_generated(item: &[T]) -> R<Option<(usize, usize, bool, bool)>> {
     let s = sig(item);
     for (n, &j) in s.iter().enumerate() {
         let w = |k: usize| s.get(n + k).map(|&x| &item[x]);
@@ -618,11 +628,9 @@ fn row_generated(item: &[T]) -> R<Option<(usize, usize, bool)>> {
         if !start && !is(4, "END") {
             return no("GENERATED ALWAYS AS ROW …: only ROW START and ROW END have a rule");
         }
-        if is(5, "HIDDEN") {
-            return no("HIDDEN period column: PostgreSQL has no hidden columns, so SELECT * would return it");
-        }
-        let last = s[n + 4];
-        return Ok(Some((j, last + 1 - j, start)));
+        let hidden = is(5, "HIDDEN");
+        let last = s[n + if hidden { 5 } else { 4 }];
+        return Ok(Some((j, last + 1 - j, start, hidden)));
     }
     Ok(None)
 }

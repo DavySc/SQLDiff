@@ -12,9 +12,9 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 |---|---|---|
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 57 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 21 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 111 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 112 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 30 |
-| | Total | 219 |
+| | Total | 220 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -122,6 +122,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-GRANT-PRINCIPAL` | The target role a GRANT names stands for the same users as the T-SQL principal of that name, and no T-SQL DENY outranks the grant. | `deployment` | How T-SQL users and roles map to PostgreSQL roles, and the DENY statements on the object. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/ddl.rs` |
 | `ASM-HAND-WRITTEN` | A unit's output written by hand means what the source means, beyond what the check compares. | `nothing` | A reviewer reading the text against the source (a review decision, per unit). | `sqldiff-convert/src/tree.rs` |
 | `ASM-HEX-BINARY` | A 0x... constant is used as a binary value, not converted to a number. | `catalog` | The type of what the constant is compared with or stored into. | `sqldiff-convert/src/tsql.rs` |
+| `ASM-HIDDEN-PERIOD-COLUMN` | No code reads a table with HIDDEN period columns through SELECT * or writes it through an INSERT without a column list (T-SQL leaves hidden columns out of both; the converted table has them as ordinary columns). | `deployment` | How the table is read and written: every SELECT and INSERT on it names its columns. | `sqldiff-convert/src/tsql/temporal.rs` |
 | `ASM-HISTORY-RETENTION` | No reader relies on history rows older than the table's HISTORY_RETENTION_PERIOD (a number of days, weeks, months or years) being absent: SQL Server hides them from FOR SYSTEM_TIME queries at once and deletes them in the background, while on PostgreSQL they stay visible until a scheduled job deletes them. | `deployment` | Which job prunes the history table, that it runs often enough, and that it deletes on the period-end column (rows whose end is older than the retention period against UTC time, as SQL Server ages them). SQL Server prunes only while the database option TEMPORAL_HISTORY_RETENTION is ON (the default; OFF after a point-in-time restore), so a source with it OFF does not prune either. | `sqldiff-convert/src/tsql/temporal.rs` |
 | `ASM-IDENT-FOLD` | Names on both sides name the same objects after case folding: unquoted names, and quoted PostgreSQL names that no other name of the statement or catalog matches up to letter case. | `catalog` | The object names in both catalogs and the T-SQL catalog collation. (fact key `collation`) | `sqldiff-convert/src/lib.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-IDENTITY` | Nobody inserts explicit identity values without OVERRIDING SYSTEM VALUE, or relies on the values rolled-back inserts use. | `deployment` | How callers write identity columns. | `sqldiff-convert/src/tsql.rs` |

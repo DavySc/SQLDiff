@@ -559,6 +559,13 @@ fact = "The type of what the constant is compared with or stored into."
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-HIDDEN-PERIOD-COLUMN"
+statement = "No code reads a table with HIDDEN period columns through SELECT * or writes it through an INSERT without a column list (T-SQL leaves hidden columns out of both; the converted table has them as ordinary columns)."
+discharge = "deployment"
+fact = "How the table is read and written: every SELECT and INSERT on it names its columns."
+sites = ["sqldiff-convert/src/tsql/temporal.rs"]
+
+[[assumption]]
 id = "ASM-HISTORY-RETENTION"
 statement = "No reader relies on history rows older than the table's HISTORY_RETENTION_PERIOD (a number of days, weeks, months or years) being absent: SQL Server hides them from FOR SYSTEM_TIME queries at once and deletes them in the background, while on PostgreSQL they stay visible until a scheduled job deletes them."
 discharge = "deployment"
