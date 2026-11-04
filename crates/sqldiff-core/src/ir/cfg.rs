@@ -193,6 +193,30 @@ pub struct Node {
     pub routes: Vec<(ErrorKind, Route)>,
 }
 
+impl Cfg {
+    /// The nodes `from` and every node a path can run after them: along the
+    /// edges, to the handler of each error route, and to the statement after
+    /// a failing one (a continue handler resumes there).
+    pub fn reachable_from(&self, from: &[NodeId]) -> std::collections::BTreeSet<NodeId> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut todo: Vec<NodeId> = from.to_vec();
+        while let Some(n) = todo.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            let node = self.node(n);
+            todo.extend(node.succ.iter().map(|(_, t)| *t));
+            for (_, r) in &node.routes {
+                todo.push(r.resume);
+                if let Some(h) = &r.handler {
+                    todo.push(h.entry);
+                }
+            }
+        }
+        seen
+    }
+}
+
 impl Node {
     pub fn next(&self, e: Edge) -> Option<NodeId> {
         self.succ.iter().find(|(x, _)| *x == e).map(|(_, n)| *n)

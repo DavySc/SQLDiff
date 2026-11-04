@@ -120,6 +120,11 @@ pub struct Outcome {
     /// Decisions on conditions the interpreter could not evaluate.
     pub signature: Vec<(String, bool)>,
     pub imprecise: Vec<String>,
+    /// Where the exploration stopped short of this path's end: the statement
+    /// the step budget cut the path before, and the first statements of the
+    /// branches the path budget dropped. What the path could still have run
+    /// from these was not explored (see `Cfg::reachable_from`).
+    pub cut: Vec<NodeId>,
     /// Set when the fates of effects are not known (e.g. the Db2 for i
     /// commit level is not declared); control flow is still exact.
     pub durability_unknown: Option<String>,
@@ -153,6 +158,7 @@ impl Outcome {
             doomed: false,
             signature: Vec::new(),
             imprecise: Vec::new(),
+            cut: Vec::new(),
             durability_unknown: None,
             rows: BTreeSet::new(),
             assumptions: BTreeSet::new(),
@@ -223,6 +229,7 @@ struct State {
     loop_seen: HashMap<NodeId, Vec<String>>,
     signature: Vec<(String, bool)>,
     imprecise: Vec<String>,
+    cut: Vec<NodeId>,
     durability_unknown: Option<String>,
     rows: BTreeSet<String>,
     assumptions: BTreeSet<String>,
@@ -498,6 +505,7 @@ impl Interp<'_> {
         st.steps += 1;
         if st.steps > MAX_STEPS {
             st.imprecise.push("step budget exhausted".into());
+            st.cut.push(node);
             m.outs.push(self.finish(Exit::Normal, *st));
             return;
         }
@@ -509,6 +517,7 @@ impl Interp<'_> {
                     m.work.extend(v);
                 } else {
                     s.imprecise.push("path budget exhausted".into());
+                    s.cut.extend(v.iter().map(|(n, _)| *n));
                 }
                 m.cur = Some((n, s));
             }
@@ -567,6 +576,7 @@ impl Interp<'_> {
             loop_seen: HashMap::new(),
             signature: Vec::new(),
             imprecise: Vec::new(),
+            cut: Vec::new(),
             durability_unknown: None,
             rows: BTreeSet::new(),
             assumptions: BTreeSet::new(),
@@ -1490,6 +1500,7 @@ impl Interp<'_> {
             doomed: st.doomed,
             signature: st.signature,
             imprecise: st.imprecise,
+            cut: st.cut,
             durability_unknown: st.durability_unknown,
             rows: st.rows,
             assumptions: st.assumptions,

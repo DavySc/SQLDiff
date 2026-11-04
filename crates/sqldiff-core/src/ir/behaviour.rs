@@ -1056,6 +1056,10 @@ struct Collector<'x, 'a> {
     /// statements start with the same words must not share a fingerprint.
     prior: HashSet<String>,
     salt: String,
+    /// Statements where a path of some scenario was cut by a budget, per
+    /// side (see `Outcome::cut`).
+    cut_a: BTreeSet<NodeId>,
+    cut_b: BTreeSet<NodeId>,
 }
 
 impl<'x, 'a> Collector<'x, 'a> {
@@ -1079,6 +1083,8 @@ impl<'x, 'a> Collector<'x, 'a> {
             incomplete: false,
             prior: HashSet::new(),
             salt: String::new(),
+            cut_a: BTreeSet::new(),
+            cut_b: BTreeSet::new(),
         };
         c.splits = splits(&c.sa, &c.sb, true);
         c.splits.extend(splits(&c.sb, &c.sa, false));
@@ -1143,6 +1149,10 @@ impl<'x, 'a> Collector<'x, 'a> {
         scen_b: Scenario,
     ) -> (Vec<Outcome>, Vec<Outcome>) {
         let (pa, pb) = self.outcomes(&sc, &scen_a, &scen_b);
+        self.cut_a
+            .extend(pa.iter().flat_map(|o| o.cut.iter().copied()));
+        self.cut_b
+            .extend(pb.iter().flat_map(|o| o.cut.iter().copied()));
         let inexact = |o: &Outcome| {
             !o.imprecise.is_empty() || o.durability_unknown.is_some() || !o.untested.is_empty()
         };
@@ -1384,6 +1394,59 @@ impl<'x, 'a> Collector<'x, 'a> {
                 }
                 self.out.witnesses.push(w);
                 self.out.findings.push(f);
+            }
+        }
+    }
+
+    /// One unknown finding (`equiv.budget`) on every statement a budget kept
+    /// the exploration from running: each statement a cut path could still
+    /// have run, in any scenario. Without it a statement past the budget is
+    /// absent from every outcome, nothing is compared there, and its unit
+    /// reads as "under assumptions".
+    fn budget_findings(&mut self) {
+        for on_a in [true, false] {
+            let (side, cuts) = if on_a {
+                (&self.sa, &self.cut_a)
+            } else {
+                (&self.sb, &self.cut_b)
+            };
+            if cuts.is_empty() {
+                continue;
+            }
+            let from: Vec<NodeId> = cuts.iter().copied().collect();
+            let mut nodes: Vec<&SyntaxNode> = side
+                .cfg
+                .reachable_from(&from)
+                .into_iter()
+                .filter(|&i| side.cfg.node(i).stmt().is_some())
+                .filter_map(|i| side.cfg.node(i).syntax.as_ref())
+                .collect();
+            nodes.sort_by_key(|n| n.text_range().start());
+            nodes.dedup_by_key(|n| n.text_range());
+            let mut seen: HashMap<String, usize> = HashMap::new();
+            for n in nodes {
+                let words = ast::first_words(n, 3).join(" ");
+                let nth = seen.entry(words.clone()).or_insert(0);
+                *nth += 1;
+                let loc = side.a.node_location(n);
+                let fp = fingerprint(&FingerprintInput {
+                    object: &side.a.object,
+                    class: ChangeClass::Transactional,
+                    rule: "equiv.budget",
+                    anchor_a: &format!("{}{words}#{nth}", self.salt),
+                    anchor_b: "",
+                });
+                self.out.findings.push(Finding {
+                    fingerprint: fp,
+                    rule: "equiv.budget".to_string(),
+                    class: ChangeClass::Transactional,
+                    severity: Severity::Medium,
+                    verdict: Verdict::Unknown,
+                    witness: "Not proven: the behaviour model stopped at its step or path budget before it ran this statement in at least one scenario, so what happens when it fails and how its transaction goes are not compared.".to_string(),
+                    a: on_a.then(|| loc.clone()),
+                    b: (!on_a).then_some(loc),
+                    assumptions: Vec::new(),
+                });
             }
         }
     }
@@ -1739,6 +1802,7 @@ fn analyze_pair(
         };
         c.run(Kind::CallerTxn, caller.clone(), caller);
     }
+    c.budget_findings();
     // A replaced routine-wide finding may have brought assumptions that no
     // finding uses any more.
     let used: HashSet<String> = c
