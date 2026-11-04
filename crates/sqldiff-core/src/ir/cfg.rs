@@ -356,12 +356,22 @@ pub fn lower(a: &Analyzed) -> Cfg {
 /// `lower`, keying a T-SQL table variable by the temporary table it is
 /// converted to when the other side has that table (`other_temps`).
 pub fn lower_with(a: &Analyzed, other_temps: HashSet<String>) -> Cfg {
-    let d = a.dialect();
-    let prof = Profile::of(d);
-    let routine_node = a
+    let first = a
         .root
         .descendants()
         .find(|n| n.kind() == SyntaxKind::ROUTINE);
+    lower_routine(a, other_temps, first)
+}
+
+/// `lower_with` for the given routine of the artifact, or the artifact's
+/// statements when `routine_node` is `None` (a script).
+pub fn lower_routine(
+    a: &Analyzed,
+    other_temps: HashSet<String>,
+    routine_node: Option<SyntaxNode>,
+) -> Cfg {
+    let d = a.dialect();
+    let prof = Profile::of(d);
     let routine = routine_node
         .as_ref()
         .map(routine_kind)

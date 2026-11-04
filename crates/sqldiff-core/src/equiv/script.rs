@@ -137,7 +137,10 @@ fn same_routine(
     Some(asms)
 }
 
-fn routine_key(r: &SyntaxNode, d: Dialect) -> Option<(&'static str, (Option<String>, String))> {
+pub(crate) fn routine_key(
+    r: &SyntaxNode,
+    d: Dialect,
+) -> Option<(&'static str, (Option<String>, String))> {
     let toks: Vec<Tok> = cst::header_tokens(r).iter().map(Tok::from_syntax).collect();
     let kw = toks.iter().position(|t| {
         matches!(
