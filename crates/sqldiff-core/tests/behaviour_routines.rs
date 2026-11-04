@@ -106,14 +106,25 @@ fn the_first_routine_keeps_its_findings() {
 
 #[test]
 fn routines_meet_by_name_when_their_order_differs() {
+    // The second routine of A is the first of B, and it differs.
     let a = format!("{FIRST}{SECOND}");
-    let b = format!("{SECOND}{FIRST}");
+    let b = format!("{SECOND_MUTATED}{FIRST}");
     let r = run(&a, &b);
+    let f = r
+        .findings
+        .iter()
+        .find(|f| f.rule == "txn.atomicity" && f.verdict == Verdict::Different)
+        .unwrap_or_else(|| panic!("difference not found: {:#?}", r.findings));
+    // It is the mutated routine, not the first one of A.
+    assert!(f.a.as_ref().unwrap().start_line > FIRST.lines().count());
+    // Reordered and equal: no behavioural difference (the statement layer
+    // reports the move).
+    let same = run(&a, &format!("{SECOND}{FIRST}"));
     assert!(
-        !r.findings
+        !behavioural(&same)
             .iter()
-            .any(|f| f.rule == "behaviour.unmet-routine"),
+            .any(|f| matches!(f.verdict, Verdict::Different | Verdict::Unknown)),
         "{:#?}",
-        r.findings
+        same.findings
     );
 }

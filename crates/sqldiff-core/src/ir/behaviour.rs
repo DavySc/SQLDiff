@@ -1583,7 +1583,9 @@ struct Meeting {
 
 fn meet(a: &Analyzed, b: &Analyzed) -> Option<Meeting> {
     let (ra, rb) = (routines_of(a), routines_of(b));
-    if ra.len() <= 1 && rb.len() <= 1 {
+    // At most one routine each, or a side with none (a script of batches
+    // against `DO` blocks): analysed whole, as before.
+    if (ra.len() <= 1 && rb.len() <= 1) || ra.is_empty() || rb.is_empty() {
         return None;
     }
     let key = |r: &SyntaxNode, an: &Analyzed| crate::equiv::script::routine_key(r, an.dialect());
