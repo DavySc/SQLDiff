@@ -254,3 +254,23 @@ fn a_stored_result_that_a_fresh_check_contradicts_fails_the_run_and_empties_the_
     convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
     assert_eq!(results(&f.out("o")).len(), 1);
 }
+
+#[test]
+fn a_directory_holding_only_the_store_is_empty_for_a_resume() {
+    let f = Fixture::standard("onlystore");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    // As after a run killed before it wrote its tree.
+    for e in std::fs::read_dir(f.out("o")).unwrap() {
+        let p = e.unwrap().path();
+        if p.file_name().unwrap() == ".sqldiff" {
+            continue;
+        }
+        if p.is_dir() {
+            std::fs::remove_dir_all(&p).unwrap();
+        } else {
+            std::fs::remove_file(&p).unwrap();
+        }
+    }
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    assert!(reused(&f.out("o")).iter().any(|(_, r)| *r));
+}

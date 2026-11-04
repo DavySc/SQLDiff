@@ -1506,8 +1506,8 @@ pub fn prepare_out(src: &Path, out: &Path, overwrite: bool) -> Result<(), String
     }
     let empty = std::fs::read_dir(&out_c)
         .map_err(|e| format!("{}: {e}", out.display()))?
-        .next()
-        .is_none();
+        .filter_map(|e| e.ok())
+        .all(|e| e.file_name() == ".sqldiff");
     if !empty && !overwrite {
         return Err(format!(
             "{}: not empty; pass --overwrite to replace the files a conversion writes",

@@ -165,7 +165,11 @@ impl Store {
         if let Some(p) = dest.parent() {
             std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
         }
-        let tmp = dest.with_extension(format!("tmp{}", std::process::id()));
+        let tmp = dest.with_extension(format!(
+            "tmp{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::write(&tmp, &bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
         let mut last = String::new();
         for attempt in 0..5u64 {
