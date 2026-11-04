@@ -320,28 +320,14 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     let env = crate::ir::behaviour::Env::from_options(opts);
     let beh = crate::ir::behaviour::analyze(&aa, &ab, &env);
     // A transaction statement between data statements is compared when the
-    // behaviour model compared the routine that holds it: it lowers the
-    // first routine of each side, so only a side with exactly one routine
-    // counts.
-    let only_routine = |an: &Analyzed| {
-        let mut rs = an
-            .root
-            .descendants()
-            .filter(|n| n.kind() == sqldiff_syntax::SyntaxKind::ROUTINE);
-        match (rs.next(), rs.next()) {
-            (Some(r), None) => {
-                let r = r.text_range();
-                Some(usize::from(r.start())..usize::from(r.end()))
-            }
-            _ => None,
-        }
-    };
-    let (ra, rb) = (only_routine(&aa), only_routine(&ab));
+    // behaviour model compared the routine that holds it, on its side.
     for (on_a, at, why) in txn_unknown {
-        let within = if on_a { &ra } else { &rb }
-            .as_ref()
-            .is_some_and(|r| r.contains(&at));
-        if !(beh.txn_compared && ra.is_some() && rb.is_some() && within) {
+        let ranges = if on_a {
+            &beh.txn_compared_a
+        } else {
+            &beh.txn_compared_b
+        };
+        if !ranges.iter().any(|r| r.contains(&at)) {
             unknown_reasons.push(why);
         }
     }

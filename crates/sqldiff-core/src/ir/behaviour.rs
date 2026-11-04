@@ -94,8 +94,8 @@ impl<'x, 'a> SideIr<'x, 'a> {
     /// Lowers one side and indexes its effects and reads: the scenarios
     /// look keys up for every outcome pair, so a scan per lookup made large
     /// routines cubic.
-    fn new(a: &'x Analyzed<'a>, other: &Analyzed) -> Self {
-        let cfg = super::cfg::lower_with(a, other_temps(a, other));
+    fn new(a: &'x Analyzed<'a>, other: &Analyzed, routine: Option<SyntaxNode>) -> Self {
+        let cfg = super::cfg::lower_routine(a, other_temps(a, other), routine);
         let mut at = HashMap::new();
         let mut bases = HashMap::new();
         for (i, (n, e)) in cfg.effect_nodes().into_iter().enumerate() {
@@ -1029,6 +1029,11 @@ pub struct Behaviour {
     /// equivalence need not refuse transaction statements between data
     /// statements.
     pub txn_compared: bool,
+    /// Source ranges (byte offsets) of the routines on each side whose
+    /// behaviour was compared exactly, as `txn_compared` says for a whole
+    /// file: a transaction statement inside one of them need not be refused.
+    pub txn_compared_a: Vec<std::ops::Range<usize>>,
+    pub txn_compared_b: Vec<std::ops::Range<usize>>,
 }
 
 struct Collector<'x, 'a> {
@@ -1046,13 +1051,24 @@ struct Collector<'x, 'a> {
     /// Some scenario had no outcome on a side, or an outcome or finding
     /// that is not exact (see [`Behaviour::txn_compared`]).
     incomplete: bool,
+    /// Fingerprints of the findings of the routines analysed before this one
+    /// in the same files, and this routine's name: two routines whose
+    /// statements start with the same words must not share a fingerprint.
+    prior: HashSet<String>,
+    salt: String,
 }
 
 impl<'x, 'a> Collector<'x, 'a> {
-    fn new(a: &'x Analyzed<'a>, b: &'x Analyzed<'a>, env: Env) -> Self {
+    fn new(
+        a: &'x Analyzed<'a>,
+        b: &'x Analyzed<'a>,
+        env: Env,
+        ra: Option<SyntaxNode>,
+        rb: Option<SyntaxNode>,
+    ) -> Self {
         let mut c = Collector {
-            sa: SideIr::new(a, b),
-            sb: SideIr::new(b, a),
+            sa: SideIr::new(a, b, ra),
+            sb: SideIr::new(b, a, rb),
             env,
             splits: Vec::new(),
             out: Behaviour::default(),
@@ -1061,6 +1077,8 @@ impl<'x, 'a> Collector<'x, 'a> {
             xa: OnceCell::new(),
             xb: OnceCell::new(),
             incomplete: false,
+            prior: HashSet::new(),
+            salt: String::new(),
         };
         c.splits = splits(&c.sa, &c.sb, true);
         c.splits.extend(splits(&c.sb, &c.sa, false));
@@ -1322,8 +1340,12 @@ impl<'x, 'a> Collector<'x, 'a> {
             .iter()
             .enumerate()
             .any(|(i, f)| f.fingerprint == fp && Some(i) != replace)
+            || self.prior.contains(&fp)
         {
-            fp = print(&format!("{}|", d.anchor), &format!("{anchor_b}|"));
+            fp = print(
+                &format!("{}{}|", self.salt, d.anchor),
+                &format!("{}{anchor_b}|", self.salt),
+            );
         }
         let w = Witness {
             fingerprint: fp.clone(),
@@ -1519,9 +1541,192 @@ pub fn compare(a: &Analyzed, b: &Analyzed) -> (Vec<Finding>, Vec<Assumption>) {
     (r.findings, r.assumptions)
 }
 
+/// The routines of an artifact the behaviour model analyses: the outermost
+/// `ROUTINE` nodes in document order, without PostgreSQL `DO` blocks when the
+/// artifact also creates a named routine (a converted script's setup batch,
+/// as `equiv::lower` reads it).
+fn routines_of(a: &Analyzed) -> Vec<SyntaxNode> {
+    let mut top: Vec<SyntaxNode> = Vec::new();
+    for n in a.root.descendants() {
+        if n.kind() == sqldiff_syntax::SyntaxKind::ROUTINE
+            && !top
+                .last()
+                .is_some_and(|t| t.text_range().contains_range(n.text_range()))
+        {
+            top.push(n);
+        }
+    }
+    let named: Vec<SyntaxNode> = top
+        .iter()
+        .filter(|r| !(a.dialect() == Dialect::Postgres && crate::equiv::lower::is_do(r)))
+        .cloned()
+        .collect();
+    if named.is_empty() {
+        top
+    } else {
+        named
+    }
+}
+
+/// How the routines of two artifacts meet. One routine (or none) on each
+/// side meet as they are: the behaviour model has always compared them
+/// whatever their names. With more, they meet in order when both sides have
+/// the same number and no pair is known to differ in kind or name, and
+/// otherwise by kind and name (`equiv::script::routine_key`), as the
+/// statement-level comparison meets them. A routine without a partner is
+/// listed on its own side.
+struct Meeting {
+    pairs: Vec<(SyntaxNode, SyntaxNode)>,
+    only_a: Vec<SyntaxNode>,
+    only_b: Vec<SyntaxNode>,
+}
+
+fn meet(a: &Analyzed, b: &Analyzed) -> Option<Meeting> {
+    let (ra, rb) = (routines_of(a), routines_of(b));
+    if ra.len() <= 1 && rb.len() <= 1 {
+        return None;
+    }
+    let key = |r: &SyntaxNode, an: &Analyzed| crate::equiv::script::routine_key(r, an.dialect());
+    let mut m = Meeting {
+        pairs: Vec::new(),
+        only_a: Vec::new(),
+        only_b: Vec::new(),
+    };
+    let ka: Vec<Option<_>> = ra.iter().map(|r| key(r, a)).collect();
+    let kb: Vec<Option<_>> = rb.iter().map(|r| key(r, b)).collect();
+    // In order, when no pair is known to name different objects.
+    if ra.len() == rb.len()
+        && ka
+            .iter()
+            .zip(&kb)
+            .all(|(x, y)| !matches!((x, y), (Some(x), Some(y)) if x != y))
+    {
+        m.pairs = ra.iter().cloned().zip(rb.iter().cloned()).collect();
+        return Some(m);
+    }
+    // By kind and name; a name that occurs a different number of times on
+    // the two sides (overloads) meets nothing.
+    let count = |ks: &[Option<_>], k: &_| ks.iter().filter(|x| x.as_ref() == Some(k)).count();
+    let mut used = vec![false; rb.len()];
+    for (x, kx) in ra.iter().zip(&ka) {
+        let partner = kx.as_ref().and_then(|k| {
+            if count(&ka, k) != 1 || count(&kb, k) != 1 {
+                return None;
+            }
+            kb.iter().position(|y| y.as_ref() == Some(k))
+        });
+        match partner {
+            Some(j) => {
+                used[j] = true;
+                m.pairs.push((x.clone(), rb[j].clone()));
+            }
+            None => m.only_a.push(x.clone()),
+        }
+    }
+    for (j, y) in rb.iter().enumerate() {
+        if !used[j] {
+            m.only_b.push(y.clone());
+        }
+    }
+    Some(m)
+}
+
 /// [`compare`] under an environment, with structured witnesses.
+///
+/// A file that creates several routines is analysed routine by routine
+/// (`meet`): each pair gets its own control-flow graph, scenarios and
+/// budgets. A routine that meets none is not analysed, and a transaction
+/// statement inside it stays unproven.
 pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
-    let mut c = Collector::new(a, b, env.clone());
+    let Some(m) = meet(a, b) else {
+        // At most one routine on each side: `routines_of` picks it, so a
+        // setup `DO` block beside it is not mistaken for it.
+        let (ra, rb) = (routines_of(a), routines_of(b));
+        let mut out = analyze_pair(
+            a,
+            b,
+            env,
+            ra.first().cloned(),
+            rb.first().cloned(),
+            "",
+            &HashSet::new(),
+        );
+        // Transaction statements are compared only inside a routine both
+        // sides hold exactly once.
+        let span = |x: &SyntaxNode| {
+            let r = x.text_range();
+            usize::from(r.start())..usize::from(r.end())
+        };
+        let single = |an: &Analyzed| {
+            let mut rs = an
+                .root
+                .descendants()
+                .filter(|n| n.kind() == sqldiff_syntax::SyntaxKind::ROUTINE);
+            match (rs.next(), rs.next()) {
+                (Some(r), None) => Some(span(&r)),
+                _ => None,
+            }
+        };
+        if let (true, Some(x), Some(y)) = (out.txn_compared, single(a), single(b)) {
+            out.txn_compared_a.push(x);
+            out.txn_compared_b.push(y);
+        }
+        return out;
+    };
+    let mut out = Behaviour::default();
+    let mut prior: HashSet<String> = HashSet::new();
+    let mut all_compared = m.only_a.is_empty() && m.only_b.is_empty();
+    for (x, y) in &m.pairs {
+        let name = sqldiff_syntax::ast::routine_name(x).unwrap_or_default();
+        let r = analyze_pair(
+            a,
+            b,
+            env,
+            Some(x.clone()),
+            Some(y.clone()),
+            &format!("{name}|"),
+            &prior,
+        );
+        prior.extend(r.findings.iter().map(|f| f.fingerprint.clone()));
+        all_compared &= r.txn_compared;
+        if r.txn_compared {
+            let span = |n: &SyntaxNode| {
+                let t = n.text_range();
+                usize::from(t.start())..usize::from(t.end())
+            };
+            out.txn_compared_a.push(span(x));
+            out.txn_compared_b.push(span(y));
+        }
+        out.findings.extend(r.findings);
+        out.witnesses.extend(r.witnesses);
+        for x in r.assumptions {
+            if !out.assumptions.iter().any(|y| y.id == x.id) {
+                out.assumptions.push(x);
+            }
+        }
+    }
+    // A routine that meets none is not analysed (as before): the
+    // statement-level comparison pairs scripts, triggers and views by
+    // other rules than this one, and says what it could not compare.
+    all_compared &= m.only_a.is_empty() && m.only_b.is_empty();
+    out.txn_compared = all_compared;
+    out
+}
+
+/// The analysis of one pair of routines (or, with `None`, of the statements
+/// outside any routine).
+fn analyze_pair(
+    a: &Analyzed,
+    b: &Analyzed,
+    env: &Env,
+    ra: Option<SyntaxNode>,
+    rb: Option<SyntaxNode>,
+    salt: &str,
+    prior: &HashSet<String>,
+) -> Behaviour {
+    let mut c = Collector::new(a, b, env.clone(), ra, rb);
+    c.salt = salt.to_string();
+    c.prior = prior.clone();
     c.faults();
     c.split_findings();
     c.run(Kind::Baseline, env.scenario(), env.scenario());
@@ -1560,22 +1765,8 @@ fn rank(v: Verdict) -> u8 {
     }
 }
 
-/// "What if this statement fails with this error kind?" for the statement
-/// starting on `line` of side `side`, aligned to the other side by its write
-/// (or, for statements without one, by kind and order).
-pub fn what_if(
-    a: &Analyzed,
-    b: &Analyzed,
-    side: crate::model::Side,
-    line: usize,
-    kind: ErrorKind,
-    env: &Env,
-) -> WhatIf {
-    let mut c = Collector::new(a, b, env.clone());
-    let on_a = side == crate::model::Side::A;
-    let (this, other) = if on_a { (&c.sa, &c.sb) } else { (&c.sb, &c.sa) };
-    let mut notes = Vec::new();
-    let empty = |notes: Vec<String>, text: String| WhatIf {
+fn what_if_empty(env: &Env, kind: ErrorKind, text: String) -> WhatIf {
+    WhatIf {
         scenario: ScenarioInfo {
             kind: ScenarioKind::Fault,
             statement: None,
@@ -1593,7 +1784,57 @@ pub fn what_if(
         b: Vec::new(),
         findings: Vec::new(),
         witnesses: Vec::new(),
+        notes: Vec::new(),
+    }
+}
+
+/// "What if this statement fails with this error kind?" for the statement
+/// starting on `line` of side `side`, aligned to the other side by its write
+/// (or, for statements without one, by kind and order).
+pub fn what_if(
+    a: &Analyzed,
+    b: &Analyzed,
+    side: crate::model::Side,
+    line: usize,
+    kind: ErrorKind,
+    env: &Env,
+) -> WhatIf {
+    let on_a = side == crate::model::Side::A;
+    // The routine pair that holds the line; a file with at most one routine
+    // on each side is analysed whole.
+    let (ra, rb) = match meet(a, b) {
+        None => (
+            routines_of(a).first().cloned(),
+            routines_of(b).first().cloned(),
+        ),
+        Some(m) => {
+            let holds = |r: &SyntaxNode| {
+                let l = if on_a { a } else { b }.node_location(r);
+                l.start_line <= line && line <= l.end_line
+            };
+            match m
+                .pairs
+                .iter()
+                .find(|(x, y)| holds(if on_a { x } else { y }))
+            {
+                Some((x, y)) => (Some(x.clone()), Some(y.clone())),
+                None => {
+                    return WhatIf {
+                        notes: vec![format!(
+                            "line {line} is in no routine that has a counterpart on the other side"
+                        )],
+                        ..what_if_empty(env, kind, format!("No statement at line {line}"))
+                    }
+                }
+            }
+        }
+    };
+    let mut c = Collector::new(a, b, env.clone(), ra, rb);
+    let (this, other) = if on_a { (&c.sa, &c.sb) } else { (&c.sb, &c.sa) };
+    let mut notes = Vec::new();
+    let empty = |notes: Vec<String>, text: String| WhatIf {
         notes,
+        ..what_if_empty(env, kind, text)
     };
     let nodes = this.stmt_nodes();
     let Some(&n) = nodes
