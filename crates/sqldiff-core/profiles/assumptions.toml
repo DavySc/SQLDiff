@@ -560,9 +560,9 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
 id = "ASM-HISTORY-RETENTION"
-statement = "A scheduled job on PostgreSQL deletes the history rows older than the table's HISTORY_RETENTION_PERIOD (a number of days, weeks, months or years); the converted table keeps every history row until then."
+statement = "No reader relies on history rows older than the table's HISTORY_RETENTION_PERIOD (a number of days, weeks, months or years) being absent: SQL Server hides them from FOR SYSTEM_TIME queries at once and deletes them in the background, while on PostgreSQL they stay visible until a scheduled job deletes them."
 discharge = "deployment"
-fact = "Which job prunes the history table, and that it runs at least as often as the retention period needs."
+fact = "Which job prunes the history table, that it runs often enough, and that it deletes on the period-end column (rows whose end is older than the retention period against UTC time, as SQL Server ages them). SQL Server prunes only while the database option TEMPORAL_HISTORY_RETENTION is ON (the default; OFF after a point-in-time restore), so a source with it OFF does not prune either."
 sites = ["sqldiff-convert/src/tsql/temporal.rs"]
 
 [[assumption]]

@@ -2278,6 +2278,9 @@ impl<'a> Cx<'a> {
         }
         let s = sig(&ts);
         // `PERIOD FOR SYSTEM_TIME` declares the period; `t FOR SYSTEM_TIME …` queries it.
+        // A future rule must, for a table with a finite HISTORY_RETENTION_PERIOD
+        // (ASM-HISTORY-RETENTION), also filter the history on `period_end >= now() - retention`:
+        // SQL Server hides aged rows from these queries at once, a PostgreSQL prune job lags.
         if s.windows(3)
             .any(|p| !ts[p[0]].is("PERIOD") && ts[p[1]].is("FOR") && ts[p[2]].is("SYSTEM_TIME"))
         {

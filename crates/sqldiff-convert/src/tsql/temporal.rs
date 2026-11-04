@@ -82,7 +82,7 @@ impl Cx<'_> {
                         self.note(
                             Status::Assumptions,
                             "ASM-HISTORY-RETENTION",
-                            &format!("SQL Server deletes history rows older than {r} in the background; the converted table keeps every history row, and a scheduled job (pg_cron or the like) must delete the old ones, or the history grows without bound."),
+                            &format!("SQL Server hides history rows older than {r} from FOR SYSTEM_TIME queries at once and deletes them in the background; the converted table keeps every history row visible until a scheduled job (pg_cron or the like) deletes those whose period end is older than {r} (UTC), or the history grows without bound."),
                         );
                     }
                     self.step_ts("tsql.temporal.versioning-option", opt);
