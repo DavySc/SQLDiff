@@ -2143,6 +2143,7 @@ fn prepare(
         out: out.clone(),
         overwrite: spec.overwrite,
         discard_edits: false,
+        fresh: false,
         instances,
         queue_all: false,
         // The GUI does not start the proof checker yet.

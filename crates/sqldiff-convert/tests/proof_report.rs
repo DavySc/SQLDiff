@@ -93,6 +93,7 @@ impl Fixture {
             out: self.dir.join("out"),
             overwrite: true,
             discard_edits: false,
+            fresh: false,
             instances: None,
             queue_all: false,
             proof,

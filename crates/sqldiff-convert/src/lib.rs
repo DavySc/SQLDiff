@@ -30,6 +30,7 @@ pub mod queue;
 mod refused;
 pub mod review;
 pub mod shared;
+pub mod store;
 mod table_vars;
 mod template;
 mod tok;
@@ -277,6 +278,13 @@ pub struct Draft {
 impl Draft {
     pub fn output(&self) -> &str {
         &self.raw.text
+    }
+
+    /// Every field, as text, for the key of a stored result
+    /// (`store::CheckInput`): its text, its units with their notes, traces
+    /// and hand-written marks, and the variant without exception blocks.
+    pub(crate) fn canonical(&self) -> String {
+        format!("{self:?}")
     }
 
     /// Unit ids as [`review::unit_ids`] gives them for the checked
