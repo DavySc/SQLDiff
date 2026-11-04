@@ -559,6 +559,13 @@ fact = "The type of what the constant is compared with or stored into."
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-HISTORY-RETENTION"
+statement = "A scheduled job on PostgreSQL deletes the history rows older than the table's HISTORY_RETENTION_PERIOD (a number of days, weeks, months or years); the converted table keeps every history row until then."
+discharge = "deployment"
+fact = "Which job prunes the history table, and that it runs at least as often as the retention period needs."
+sites = ["sqldiff-convert/src/tsql/temporal.rs"]
+
+[[assumption]]
 id = "ASM-IDENT-FOLD"
 statement = "Names on both sides name the same objects after case folding: unquoted names, and quoted PostgreSQL names that no other name of the statement or catalog matches up to letter case."
 discharge = "catalog"

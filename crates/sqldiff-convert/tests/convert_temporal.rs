@@ -201,7 +201,7 @@ fn what_has_no_exact_equivalent_is_refused() {
         (
             base(
                 cols,
-                "SYSTEM_VERSIONING = ON (HISTORY_TABLE = s.h, HISTORY_RETENTION_PERIOD = 6 MONTHS)",
+                "SYSTEM_VERSIONING = ON (HISTORY_TABLE = s.h, HISTORY_RETENTION_PERIOD = 6 FORTNIGHTS)",
             ),
             "HISTORY_RETENTION_PERIOD",
         ),
@@ -243,6 +243,35 @@ fn what_has_no_exact_equivalent_is_refused() {
         "{:?}",
         c.units[0].notes
     );
+}
+
+/// A finite retention period converts with ASM-HISTORY-RETENTION: the output
+/// keeps all history, so the note says who must prune it.
+#[test]
+fn a_finite_retention_period_is_an_assumption() {
+    let cols = "f DATETIME2 GENERATED ALWAYS AS ROW START NOT NULL, e DATETIME2 GENERATED ALWAYS AS ROW END NOT NULL";
+    for (period, shown) in [("12 months", "12 months"), ("1 YEAR", "1 YEAR")] {
+        let c = pg(&format!(
+            "CREATE TABLE s.t (k INT NOT NULL PRIMARY KEY, {cols}, PERIOD FOR SYSTEM_TIME (f, e)) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = s.h, HISTORY_RETENTION_PERIOD = {period}));
+"
+        ));
+        let u = &c.units[0];
+        assert_eq!(
+            rules_only(u),
+            Status::Assumptions,
+            "{:?}
+{}",
+            u.notes,
+            c.output
+        );
+        let n = u
+            .notes
+            .iter()
+            .find(|n| n.text.contains("older than"))
+            .unwrap_or_else(|| panic!("no retention note: {:?}", u.notes));
+        assert!(n.text.contains(shown), "{}", n.text);
+        assert!(!c.output.contains("HISTORY_RETENTION"), "{}", c.output);
+    }
 }
 
 #[test]
