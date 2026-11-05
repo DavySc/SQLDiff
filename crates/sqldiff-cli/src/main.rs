@@ -204,6 +204,11 @@ enum Command {
         /// run (refused otherwise; record such edits in the review ledger).
         #[arg(long, requires = "overwrite")]
         discard_edits: bool,
+        /// Check every file again instead of reusing the results stored in
+        /// OUT/.sqldiff/results by an earlier run (a result is reused only
+        /// when everything its check reads is the same).
+        #[arg(long)]
+        fresh: bool,
         /// Check each file alone, without catalogs built from the whole tree.
         #[arg(long)]
         no_catalog: bool,
@@ -705,6 +710,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             jobs,
             overwrite,
             discard_edits,
+            fresh,
             no_catalog,
             catalogs,
             catalogs_b,
@@ -742,6 +748,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 out,
                 overwrite,
                 discard_edits,
+                fresh,
                 instances,
                 queue_all,
                 proof: resolved.proof.clone(),

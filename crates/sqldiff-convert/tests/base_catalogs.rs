@@ -180,6 +180,7 @@ fn base_ddl_is_not_written_listed_or_counted() {
         out: fx.path("out"),
         overwrite: false,
         discard_edits: false,
+        fresh: false,
         instances: None,
         queue_all: false,
         proof: Default::default(),
@@ -189,6 +190,7 @@ fn base_ddl_is_not_written_listed_or_counted() {
     let mut written: Vec<String> = std::fs::read_dir(fx.path("out"))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|n| n != ".sqldiff")
         .collect();
     written.sort();
     assert_eq!(
@@ -488,6 +490,7 @@ fn a_catalog_only_procedure_changes_the_rules_and_the_ledger_follows_its_content
         out: out.clone(),
         overwrite: true,
         discard_edits: false,
+        fresh: false,
         instances: None,
         queue_all: false,
         proof: Default::default(),
@@ -619,6 +622,7 @@ fn bad_catalogs_are_refused_before_anything_is_written() {
             out: fx.path("out"),
             overwrite: false,
             discard_edits: false,
+            fresh: false,
             instances: None,
             queue_all: false,
             proof: Default::default(),

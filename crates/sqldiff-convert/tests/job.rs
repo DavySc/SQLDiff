@@ -50,6 +50,7 @@ impl Fixture {
             out: self.dir.join(out),
             overwrite: false,
             discard_edits: false,
+            fresh: false,
             instances: None,
             queue_all: false,
             proof: Default::default(),
@@ -71,6 +72,11 @@ fn files(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
     while let Some(d) = stack.pop() {
         for e in std::fs::read_dir(&d).unwrap().flatten() {
             let p = e.path();
+            // The result store (`.sqldiff`) holds the checks a stopped job
+            // finished, so that a later run resumes from them.
+            if p.file_name().is_some_and(|n| n == ".sqldiff") {
+                continue;
+            }
             if p.is_dir() {
                 stack.push(p);
             } else {

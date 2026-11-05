@@ -18,7 +18,8 @@
 //!   the code, not of the environment.
 //! - `fs::`, `File::open`, `current_exe`, `Instant::now` in `sqldiff-convert`:
 //!   the tree run (reading sources, writing the output, timing the report)
-//!   and the build hash of `instances.rs`; timings are kept out of the
+//!   and the build hash of `instances.rs`; `store.rs` reads and writes the
+//!   result store and seeds the sampled re-check, none of which the check sees; timings are kept out of the
 //!   bytes a stored result is compared by.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -50,6 +51,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("sqldiff-convert/src/queue.rs", &["fs::"]),
     ("sqldiff-convert/src/review.rs", &["fs::"]),
     ("sqldiff-convert/src/shared.rs", &["Mutex"]),
+    ("sqldiff-convert/src/store.rs", &["SystemTime", "fs::"]),
     (
         "sqldiff-convert/src/tree.rs",
         &["Instant::now", "Mutex", "fs::"],

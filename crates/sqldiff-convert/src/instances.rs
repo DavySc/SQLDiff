@@ -700,7 +700,7 @@ fn hash(text: &str) -> String {
 }
 
 /// The running executable's hash: another build may check differently.
-fn build_hash() -> Result<String, String> {
+pub(crate) fn build_hash() -> Result<String, String> {
     use sha2::{Digest, Sha256};
     static HASH: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
     HASH.get_or_init(|| {

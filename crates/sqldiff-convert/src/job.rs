@@ -14,6 +14,9 @@ pub struct Job {
     pub overwrite: bool,
     /// Overwrite files edited by hand since the last run.
     pub discard_edits: bool,
+    /// Reuse no stored result (`OUT/.sqldiff/results`); every file is
+    /// checked again and its result stored.
+    pub fresh: bool,
     /// `instance-report.json`, or the directory holding it.
     pub instances: Option<PathBuf>,
     /// Tier 6 (nothing found, not proven) in the queue too.
@@ -220,8 +223,9 @@ pub struct Written {
 /// Reads the source tree, converts and checks it, applies the review ledger
 /// in the output folder and writes the output tree, its report and its
 /// review queue. A job stopped through `hooks` fails with
-/// [`tree::CANCELLED`] before anything is written into the output folder
-/// (which is created if it did not exist).
+/// [`tree::CANCELLED`] before any output file is written into the output
+/// folder (which is created if it did not exist); the checks it finished are
+/// kept in the result store (`.sqldiff/results`) for the next run.
 pub fn convert_into(job: &Job, hooks: &Hooks) -> Result<Written, String> {
     // Read before anything is written, so a bad path fails early.
     let inst = match &job.instances {
@@ -231,7 +235,7 @@ pub fn convert_into(job: &Job, hooks: &Hooks) -> Result<Written, String> {
     let (inputs, unreadable) = tree::read(&job.tree)?;
     tree::prepare_out(&job.tree.src, &job.out, job.overwrite)?;
     tree::guard_hand_edits(&job.out, job.discard_edits)?;
-    let mut t = tree::convert_with(&job.tree, &inputs, unreadable, Some(&job.out), hooks)?;
+    let mut t = tree::convert_stored(&job.tree, &inputs, unreadable, &job.out, hooks, job.fresh)?;
     // Review decisions committed next to the converted tree.
     let not_applied = tree::review_in(&mut t, &inputs, &job.out)?;
     // The last point a job stops at: from here on the output is written.

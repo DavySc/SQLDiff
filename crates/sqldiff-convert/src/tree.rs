@@ -157,6 +157,10 @@ pub struct FileReport {
     pub status: Status,
     pub counts: crate::Counts,
     pub seconds: f64,
+    /// The check came from the result store (an exact key matched) instead
+    /// of being run in this run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reused: bool,
     /// Units that are not plainly converted, in output order.
     pub units: Vec<UnitReport>,
     /// Plainly converted units, in output order: nothing found, not proven.
@@ -466,7 +470,21 @@ pub fn convert_with(
     out: Option<&Path>,
     hooks: &Hooks,
 ) -> Result<Tree, String> {
-    convert_kept(a, inputs, unreadable, out, hooks, false)
+    convert_kept(a, inputs, unreadable, out, hooks, false, None)
+}
+
+/// [`convert_with`] keeping each file's checked result in the store of `out`
+/// (`crate::store`) and reusing the ones whose key matches. With `fresh`
+/// nothing is reused, but every result is stored again.
+pub fn convert_stored(
+    a: &Args,
+    inputs: &[Input],
+    unreadable: Vec<String>,
+    out: &Path,
+    hooks: &Hooks,
+    fresh: bool,
+) -> Result<Tree, String> {
+    convert_kept(a, inputs, unreadable, Some(out), hooks, false, Some(fresh))
 }
 
 /// [`convert_with`] for a review, which reads of the engine's reports only
@@ -481,7 +499,7 @@ pub fn convert_for_review(
     out: Option<&Path>,
     hooks: &Hooks,
 ) -> Result<Tree, String> {
-    convert_kept(a, inputs, unreadable, out, hooks, true)
+    convert_kept(a, inputs, unreadable, out, hooks, true, None)
 }
 
 /// What is kept of each file as it is checked: its notes, shared with the
@@ -508,6 +526,7 @@ fn convert_kept(
     out: Option<&Path>,
     hooks: &Hooks,
     trim: bool,
+    stored: Option<bool>,
 ) -> Result<Tree, String> {
     let started = Instant::now();
     if !crate::supported(a.from, a.to) {
@@ -551,6 +570,17 @@ fn convert_kept(
         pool: Default::default(),
         trim,
     };
+    // The result store applies to plain files, not to templates.
+    let cache = match (stored, out, &a.template) {
+        (Some(fresh), Some(o), None) => Some(Cache {
+            store: crate::store::Store::of(o),
+            build: crate::instances::build_hash()?,
+            fresh,
+            trim,
+        }),
+        _ => None,
+    };
+    let mut reused: Vec<bool> = Vec::new();
     let results = match &a.template {
         None => convert_files(
             a,
@@ -561,6 +591,8 @@ fn convert_kept(
             base.as_ref(),
             hooks,
             &finish,
+            cache.as_ref(),
+            &mut reused,
         )?,
         Some(tm) => convert_templates(
             a,
@@ -592,6 +624,7 @@ fn convert_kept(
     for (input, (c, secs)) in inputs.iter().zip(results) {
         let (text, lines) = annotate(&c);
         let mut f = file_report(&input.rel, &input.text, &c, &lines, secs);
+        f.reused = reused.get(files.len()).copied().unwrap_or(false);
         f.output_hash = crate::review::file_hash(&text);
         mark_accepted(&mut f, input, &c, &a.deployment);
         files.push(f);
@@ -713,6 +746,8 @@ fn convert_files(
     base: Option<&crate::base::Base>,
     hooks: &Hooks,
     finish: &Finish,
+    cache: Option<&Cache>,
+    reused: &mut Vec<bool>,
 ) -> Result<Vec<(Conversion, f64)>, String> {
     // Catalogs from the whole tree, so names defined in other files bind:
     // the source catalog also lets the rules see other files' procedures.
@@ -781,27 +816,126 @@ fn convert_files(
         opts.facts_a = vec![source];
         opts.facts_b = vec![Arc::new(target)];
     }
-    // Pass 2: check every draft.
+    // Pass 2: check every draft, or take its stored result when the key of
+    // everything the check reads matches.
     hooks.stop_if_cancelled()?;
-    let work = slots(inputs.iter().zip(drafts));
+    let digests = cache.map(|_| {
+        (
+            opts.facts_a
+                .first()
+                .map(|c| crate::store::catalog_digest(c)),
+            opts.facts_b
+                .first()
+                .map(|c| crate::store::catalog_digest(c)),
+        )
+    });
+    let keys: Vec<Option<crate::store::Key>> = match (cache, &digests) {
+        (Some(c), Some((src, tgt))) => parallel(
+            jobs,
+            &inputs.iter().zip(&drafts).collect::<Vec<_>>(),
+            |(i, d)| {
+                Some(
+                    crate::store::CheckInput {
+                        build: &c.build,
+                        from: a.from,
+                        to: a.to,
+                        trim: c.trim,
+                        helpers: &a.helpers,
+                        text: &i.text,
+                        draft: d,
+                        source: src.as_deref(),
+                        target: tgt.as_deref(),
+                    }
+                    .key(),
+                )
+            },
+        ),
+        _ => inputs.iter().map(|_| None).collect(),
+    };
+    // Some stored results are checked again and compared with the stored
+    // ones; a file larger than the budget is never one of them.
+    let sample = match cache {
+        Some(c) if !c.fresh => {
+            let present: Vec<(usize, usize)> = keys
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| k.as_ref().is_some_and(|k| c.store.has(k)))
+                .map(|(i, _)| (i, inputs[i].text.len()))
+                .collect();
+            crate::store::pick(&present, crate::store::seed())
+        }
+        _ => Default::default(),
+    };
+    let mismatch: std::sync::Mutex<Option<String>> = Default::default();
+    let work = slots(inputs.iter().zip(drafts).zip(keys.iter()).enumerate());
     let progress = Progress::new(work.len(), hooks);
     let done = parallel(jobs, &work, |w| {
-        let (input, draft) = w.lock().unwrap().take().unwrap();
+        let (idx, ((input, draft), key)) = w.lock().unwrap().take().unwrap();
         if hooks.cancelled() {
             return None;
+        }
+        let stored = match (cache, key) {
+            (Some(c), Some(k)) if !c.fresh => c.store.get(k).map(|r| (c, k, r)),
+            _ => None,
+        };
+        if let Some((_, _, conv)) = &stored {
+            if !sample.contains(&idx) {
+                let mut conv = conv.clone();
+                finish.apply(&mut conv);
+                progress.tick();
+                return Some((conv, 0.0, true));
+            }
         }
         let t = Instant::now();
         let mut c = crate::check(&input.text, draft, &opts);
         finish.apply(&mut c);
+        let secs = t.elapsed().as_secs_f64();
+        if let Some((cc, k, old)) = &stored {
+            let mut old = old.clone();
+            finish.apply(&mut old);
+            if !crate::store::compare(&old, &c) {
+                cc.store.bundle(k, &old, &c);
+                *mismatch.lock().unwrap() = Some(format!(
+                    "{}: the stored result {} differs from a fresh check of the same input; \
+                     both are in {}/{}.json. The store is emptied: run again.",
+                    input.rel,
+                    k.as_str(),
+                    crate::store::MISMATCH_DIR,
+                    k.as_str()
+                ));
+            }
+        }
+        if let (Some(cc), Some(k)) = (cache, key) {
+            if let Err(e) = cc.store.put(k, &c) {
+                eprintln!("sqldiff: result not stored: {e}");
+            }
+        }
         progress.tick();
-        Some((c, t.elapsed().as_secs_f64()))
+        Some((c, secs, false))
     });
-    let mut done: Vec<(Conversion, f64)> = done
+    if let Some(msg) = mismatch.into_inner().unwrap() {
+        if let Some(c) = cache {
+            c.store.clear();
+        }
+        return Err(msg);
+    }
+    let done: Vec<(Conversion, f64, bool)> = done
         .into_iter()
         .map(|d| d.ok_or_else(|| CANCELLED.to_string()))
         .collect::<Result<_, _>>()?;
+    *reused = done.iter().map(|d| d.2).collect();
+    let mut done: Vec<(Conversion, f64)> = done.into_iter().map(|(c, s, _)| (c, s)).collect();
     stand_ins.flag(&files, done.iter_mut().map(|(c, _)| c), a.from, a.to);
     Ok(done)
+}
+
+/// The result store of this run and what every key holds besides the file.
+struct Cache {
+    store: crate::store::Store,
+    build: String,
+    /// Reuse nothing; store every result again.
+    fresh: bool,
+    trim: bool,
 }
 
 /// Reads the review ledger in `out`, if there is one.
@@ -1646,6 +1780,7 @@ fn file_report(rel: &str, input: &str, c: &Conversion, lines: &[usize], secs: f6
         status,
         counts: c.counts.clone(),
         seconds: (secs * 1000.0).round() / 1000.0,
+        reused: false,
         units,
         converted_units,
         output_hash: String::new(),
