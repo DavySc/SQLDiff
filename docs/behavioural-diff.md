@@ -44,6 +44,7 @@ a second.
 | `error.contract` | semantic | The caller sees different endings: return code, normal return or SQLSTATE |
 | `concurrency.split-statement` | concurrency | One statement on one side is several on the other, each reading the source at its own time |
 | `assumption.contradiction` | transactional | A declared fact contradicts the object's own source |
+| `equiv.budget` | transactional | A step or path budget cut the exploration before this statement, so its behaviour was not run; the statement is not proven. The step budget counts CFG nodes, several per statement, so in a procedure it cuts at roughly the 1000th statement of 4000 steps (the budget stays fixed until state merging lands) |
 
 `txn.caller-continuation` needs the continuing side to run at least one more
 statement. A routine whose only statement fails reports an error either way, so
