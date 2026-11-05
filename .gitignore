@@ -6,3 +6,5 @@ __pycache__/
 # A colleague bundle (sqldiff dist) never belongs in the repository.
 /config/
 /dist/
+# nix build
+/result
