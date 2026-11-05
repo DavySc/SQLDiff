@@ -102,7 +102,7 @@ pub struct CheckInput<'a> {
 impl CheckInput<'_> {
     pub fn key(&self) -> Key {
         let mut k = KeyBuilder::new();
-        k.field("format", b"1");
+        k.field("format", b"2");
         k.field("build", self.build.as_bytes());
         k.field("from", self.from.id().as_bytes());
         k.field("to", self.to.id().as_bytes());
@@ -116,10 +116,92 @@ impl CheckInput<'_> {
     }
 }
 
+/// What a result file holds. `conversion` is the serialised conversion with
+/// every long string that occurs more than once replaced by a marker into
+/// `pool` (see [`intern`]): the notes of a tree repeat the same few texts in
+/// every unit, and written out in full they made a result several times the
+/// size of its input.
 #[derive(Serialize, Deserialize)]
 struct Entry {
     key: String,
-    conversion: Conversion,
+    pool: Vec<String>,
+    conversion: serde_json::Value,
+}
+
+/// A string at least this long that occurs twice goes to the pool.
+const POOL_MIN: usize = 40;
+/// Starts a marker. A real string starting with it is written with one more.
+const MARK: char = '\u{1}';
+
+fn count(v: &serde_json::Value, seen: &mut std::collections::HashMap<String, usize>) {
+    match v {
+        serde_json::Value::String(s) if s.len() >= POOL_MIN => {
+            *seen.entry(s.clone()).or_default() += 1;
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|x| count(x, seen)),
+        serde_json::Value::Object(o) => o.values().for_each(|x| count(x, seen)),
+        _ => {}
+    }
+}
+
+fn replace(v: &mut serde_json::Value, index: &std::collections::HashMap<&str, usize>) {
+    match v {
+        serde_json::Value::String(s) => {
+            if let Some(i) = index.get(s.as_str()) {
+                *s = format!("{MARK}{i}");
+            } else if s.starts_with(MARK) {
+                s.insert(0, MARK);
+            }
+        }
+        serde_json::Value::Array(a) => a.iter_mut().for_each(|x| replace(x, index)),
+        serde_json::Value::Object(o) => o.values_mut().for_each(|x| replace(x, index)),
+        _ => {}
+    }
+}
+
+/// Moves the strings that repeat into a pool. Object keys are not touched.
+fn intern(mut v: serde_json::Value) -> (Vec<String>, serde_json::Value) {
+    let mut seen = std::collections::HashMap::new();
+    count(&v, &mut seen);
+    let mut pool: Vec<String> = seen
+        .into_iter()
+        .filter(|(_, n)| *n >= 2)
+        .map(|(s, _)| s)
+        .collect();
+    pool.sort();
+    let index: std::collections::HashMap<&str, usize> = pool
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
+    replace(&mut v, &index);
+    (pool, v)
+}
+
+/// The inverse of [`intern`]; `None` when a marker points outside the pool.
+fn expand(v: &mut serde_json::Value, pool: &[String]) -> Option<()> {
+    match v {
+        serde_json::Value::String(s) if s.starts_with(MARK) => {
+            let rest = &s[MARK.len_utf8()..];
+            if rest.starts_with(MARK) {
+                *s = rest.to_string();
+            } else {
+                *s = pool.get(rest.parse::<usize>().ok()?)?.clone();
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for x in a {
+                expand(x, pool)?;
+            }
+        }
+        serde_json::Value::Object(o) => {
+            for x in o.values_mut() {
+                expand(x, pool)?;
+            }
+        }
+        _ => {}
+    }
+    Some(())
 }
 
 /// The results of one output tree.
@@ -148,17 +230,23 @@ impl Store {
     /// not name its own key, is a miss.
     pub fn get(&self, key: &Key) -> Option<Conversion> {
         let path = crate::tree::dest_under(&self.out, &Self::rel(key)).ok()?;
-        let e: Entry = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-        (e.key == key.0).then_some(e.conversion)
+        let mut e: Entry = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        if e.key != key.0 {
+            return None;
+        }
+        expand(&mut e.conversion, &e.pool)?;
+        serde_json::from_value(e.conversion).ok()
     }
 
     /// Stores a result: written beside its name and renamed into place,
     /// retried a few times because a virus scanner on Windows can hold the
     /// file for a moment.
     pub fn put(&self, key: &Key, c: &Conversion) -> Result<(), String> {
+        let (pool, conversion) = intern(serde_json::to_value(c).map_err(|e| e.to_string())?);
         let bytes = serde_json::to_vec(&Entry {
             key: key.0.clone(),
-            conversion: c.clone(),
+            pool,
+            conversion,
         })
         .map_err(|e| e.to_string())?;
         let dest = crate::tree::dest_under(&self.out, &Self::rel(key))?;
@@ -270,6 +358,27 @@ pub fn seed() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interned_strings_round_trip() {
+        let long = "a note text that is long enough to be pooled ".repeat(2);
+        let tricky = format!("{MARK}7 looks like a marker");
+        let v = serde_json::json!({
+            "a": [long, long, tricky, tricky, "short", "short"],
+            "b": { "c": long, "d": format!("{MARK}") },
+        });
+        let (pool, packed) = intern(v.clone());
+        assert_eq!(
+            pool,
+            vec![long.clone()],
+            "only the repeated long string is pooled"
+        );
+        let mut back = packed;
+        expand(&mut back, &pool).unwrap();
+        assert_eq!(back, v);
+        let mut bad = serde_json::json!([format!("{MARK}9")]);
+        assert!(expand(&mut bad, &pool).is_none());
+    }
 
     #[test]
     fn the_sample_reaches_the_largest_file() {
