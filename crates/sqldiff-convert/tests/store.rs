@@ -159,9 +159,9 @@ fn a_second_run_reuses_the_results_and_gives_the_same_tree() {
     convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
     let second = tree_of(&f.out("o"));
     assert_eq!(first, second, "a resumed run differs from the first");
-    // The sampled re-check runs at least one file again; the rest is reused.
+    // The sampled re-check runs up to two files again; the rest is reused.
     let r = reused(&f.out("o"));
-    assert!(r.iter().filter(|(_, x)| *x).count() >= 3, "{r:?}");
+    assert!(r.iter().filter(|(_, x)| *x).count() >= 2, "{r:?}");
     // A fresh run gives the same tree too.
     convert_into(&f.job("o", true, true), &Hooks::default()).unwrap();
     assert_eq!(first, tree_of(&f.out("o")));
@@ -189,8 +189,8 @@ fn editing_a_procedure_body_checks_that_file_again() {
     let p = r.iter().find(|(p, _)| p == "sub/p.sql").unwrap();
     assert!(!p.1, "the edited file was reused: {r:?}");
     // The catalogs hold signatures only, so the other files keep their keys
-    // (one of them is re-checked as the sample).
-    assert!(r.iter().filter(|(_, x)| *x).count() >= 2, "{r:?}");
+    // (up to two of them are re-checked as the sample).
+    assert!(r.iter().filter(|(_, x)| *x).count() >= 1, "{r:?}");
     // The edit is in the output, and the old result is still stored.
     assert!(tree_of(&f.out("o"))
         .iter()
@@ -253,4 +253,24 @@ fn a_stored_result_that_a_fresh_check_contradicts_fails_the_run_and_empties_the_
     // The next run works, from nothing.
     convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
     assert_eq!(results(&f.out("o")).len(), 1);
+}
+
+#[test]
+fn a_directory_holding_only_the_store_is_empty_for_a_resume() {
+    let f = Fixture::standard("onlystore");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    // As after a run killed before it wrote its tree.
+    for e in std::fs::read_dir(f.out("o")).unwrap() {
+        let p = e.unwrap().path();
+        if p.file_name().unwrap() == ".sqldiff" {
+            continue;
+        }
+        if p.is_dir() {
+            std::fs::remove_dir_all(&p).unwrap();
+        } else {
+            std::fs::remove_file(&p).unwrap();
+        }
+    }
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    assert!(reused(&f.out("o")).iter().any(|(_, r)| *r));
 }
