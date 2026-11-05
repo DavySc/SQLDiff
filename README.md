@@ -72,6 +72,8 @@ target/release/sqldiff-gui review src/tsql out/pg --to postgres
 
 Ready-to-run builds for Windows, macOS and Linux come from the Release workflow; `sqldiff dist` adds a private config for colleagues on your own machine.
 
+With Nix, the flake builds the `sqldiff` command (its tests run in the build): `nix run github:DavySc/SQLDiff -- diff a.sql b.sql -d tsql`, or `nix develop` for a shell with the Rust toolchain.
+
 Exit codes: `0` equal or equal under assumptions, `1` different or unknown, `2` usage or I/O error.
 
 Example output for the worked example:
@@ -137,6 +139,10 @@ Or in any client's `mcpServers` config: `{"sqldiff": {"command": "/path/to/sqldi
 The CLI has the same review commands: `sqldiff queue [SOURCE]`, `sqldiff assumptions A B`, `sqldiff comment A B [--finding FP]` and `sqldiff open A B [--finding FP]`. `--deny ID` / `--confirm ID` flip an assumption for that run only. Review state comes from the review store: accepted findings (and in-source deliberate-difference markers) are suppressed and counted, and a pair still needs review while it has an undecided finding or a verdict short of equal.
 
 Each result carries a readable text block and the same data as `structuredContent` JSON.
+
+## Editors
+
+Emacs: [kittymax](https://github.com/DavySc/nixfiles/tree/main/kittymax) runs the `sqldiff` it finds on `PATH` and reads `-f json`: `check` as a flymake backend, `diff` of a file against another (its sibling in another dialect by default) in a buffer whose locations jump to both sides, and a before/after `diff` that warns when a formatter changed what the code means.
 
 ## Layout
 
