@@ -138,9 +138,13 @@ pub struct TreeState {
 }
 
 impl TreeState {
-    /// Whether two states serialise to the same bytes.
+    /// Whether two states serialise to the same bytes. A state that does not
+    /// serialise equals nothing, not even itself.
     pub fn same_as(&self, other: &TreeState) -> bool {
-        serde_json::to_vec(self).ok() == serde_json::to_vec(other).ok()
+        match (serde_json::to_vec(self), serde_json::to_vec(other)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
     }
 }
 
