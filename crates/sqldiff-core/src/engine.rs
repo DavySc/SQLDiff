@@ -561,6 +561,10 @@ fn pair_writes_in(
             .unwrap_or_default()
     };
     let split = |x: &Analyzed| -> (Vec<facts::Write>, Vec<facts::Write>) {
+        // With `historyless` the history write is dropped for every table
+        // with HIDDEN period columns in the tree, including one the
+        // converter refused in that mode. That table's own unit is refused
+        // (never converted), so nothing that passes relies on this.
         facts::writes_in(x, historyless)
             .into_iter()
             .filter(|w| {

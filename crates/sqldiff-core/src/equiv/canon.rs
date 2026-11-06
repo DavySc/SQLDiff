@@ -5424,6 +5424,23 @@ impl<'a> Canon<'a> {
             .filter(|b| want.as_ref().map_or(true, |w| &b.key == w))
             .collect();
         let tsql_hides = self.d == Dialect::Tsql && scope.iter().any(hides);
+        // A view defined with `*` returns the visible columns of its sources
+        // on T-SQL, all of them on PostgreSQL; which those are is not
+        // modelled, so the star over it is refused (derived tables and CTEs
+        // keep their symbolic star).
+        if self.d == Dialect::Tsql
+            && picked.iter().any(|b| {
+                b.derived.is_none()
+                    && self
+                        .schema
+                        .star_views
+                        .contains(&lc(Self::base_table(&b.table)))
+            })
+        {
+            return Err(
+                "a * over a view defined with * in a comparison with HIDDEN columns".into(),
+            );
+        }
         if picked.is_empty() || picked.iter().any(|b| table_of(b).is_none()) {
             if tsql_hides {
                 return Err(

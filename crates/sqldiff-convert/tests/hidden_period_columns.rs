@@ -428,3 +428,31 @@ fn the_stored_result_key_differs_with_the_option() {
         )
     );
 }
+
+#[test]
+fn a_star_over_a_view_defined_with_a_star_follows_the_option() {
+    let fx = Fixture::new(
+        "view",
+        &[
+            ("a.sql", TABLE.to_string()),
+            (
+                "v.sql",
+                "CREATE VIEW dbo.v AS SELECT * FROM dbo.t;\n".to_string(),
+            ),
+            ("reader.sql", proc("reader", "SELECT * FROM dbo.v;")),
+            ("named.sql", proc("named", "SELECT k, v FROM dbo.v;")),
+        ],
+    );
+    // By default the view returns the period columns on PostgreSQL, and the
+    // reader's star would differ from SQL Server's.
+    let t = fx.convert(false);
+    none_clean(&t, "reader.sql");
+    none_clean(&t, "v.sql");
+    // Naming the columns is still fine.
+    all_clean(&t, "named.sql");
+    // Without the period columns both views return k and v.
+    let t = fx.convert(true);
+    all_clean(&t, "v.sql");
+    all_clean(&t, "reader.sql");
+    all_clean(&t, "named.sql");
+}

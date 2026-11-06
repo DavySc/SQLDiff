@@ -889,6 +889,7 @@ fn view_table(
     let (schema, vname) = stored_name(&name, dialect).unwrap_or((None, String::new()));
     let mut tb = Table::new(schema, vname, TableKind::View);
     let outputs = select_outputs(query);
+    tb.star_outputs = outputs.is_none();
     // Tables in the top-level FROM, for typing plain column references.
     let mut from_tables: Vec<(Option<Ident>, &Table)> = Vec::new();
     if let Some(f) = find_kw(query, 0, "FROM") {

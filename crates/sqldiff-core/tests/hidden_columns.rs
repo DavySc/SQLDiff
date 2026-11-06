@@ -193,3 +193,111 @@ fn a_comparison_without_hidden_columns_keeps_its_stars() {
     let r = run(&[tsql], &[PG_PLAIN], &a, &b);
     assert!(proven(&r), "{:#?}\n{:?}", r.findings, r.unknown_reasons);
 }
+
+const VIEW_T: &str = "CREATE VIEW dbo.v AS SELECT * FROM dbo.t;";
+const VIEW_P: &str = "CREATE VIEW v AS SELECT * FROM t;";
+
+#[test]
+fn a_star_over_a_view_defined_with_a_star_follows_the_tables_columns() {
+    let a = proc_t("SELECT * FROM dbo.v;");
+    let b = proc_p("OPEN result_set_1 FOR SELECT * FROM v;");
+    // SQL Server returns k, v; the full conversion's view returns k, f, e, v.
+    let r = run(&[TSQL_TABLE, VIEW_T], &[PG_FULL, VIEW_P], &a, &b);
+    assert!(!proven(&r), "{:#?}\n{:?}", r.findings, r.unknown_reasons);
+    let why = format!("{:?}{:?}", r.findings, r.unknown_reasons);
+    assert!(why.contains("view defined with *"), "{why}");
+    // Without the period columns the two views return the same.
+    let r = run(&[TSQL_TABLE, VIEW_T], &[PG_PLAIN, VIEW_P], &a, &b);
+    assert!(proven(&r), "{:#?}\n{:?}", r.findings, r.unknown_reasons);
+}
+
+#[test]
+fn a_qualified_star_over_such_a_view_is_refused_too() {
+    for (ta, pb) in [
+        ("SELECT v.* FROM dbo.v;", "SELECT v.* FROM v;"),
+        ("SELECT x.* FROM dbo.v AS x;", "SELECT x.* FROM v AS x;"),
+        (
+            "SELECT x.*, u.w FROM dbo.v AS x JOIN dbo.u ON u.k = x.k;",
+            "SELECT x.*, u.w FROM v AS x JOIN u ON u.k = x.k;",
+        ),
+    ] {
+        let a = proc_t(ta);
+        let b = proc_p(&format!("OPEN result_set_1 FOR {pb}"));
+        let r = run(
+            &[TSQL_TABLE, VIEW_T, OTHER_T],
+            &[PG_FULL, VIEW_P, OTHER_P],
+            &a,
+            &b,
+        );
+        assert!(
+            !proven(&r),
+            "{ta}\n{:#?}\n{:?}",
+            r.findings,
+            r.unknown_reasons
+        );
+        let r = run(
+            &[TSQL_TABLE, VIEW_T, OTHER_T],
+            &[PG_PLAIN, VIEW_P, OTHER_P],
+            &a,
+            &b,
+        );
+        assert!(
+            proven(&r),
+            "{ta}\n{:#?}\n{:?}",
+            r.findings,
+            r.unknown_reasons
+        );
+    }
+}
+
+#[test]
+fn a_view_over_a_view_defined_with_a_star_is_refused() {
+    let v2_t = "CREATE VIEW dbo.v2 AS SELECT * FROM dbo.v;";
+    let v2_p = "CREATE VIEW v2 AS SELECT * FROM v;";
+    let a = proc_t("SELECT * FROM dbo.v2;");
+    let b = proc_p("OPEN result_set_1 FOR SELECT * FROM v2;");
+    let r = run(
+        &[TSQL_TABLE, VIEW_T, v2_t],
+        &[PG_FULL, VIEW_P, v2_p],
+        &a,
+        &b,
+    );
+    assert!(!proven(&r), "{:#?}\n{:?}", r.findings, r.unknown_reasons);
+    let r = run(
+        &[TSQL_TABLE, VIEW_T, v2_t],
+        &[PG_PLAIN, VIEW_P, v2_p],
+        &a,
+        &b,
+    );
+    assert!(proven(&r), "{:#?}\n{:?}", r.findings, r.unknown_reasons);
+}
+
+#[test]
+fn a_view_with_known_columns_that_reads_the_table_through_a_star_is_refused() {
+    // The names are listed, but which columns they stand for is the star's.
+    let view_t = "CREATE VIEW dbo.v (a, b) AS SELECT * FROM dbo.t;";
+    let view_p = "CREATE VIEW v (a, b) AS SELECT * FROM t;";
+    let a = proc_t("SELECT * FROM dbo.v;");
+    let b = proc_p("OPEN result_set_1 FOR SELECT * FROM v;");
+    let r = run(&[TSQL_TABLE, view_t], &[PG_FULL, view_p], &a, &b);
+    assert!(!proven(&r), "{:#?}\n{:?}", r.findings, r.unknown_reasons);
+}
+
+#[test]
+fn a_view_that_names_its_columns_keeps_its_star() {
+    let view_t = "CREATE VIEW dbo.v AS SELECT k, v FROM dbo.t;";
+    let view_p = "CREATE VIEW v AS SELECT k, v FROM t;";
+    let a = proc_t("SELECT * FROM dbo.v;");
+    let b = proc_p("OPEN result_set_1 FOR SELECT * FROM v;");
+    let r = run(&[TSQL_TABLE, view_t], &[PG_FULL, view_p], &a, &b);
+    assert!(proven(&r), "{:#?}\n{:?}", r.findings, r.unknown_reasons);
+}
+
+#[test]
+fn a_view_with_a_star_is_untouched_when_nothing_is_hidden() {
+    let tsql = "CREATE TABLE dbo.t (k INT NOT NULL PRIMARY KEY, v INT NULL);";
+    let a = proc_t("SELECT * FROM dbo.v;");
+    let b = proc_p("OPEN result_set_1 FOR SELECT * FROM v;");
+    let r = run(&[tsql, VIEW_T], &[PG_PLAIN, VIEW_P], &a, &b);
+    assert!(proven(&r), "{:#?}\n{:?}", r.findings, r.unknown_reasons);
+}

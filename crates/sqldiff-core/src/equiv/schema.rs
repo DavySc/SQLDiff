@@ -338,6 +338,10 @@ pub struct Schema {
     view: Option<std::sync::Arc<CatalogView>>,
     /// Unqualified names of user tables in more than one schema.
     ambiguous: std::collections::HashSet<String>,
+    /// Lower-cased unqualified names of views defined with a `*` select
+    /// list (`catalog::Table::star_outputs`): which columns of their sources
+    /// they return is not modelled.
+    pub star_views: std::collections::HashSet<String>,
     /// PostgreSQL: the stored spellings of every catalog name (schemas,
     /// tables and views, columns, keys, indexes, routines), by lower case.
     /// Two spellings under one key are names that differ only in letter case.
@@ -472,6 +476,7 @@ impl Schema {
             }
         }
         s.ambiguous.extend(extra.ambiguous);
+        s.star_views.extend(extra.star_views);
         s.tables.extend(extra.tables);
         for (k, v) in extra.spellings {
             s.spellings.entry(k).or_default().extend(v);
@@ -572,6 +577,28 @@ impl Schema {
         if self.hides_columns() || other.hides_columns() {
             self.list_stars = true;
             other.list_stars = true;
+            // A view defined with `*` returns what its sources do, so it is
+            // only the same on both sides when every table with HIDDEN
+            // columns has a counterpart on the other side that keeps exactly
+            // its visible columns (the historyless conversion). Otherwise a
+            // star over such a view is refused (`Canon::visible_star`).
+            let mirrored = |a: &Schema, b: &Schema| {
+                a.tables.iter().all(|(n, t)| {
+                    !t.columns.iter().any(|c| c.hidden)
+                        || b.tables.get(n).is_some_and(|o| {
+                            o.complete
+                                && o.columns.iter().map(|c| &c.name).eq(t
+                                    .columns
+                                    .iter()
+                                    .filter(|c| !c.hidden)
+                                    .map(|c| &c.name))
+                        })
+                })
+            };
+            if mirrored(self, other) && mirrored(other, self) {
+                self.star_views.clear();
+                other.star_views.clear();
+            }
         }
     }
 
@@ -611,6 +638,13 @@ impl Schema {
                     .insert(n.clone());
             }
         }
+        s.star_views.extend(
+            view.catalog
+                .tables
+                .iter()
+                .filter(|t| t.kind == TableKind::View && t.star_outputs)
+                .map(|t| t.name.to_lowercase()),
+        );
         // Base and temporary tables only: view columns are derived, and their
         // types and nullability are not facts equivalence may rely on.
         for t in view
