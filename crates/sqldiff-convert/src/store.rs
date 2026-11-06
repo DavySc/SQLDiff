@@ -366,9 +366,9 @@ mod tests {
 
     #[test]
     fn the_sample_reaches_the_largest_file() {
-        // 99 small files and one huge one: the byte sample can never take the
-        // huge one, the count sample does for some seeds, and every file has
-        // the same chance whatever its size.
+        // 99 small files and one huge one: the sample is drawn by count, so
+        // the huge file is picked for some seeds and every file has the same
+        // chance whatever its size.
         let mut present: Vec<(usize, usize)> = (0..99).map(|i| (i, 100)).collect();
         present.push((99, 1_000_000));
         let hits = (0..2000u64)
