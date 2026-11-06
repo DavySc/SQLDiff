@@ -156,6 +156,9 @@ fn a_second_run_reuses_the_results_and_gives_the_same_tree() {
     let f = Fixture::standard("same");
     convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
     assert_eq!(results(&f.out("o")).len(), 4);
+    // The drafts stored as pass 1 went are dropped once the state is stored.
+    assert!(!f.out("o").join(".sqldiff/drafts").exists());
+    assert_eq!(states(&f.out("o")).len(), 1);
     assert!(reused(&f.out("o")).iter().all(|(_, r)| !r), "first run");
     let first = tree_of(&f.out("o"));
     convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
