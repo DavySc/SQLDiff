@@ -349,6 +349,29 @@ impl Store {
         }
     }
 
+    /// Removes every stored result whose key is not in `live`: the results
+    /// of files as they were before an edit, or of another build of the
+    /// program, which no later run of this tree can use. Files that are not
+    /// results (a result being written, which has a temporary name) are left
+    /// alone. Returns how many were removed.
+    pub fn gc(&self, live: &std::collections::HashSet<String>) -> usize {
+        let Ok(dir) = crate::tree::dest_under(&self.out, DIR) else {
+            return 0;
+        };
+        let mut removed = 0;
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(key) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let is_key = key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit());
+            if is_key && !live.contains(key) && std::fs::remove_file(e.path()).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     fn tree_rel(key: &TreeKey) -> String {
         format!("{TREE_DIR}/{}.json", key.0)
     }

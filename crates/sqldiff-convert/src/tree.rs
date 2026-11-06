@@ -655,6 +655,7 @@ fn convert_kept(
     let mut reused: Vec<bool> = Vec::new();
     let mut unchecked: Vec<bool> = Vec::new();
     let mut progress = None;
+    let mut live: Option<std::collections::HashSet<String>> = None;
     let results = match &a.template {
         None => convert_files(
             a,
@@ -670,6 +671,7 @@ fn convert_kept(
             select,
             &mut unchecked,
             &mut progress,
+            &mut live,
         )?,
         Some(tm) => convert_templates(
             a,
@@ -727,6 +729,12 @@ fn convert_kept(
         finished.push((c, secs));
     }
     let results = finished;
+    // Every stored result this run could still need has been read: the ones
+    // under keys of files as they were before an edit (or of another build)
+    // are of no use to any later run of this tree.
+    if let (Some(live), Some(c)) = (&live, cache.as_ref()) {
+        c.store.gc(live);
+    }
     let mut files = Vec::new();
     let mut outputs = Vec::new();
     let mut conversions = Vec::new();
@@ -1080,6 +1088,7 @@ fn convert_files(
     select: Option<&crate::plan::Select>,
     unchecked: &mut Vec<bool>,
     progress: &mut Option<crate::plan::Progress>,
+    live: &mut Option<std::collections::HashSet<String>>,
 ) -> Result<Vec<(Held, f64)>, String> {
     // What the checks start from (catalogs, drafts, stand-ins) is a function
     // of the whole tree: taken from the store when its key matches exactly,
@@ -1174,6 +1183,16 @@ fn convert_files(
         ),
         _ => inputs.iter().map(|_| None).collect(),
     };
+    // The keys of every file as it is now: the results a later run of this
+    // tree can use (`Store::gc`).
+    if cache.is_some() {
+        *live = Some(
+            keys.iter()
+                .flatten()
+                .map(|k| k.as_str().to_string())
+                .collect(),
+        );
+    }
     // The increment: which files this run checks. The others are taken from
     // the store when their key matches, else they are not checked.
     let in_increment: Option<Vec<bool>> = match (select, cache) {
