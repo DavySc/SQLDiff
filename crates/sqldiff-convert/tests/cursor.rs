@@ -274,3 +274,40 @@ fn db2_keeps_cursors_refused() {
     let c = convert_to(&body(DECL, LOOP), Dialect::Db2i);
     assert_eq!(at(&c, 9)[0].status, Status::NotConverted);
 }
+
+#[test]
+fn a_cursor_declared_in_one_routine_is_not_found_by_the_next() {
+    // The second procedure uses a cursor `c` it never declares: it must not
+    // pick up the first one's plan.
+    let src = format!(
+        "CREATE PROCEDURE dbo.a @n int\nAS\nBEGIN\n  DECLARE @id int;\n  DECLARE @v int;\n{DECL}\n{LOOP}\nEND\nCREATE PROCEDURE dbo.b @n int\nAS\nBEGIN\n  DECLARE @id int;\n  DECLARE @v int;\n  OPEN c;\n  FETCH NEXT FROM c INTO @id, @v;\n  CLOSE c;\nEND\n"
+    );
+    let mut cat = Catalog::default();
+    let root = sqldiff_syntax::parse(TABLES, Dialect::Tsql).syntax();
+    ddl::load_tree(&mut cat, &root, Dialect::Tsql);
+    let c = rewrite_in(&src, Dialect::Tsql, Dialect::Postgres, Some(&cat));
+    let out = c.output();
+    let tail = out
+        .split("PROCEDURE b(")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no second procedure:\n{out}"));
+    assert!(
+        !tail.contains("OPEN cur_c") && tail.contains("not converted"),
+        "the second routine opened the first one's cursor:\n{out}"
+    );
+}
+
+#[test]
+fn a_cursor_closed_in_a_later_batch_is_not_converted_with_the_earlier_plan() {
+    // Batch two CLOSEs a cursor batch one declared and finished: batch two's
+    // DO block has no `cur_c`, so the CLOSE must not become `CLOSE cur_c`.
+    let src = format!("DECLARE @id int;\nDECLARE @v int;\n{DECL}\n{LOOP}\nGO\nCLOSE c;\n");
+    let mut cat = Catalog::default();
+    let root = sqldiff_syntax::parse(TABLES, Dialect::Tsql).syntax();
+    ddl::load_tree(&mut cat, &root, Dialect::Tsql);
+    let c = rewrite_in(&src, Dialect::Tsql, Dialect::Postgres, Some(&cat));
+    let out = c.output();
+    let tail = out.rsplit("END LOOP;").next().unwrap();
+    let after = tail.rsplit("$$;").next().unwrap();
+    assert!(!after.contains("CLOSE cur_c"), "{out}");
+}
