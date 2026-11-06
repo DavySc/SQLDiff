@@ -49,6 +49,7 @@ impl Fixture {
 
     fn plain_args(&self) -> tree::Args {
         tree::Args {
+            rules: Default::default(),
             src: self.src(),
             from: Dialect::Tsql,
             to: Dialect::Postgres,

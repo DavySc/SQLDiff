@@ -313,6 +313,7 @@ pub fn column_defs(tb: &mut Table, inner: &[Tok], dialect: Dialect) {
             identity: false,
             has_default: false,
             generated: false,
+            hidden: false,
             collation: None,
         };
         let opts = &el[ty_end..];
@@ -349,6 +350,13 @@ pub fn column_defs(tb: &mut Table, inner: &[Tok], dialect: Dialect) {
                         col.has_default = true;
                         // GENERATED ALWAYS AS ROW START / END, AS (expr) STORED.
                         col.generated = opts.get(k + 1).is_some_and(|x| x.is_kw("ALWAYS"));
+                        // ROW START|END HIDDEN (T-SQL only).
+                        col.hidden = dialect == Dialect::Tsql
+                            && opts[k..].windows(3).any(|w| {
+                                w[0].is_kw("ROW")
+                                    && (w[1].is_kw("START") || w[1].is_kw("END"))
+                                    && w[2].is_kw("HIDDEN")
+                            });
                     }
                 }
                 "DEFAULT" => col.has_default = true,
@@ -881,6 +889,7 @@ fn view_table(
     let (schema, vname) = stored_name(&name, dialect).unwrap_or((None, String::new()));
     let mut tb = Table::new(schema, vname, TableKind::View);
     let outputs = select_outputs(query);
+    tb.star_outputs = outputs.is_none();
     // Tables in the top-level FROM, for typing plain column references.
     let mut from_tables: Vec<(Option<Ident>, &Table)> = Vec::new();
     if let Some(f) = find_kw(query, 0, "FROM") {
@@ -957,6 +966,7 @@ fn view_table(
                     identity: false,
                     has_default: false,
                     generated: false,
+                    hidden: false,
                     collation: src.and_then(|c| c.collation.clone()),
                 });
             }
@@ -970,6 +980,7 @@ fn view_table(
                     identity: false,
                     has_default: false,
                     generated: false,
+                    hidden: false,
                     collation: None,
                 });
             }

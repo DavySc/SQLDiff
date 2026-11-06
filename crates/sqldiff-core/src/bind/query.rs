@@ -1071,6 +1071,7 @@ impl<'a> Binder<'a> {
                 identity: false,
                 has_default: false,
                 generated: false,
+                hidden: false,
                 collation: None,
             });
             self.add_ref(
@@ -3018,6 +3019,7 @@ impl<'a> Binder<'a> {
                         identity: false,
                         has_default: false,
                         generated: false,
+                        hidden: false,
                         collation: None,
                     });
                 }

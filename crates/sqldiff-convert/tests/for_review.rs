@@ -41,6 +41,7 @@ fn tree_dir() -> PathBuf {
 
 fn args(d: &std::path::Path) -> tree::Args {
     tree::Args {
+        rules: Default::default(),
         src: d.join("src"),
         from: Dialect::Tsql,
         to: Dialect::Postgres,

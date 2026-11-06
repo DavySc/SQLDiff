@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 195 | 35 (18%) | 6 (3%) | 154 (79%) |
+| `converter` | 196 | 35 (18%) | 6 (3%) | 155 (79%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 224 | 38 (17%) | 8 (4%) | 178 (79%) |
+| **All** | 225 | 38 (17%) | 8 (4%) | 179 (80%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -218,6 +218,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.table.temp` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.with-check` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.temporal-history-created` | `converter` | engine |  | `sqldiff-convert/src/tsql/temporal.rs` |
+| `tsql.temporal.historyless` | `converter` | engine |  | `sqldiff-convert/src/tsql/temporal.rs` |
 | `tsql.temporal.period` | `converter` | engine |  | `sqldiff-convert/src/tsql/temporal.rs` |
 | `tsql.temporal.period-column` | `converter` | engine |  | `sqldiff-convert/src/tsql/temporal.rs` |
 | `tsql.temporal.switch` | `converter` | engine |  | `sqldiff-convert/src/tsql/temporal.rs` |

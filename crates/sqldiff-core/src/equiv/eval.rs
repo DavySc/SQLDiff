@@ -4468,7 +4468,13 @@ impl Ctx<'_> {
                 let names: Vec<String> = if cols.is_empty() {
                     self.schema
                         .table(&key)
-                        .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
+                        .map(|t| {
+                            t.columns
+                                .iter()
+                                .filter(|c| !c.hidden)
+                                .map(|c| c.name.clone())
+                                .collect()
+                        })
                         .unwrap_or_default()
                 } else {
                     cols.iter().map(|c| c.to_lowercase()).collect()

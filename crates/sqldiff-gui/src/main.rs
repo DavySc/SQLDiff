@@ -511,6 +511,7 @@ fn run(cli: Cli) -> Result<(), String> {
             };
             let review = convert_review::Review::open(convert_review::Setup {
                 tree: sqldiff_convert::tree::Args {
+                    rules: Default::default(),
                     src,
                     from,
                     to,

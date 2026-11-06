@@ -417,6 +417,7 @@ struct Seen {
 /// verdict and the engine compares each `CREATE TABLE` by itself.
 ///
 /// With the target's own base catalogs (`b`), side B is those, as given.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare(
     files: &[File],
     b: &[File],
@@ -425,6 +426,7 @@ pub fn prepare(
     helpers: &[Helper],
     jobs: usize,
     hooks: &crate::tree::Hooks,
+    rules: crate::RuleOptions,
 ) -> Result<Base, String> {
     let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
     let source = crate::tree::catalog(
@@ -463,7 +465,7 @@ pub fn prepare(
     let text = |&(f, n): &(usize, usize)| &files[f].text[all[f][n].start..all[f][n].end];
     // Converted with the base catalogs alone.
     let drafts = crate::tree::parallel(jobs, &pieces, |p| {
-        crate::rewrite_in(text(p), from, to, Some(&source))
+        crate::rewrite_with(text(p), from, to, Some(&source), rules)
     });
     let outputs: Vec<String> = drafts.iter().map(|d| d.output().to_string()).collect();
     let source = Arc::new(source);

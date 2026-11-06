@@ -77,10 +77,12 @@ pub(crate) fn convert(
     to: Dialect,
     catalog: Option<&sqldiff_core::catalog::Catalog>,
     claims: &crate::table_vars::Claims,
+    options: crate::RuleOptions,
 ) -> Out {
     let mut cx = Cx {
         src,
         to,
+        options,
         catalog,
         claims,
         loops: Vec::new(),
@@ -367,6 +369,8 @@ struct Cx<'a> {
     src: &'a str,
     /// Target dialect: PostgreSQL or Db2 for i.
     to: Dialect,
+    /// The options this conversion runs with.
+    options: crate::RuleOptions,
     /// The source catalog of the whole tree being converted, when there is one.
     catalog: Option<&'a sqldiff_core::catalog::Catalog>,
     /// The temporary table names the tree's table variables claim, by the
@@ -1741,7 +1745,14 @@ impl<'a> Cx<'a> {
             }
         };
         let root = sqldiff_syntax::parse(&wrapped, Dialect::Tsql).syntax();
-        let inner = convert(&root, &wrapped, self.to, self.catalog, self.claims);
+        let inner = convert(
+            &root,
+            &wrapped,
+            self.to,
+            self.catalog,
+            self.claims,
+            self.options,
+        );
         let units: Vec<_> = inner
             .units
             .iter()
@@ -6821,6 +6832,16 @@ impl<'a> Cx<'a> {
             let (t, ts) = self.temporal(ts)?;
             (Some(t), ts)
         } else {
+            let name_t: Vec<T> = ts
+                .iter()
+                .take_while(|t| t.k != L_PAREN)
+                .skip_while(|t| !t.is("TABLE"))
+                .skip(1)
+                .cloned()
+                .collect();
+            if let Some(table) = self.history_of_historyless(&name_t) {
+                return no(format!("{} is the history table of {table}, converted without history (--temporal-historyless, ASM-TEMPORAL-HISTORYLESS): a plain table of that name would read as an empty history, so it is not created and reading it does not bind", self.expr(&name_t).trim()));
+            }
             (None, ts.to_vec())
         };
         let ts = self.strip_storage(&ts)?;
@@ -6907,7 +6928,7 @@ impl<'a> Cx<'a> {
             }
         }
         let tail = self.expr(&ts[close + 1..]);
-        if let Some(t) = temporal {
+        if let Some(t) = temporal.filter(|t| !t.historyless) {
             let table = Ok(format!(
                 "CREATE TABLE {name} ({}\n){}",
                 cols.join(","),

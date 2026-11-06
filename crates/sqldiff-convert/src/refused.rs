@@ -256,6 +256,7 @@ impl StandIns {
                         identity: false,
                         has_default: false,
                         generated: true,
+                        hidden: false,
                         collation: None,
                     };
                     let at = (*pos).min(table.columns.len());

@@ -335,12 +335,28 @@ pub fn convert_with(
     Ok(check(text, rewrite(text, from, to), opts))
 }
 
+/// Choices that change what the rules write, every one off by default and
+/// set by the person running the conversion. They are part of a [`Draft`],
+/// so the key of a stored result (`store::CheckInput`) differs when one is
+/// switched.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuleOptions {
+    /// T-SQL → PostgreSQL: a system-versioned table whose period columns
+    /// are both HIDDEN becomes a plain table without the period columns,
+    /// history table and triggers, under `ASM-TEMPORAL-HISTORYLESS`. History
+    /// support for it is future work. Tables with visible period columns are
+    /// converted with their history as ever.
+    pub temporal_historyless: bool,
+}
+
 /// The rules' output before it is checked. Lets a caller convert many files
 /// first and then check each one against catalogs built from all of them.
 #[derive(Debug)]
 pub struct Draft {
     from: Dialect,
     to: Dialect,
+    /// The options the rules ran with.
+    options: RuleOptions,
     raw: out::Out,
     /// The conversion without the per-statement exception blocks
     /// (`tsql.txn.continue`), when the draft has them: [`check`] keeps the
@@ -351,6 +367,11 @@ pub struct Draft {
 impl Draft {
     pub fn output(&self) -> &str {
         &self.raw.text
+    }
+
+    /// The options the rules ran with.
+    pub fn options(&self) -> RuleOptions {
+        self.options
     }
 
     /// Every field, as text, for the key of a stored result
@@ -448,7 +469,18 @@ pub fn rewrite_in(
     to: Dialect,
     source: Option<&sqldiff_core::catalog::Catalog>,
 ) -> Draft {
-    rewrite_in_tree(text, from, to, source, None)
+    rewrite_in_tree(text, from, to, source, None, RuleOptions::default())
+}
+
+/// [`rewrite_in`] with `options` for the rules.
+pub fn rewrite_with(
+    text: &str,
+    from: Dialect,
+    to: Dialect,
+    source: Option<&sqldiff_core::catalog::Catalog>,
+    options: RuleOptions,
+) -> Draft {
+    rewrite_in_tree(text, from, to, source, None, options)
 }
 
 /// [`rewrite_in`] with the temporary table names the whole tree's table
@@ -461,6 +493,7 @@ pub(crate) fn rewrite_in_tree(
     to: Dialect,
     source: Option<&sqldiff_core::catalog::Catalog>,
     claims: Option<&table_vars::Claims>,
+    options: RuleOptions,
 ) -> Draft {
     let root = parse(text, from).syntax();
     let own;
@@ -478,7 +511,7 @@ pub(crate) fn rewrite_in_tree(
     let run = || {
         guarded(&root, text, || match (from, to) {
             (Dialect::Tsql, Dialect::Postgres | Dialect::Db2i) => {
-                tsql::convert(&root, text, to, source, claims)
+                tsql::convert(&root, text, to, source, claims, options)
             }
             _ => no_rules(&root, text, from, to),
         })
@@ -493,6 +526,7 @@ pub(crate) fn rewrite_in_tree(
             Box::new(Draft {
                 from,
                 to,
+                options,
                 raw,
                 plain: None,
             })
@@ -500,6 +534,7 @@ pub(crate) fn rewrite_in_tree(
     Draft {
         from,
         to,
+        options,
         raw,
         plain,
     }
@@ -588,7 +623,13 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
 }
 
 fn check_one(input: &str, draft: Draft, opts: &Options) -> Conversion {
-    let Draft { from, to, raw, .. } = draft;
+    let Draft {
+        from,
+        to,
+        raw,
+        options,
+        ..
+    } = draft;
     let a = Artifact::new("input.sql", from, input);
     let b = Artifact::new("converted.sql", to, raw.text.as_str());
     // The engine pairs statements through the units' trace: an input
@@ -599,6 +640,7 @@ fn check_one(input: &str, draft: Draft, opts: &Options) -> Conversion {
             .iter()
             .map(|u| sqldiff_core::equiv::Anchor { a: u.src, b: u.out })
             .collect(),
+        historyless: options.temporal_historyless,
         // Nothing here reads the witnesses (see `trim_reports`).
         skip_witnesses: true,
         ..opts.clone()
