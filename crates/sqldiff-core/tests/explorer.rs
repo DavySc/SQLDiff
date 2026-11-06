@@ -229,3 +229,76 @@ fn explorer_matches_full_exploration_at_the_budget_edges_and_on_data_scripts() {
         }
     }
 }
+
+/// Loops whose condition is unknown, run inside a transaction that the loop
+/// body ends: the loop is summarized after two iterations unless its state
+/// changes between them, and what changes it includes the transaction's log.
+fn loops_in_transactions() -> Vec<(&'static str, Dialect, String)> {
+    let commit_in_loop = "CREATE PROCEDURE dbo.l @p int AS\nBEGIN\n  BEGIN TRANSACTION;\n  INSERT INTO dbo.a (x) VALUES (1);\n  INSERT INTO dbo.a (x) VALUES (2);\n  WHILE EXISTS (SELECT 1 FROM dbo.q)\n  BEGIN\n    DELETE FROM dbo.q WHERE id = @p;\n    COMMIT TRANSACTION;\n    BEGIN TRANSACTION;\n    INSERT INTO dbo.b (x) VALUES (2);\n  END\n  COMMIT TRANSACTION;\nEND\n";
+    let rollback_in_loop = "CREATE PROCEDURE dbo.l @p int AS\nBEGIN\n  BEGIN TRANSACTION;\n  INSERT INTO dbo.a (x) VALUES (1);\n  SAVE TRANSACTION s1;\n  INSERT INTO dbo.a (x) VALUES (2);\n  WHILE EXISTS (SELECT 1 FROM dbo.q)\n  BEGIN\n    INSERT INTO dbo.b (x) VALUES (2);\n    ROLLBACK TRANSACTION s1;\n    DELETE FROM dbo.q WHERE id = @p;\n  END\n  COMMIT TRANSACTION;\nEND\n";
+    let savepoint_after_fault = "CREATE PROCEDURE dbo.s @p int AS\nBEGIN\n  BEGIN TRANSACTION;\n  INSERT INTO dbo.a (x) VALUES (1);\n  INSERT INTO dbo.a (x) VALUES (2);\n  SAVE TRANSACTION s1;\n  INSERT INTO dbo.a (x) VALUES (3);\n  ROLLBACK TRANSACTION s1;\n  INSERT INTO dbo.a (x) VALUES (4);\n  SAVE TRANSACTION s2;\n  INSERT INTO dbo.a (x) VALUES (5);\n  ROLLBACK TRANSACTION s2;\n  COMMIT TRANSACTION;\nEND\n";
+    let late_commit = "CREATE PROCEDURE dbo.l @p int AS\nBEGIN\n  BEGIN TRANSACTION;\n  INSERT INTO dbo.a (x) VALUES (1);\n  PRINT 'inserted';\n  WHILE EXISTS (SELECT 1 FROM dbo.q)\n  BEGIN\n    IF EXISTS (SELECT 1 FROM dbo.r)\n    BEGIN\n      COMMIT TRANSACTION;\n      BEGIN TRANSACTION;\n    END\n    ELSE\n      PRINT 'again';\n  END\n  COMMIT TRANSACTION;\nEND\n";
+    let pg = "CREATE OR REPLACE PROCEDURE l(p integer) LANGUAGE plpgsql AS $$\nBEGIN\n  INSERT INTO a (x) VALUES (1);\n  INSERT INTO a (x) VALUES (2);\n  WHILE EXISTS (SELECT 1 FROM q) LOOP\n    DELETE FROM q WHERE id = p;\n    COMMIT;\n    INSERT INTO b (x) VALUES (2);\n  END LOOP;\nEND;\n$$;\n";
+    // The unsafe loop is reachable only through a continue handler's resume.
+    let resume_loop = "CREATE PROCEDURE t (IN p INTEGER)\nLANGUAGE SQL\nBEGIN\n  DECLARE CONTINUE HANDLER FOR SQLSTATE '75000'\n  BEGIN\n    SET p = 0;\n    SET p = 1;\n  END;\n  BEGIN\n    DECLARE EXIT HANDLER FOR SQLEXCEPTION SET p = 2;\n    INSERT INTO a (x) VALUES (1);\n    SET p = 3;\n  END;\n  SIGNAL SQLSTATE '75000';\n  WHILE p > 0 DO\n    IF p > 5 THEN\n      COMMIT;\n    END IF;\n    SET p = p - 1;\n  END WHILE;\n  INSERT INTO d (x) VALUES (1);\nEND\n";
+    vec![
+        (
+            "resume_loop.db2i.sql",
+            Dialect::Db2i,
+            resume_loop.to_string(),
+        ),
+        (
+            "commit_in_loop.tsql.sql",
+            Dialect::Tsql,
+            commit_in_loop.to_string(),
+        ),
+        (
+            "rollback_in_loop.tsql.sql",
+            Dialect::Tsql,
+            rollback_in_loop.to_string(),
+        ),
+        (
+            "savepoint_after_fault.tsql.sql",
+            Dialect::Tsql,
+            savepoint_after_fault.to_string(),
+        ),
+        (
+            "late_commit.tsql.sql",
+            Dialect::Tsql,
+            late_commit.to_string(),
+        ),
+        ("commit_in_loop.pg.sql", Dialect::Postgres, pg.to_string()),
+    ]
+}
+
+#[test]
+fn explorer_matches_full_exploration_for_loops_and_savepoints_in_transactions() {
+    for (name, d, sql) in loops_in_transactions() {
+        let (r, m) = check(name, d, &sql);
+        eprintln!("{name}: {m} of {r} merged");
+    }
+}
+
+/// Reads of a temporary table that the fault-free path made and a faulted
+/// one did not: at a statement that cannot run again they are let go of, in a
+/// loop that reads again they are not.
+fn temp_reads_after_faults() -> Vec<(&'static str, Dialect, String)> {
+    let straight = "CREATE PROCEDURE dbo.t @p int AS\nBEGIN\n  CREATE TABLE #w (a int);\n  INSERT INTO #w (a) VALUES (1);\n  UPDATE dbo.t SET b = (SELECT COUNT(*) FROM #w);\n  PRINT 'x';\n  UPDATE dbo.t SET b = (SELECT COUNT(*) FROM #w);\n  DELETE FROM dbo.u WHERE a IN (SELECT a FROM #w);\nEND\n";
+    let looped = "CREATE PROCEDURE dbo.t @p int AS\nBEGIN\n  CREATE TABLE #w (a int);\n  INSERT INTO #w (a) VALUES (1);\n  PRINT 'x';\n  WHILE EXISTS (SELECT 1 FROM dbo.q)\n  BEGIN\n    UPDATE dbo.t SET b = (SELECT COUNT(*) FROM #w);\n    PRINT 'y';\n  END\n  DELETE FROM dbo.u WHERE a IN (SELECT a FROM #w);\nEND\n";
+    let in_txn = "CREATE PROCEDURE dbo.t @p int AS\nBEGIN\n  CREATE TABLE #w (a int);\n  BEGIN TRANSACTION;\n  INSERT INTO #w (a) VALUES (1);\n  UPDATE dbo.t SET b = (SELECT COUNT(*) FROM #w);\n  SAVE TRANSACTION s1;\n  INSERT INTO #w (a) VALUES (2);\n  ROLLBACK TRANSACTION s1;\n  UPDATE dbo.t SET b = (SELECT COUNT(*) FROM #w);\n  COMMIT TRANSACTION;\n  UPDATE dbo.t SET b = (SELECT COUNT(*) FROM #w);\nEND\n";
+    let pg = "CREATE OR REPLACE PROCEDURE t(p integer) LANGUAGE plpgsql AS $$\nBEGIN\n  CREATE TEMP TABLE w (a integer);\n  INSERT INTO w (a) VALUES (1);\n  UPDATE t SET b = (SELECT COUNT(*) FROM w);\n  COMMIT;\n  UPDATE t SET b = (SELECT COUNT(*) FROM w);\nEND;\n$$;\n";
+    vec![
+        ("straight.tsql.sql", Dialect::Tsql, straight.to_string()),
+        ("looped.tsql.sql", Dialect::Tsql, looped.to_string()),
+        ("in_txn.tsql.sql", Dialect::Tsql, in_txn.to_string()),
+        ("temp.pg.sql", Dialect::Postgres, pg.to_string()),
+    ]
+}
+
+#[test]
+fn explorer_matches_full_exploration_for_temp_reads_after_faults() {
+    for (name, d, sql) in temp_reads_after_faults() {
+        let (r, m) = check(name, d, &sql);
+        eprintln!("{name}: {m} of {r} merged");
+    }
+}
