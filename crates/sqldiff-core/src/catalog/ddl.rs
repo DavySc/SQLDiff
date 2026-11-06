@@ -24,7 +24,18 @@ pub fn load(text: &str, dialect: Dialect, origin: &str) -> Catalog {
 
 /// Adds the definitions found at the top level of a parsed tree.
 pub fn load_tree(cat: &mut Catalog, root: &SyntaxNode, dialect: Dialect) {
-    for node in root.descendants() {
+    // Top-level nodes are children of the file or of a batch (the parser
+    // opens a batch only at the top), so no other subtree is entered: a
+    // routine's body is not walked.
+    let mut walk = root.preorder();
+    while let Some(event) = walk.next() {
+        let rowan::WalkEvent::Enter(node) = event else {
+            continue;
+        };
+        let container = matches!(node.kind(), SyntaxKind::SOURCE_FILE | SyntaxKind::BATCH);
+        if !container {
+            walk.skip_subtree();
+        }
         let top = node
             .parent()
             .is_some_and(|p| matches!(p.kind(), SyntaxKind::SOURCE_FILE | SyntaxKind::BATCH));

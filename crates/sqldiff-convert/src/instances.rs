@@ -339,12 +339,14 @@ pub fn check(a: &Args, hooks: &Hooks) -> Result<Checked, String> {
         a.from,
         &source_root,
         None,
+        1,
     )));
     opts.facts_b.push(Arc::new(catalog(
         woven.iter().map(|(_, t)| t.text.as_str()),
         a.to,
         &target_root,
         None,
+        1,
     )));
 
     // The name values each instance gives the target, for the name checks
@@ -1670,6 +1672,7 @@ mod tests {
             Dialect::Postgres,
             Path::new("conv"),
             None,
+            1,
         )
     }
 
