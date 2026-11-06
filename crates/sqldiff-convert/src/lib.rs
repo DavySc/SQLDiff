@@ -526,6 +526,8 @@ fn check_one(input: &str, draft: Draft, opts: &Options) -> Conversion {
             .iter()
             .map(|u| sqldiff_core::equiv::Anchor { a: u.src, b: u.out })
             .collect(),
+        // Nothing here reads the witnesses (see `trim_reports`).
+        skip_witnesses: true,
         ..opts.clone()
     };
     // Davy, 2026-10-29: the output keeps the target's text types, and each
