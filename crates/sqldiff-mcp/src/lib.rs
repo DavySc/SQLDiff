@@ -1101,6 +1101,7 @@ impl Server {
             _ => return Err("`artifact` needs exactly one of `path` or `text`".to_string()),
         };
         let a = tree::Args {
+            rules: Default::default(),
             src,
             from,
             to,
@@ -1147,6 +1148,7 @@ impl Server {
             None => Dialect::Tsql,
         };
         Ok(tree::Args {
+            rules: Default::default(),
             src: src.into(),
             from,
             to: target(args)?,

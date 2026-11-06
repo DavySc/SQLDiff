@@ -278,6 +278,13 @@ enum Command {
         /// too (tier 6: nothing found, not proven).
         #[arg(long)]
         queue_all: bool,
+        /// T-SQL to PostgreSQL: convert a system-versioned table whose two
+        /// period columns are HIDDEN to a plain table without them, without
+        /// the history table and the versioning triggers (ASM-TEMPORAL-
+        /// HISTORYLESS; history support is future work). Off by default;
+        /// tables with visible period columns keep their history.
+        #[arg(long)]
+        temporal_historyless: bool,
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
     },
@@ -321,6 +328,9 @@ enum Command {
         /// `instance-report.json` from `sqldiff instances`, or its directory.
         #[arg(long, value_name = "PATH")]
         instances: Option<PathBuf>,
+        /// As given to `sqldiff convert`.
+        #[arg(long)]
+        temporal_historyless: bool,
         /// Exit with 1 unless the review is complete.
         #[arg(long)]
         require_complete: bool,
@@ -694,6 +704,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             parameters,
             extensions,
             instances,
+            temporal_historyless,
             require_complete,
             json,
             cfg,
@@ -721,6 +732,9 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     deployment: resolved.deployment.clone(),
                     catalogs,
                     catalogs_b,
+                    rules: sqldiff_convert::RuleOptions {
+                        temporal_historyless,
+                    },
                 },
                 out,
                 instances,
@@ -751,6 +765,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             extensions,
             instances,
             queue_all,
+            temporal_historyless,
             cfg,
         } => {
             let select = sqldiff_convert::plan::Select {
@@ -782,6 +797,9 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 deployment: resolved.deployment.clone(),
                 catalogs,
                 catalogs_b,
+                rules: sqldiff_convert::RuleOptions {
+                    temporal_historyless,
+                },
             };
             if plan {
                 return convert_cmd::plan(&tree, &out);

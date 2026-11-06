@@ -60,6 +60,8 @@ pub struct Args {
     /// `catalogs` as DDL in the target dialect. Side B binds against these,
     /// as given, instead of converting `catalogs`. Needs `catalogs`.
     pub catalogs_b: Vec<PathBuf>,
+    /// Choices for the rules (`--temporal-historyless`), all off by default.
+    pub rules: crate::RuleOptions,
 }
 
 /// How templates are read: the placeholder rules of `diff --template`.
@@ -633,6 +635,7 @@ fn convert_kept(
             &a.helpers,
             jobs,
             hooks,
+            a.rules,
         )?),
     };
     let finish = Finish {
@@ -909,7 +912,14 @@ fn convert_files(
     );
     // Pass 1: rules only.
     let mut drafts = parallel(jobs, inputs, |i| {
-        crate::rewrite_in_tree(&i.text, a.from, a.to, source.as_deref(), Some(&claims))
+        crate::rewrite_in_tree(
+            &i.text,
+            a.from,
+            a.to,
+            source.as_deref(),
+            Some(&claims),
+            a.rules,
+        )
     });
     crate::mem::release();
     // Hand-written output replaces the rules' before anything is checked,

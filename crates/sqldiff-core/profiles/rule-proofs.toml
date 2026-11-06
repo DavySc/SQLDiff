@@ -1281,6 +1281,12 @@ proof = "engine"
 sites = ["sqldiff-convert/src/tsql/temporal.rs"]
 
 [[rule]]
+id = "tsql.temporal.historyless"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/temporal.rs"]
+
+[[rule]]
 id = "tsql.temporal.period"
 kind = "converter"
 proof = "engine"

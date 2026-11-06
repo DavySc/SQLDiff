@@ -78,6 +78,7 @@ impl Fixture {
     fn run(&self, proof: Settings) -> Written {
         let job = Job {
             tree: tree::Args {
+                rules: Default::default(),
                 src: self.dir.join("src"),
                 from: Dialect::Tsql,
                 to: Dialect::Postgres,

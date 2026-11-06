@@ -117,6 +117,11 @@ pub struct Column {
     /// columns, PostgreSQL GENERATED ALWAYS AS (expr).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub generated: bool,
+    /// T-SQL `GENERATED ALWAYS AS ROW START|END HIDDEN`: `SELECT *`, `t.*`
+    /// and an INSERT without a column list leave the column out; naming it
+    /// reads it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collation: Option<String>,
 }
@@ -146,6 +151,11 @@ pub struct Table {
     /// False when the column list could not be read (`CREATE TABLE ... AS`,
     /// `SELECT ... INTO #t`, views over `*`): columns are then not checked.
     pub columns_known: bool,
+    /// A view whose select list the catalog could not list (it has a `*`):
+    /// its column names may be known (an explicit list) while which columns
+    /// of its sources they stand for is not.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub star_outputs: bool,
     #[serde(default)]
     pub keys: Vec<Key>,
     #[serde(default)]
@@ -178,6 +188,7 @@ impl Table {
             kind,
             columns: Vec::new(),
             columns_known: true,
+            star_outputs: false,
             keys: Vec::new(),
             indexes: Vec::new(),
             triggers: Vec::new(),

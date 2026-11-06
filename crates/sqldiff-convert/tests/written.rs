@@ -34,6 +34,7 @@ impl Fixture {
 
     fn args(&self) -> tree::Args {
         tree::Args {
+            rules: Default::default(),
             src: self.dir.join("src"),
             from: Dialect::Tsql,
             to: Dialect::Postgres,

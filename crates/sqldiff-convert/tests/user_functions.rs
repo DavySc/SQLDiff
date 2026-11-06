@@ -75,6 +75,7 @@ impl Fixture {
 
     fn convert(&self) -> Tree {
         let a = tree::Args {
+            rules: Default::default(),
             src: self.dir.clone(),
             from: Dialect::Tsql,
             to: Dialect::Postgres,
@@ -227,6 +228,7 @@ fn a_tree_held_in_the_store_gives_the_tree_held_whole() {
     );
     let whole = fx.convert();
     let a = tree::Args {
+        rules: Default::default(),
         src: fx.dir.clone(),
         from: Dialect::Tsql,
         to: Dialect::Postgres,

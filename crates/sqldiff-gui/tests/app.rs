@@ -67,6 +67,7 @@ fn session(d: &Dir) -> Session {
 fn review(d: &Dir) -> Review {
     d.write("src/p.sql", "CREATE TABLE t (a int NOT NULL);\n");
     let args = tree::Args {
+        rules: Default::default(),
         src: d.0.join("src"),
         from: Dialect::Tsql,
         to: Dialect::Postgres,
