@@ -1036,7 +1036,8 @@ fn convert_files(
         _ => None,
     };
     // Some stored results are checked again and compared with the stored
-    // ones; a file larger than the budget is never one of them.
+    // ones: one file in 50, drawn from all stored files whatever their size
+    // (`store::pick`).
     let sample = match cache {
         Some(c) if !c.fresh => {
             let present: Vec<(usize, usize)> = keys
