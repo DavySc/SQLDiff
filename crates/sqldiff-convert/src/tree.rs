@@ -935,23 +935,20 @@ pub(crate) fn verify_tree_state(
     ledger: Option<&crate::review::Ledger>,
     base: Option<&crate::base::Base>,
 ) -> Option<String> {
-    let wrong = |what: &str| {
-        Some(format!(
+    let mismatch = |what: &str| {
+        format!(
             "the stored tree state ({what}) differs from one built again from the same \
              input; its store is emptied: run again"
-        ))
+        )
     };
+    let wrong = |what: &str| Some(mismatch(what));
     if st.drafts.len() != inputs.len() || st.source.is_some() == a.no_catalog {
         return wrong("its shape");
     }
     if seed % 10 == 0 {
         let mut fresh = build_tree_state(a, out, inputs, jobs, ledger, base);
         fresh.key = st.key.clone();
-        return (!st.same_as(&fresh)).then(|| {
-            "the stored tree state differs from one built again from the same input; \
-             its store is emptied: run again"
-                .to_string()
-        });
+        return (!st.same_as(&fresh)).then(|| mismatch("the whole state"));
     }
     let source = st.source.as_ref();
     let claims = crate::table_vars::Claims::of(
