@@ -34,6 +34,10 @@ pub const DIR: &str = ".sqldiff/results";
 /// Where a mismatch writes its diagnostic bundle.
 /// The state of the whole tree that the per-file checks start from.
 pub const TREE_DIR: &str = ".sqldiff/tree";
+/// The rules' drafts of the files of one tree, one file each under a folder
+/// named by the key of the tree, written as pass 1 goes. They survive a run
+/// killed in pass 1 and are dropped once the whole tree state is stored.
+pub const DRAFTS_DIR: &str = ".sqldiff/drafts";
 
 pub const MISMATCH_DIR: &str = ".sqldiff/mismatch";
 
@@ -195,6 +199,21 @@ struct Entry {
     conversion: serde_json::Value,
 }
 
+/// What a draft file holds.
+#[derive(Deserialize)]
+struct DraftEntry {
+    key: String,
+    rel: String,
+    draft: crate::Draft,
+}
+
+#[derive(Serialize)]
+struct DraftEntryRef<'a> {
+    key: &'a str,
+    rel: &'a str,
+    draft: &'a crate::Draft,
+}
+
 /// A string at least this long that occurs twice goes to the pool.
 const POOL_MIN: usize = 40;
 /// Starts a marker. A real string starting with it is written with one more.
@@ -342,7 +361,7 @@ impl Store {
 
     /// Empties the store (after a mismatch).
     pub fn clear(&self) {
-        for d in [DIR, TREE_DIR] {
+        for d in [DIR, TREE_DIR, DRAFTS_DIR] {
             if let Ok(p) = crate::tree::dest_under(&self.out, d) {
                 let _ = std::fs::remove_dir_all(p);
             }
@@ -393,6 +412,70 @@ impl Store {
             let _ = std::fs::remove_file(&tmp);
             format!("{}: {e}", dest.display())
         })
+    }
+
+    fn draft_rel(key: &TreeKey, rel: &str) -> String {
+        let h = Sha256::digest(rel.as_bytes());
+        let name: String = h.iter().map(|b| format!("{b:02x}")).collect();
+        format!("{DRAFTS_DIR}/{}/{name}.json", key.0)
+    }
+
+    /// The stored draft of file `rel` of the tree `key`. A file that does
+    /// not read back whole, or does not name its own tree and path, is a
+    /// miss.
+    pub fn get_draft(&self, key: &TreeKey, rel: &str) -> Option<crate::Draft> {
+        let path = crate::tree::dest_under(&self.out, &Self::draft_rel(key, rel)).ok()?;
+        let e: DraftEntry = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        (e.key == key.0 && e.rel == rel).then_some(e.draft)
+    }
+
+    /// Stores the draft of file `rel` of the tree `key`, whole or not at
+    /// all. Another tree's drafts are dropped first. Failing to store is
+    /// not an error: the run builds the draft itself.
+    pub fn put_draft(&self, key: &TreeKey, rel: &str, draft: &crate::Draft) {
+        let e = DraftEntryRef {
+            key: &key.0,
+            rel,
+            draft,
+        };
+        let Ok(bytes) = serde_json::to_vec(&e) else {
+            return;
+        };
+        let Ok(dest) = crate::tree::dest_under(&self.out, &Self::draft_rel(key, rel)) else {
+            return;
+        };
+        let Some(dir) = dest.parent() else { return };
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        let tmp = dest.with_extension(format!("tmp{}", std::process::id()));
+        if std::fs::write(&tmp, &bytes).is_err() || std::fs::rename(&tmp, &dest).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// Drops the drafts of every tree except `key`'s (a tree that changed
+    /// leaves nothing of use behind).
+    pub fn keep_drafts_of(&self, key: &TreeKey) {
+        let Ok(root) = crate::tree::dest_under(&self.out, DRAFTS_DIR) else {
+            return;
+        };
+        for e in std::fs::read_dir(root).into_iter().flatten().flatten() {
+            if e.file_name().to_string_lossy() != key.0 {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+
+    /// Drops every stored draft, and the `.sqldiff` folder if that leaves it
+    /// empty.
+    pub fn drop_drafts(&self) {
+        if let Ok(p) = crate::tree::dest_under(&self.out, DRAFTS_DIR) {
+            let _ = std::fs::remove_dir_all(&p);
+            if let Some(d) = p.parent() {
+                let _ = std::fs::remove_dir(d);
+            }
+        }
     }
 
     /// Writes what a mismatch found, for whoever looks into it.
