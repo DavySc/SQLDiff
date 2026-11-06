@@ -209,6 +209,32 @@ enum Command {
         /// when everything its check reads is the same).
         #[arg(long)]
         fresh: bool,
+        /// Only plan: read SRC, find which file defines and uses which
+        /// object, order the files so that what a file uses comes first and
+        /// write OUT/.sqldiff/plan.json. Nothing is converted.
+        #[arg(long, conflicts_with_all = ["next", "schema", "object", "path", "changed"])]
+        plan: bool,
+        /// Check only the next N groups of files in plan order that have a
+        /// file not checked yet; the other files are taken from the result
+        /// store, or are not checked and count as not converted. `--next 0`
+        /// checks nothing and reports how much the store covers. Not with
+        /// --template or --no-catalog.
+        #[arg(long, value_name = "N")]
+        next: Option<usize>,
+        /// Check the files that define an object in this schema (repeatable).
+        #[arg(long, value_name = "SCHEMA")]
+        schema: Vec<String>,
+        /// Check this object (`schema.name` or a name) and what it uses that
+        /// is not checked yet (repeatable).
+        #[arg(long, value_name = "NAME")]
+        object: Vec<String>,
+        /// Check the files whose path matches this glob (`*`, `**`, `?`;
+        /// repeatable).
+        #[arg(long, value_name = "GLOB")]
+        path: Vec<String>,
+        /// Check every file with no stored result that matches.
+        #[arg(long)]
+        changed: bool,
         /// Check each file alone, without catalogs built from the whole tree.
         #[arg(long)]
         no_catalog: bool,
@@ -725,6 +751,12 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             overwrite,
             discard_edits,
             fresh,
+            plan,
+            next,
+            schema,
+            object,
+            path,
+            changed,
             no_catalog,
             catalogs,
             catalogs_b,
@@ -736,6 +768,13 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             temporal_historyless,
             cfg,
         } => {
+            let select = sqldiff_convert::plan::Select {
+                next,
+                schemas: schema,
+                objects: object,
+                paths: path,
+                changed,
+            };
             let resolved = cfg.resolve()?;
             let helpers = resolved.options().helpers;
             let template = if template {
@@ -746,27 +785,32 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             } else {
                 None
             };
-            convert_cmd::run(convert_cmd::Args {
-                tree: sqldiff_convert::tree::Args {
-                    src,
-                    from,
-                    to,
-                    jobs,
-                    no_catalog,
-                    template,
-                    extensions: sqldiff_convert::tree::extensions(extensions),
-                    helpers,
-                    deployment: resolved.deployment.clone(),
-                    catalogs,
-                    catalogs_b,
-                    rules: sqldiff_convert::RuleOptions {
-                        temporal_historyless,
-                    },
+            let tree = sqldiff_convert::tree::Args {
+                src,
+                from,
+                to,
+                jobs,
+                no_catalog,
+                template,
+                extensions: sqldiff_convert::tree::extensions(extensions),
+                helpers,
+                deployment: resolved.deployment.clone(),
+                catalogs,
+                catalogs_b,
+                rules: sqldiff_convert::RuleOptions {
+                    temporal_historyless,
                 },
+            };
+            if plan {
+                return convert_cmd::plan(&tree, &out);
+            }
+            convert_cmd::run(convert_cmd::Args {
+                tree,
                 out,
                 overwrite,
                 discard_edits,
                 fresh,
+                select,
                 instances,
                 queue_all,
                 proof: resolved.proof.clone(),

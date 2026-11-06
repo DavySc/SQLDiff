@@ -24,7 +24,13 @@ const FILES: &[(&str, &str)] = &[
 ];
 
 fn tree_dir() -> PathBuf {
-    let d = std::env::temp_dir().join(format!("sqldiff-for-review-{}", std::process::id()));
+    // One directory per test: the tests of this file run on threads of one
+    // process, and one must not delete the files of the other.
+    let d = std::env::temp_dir().join(format!(
+        "sqldiff-for-review-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     let _ = std::fs::remove_dir_all(&d);
     for (p, text) in FILES {
         std::fs::create_dir_all(d.join("src")).unwrap();

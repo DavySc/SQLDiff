@@ -151,6 +151,14 @@ pub struct Input {
     pub text: String,
 }
 
+fn yes() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct FileReport {
     pub path: String,
@@ -163,6 +171,11 @@ pub struct FileReport {
     /// of being run in this run.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reused: bool,
+    /// False when this run did not check the file and no stored result
+    /// matches it (an increment left it out): every unit is then not
+    /// converted (`plan.not-checked`).
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub checked: bool,
     /// Units that are not plainly converted, in output order.
     pub units: Vec<UnitReport>,
     /// Plainly converted units, in output order: nothing found, not proven.
@@ -415,6 +428,17 @@ pub struct Totals {
     /// The proof checker's answers, when a proof mode is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof: Option<ProofTotals>,
+    /// Files this run did not check and no stored result matches; they
+    /// count as not converted.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub files_not_checked: usize,
+    /// How much of the plan is checked, for a run that chose an increment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<crate::plan::Progress>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// A converted tree: the report, and every file as it is written (the
@@ -472,7 +496,7 @@ pub fn convert_with(
     out: Option<&Path>,
     hooks: &Hooks,
 ) -> Result<Tree, String> {
-    convert_kept(a, inputs, unreadable, out, hooks, false, None)
+    convert_kept(a, inputs, unreadable, out, hooks, false, None, None)
 }
 
 /// [`convert_with`] keeping each file's checked result in the store of `out`
@@ -486,7 +510,43 @@ pub fn convert_stored(
     hooks: &Hooks,
     fresh: bool,
 ) -> Result<Tree, String> {
-    convert_kept(a, inputs, unreadable, Some(out), hooks, false, Some(fresh))
+    convert_kept(
+        a,
+        inputs,
+        unreadable,
+        Some(out),
+        hooks,
+        false,
+        Some(fresh),
+        None,
+    )
+}
+
+/// [`convert_stored`] checking only the increment `select` names (see
+/// [`crate::plan`]). A file outside it is taken from the store when its key
+/// matches and is otherwise not checked: it counts as not converted, so an
+/// increment never makes a tree look more converted than a full run. With an
+/// empty `select` this is [`convert_stored`].
+pub fn convert_increment(
+    a: &Args,
+    inputs: &[Input],
+    unreadable: Vec<String>,
+    out: &Path,
+    hooks: &Hooks,
+    fresh: bool,
+    select: &crate::plan::Select,
+) -> Result<Tree, String> {
+    let select = (!select.is_empty()).then_some(select);
+    convert_kept(
+        a,
+        inputs,
+        unreadable,
+        Some(out),
+        hooks,
+        false,
+        Some(fresh),
+        select,
+    )
 }
 
 /// [`convert_with`] for a review, which reads of the engine's reports only
@@ -501,7 +561,7 @@ pub fn convert_for_review(
     out: Option<&Path>,
     hooks: &Hooks,
 ) -> Result<Tree, String> {
-    convert_kept(a, inputs, unreadable, out, hooks, true, None)
+    convert_kept(a, inputs, unreadable, out, hooks, true, None, None)
 }
 
 /// What is kept of each file as it is checked: its notes, shared with the
@@ -521,6 +581,7 @@ impl Finish {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn convert_kept(
     a: &Args,
     inputs: &[Input],
@@ -529,8 +590,16 @@ fn convert_kept(
     hooks: &Hooks,
     trim: bool,
     stored: Option<bool>,
+    select: Option<&crate::plan::Select>,
 ) -> Result<Tree, String> {
     let started = Instant::now();
+    if select.is_some() && (a.template.is_some() || a.no_catalog) {
+        return Err(
+            "an increment needs the whole tree's catalogs and plain files: it cannot be \
+                    combined with --template or --no-catalog"
+                .to_string(),
+        );
+    }
     if !crate::supported(a.from, a.to) {
         return Err(format!(
             "no conversion rules from {} to {} yet",
@@ -584,6 +653,8 @@ fn convert_kept(
         _ => None,
     };
     let mut reused: Vec<bool> = Vec::new();
+    let mut unchecked: Vec<bool> = Vec::new();
+    let mut progress = None;
     let results = match &a.template {
         None => convert_files(
             a,
@@ -596,6 +667,9 @@ fn convert_kept(
             &finish,
             cache.as_ref(),
             &mut reused,
+            select,
+            &mut unchecked,
+            &mut progress,
         )?,
         Some(tm) => convert_templates(
             a,
@@ -660,12 +734,14 @@ fn convert_kept(
         let (text, lines) = annotate(&c);
         let mut f = file_report(&input.rel, &input.text, &c, &lines, secs);
         f.reused = reused.get(files.len()).copied().unwrap_or(false);
+        f.checked = !unchecked.get(files.len()).copied().unwrap_or(false);
         f.output_hash = crate::review::file_hash(&text);
         mark_accepted(&mut f, input, &c, &a.deployment);
         files.push(f);
         outputs.push(text);
         conversions.push(c);
     }
+    crate::mem::release();
     let report = Report {
         from: a.from.id().to_string(),
         to: a.to.id().to_string(),
@@ -681,7 +757,12 @@ fn convert_kept(
             .as_ref()
             .map(|b| b.statements.clone())
             .unwrap_or_default(),
-        totals: totals(&files, started.elapsed().as_secs_f64()),
+        totals: {
+            let mut t = totals(&files, started.elapsed().as_secs_f64());
+            t.files_not_checked = files.iter().filter(|f| !f.checked).count();
+            t.progress = progress;
+            t
+        },
         deployment: deployment_report(&a.deployment, &conversions),
         files,
         unreadable,
@@ -708,11 +789,8 @@ pub fn write(tree: &Tree, out: &Path) -> Result<(PathBuf, PathBuf), String> {
     for (f, text) in tree.report.files.iter().zip(&tree.outputs) {
         write_under(out, &f.path, text.as_bytes())?;
     }
-    let json = write_under(
-        out,
-        "conversion-report.json",
-        (serde_json::to_string_pretty(&tree.report).unwrap() + "\n").as_bytes(),
-    )?;
+    crate::mem::release();
+    let json = write_json_under(out, "conversion-report.json", &tree.report)?;
     let md = write_under(
         out,
         "conversion-report.md",
@@ -730,6 +808,29 @@ pub fn inside(rel: &str) -> bool {
         && rel
             .split('/')
             .all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// Writes `value` to `out/rel` as pretty JSON and a newline, straight to the
+/// file: the report of a large tree is hundreds of megabytes, which built as
+/// one string doubled the run's size at its last step. The bytes are the same
+/// as `to_string_pretty(value) + "\n"`.
+pub(crate) fn write_json_under<T: Serialize>(
+    out: &Path,
+    rel: &str,
+    value: &T,
+) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let dest = dest_under(out, rel)?;
+    if let Some(p) = dest.parent() {
+        std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    }
+    let file = std::fs::File::create(&dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    let mut w = std::io::BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut w, value).map_err(|e| format!("{}: {e}", dest.display()))?;
+    w.write_all(b"\n")
+        .and_then(|()| w.flush())
+        .map_err(|e| format!("{}: {e}", dest.display()))?;
+    Ok(dest)
 }
 
 /// Writes `bytes` to `out/rel`, creating the directories between. Refuses a
@@ -783,6 +884,9 @@ fn convert_files(
     finish: &Finish,
     cache: Option<&Cache>,
     reused: &mut Vec<bool>,
+    select: Option<&crate::plan::Select>,
+    unchecked: &mut Vec<bool>,
+    progress: &mut Option<crate::plan::Progress>,
 ) -> Result<Vec<(Held, f64)>, String> {
     // Catalogs from the whole tree, so names defined in other files bind:
     // the source catalog also lets the rules see other files' procedures.
@@ -817,6 +921,7 @@ fn convert_files(
             a.rules,
         )
     });
+    crate::mem::release();
     // Hand-written output replaces the rules' before anything is checked,
     // so it is checked like theirs and the target catalog has it.
     if let Some(l) = ledger {
@@ -894,6 +999,42 @@ fn convert_files(
         ),
         _ => inputs.iter().map(|_| None).collect(),
     };
+    // The increment: which files this run checks. The others are taken from
+    // the store when their key matches, else they are not checked.
+    let in_increment: Option<Vec<bool>> = match (select, cache) {
+        (Some(sel), Some(c)) => {
+            let plan = crate::plan::Plan::build(inputs, a.from);
+            let at: std::collections::HashMap<&str, usize> = plan
+                .files
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (f.path.as_str(), i))
+                .collect();
+            let stored_here: Vec<bool> = keys
+                .iter()
+                .map(|k| !c.fresh && k.as_ref().is_some_and(|k| c.store.has(k)))
+                .collect();
+            let mut by_plan = vec![false; plan.files.len()];
+            for (i, inp) in inputs.iter().enumerate() {
+                by_plan[at[inp.rel.as_str()]] = stored_here[i];
+            }
+            let on = plan.select(sel, &by_plan)?;
+            let mut done = by_plan.clone();
+            let mask: Vec<bool> = inputs.iter().map(|inp| on[at[inp.rel.as_str()]]).collect();
+            for (i, inp) in inputs.iter().enumerate() {
+                // A selected file is checked in this run.
+                done[at[inp.rel.as_str()]] |= mask[i];
+            }
+            *progress = Some(plan.progress(&done));
+            Some(mask)
+        }
+        (Some(_), None) => {
+            return Err(
+                "an increment needs an output folder: its results are kept there".to_string(),
+            )
+        }
+        _ => None,
+    };
     // Some stored results are checked again and compared with the stored
     // ones; a file larger than the budget is never one of them.
     let sample = match cache {
@@ -920,6 +1061,12 @@ fn convert_files(
             (Some(c), Some(k)) if !c.fresh => c.store.get(k).map(|r| (c, k, r)),
             _ => None,
         };
+        if stored.is_none() && in_increment.as_ref().is_some_and(|m| !m[idx]) {
+            let mut c = crate::not_checked(&input.text, draft);
+            finish.apply(&mut c);
+            progress.tick();
+            return Some((Held::Whole(Box::new(c)), 0.0, false, true));
+        }
         // A file is flagged for the stand-in tables it names, and then its
         // output and reports are let go when the store holds them.
         let hold = |mut c: Conversion, key: Option<&crate::store::Key>, in_store: bool| {
@@ -937,7 +1084,7 @@ fn convert_files(
                 let mut conv = conv.clone();
                 finish.apply(&mut conv);
                 progress.tick();
-                return Some((hold(conv, Some(k), true), 0.0, true));
+                return Some((hold(conv, Some(k), true), 0.0, true, false));
             }
         }
         let t = Instant::now();
@@ -967,20 +1114,22 @@ fn convert_files(
             }
         }
         progress.tick();
-        Some((hold(c, key.as_ref(), in_store), secs, false))
+        Some((hold(c, key.as_ref(), in_store), secs, false, false))
     });
+    crate::mem::release();
     if let Some(msg) = mismatch.into_inner().unwrap() {
         if let Some(c) = cache {
             c.store.clear();
         }
         return Err(msg);
     }
-    let done: Vec<(Held, f64, bool)> = done
+    let done: Vec<(Held, f64, bool, bool)> = done
         .into_iter()
         .map(|d| d.ok_or_else(|| CANCELLED.to_string()))
         .collect::<Result<_, _>>()?;
     *reused = done.iter().map(|d| d.2).collect();
-    Ok(done.into_iter().map(|(h, s, _)| (h, s)).collect())
+    *unchecked = done.iter().map(|d| d.3).collect();
+    Ok(done.into_iter().map(|(h, s, _, _)| (h, s)).collect())
 }
 
 /// A checked file while the cross-file passes run. With a result store its
@@ -1437,6 +1586,11 @@ impl<'h> Progress<'h> {
 
     fn tick(&self) {
         let n = self.done.fetch_add(1, Ordering::Relaxed) + 1;
+        // The worker threads free most of what they allocate, and the
+        // allocator keeps it; give it back now and then, not once at the end.
+        if n % 16 == 0 {
+            crate::mem::release();
+        }
         match &self.hooks.progress {
             Some(f) => f(n, self.total),
             None if n % 50 == 0 || n == self.total => eprintln!("checked {n}/{}", self.total),
@@ -1848,6 +2002,7 @@ fn file_report(rel: &str, input: &str, c: &Conversion, lines: &[usize], secs: f6
         counts: c.counts.clone(),
         seconds: (secs * 1000.0).round() / 1000.0,
         reused: false,
+        checked: true,
         units,
         converted_units,
         output_hash: String::new(),
@@ -2352,6 +2507,18 @@ pub fn summary(r: &Report) -> String {
     }
     if !r.unreadable.is_empty() {
         let _ = writeln!(s, "{:<20} {:>6}", "unreadable", r.unreadable.len());
+    }
+    if let Some(p) = &r.totals.progress {
+        let _ = writeln!(
+            s,
+            "increment: {}; {} file(s) not checked count as not converted{}",
+            p.line(),
+            r.totals.files_not_checked,
+            match p.next_group {
+                Some(g) => format!(" (next group in plan order: {})", g + 1),
+                None => " (nothing left to check)".to_string(),
+            }
+        );
     }
     if !r.base_catalogs_b.is_empty() {
         let _ = writeln!(

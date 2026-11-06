@@ -11,6 +11,36 @@ pub use sqldiff_convert::tree::TemplateMode;
 
 pub use sqldiff_convert::job::Job as Args;
 
+/// `convert --plan`: writes the plan and prints the groups in order.
+pub fn plan(tree: &tree::Args, out: &std::path::Path) -> Result<ExitCode, String> {
+    let (plan, path) = sqldiff_convert::job::plan_into(tree, out)?;
+    let cyclic = plan.groups.iter().filter(|g| g.cyclic).count();
+    println!(
+        "{} files in {} groups ({} cyclic); what a file uses comes first",
+        plan.files.len(),
+        plan.groups.len(),
+        cyclic
+    );
+    for (i, g) in plan.groups.iter().enumerate().take(20) {
+        let names: Vec<&str> = g
+            .files
+            .iter()
+            .map(|&f| plan.files[f].path.as_str())
+            .collect();
+        let shown = if names.len() > 3 {
+            format!("{}, … ({} files)", names[..3].join(", "), names.len())
+        } else {
+            names.join(", ")
+        };
+        println!("  {:>4}. {shown}", i + 1);
+    }
+    if plan.groups.len() > 20 {
+        println!("  … and {} more groups", plan.groups.len() - 20);
+    }
+    eprintln!("wrote {}", path.display());
+    Ok(ExitCode::SUCCESS)
+}
+
 pub fn run(a: Args) -> Result<ExitCode, String> {
     let w = sqldiff_convert::job::convert_into(&a, &tree::Hooks::default())?;
     for n in &w.not_applied {
