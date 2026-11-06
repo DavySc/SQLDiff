@@ -296,48 +296,29 @@ pub fn compare(stored: &Conversion, fresh: &Conversion) -> bool {
     serde_json::to_vec(stored).ok() == serde_json::to_vec(fresh).ok()
 }
 
-/// Which stored results to re-check this run: two samples, joined.
+/// Which stored results to re-check this run: one file in 50 (at least one),
+/// drawn uniformly whatever its size. A file's chance of being re-checked is
+/// the same on every run, however large it is, so the biggest files are
+/// covered too; the expected cost is 2% of the bytes, the worst case is the
+/// largest files.
 ///
-/// - By bytes: about 2% of the stored files' bytes, small files first from a
-///   start that differs from run to run. It re-checks many files cheaply.
-/// - By count: one file in 50 (at least one), drawn uniformly whatever its
-///   size. A file's chance of being re-checked is therefore the same on every
-///   run, however large it is, so the biggest files are covered too; the
-///   expected cost is 2% of the bytes, the worst case is the largest files.
+/// (An earlier sample took 2% of the stored bytes, smallest files first. A
+/// tree has many tiny files, so that took 80 to 146 of 336 files of
+/// WideWorldImporters on every resume and saved little.)
 ///
 /// `present` is `(index, bytes)` of every file whose result is stored.
 pub fn pick(present: &[(usize, usize)], seed: u64) -> BTreeSet<usize> {
-    let mut by_size: Vec<(usize, usize)> = present.iter().map(|&(i, b)| (b, i)).collect();
-    by_size.sort();
-    let n = by_size.len();
-    let mut out = BTreeSet::new();
-    if n == 0 {
-        return out;
-    }
-    let total: usize = by_size.iter().map(|x| x.0).sum();
-    let budget = (total / 50).max(by_size[0].0);
-    let mut spent = 0usize;
-    let start = (seed % n as u64) as usize;
-    for k in 0..n {
-        let (bytes, i) = by_size[(start + k) % n];
-        if spent + bytes <= budget {
-            spent += bytes;
-            out.insert(i);
-        }
-        if spent >= budget {
-            break;
-        }
-    }
-    // By count: rank the files by a hash of (seed, index) and take the first.
+    // Rank the files by a hash of (seed, index) and take the first.
     let mut ranked: Vec<(u64, usize)> = present
         .iter()
         .map(|&(i, _)| (mix(seed, i as u64), i))
         .collect();
     ranked.sort();
-    for &(_, i) in ranked.iter().take(n.div_ceil(50)) {
-        out.insert(i);
-    }
-    out
+    ranked
+        .into_iter()
+        .take(present.len().div_ceil(50))
+        .map(|(_, i)| i)
+        .collect()
 }
 
 /// A splitmix64 step over `seed` and `i`.
@@ -413,16 +394,14 @@ mod tests {
     fn the_sample_is_small_and_never_empty() {
         let files: Vec<(usize, usize)> = (0..100).map(|i| (i, 1000)).collect();
         for seed in 0..10 {
-            let s = pick(&files, seed);
-            assert!(
-                (2..=4).contains(&s.len()),
-                "2% by bytes plus 1 in 50: {s:?}"
-            );
+            assert_eq!(pick(&files, seed).len(), 2, "one in 50 of 100 files");
         }
-        // The byte sample alone never takes a file bigger than its budget,
-        // but it is never empty.
-        let s = pick(&[(0, 1_000_000), (1, 10), (2, 10)], 7);
-        assert!(!s.is_empty());
+        // Many tiny files and one huge one: the sample stays one in 50.
+        let mut many: Vec<(usize, usize)> = (0..336).map(|i| (i, 300)).collect();
+        many.push((336, 3_000_000));
+        for seed in 0..10 {
+            assert_eq!(pick(&many, seed).len(), 337usize.div_ceil(50));
+        }
         // A single file is always re-checked.
         assert_eq!(pick(&[(5, 123)], 3), BTreeSet::from([5]));
         assert!(pick(&[], 1).is_empty());
