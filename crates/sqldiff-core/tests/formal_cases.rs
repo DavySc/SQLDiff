@@ -299,7 +299,7 @@ fn run_case(case: &toml::Value) -> Result<(), String> {
         durable: o
             .effects
             .iter()
-            .filter(|(k, f)| matches!(f, Fate::Durable | Fate::Partial) && !o.open.contains(*k))
+            .filter(|(k, f)| matches!(f, Fate::Durable | Fate::Partial) && !o.open.contains(k))
             .map(|(k, _)| name(k))
             .collect(),
         open: o.open.iter().map(|k| name(k)).collect(),

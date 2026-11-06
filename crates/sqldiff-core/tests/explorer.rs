@@ -103,7 +103,9 @@ fn generated_pg(n: usize) -> String {
     s + "END;\n$$;\n"
 }
 
-fn check(name: &str, d: Dialect, sql: &str) -> usize {
+/// Returns the number of fault scenarios compared and how many of them
+/// merged into the fault-free run.
+fn check(name: &str, d: Dialect, sql: &str) -> (usize, usize) {
     let art = Artifact::new(name, d, sql);
     let a = Analyzed::new(&art, Side::A, 3);
     let cfg = ir::lower(&a);
@@ -111,6 +113,7 @@ fn check(name: &str, d: Dialect, sql: &str) -> usize {
         .filter(|&n| cfg.node(n).stmt().is_some())
         .collect();
     let mut runs = 0;
+    let mut merged = 0;
     for (caller_txn, xact_abort) in [(false, false), (true, false), (false, true)] {
         let base = Scenario {
             caller_txn,
@@ -134,22 +137,95 @@ fn check(name: &str, d: Dialect, sql: &str) -> usize {
                 runs += 1;
             }
         }
+        merged += x.merges();
     }
-    runs
+    (runs, merged)
 }
 
 #[test]
 fn explorer_matches_full_exploration_on_the_corpus() {
     let files = corpus();
     assert!(files.len() > 40, "corpus not found");
-    let runs: usize = files.iter().map(|(n, d, s)| check(n, *d, s)).sum();
+    let (mut runs, mut merged) = (0, 0);
+    for (n, d, s) in &files {
+        let (r, m) = check(n, *d, s);
+        runs += r;
+        merged += m;
+    }
     assert!(runs > 1000);
+    // The merge is exercised, not just allowed.
+    assert!(merged > 100, "only {merged} of {runs} scenarios merged");
+    eprintln!("{merged} of {runs} fault scenarios merged");
 }
 
 #[test]
 fn explorer_matches_full_exploration_on_long_branchy_routines() {
     for n in [5, 30, 70] {
-        check(&format!("g{n}.tsql.sql"), Dialect::Tsql, &generated_tsql(n));
-        check(&format!("g{n}.pg.sql"), Dialect::Postgres, &generated_pg(n));
+        let (r, m) = check(&format!("g{n}.tsql.sql"), Dialect::Tsql, &generated_tsql(n));
+        eprintln!("tsql {n}: {m} of {r} merged");
+        let (r, m) = check(&format!("g{n}.pg.sql"), Dialect::Postgres, &generated_pg(n));
+        eprintln!("pg {n}: {m} of {r} merged");
+    }
+}
+
+/// A script of plain statements with no routine around it: nearly every
+/// fault scenario merges.
+fn straight_line(n: usize) -> String {
+    (0..n)
+        .map(|i| match i % 4 {
+            0 => format!("INSERT INTO dbo.t{} (a, b) VALUES ({i}, {i});\n", i % 3),
+            1 => format!(
+                "UPDATE dbo.t{} SET b = {i} WHERE a = {};\nGO\n",
+                i % 3,
+                i - 1
+            ),
+            2 => format!("DELETE FROM dbo.t{} WHERE a = {i};\n", i % 3),
+            _ => "IF @@ERROR <> 0 PRINT 'x';\n".to_string(),
+        })
+        .collect()
+}
+
+/// Loops that run past the step budget and branches that run past the path
+/// budget, so the cut-off paths and what a merge must not hide are compared.
+fn budget_edges() -> Vec<(&'static str, Dialect, String)> {
+    let mut branches = String::from("CREATE PROCEDURE dbo.b @p int AS\nBEGIN\n");
+    for i in 0..9 {
+        branches += &format!(
+            "  IF @p > {i} UPDATE dbo.t{} SET b = {i};\n  ELSE DELETE FROM dbo.t{};\n",
+            i % 3,
+            i % 3
+        );
+    }
+    branches += "  INSERT INTO dbo.done (a) VALUES (1);\nEND\n";
+    let mut nested = String::from(
+        "CREATE PROCEDURE dbo.n @p int AS\nBEGIN\n  DECLARE @i int = 0, @j int = 0;\n",
+    );
+    nested += "  WHILE @i < 100\n  BEGIN\n    SET @j = 0;\n    WHILE @j < 100\n    BEGIN\n      UPDATE dbo.t SET b = @j WHERE a = @i;\n      SET @j = @j + 1;\n    END\n    SET @i = @i + 1;\n  END\n  INSERT INTO dbo.done (a) VALUES (1);\nEND\n";
+    let handler = "CREATE PROCEDURE dbo.h @p int AS\nBEGIN\n  BEGIN TRY\n    UPDATE dbo.a SET b = 1;\n    BEGIN TRY\n      INSERT INTO dbo.b (a) VALUES (1);\n    END TRY\n    BEGIN CATCH\n      INSERT INTO dbo.log (m) VALUES (ERROR_MESSAGE());\n    END CATCH\n    DELETE FROM dbo.c;\n  END TRY\n  BEGIN CATCH\n    THROW;\n  END CATCH\nEND\n".to_string();
+    let db2 = "CREATE PROCEDURE h (IN p INTEGER)\nLANGUAGE SQL\nBEGIN\n  DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET p = 0;\n  UPDATE a SET b = 1;\n  INSERT INTO b (a) VALUES (1);\n  BEGIN\n    DECLARE EXIT HANDLER FOR SQLSTATE '23505' ROLLBACK;\n    DELETE FROM c;\n    COMMIT;\n  END;\n  DELETE FROM d;\nEND\n".to_string();
+    vec![
+        ("branches.tsql.sql", Dialect::Tsql, branches),
+        ("nested.tsql.sql", Dialect::Tsql, nested),
+        ("handler.tsql.sql", Dialect::Tsql, handler),
+        ("handler.db2i.sql", Dialect::Db2i, db2),
+    ]
+}
+
+#[test]
+fn explorer_matches_full_exploration_at_the_budget_edges_and_on_data_scripts() {
+    for (name, d, sql) in budget_edges() {
+        let (r, m) = check(name, d, &sql);
+        eprintln!("{name}: {m} of {r} merged");
+    }
+    for n in [3, 40] {
+        let (r, m) = check(
+            &format!("data{n}.tsql.sql"),
+            Dialect::Tsql,
+            &straight_line(n),
+        );
+        eprintln!("data {n}: {m} of {r} merged");
+        if n > 3 {
+            assert!(m > 0, "no fault scenario of a data script merged");
+        }
     }
 }

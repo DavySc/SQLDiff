@@ -32,6 +32,26 @@ its statement. The outcomes are the ones a full run gives, in the same order
 on the corpus); this keeps routines of several hundred statements well under
 a second.
 
+A faulted run that reaches, at the same statement, a state equal to the
+fault-free run's in everything the rest of the run reads (the position, the
+variables, the transaction and savepoint stack, the handlers, the temporary
+state, the statements still to be reported and the loop counters) does not
+run on: the rest of its exploration would repeat the fault-free one step for
+step, because the step function is deterministic and reads only that state.
+Its outcome is the fault-free outcome with the entries the fault changed
+patched in, and it is held as such (`ir/delta.rs`) so that neither making nor
+comparing it costs the size of the routine. A run merges only when its fault is spent and the failing statement
+cannot run again from there, and only into a fault-free tick at the same
+statement with the same step count and the same number of paths started, so
+the step and path budgets cut both runs at the same place and a budget-cut
+statement is still reported as not proven. A state that differs in anything
+the rest of the run reads (or in history a later statement could read, such as
+temporary tables) is not merged and runs on to its end.
+`tests/explorer.rs` compares every outcome with a full exploration, on the
+corpus and on generated routines (loops, handlers, savepoints, budget edges,
+data scripts), with merging active. Converting a script of 2000 `INSERT`
+statements went from 41 s to 1.4 s with an identical report.
+
 | Rule | Class | Divergence |
 |---|---|---|
 | `txn.statement-atomicity` | transactional | One side keeps the failing statement's rows changed before the error |
