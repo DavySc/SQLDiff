@@ -21,7 +21,7 @@ use sqldiff_core::catalog::{ddl, RoutineKind};
 use sqldiff_core::Dialect;
 
 use crate::tree::Input;
-use crate::{Conversion, Note, Status};
+use crate::{Cored, Note, Status};
 
 /// Prefix of the engine's assumption ids for a called user function.
 pub const UDF_CALLEE: &str = "ASM-UDF-CALLEE:";
@@ -30,7 +30,7 @@ pub const UDF_CALLEE: &str = "ASM-UDF-CALLEE:";
 pub const CALLEE_RULE: &str = "equiv.udf-callee";
 
 /// Resolves every `ASM-UDF-CALLEE:name` in `convs` (parallel to `inputs`).
-pub fn resolve(inputs: &[Input], convs: &mut [&mut Conversion], from: Dialect) {
+pub fn resolve<C: Cored>(inputs: &[Input], convs: &mut [&mut C], from: Dialect) {
     if from != Dialect::Tsql {
         return;
     }
@@ -51,8 +51,8 @@ pub fn resolve(inputs: &[Input], convs: &mut [&mut Conversion], from: Dialect) {
                 .push(i);
         }
     }
-    let wanted = |c: &Conversion| -> BTreeSet<String> {
-        c.units
+    let wanted = |c: &C| -> BTreeSet<String> {
+        c.units()
             .iter()
             .flat_map(|u| &u.notes)
             .filter_map(|n| n.rule.strip_prefix(UDF_CALLEE).map(str::to_string))
@@ -93,7 +93,7 @@ pub fn resolve(inputs: &[Input], convs: &mut [&mut Conversion], from: Dialect) {
                         inputs[*j].rel
                     )),
                     Some([j]) => {
-                        let c = &*convs[*j];
+                        let c: &C = &*convs[*j];
                         let worst = file_status(c);
                         if worst <= Status::Assumptions {
                             Ok(carried(c))
@@ -113,7 +113,7 @@ pub fn resolve(inputs: &[Input], convs: &mut [&mut Conversion], from: Dialect) {
                 let c = &mut *convs[i];
                 let at = calling_units(&inputs[i].text, c, k, outcome.is_err());
                 for u in at {
-                    let u = &mut c.units[u];
+                    let u = &mut c.units_mut()[u];
                     match &outcome {
                         Ok(notes) => {
                             for n in notes {
@@ -153,7 +153,7 @@ pub fn resolve(inputs: &[Input], convs: &mut [&mut Conversion], from: Dialect) {
         }
     }
     for c in convs.iter_mut() {
-        crate::recount(c);
+        crate::recount(&mut **c);
     }
 }
 
@@ -167,23 +167,23 @@ fn key(schema: Option<&str>, name: &str) -> String {
 }
 
 /// The worst status in a converted file, counting what names no unit.
-fn file_status(c: &Conversion) -> Status {
+fn file_status<C: Cored>(c: &C) -> Status {
     let mut worst = c
-        .units
+        .units()
         .iter()
         .map(|u| u.status)
         .max()
         .unwrap_or(Status::Converted);
-    if !c.unproven.is_empty() || !c.unplaced.is_empty() {
+    if c.blocked() {
         worst = worst.max(Status::Unproven);
     }
     worst
 }
 
 /// The assumption notes of a converted file, once each.
-fn carried(c: &Conversion) -> Vec<Note> {
+fn carried<C: Cored>(c: &C) -> Vec<Note> {
     let mut out: Vec<Note> = Vec::new();
-    for n in c.units.iter().flat_map(|u| &u.notes) {
+    for n in c.units().iter().flat_map(|u| &u.notes) {
         if n.status == Status::Assumptions && !out.iter().any(|x| x.rule == n.rule) {
             out.push(n.clone());
         }
@@ -196,10 +196,11 @@ fn carried(c: &Conversion) -> Vec<Note> {
 /// proven) takes every unit whose text names the function at all, in a
 /// comment or a spelling the match above misses (`dbo./**/f(`) too: a unit
 /// it wrongly includes is only kept from counting.
-fn calling_units(text: &str, c: &Conversion, k: &str, wide: bool) -> Vec<usize> {
+fn calling_units<C: Cored>(text: &str, c: &C, k: &str, wide: bool) -> Vec<usize> {
     let rule = format!("{UDF_CALLEE}{k}");
-    let with: Vec<usize> = (0..c.units.len())
-        .filter(|&i| c.units[i].notes.iter().any(|n| n.rule == rule))
+    let units = c.units();
+    let with: Vec<usize> = (0..units.len())
+        .filter(|&i| units[i].notes.iter().any(|n| n.rule == rule))
         .collect();
     let call = match (wide, k.contains('.')) {
         (true, _) => k.rsplit('.').next().unwrap_or(k).to_string(),
@@ -207,7 +208,7 @@ fn calling_units(text: &str, c: &Conversion, k: &str, wide: bool) -> Vec<usize> 
         (false, false) => format!("dbo.{k}("),
     };
     let calls = |i: usize| {
-        let s = &c.units[i].src;
+        let s = &units[i].src;
         text.get(s.start..s.end).is_some_and(|t| {
             let flat: String = t
                 .chars()
@@ -224,7 +225,7 @@ fn calling_units(text: &str, c: &Conversion, k: &str, wide: bool) -> Vec<usize> 
     if wide {
         return hits;
     }
-    let span = |i: usize| (c.units[i].src.start, c.units[i].src.end);
+    let span = |i: usize| (units[i].src.start, units[i].src.end);
     hits.iter()
         .copied()
         .filter(|&i| {

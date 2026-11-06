@@ -696,10 +696,10 @@ impl Base {
     /// `convs`) that uses a suspect base object with `ASM-BASE-SUSPECT`. An
     /// object the tree defines replaces the base object of its name; a tree
     /// object whose statement uses a suspect object is suspect itself.
-    pub fn flag<'c>(
+    pub fn flag<'c, C: crate::Cored + 'c>(
         &self,
         files: &[(&str, &str)],
-        convs: impl Iterator<Item = &'c mut Conversion>,
+        convs: impl Iterator<Item = &'c mut C>,
         d: Dialect,
     ) {
         if self.suspects.is_empty() {
@@ -752,7 +752,7 @@ impl Base {
         for ((_, text), c) in files.iter().zip(convs) {
             let found = refs_at(text, d);
             let mut changed = false;
-            for u in &mut c.units {
+            for u in c.units_mut().iter_mut() {
                 let mut hit: Vec<&str> = Vec::new();
                 for (at, r) in &found {
                     if *at < u.src.start || *at >= u.src.end {
