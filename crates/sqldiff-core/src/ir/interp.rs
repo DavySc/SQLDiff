@@ -574,8 +574,9 @@ pub struct Explorer {
     outs: Vec<Outcome>,
     /// Step at which each statement is first about to run.
     first: HashMap<NodeId, usize>,
-    /// (step, exploration before that step), in step order.
-    checkpoints: Vec<(usize, Machine)>,
+    /// (step, outcomes made by then, exploration before that step without its
+    /// outcomes), in step order.
+    checkpoints: Vec<(usize, usize, Machine)>,
     /// The fault-free run, tick by tick.
     ticks: Vec<Tick>,
     /// Ticks by (node, `steps`).
@@ -650,7 +651,19 @@ impl Explorer {
                     every *= 2;
                 }
                 if t % every == 0 {
-                    checkpoints.push((t, m.clone()));
+                    // Outcomes are append-only, so the checkpoint keeps
+                    // only how many exist; `machine_at` restores them from
+                    // `outs` (copies in every checkpoint cost the memory of
+                    // all of them 256 times over).
+                    checkpoints.push((
+                        t,
+                        m.outs.len(),
+                        Machine {
+                            cur: m.cur.clone(),
+                            work: m.work.clone(),
+                            outs: Vec::new(),
+                        },
+                    ));
                 }
             }
             first.entry(n).or_insert(t);
@@ -747,8 +760,9 @@ impl Explorer {
 
     /// The fault-free exploration just before tick `t`.
     fn machine_at(&self, cfg: &Cfg, t: usize) -> Option<Machine> {
-        let (mut at, m) = self.checkpoints.iter().rev().find(|(c, _)| *c <= t)?;
+        let (mut at, made, m) = self.checkpoints.iter().rev().find(|(c, _, _)| *c <= t)?;
         let mut m = m.clone();
+        m.outs = self.outs[..*made].to_vec();
         let base = Interp {
             cfg,
             keys: &self.keys,
