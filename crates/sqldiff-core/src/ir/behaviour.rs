@@ -19,7 +19,7 @@
 //! `concurrency.split-statement`. [`what_if`] answers one scenario on demand,
 //! and [`Env`] re-runs the analysis under flipped scenario assumptions.
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
@@ -1192,6 +1192,9 @@ struct Collector<'x, 'a> {
     /// The divergences of a scenario with a default flipped (`persists`),
     /// by scenario.
     flipped: RefCell<HashMap<String, Rc<Divergences>>>,
+    /// `diff` calls spent by this routine pair, and whether a budget ran out.
+    spent: Cell<u64>,
+    out_of_budget: Cell<bool>,
 }
 
 /// The (rule, anchor) of divergences found.
@@ -1199,6 +1202,31 @@ type Divergences = BTreeSet<(&'static str, String)>;
 
 /// Flipped scenarios kept before the cache starts over (time only).
 const FLIPPED_MAX: usize = 4096;
+
+/// How many outcome-pair comparisons (`diff` calls) one routine pair may
+/// spend, and one file's check in all. A count, never a time: the same
+/// input stops at the same place on every machine. Past either, the pairs
+/// not compared are reported as "not proven: work budget" on every
+/// statement of the routine (`budget_findings`).
+const ROUTINE_DIFFS: u64 = 1 << 21;
+const FILE_DIFFS: u64 = 1 << 23;
+
+thread_local! {
+    /// The `diff` calls spent by the file being checked on this thread;
+    /// `analyze` starts it at zero.
+    static FILE_SPENT: Cell<u64> = const { Cell::new(0) };
+    /// The budgets in force on this thread (routine, file); tests lower them.
+    static BUDGETS: Cell<(u64, u64)> = const { Cell::new((ROUTINE_DIFFS, FILE_DIFFS)) };
+}
+
+/// Runs `f` with the work budgets of this thread set to `routine` and
+/// `file` diff calls, for tests that need a small budget to run out.
+pub fn with_work_budgets<T>(routine: u64, file: u64, f: impl FnOnce() -> T) -> T {
+    let old = BUDGETS.replace((routine, file));
+    let r = f();
+    BUDGETS.set(old);
+    r
+}
 
 impl<'x, 'a> Collector<'x, 'a> {
     fn new(
@@ -1229,10 +1257,26 @@ impl<'x, 'a> Collector<'x, 'a> {
             cut_a: BTreeSet::new(),
             cut_b: BTreeSet::new(),
             flipped: RefCell::new(HashMap::new()),
+            spent: Cell::new(0),
+            out_of_budget: Cell::new(false),
         };
         c.splits = splits(&c.sa, &c.sb, true);
         c.splits.extend(splits(&c.sb, &c.sa, false));
         c
+    }
+
+    /// Spends one `diff` call; false (and the routine marked as cut by its
+    /// budget) when the routine's or the file's allowance is used up.
+    fn spend(&self) -> bool {
+        let file = FILE_SPENT.get();
+        let (routine_max, file_max) = BUDGETS.get();
+        if self.spent.get() >= routine_max || file >= file_max {
+            self.out_of_budget.set(true);
+            return false;
+        }
+        self.spent.set(self.spent.get() + 1);
+        FILE_SPENT.set(file + 1);
+        true
     }
 
     fn fault_scenario(&self, n: NodeId, r: &[ErrorKind], kind: ErrorKind) -> Scenario {
@@ -1318,6 +1362,9 @@ impl<'x, 'a> Collector<'x, 'a> {
         let rb: Vec<Reads> = pb.iter().map(|o| reads(&self.sb, o)).collect();
         let mut out = BTreeSet::new();
         for &(i, j) in &ps {
+            if !self.spend() {
+                break;
+            }
             let (a, b) = ((&pa[i], &ra[i]), (&pb[j], &rb[j]));
             for x in diff(
                 &self.sa,
@@ -1360,7 +1407,12 @@ impl<'x, 'a> Collector<'x, 'a> {
         let ra: Vec<Reads> = pa.iter().map(|o| reads(&self.sa, o)).collect();
         let rb: Vec<Reads> = pb.iter().map(|o| reads(&self.sb, o)).collect();
         let mut found: Vec<(Div, &Outcome, &Outcome, usize)> = Vec::new();
+        let mut compared = 0;
         for &(i, j) in &ps {
+            if !self.spend() {
+                break;
+            }
+            compared += 1;
             let (oa, ob) = (&pa[i], &pb[j]);
             // Each divergence counts once per outcome pair.
             let mut here: Vec<(&str, String)> = Vec::new();
@@ -1394,7 +1446,8 @@ impl<'x, 'a> Collector<'x, 'a> {
                 d,
                 oa,
                 ob,
-                exact || hits == combos,
+                // Pairs left out may disagree: all agreeing is not known.
+                compared == combos && (exact || hits == combos),
                 Some((&scen_a, &scen_b)),
             );
         }
@@ -1639,7 +1692,7 @@ impl<'x, 'a> Collector<'x, 'a> {
                     class: ChangeClass::Transactional,
                     severity: Severity::Medium,
                     verdict: Verdict::Unknown,
-                    witness: "Not proven: the behaviour model stopped at its step or path budget before it ran this statement in at least one scenario, so what happens when it fails and how its transaction goes are not compared.".to_string(),
+                    witness: "Not proven: the behaviour model stopped at its step, path or work budget before it ran or compared this statement in at least one scenario, so what happens when it fails and how its transaction goes are not compared.".to_string(),
                     a: on_a.then(|| loc.clone()),
                     b: (!on_a).then_some(loc),
                     assumptions: Vec::new(),
@@ -1900,6 +1953,7 @@ fn meet(a: &Analyzed, b: &Analyzed) -> Option<Meeting> {
 /// budgets. A routine that meets none is not analysed, and a transaction
 /// statement inside it stays unproven.
 pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
+    FILE_SPENT.set(0);
     let Some(m) = meet(a, b) else {
         // At most one routine on each side: `routines_of` picks it, so a
         // setup `DO` block beside it is not mistaken for it.
@@ -1998,6 +2052,13 @@ fn analyze_pair(
             ..env.scenario()
         };
         c.run(Kind::CallerTxn, caller.clone(), caller);
+    }
+    if c.out_of_budget.get() {
+        // Some pairs of outcomes were never compared: every statement of
+        // the routine is unproven, and nothing here is exact.
+        c.cut_a.insert(c.sa.cfg.entry);
+        c.cut_b.insert(c.sb.cfg.entry);
+        c.incomplete = true;
     }
     c.budget_findings();
     // A replaced routine-wide finding may have brought assumptions that no
