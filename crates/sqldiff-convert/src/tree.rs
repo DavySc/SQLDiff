@@ -678,15 +678,22 @@ fn convert_kept(
             base.as_ref(),
             hooks,
             &finish,
-        )?,
+        )?
+        .into_iter()
+        .map(|(c, s)| (Held::Whole(Box::new(c)), s))
+        .collect(),
     };
-    let mut results = results;
     // The cross-file passes work on the units alone (`Core`): what they read
     // and change of a file is its units, counts and whether something in it
-    // names no unit.
+    // names no unit. A file held without its output and reports gets them
+    // back from the store afterwards.
+    let mut results = results;
     let mut cores: Vec<crate::Core> = results
         .iter_mut()
-        .map(|(c, _)| crate::Core::take(c))
+        .map(|(h, _)| match h {
+            Held::Whole(c) => crate::Core::take(c.as_mut()),
+            Held::Stored { core, .. } => std::mem::take(core),
+        })
         .collect();
     if let Some(b) = &base {
         let files: Vec<(&str, &str)> = inputs
@@ -699,9 +706,24 @@ fn convert_kept(
     // conversion does.
     let mut refs: Vec<&mut crate::Core> = cores.iter_mut().collect();
     crate::callees::resolve(inputs, &mut refs, a.from);
-    for ((c, _), core) in results.iter_mut().zip(cores) {
-        core.restore(c);
+    let mut finished: Vec<(Conversion, f64)> = Vec::with_capacity(results.len());
+    for ((held, secs), core) in results.into_iter().zip(cores) {
+        let mut c = match held {
+            Held::Whole(c) => *c,
+            Held::Stored { key, .. } => match cache.as_ref().and_then(|c| c.store.get(&key)) {
+                Some(c) => c,
+                None => {
+                    return Err(format!(
+                        "the stored result {} is gone or unreadable; run again",
+                        key.as_str()
+                    ))
+                }
+            },
+        };
+        core.restore(&mut c);
+        finished.push((c, secs));
     }
+    let results = finished;
     let mut files = Vec::new();
     let mut outputs = Vec::new();
     let mut conversions = Vec::new();
@@ -841,7 +863,7 @@ fn convert_files(
     select: Option<&crate::plan::Select>,
     unchecked: &mut Vec<bool>,
     progress: &mut Option<crate::plan::Progress>,
-) -> Result<Vec<(Conversion, f64)>, String> {
+) -> Result<Vec<(Held, f64)>, String> {
     // Catalogs from the whole tree, so names defined in other files bind:
     // the source catalog also lets the rules see other files' procedures.
     // Base catalogs go under the tree's objects.
@@ -1011,14 +1033,26 @@ fn convert_files(
             let mut c = crate::not_checked(&input.text, draft);
             finish.apply(&mut c);
             progress.tick();
-            return Some((c, 0.0, false, true));
+            return Some((Held::Whole(Box::new(c)), 0.0, false, true));
         }
-        if let Some((_, _, conv)) = &stored {
+        // A file is flagged for the stand-in tables it names, and then its
+        // output and reports are let go when the store holds them.
+        let hold = |mut c: Conversion, key: Option<&crate::store::Key>, in_store: bool| {
+            stand_ins.flag_file(idx, &input.text, &mut c, a.from, a.to);
+            match key {
+                Some(k) if in_store => Held::Stored {
+                    key: k.clone(),
+                    core: crate::Core::take(&mut c),
+                },
+                _ => Held::Whole(Box::new(c)),
+            }
+        };
+        if let Some((_, k, conv)) = &stored {
             if !sample.contains(&idx) {
                 let mut conv = conv.clone();
                 finish.apply(&mut conv);
                 progress.tick();
-                return Some((conv, 0.0, true, false));
+                return Some((hold(conv, Some(k), true), 0.0, true, false));
             }
         }
         let t = Instant::now();
@@ -1040,13 +1074,15 @@ fn convert_files(
                 ));
             }
         }
+        let mut in_store = false;
         if let (Some(cc), Some(k)) = (cache, key) {
-            if let Err(e) = cc.store.put(k, &c) {
-                eprintln!("sqldiff: result not stored: {e}");
+            match cc.store.put(k, &c) {
+                Ok(()) => in_store = true,
+                Err(e) => eprintln!("sqldiff: result not stored: {e}"),
             }
         }
         progress.tick();
-        Some((c, secs, false, false))
+        Some((hold(c, key.as_ref(), in_store), secs, false, false))
     });
     if let Some(msg) = mismatch.into_inner().unwrap() {
         if let Some(c) = cache {
@@ -1054,15 +1090,26 @@ fn convert_files(
         }
         return Err(msg);
     }
-    let done: Vec<(Conversion, f64, bool, bool)> = done
+    let done: Vec<(Held, f64, bool, bool)> = done
         .into_iter()
         .map(|d| d.ok_or_else(|| CANCELLED.to_string()))
         .collect::<Result<_, _>>()?;
     *reused = done.iter().map(|d| d.2).collect();
     *unchecked = done.iter().map(|d| d.3).collect();
-    let mut done: Vec<(Conversion, f64)> = done.into_iter().map(|(c, s, _, _)| (c, s)).collect();
-    stand_ins.flag(&files, done.iter_mut().map(|(c, _)| c), a.from, a.to);
-    Ok(done)
+    Ok(done.into_iter().map(|(h, s, _, _)| (h, s)).collect())
+}
+
+/// A checked file while the cross-file passes run. With a result store its
+/// output and engine reports are not kept: only the core (units, counts)
+/// stays, and the rest is read back from the store under `key` when the
+/// file is finished. Without one (templates, a tree not written anywhere)
+/// the whole conversion is held, as before.
+enum Held {
+    Whole(Box<Conversion>),
+    Stored {
+        key: crate::store::Key,
+        core: crate::Core,
+    },
 }
 
 /// The result store of this run and what every key holds besides the file.
