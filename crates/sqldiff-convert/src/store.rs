@@ -418,14 +418,30 @@ impl Store {
     /// does not name its own key, is a miss.
     pub fn get_tree(&self, key: &TreeKey) -> Option<TreeState> {
         let path = crate::tree::dest_under(&self.out, &Self::tree_rel(key)).ok()?;
-        let st: TreeState = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        let packed = std::fs::read(path).ok()?;
+        let mut json = Vec::new();
+        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&packed[..]), &mut json)
+            .ok()?;
+        drop(packed);
+        let st: TreeState = serde_json::from_slice(&json).ok()?;
+        drop(json);
         (st.key == key.0).then_some(st)
     }
 
     /// Stores the state of a tree and drops the states of other trees: only
     /// the last one is of use to a resumed run.
     pub fn put_tree(&self, key: &TreeKey, st: &TreeState) -> Result<(), String> {
-        let bytes = serde_json::to_vec(st).map_err(|e| e.to_string())?;
+        // Compressed as it is written: the drafts repeat the same long
+        // strings, and nothing is held in memory beside the state itself.
+        let mut enc = flate2::write::GzEncoder::new(
+            std::io::BufWriter::new(Vec::new()),
+            flate2::Compression::fast(),
+        );
+        serde_json::to_writer(&mut enc, st).map_err(|e| e.to_string())?;
+        let bytes = enc
+            .finish()
+            .and_then(|w| w.into_inner().map_err(|e| e.into_error()))
+            .map_err(|e| e.to_string())?;
         let dest = crate::tree::dest_under(&self.out, &Self::tree_rel(key))?;
         if let Some(p) = dest.parent() {
             let _ = std::fs::remove_dir_all(p);
