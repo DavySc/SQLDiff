@@ -7,6 +7,8 @@
 //! - `GET /runs`, `GET /api/runs`: runs started from the app (see `runs`)
 //! - `POST /api/runs` `{"src", "out", "from", "to", "overwrite"?}`: convert a
 //!   tree into an output folder, as `sqldiff convert` does
+//! - `POST /api/runs/plan` (a `/api/runs` body): the plan of the tree, with
+//!   nothing written
 //! - `POST /api/runs/instances` `{"manifest", "source"?, "target"?, "from",
 //!   "to", "out", ...}`: check the instances of converted templates, as
 //!   `sqldiff instances` does
@@ -238,6 +240,7 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
         ("GET", "/api/fs")
         | ("POST", "/api/open/compare")
         | ("POST", "/api/runs")
+        | ("POST", "/api/runs/plan")
         | ("POST", "/api/runs/instances")
         | ("POST", "/api/runs/drift")
         | ("POST", "/api/runs/changes")
@@ -277,6 +280,15 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
                 .and_then(|spec| app.runs.start(spec, app.isolated, |_| {}))
             {
                 Ok(run) => json(&run.view()),
+                Err(e) => bad(e),
+            }
+        }
+        ("POST", "/api/runs/plan") => {
+            return match serde_json::from_slice::<ConvertSpec>(&req.body)
+                .map_err(|e| e.to_string())
+                .and_then(|spec| crate::runs::plan_view(&spec, app.isolated))
+            {
+                Ok(p) => json(&p),
                 Err(e) => bad(e),
             }
         }
