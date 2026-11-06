@@ -76,7 +76,15 @@ impl Cx<'_> {
                     .first()
                     .is_some_and(|t| t.is("SYSTEM_VERSIONING"))
                 {
-                    history = Some(versioning_option(trimmed(opt))?);
+                    let (h, retention) = versioning_option(trimmed(opt), true)?;
+                    history = Some(h);
+                    if let Some(r) = retention {
+                        self.note(
+                            Status::Assumptions,
+                            "ASM-HISTORY-RETENTION",
+                            &format!("SQL Server hides history rows older than {r} from FOR SYSTEM_TIME queries at once and deletes them in the background; the converted table keeps every history row visible until a scheduled job (pg_cron or the like) deletes those whose period end is older than {r} (UTC), or the history grows without bound."),
+                        );
+                    }
                     self.step_ts("tsql.temporal.versioning-option", opt);
                 } else {
                     kept.push(opt);
@@ -426,7 +434,7 @@ impl Cx<'_> {
             if os.len() == 3 && opt[os[1]].s == "=" && opt[os[2]].is("OFF") {
                 Switch::Off
             } else {
-                Switch::On(versioning_option(opt)?)
+                Switch::On(versioning_option(opt, false)?.0)
             }
         } else {
             return no(FORMS);
@@ -535,8 +543,12 @@ fn trig(n: &str) -> &str {
 }
 
 /// `SYSTEM_VERSIONING = ON (HISTORY_TABLE = x [, DATA_CONSISTENCY_CHECK = …]
-/// [, HISTORY_RETENTION_PERIOD = INFINITE])` → the history table name.
-fn versioning_option(opt: &[T]) -> R<Vec<T>> {
+/// [, HISTORY_RETENTION_PERIOD = INFINITE | n unit])` → the history table name
+/// and the finite retention period as written (`12 MONTHS`). A finite period
+/// is read only with `allow_retention` (a CREATE TABLE, where the caller
+/// records ASM-HISTORY-RETENTION for it); `ALTER TABLE … SET` refuses it, as
+/// no note would carry the assumption there.
+fn versioning_option(opt: &[T], allow_retention: bool) -> R<(Vec<T>, Option<String>)> {
     let s = sig(opt);
     let on = s.get(2).is_some_and(|&j| opt[j].is("ON"));
     if !s.get(1).is_some_and(|&j| opt[j].s == "=") || !on {
@@ -547,6 +559,7 @@ fn versioning_option(opt: &[T]) -> R<Vec<T>> {
     };
     let r = matching(opt, p).ok_or(No("unbalanced SYSTEM_VERSIONING".into()))?;
     let mut history = None;
+    let mut retention = None;
     for o in split_commas(&opt[p + 1..r]) {
         let o = trimmed(o);
         let os = sig(o);
@@ -564,12 +577,31 @@ fn versioning_option(opt: &[T]) -> R<Vec<T>> {
             "DATA_CONSISTENCY_CHECK" => {}
             "HISTORY_RETENTION_PERIOD" if value.len() == 1 && value[0].is("INFINITE") => {}
             "HISTORY_RETENTION_PERIOD" => {
-                return no("HISTORY_RETENTION_PERIOD: SQL Server deletes old history rows in the background; PostgreSQL needs a scheduled job for that; no rule yet")
+                // `n DAYS|WEEKS|MONTHS|YEARS` (singular accepted): the only
+                // forms SQL Server takes.
+                let w: Vec<&T> = value.iter().filter(|t| t.sig()).collect();
+                let unit_ok = |u: &str| {
+                    matches!(
+                        u,
+                        "DAY" | "DAYS" | "WEEK" | "WEEKS" | "MONTH" | "MONTHS" | "YEAR" | "YEARS"
+                    )
+                };
+                match w.as_slice() {
+                    [n, u]
+                        if allow_retention
+                            && !n.s.is_empty()
+                            && n.s.chars().all(|c| c.is_ascii_digit())
+                            && unit_ok(&u.up()) =>
+                    {
+                        retention = Some(format!("{} {}", n.s, u.s));
+                    }
+                    _ => return no("HISTORY_RETENTION_PERIOD: only a number of days, weeks, months or years in CREATE TABLE has a rule; SQL Server deletes old history rows in the background and PostgreSQL needs a scheduled job for that"),
+                }
             }
             w => return no(format!("SYSTEM_VERSIONING option {w}: no rule yet")),
         }
     }
-    history.ok_or(No("SYSTEM_VERSIONING = ON without HISTORY_TABLE: SQL Server creates a history table with a generated name (MSSQL_TemporalHistoryFor_…); name one to convert".into()))
+    history.map(|h| (h, retention)).ok_or(No("SYSTEM_VERSIONING = ON without HISTORY_TABLE: SQL Server creates a history table with a generated name (MSSQL_TemporalHistoryFor_…); name one to convert".into()))
 }
 
 /// `GENERATED ALWAYS AS ROW START|END` in a column item: its token span and
