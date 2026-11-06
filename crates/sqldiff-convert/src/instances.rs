@@ -1693,6 +1693,7 @@ mod tests {
             observer,
             anchors,
             historyless,
+            skip_witnesses,
         } = Options::default();
         let base = Options {
             excerpt_lines,
@@ -1707,6 +1708,7 @@ mod tests {
             observer,
             anchors,
             historyless,
+            skip_witnesses,
         };
         let artifact = || Artifact::new("schema.sql", Dialect::Tsql, "CREATE TABLE t (id int);");
         let changes: Vec<Change<Options>> = vec![
@@ -1757,6 +1759,7 @@ mod tests {
                 }),
             ),
             ("historyless", Box::new(|o| o.historyless = true)),
+            ("skip_witnesses", Box::new(|o| o.skip_witnesses = true)),
             (
                 "proof mode",
                 Box::new(|o| o.proof.mode = sqldiff_core::proof::Mode::Require),

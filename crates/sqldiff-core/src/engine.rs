@@ -60,6 +60,12 @@ pub struct Options {
     /// on side B, so its history writes (`facts::writes_in`) and period
     /// columns have no counterpart there.
     pub historyless: bool,
+    /// Do not build the structured witnesses of behavioural findings
+    /// (`Report::witnesses` stays empty). Findings, verdicts and statuses are
+    /// the same; a witness lists every effect of the routine, so building one
+    /// per finding is quadratic on a script with thousands of writes. For
+    /// callers that never read them (`sqldiff_convert`).
+    pub skip_witnesses: bool,
 }
 
 impl Default for Options {
@@ -77,6 +83,7 @@ impl Default for Options {
             observer: crate::observer::Observer::default(),
             anchors: Vec::new(),
             historyless: false,
+            skip_witnesses: false,
         }
     }
 }

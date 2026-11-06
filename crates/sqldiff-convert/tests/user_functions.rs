@@ -215,3 +215,62 @@ END;
     let u = unit(&t, "p.sql", caller, CALL);
     assert!(u.status >= Status::Unproven, "{:#?}", u.notes);
 }
+
+/// A tree whose files are held as a core and a store key while the
+/// cross-file passes run (`convert_stored`) comes out as the one held whole
+/// (`convert`): the caller of a function that is not proven is not proven
+/// either, and everything else is the same.
+#[test]
+fn a_tree_held_in_the_store_gives_the_tree_held_whole() {
+    let fx = Fixture::new(
+        "stored",
+        &[("t.sql", TABLES), ("f.sql", BAD), ("p.sql", CALLER)],
+    );
+    let whole = fx.convert();
+    let a = tree::Args {
+        rules: Default::default(),
+        src: fx.dir.clone(),
+        from: Dialect::Tsql,
+        to: Dialect::Postgres,
+        jobs: Some(2),
+        no_catalog: false,
+        template: None,
+        extensions: tree::extensions(Vec::new()),
+        helpers: Vec::new(),
+        deployment: Default::default(),
+        catalogs: Vec::new(),
+        catalogs_b: Vec::new(),
+    };
+    let (inputs, unreadable) = tree::read(&a).unwrap();
+    let out = fx
+        .dir
+        .parent()
+        .unwrap()
+        .join(format!("sqldiff-udf-stored-out-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    let hooks = tree::Hooks::default();
+    let held = tree::convert_stored(&a, &inputs, unreadable, &out, &hooks, true).unwrap();
+    let _ = std::fs::remove_dir_all(&out);
+    assert_eq!(held.outputs, whole.outputs);
+    let json = |t: &Tree| serde_json::to_string(&t.conversions).unwrap();
+    assert_eq!(json(&held), json(&whole));
+    let p = whole
+        .report
+        .files
+        .iter()
+        .find(|f| f.path == "p.sql")
+        .unwrap();
+    assert!(
+        p.counts.unproven > 0,
+        "the caller of an unproven function is unproven in both: {:?}",
+        p.counts
+    );
+    let statuses = |t: &Tree| {
+        t.report
+            .files
+            .iter()
+            .map(|f| (f.path.clone(), f.status, format!("{:?}", f.counts)))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(statuses(&held), statuses(&whole));
+}

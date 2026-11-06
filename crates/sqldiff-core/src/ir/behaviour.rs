@@ -19,7 +19,7 @@
 //! `concurrency.split-statement`. [`what_if`] answers one scenario on demand,
 //! and [`Env`] re-runs the analysis under flipped scenario assumptions.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
@@ -279,6 +279,8 @@ pub struct Env {
     /// Db2 for i commit level declared for routines that do not state one
     /// (`ASM-DB2-COMMIT-LEVEL` in a pack).
     pub commit_level: Option<String>,
+    /// Build no witnesses (`Options::skip_witnesses`).
+    pub skip_witnesses: bool,
 }
 
 /// Assumptions whose flip changes the scenarios (and so is re-run, not relabelled).
@@ -291,6 +293,7 @@ impl Env {
             caller_txn: flips.get("ASM-NO-CALLER-TXN") == Some(&false),
             xact_abort: flips.get("ASM-TSQL-CALLER-XACT-ABORT-OFF") == Some(&false),
             commit_level: None,
+            skip_witnesses: false,
         }
     }
 
@@ -301,6 +304,7 @@ impl Env {
                 .declared
                 .get("ASM-DB2-COMMIT-LEVEL")
                 .and_then(|t| crate::ledger::declared_commit_level(t)),
+            skip_witnesses: opts.skip_witnesses,
             ..Env::from_flips(&opts.flips)
         }
     }
@@ -1045,9 +1049,11 @@ struct Collector<'x, 'a> {
     seen: HashSet<(String, String)>,
     /// Index in `out.findings` of the routine-wide finding of each rule.
     contract_at: HashMap<&'static str, usize>,
-    /// Each side's fault-free run, which fault scenarios resume from.
-    xa: OnceCell<Explorer>,
-    xb: OnceCell<Explorer>,
+    /// Each side's fault-free runs, one per environment (the analysed one
+    /// and those a flipped assumption re-runs under), which fault scenarios
+    /// resume from.
+    xa: RefCell<Vec<Rc<Explorer>>>,
+    xb: RefCell<Vec<Rc<Explorer>>>,
     /// Some scenario had no outcome on a side, or an outcome or finding
     /// that is not exact (see [`Behaviour::txn_compared`]).
     incomplete: bool,
@@ -1078,8 +1084,8 @@ impl<'x, 'a> Collector<'x, 'a> {
             out: Behaviour::default(),
             seen: HashSet::new(),
             contract_at: HashMap::new(),
-            xa: OnceCell::new(),
-            xb: OnceCell::new(),
+            xa: RefCell::new(Vec::new()),
+            xb: RefCell::new(Vec::new()),
             incomplete: false,
             prior: HashSet::new(),
             salt: String::new(),
@@ -1102,22 +1108,31 @@ impl<'x, 'a> Collector<'x, 'a> {
         }
     }
 
+    /// The fault-free run of `cfg` under the environment of `sc` (the
+    /// scenario without its faults), made once per environment.
+    fn explorer(cache: &RefCell<Vec<Rc<Explorer>>>, cfg: &Cfg, sc: &Scenario) -> Rc<Explorer> {
+        let env = Scenario {
+            faults: Vec::new(),
+            ..sc.clone()
+        };
+        let mut c = cache.borrow_mut();
+        if let Some(x) = c.iter().find(|x| *x.base_scenario() == env) {
+            return x.clone();
+        }
+        let x = Rc::new(Explorer::new(cfg, &env));
+        c.push(x.clone());
+        x
+    }
+
     fn outcomes(
         &self,
         sc: &Kind,
         scen_a: &Scenario,
         scen_b: &Scenario,
     ) -> (Vec<Outcome>, Vec<Outcome>) {
-        let base = self.env.scenario();
         let (ca, cb) = (&self.sa.cfg, &self.sb.cfg);
-        let mut pa = self
-            .xa
-            .get_or_init(|| Explorer::new(ca, &base))
-            .explore(ca, scen_a);
-        let mut pb = self
-            .xb
-            .get_or_init(|| Explorer::new(cb, &base))
-            .explore(cb, scen_b);
+        let mut pa = Self::explorer(&self.xa, ca, scen_a).explore(ca, scen_a);
+        let mut pb = Self::explorer(&self.xb, cb, scen_b).explore(cb, scen_b);
         if let Kind::Fault { key, .. } = sc {
             // Only paths that reach the failing statement belong to the scenario.
             let reached = |o: &Outcome| o.fault_hit || o.effects.contains_key(key.as_str());
@@ -1357,13 +1372,13 @@ impl<'x, 'a> Collector<'x, 'a> {
                 &format!("{}{anchor_b}|", self.salt),
             );
         }
-        let w = Witness {
+        let w = (!self.env.skip_witnesses).then(|| Witness {
             fingerprint: fp.clone(),
             rule: d.rule.to_string(),
             scenario: scenario_info(&self.sa, &self.sb, sc, &self.env, oa),
             a: side_outcome(&self.sa, oa),
             b: side_outcome(&self.sb, ob),
-        };
+        });
         let f = Finding {
             fingerprint: fp,
             rule: d.rule.to_string(),
@@ -1378,21 +1393,25 @@ impl<'x, 'a> Collector<'x, 'a> {
         match replace {
             Some(i) => {
                 let old = std::mem::replace(&mut self.out.findings[i], f);
-                match self
-                    .out
-                    .witnesses
-                    .iter_mut()
-                    .find(|x| x.fingerprint == old.fingerprint)
-                {
-                    Some(x) => *x = w,
-                    None => self.out.witnesses.push(w),
+                if let Some(w) = w {
+                    match self
+                        .out
+                        .witnesses
+                        .iter_mut()
+                        .find(|x| x.fingerprint == old.fingerprint)
+                    {
+                        Some(x) => *x = w,
+                        None => self.out.witnesses.push(w),
+                    }
                 }
             }
             None => {
                 if matches!(d.rule, "error.contract" | "txn.caller-continuation") {
                     self.contract_at.insert(d.rule, self.out.findings.len());
                 }
-                self.out.witnesses.push(w);
+                if let Some(w) = w {
+                    self.out.witnesses.push(w);
+                }
                 self.out.findings.push(f);
             }
         }
