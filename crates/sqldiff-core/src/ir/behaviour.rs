@@ -1191,8 +1191,11 @@ struct Collector<'x, 'a> {
     cut_b: BTreeSet<NodeId>,
     /// The divergences of a scenario with a default flipped (`persists`),
     /// by scenario.
-    flipped: RefCell<HashMap<String, Rc<BTreeSet<(&'static str, String)>>>>,
+    flipped: RefCell<HashMap<String, Rc<Divergences>>>,
 }
+
+/// The (rule, anchor) of divergences found.
+type Divergences = BTreeSet<(&'static str, String)>;
 
 /// Flipped scenarios kept before the cache starts over (time only).
 const FLIPPED_MAX: usize = 4096;
@@ -1308,12 +1311,7 @@ impl<'x, 'a> Collector<'x, 'a> {
 
     /// The (rule, anchor) of every divergence between any pair of outcomes
     /// of the two sides under the scenarios.
-    fn divergences_of(
-        &self,
-        sc: &Kind,
-        scen_a: &Scenario,
-        scen_b: &Scenario,
-    ) -> BTreeSet<(&'static str, String)> {
+    fn divergences_of(&self, sc: &Kind, scen_a: &Scenario, scen_b: &Scenario) -> Divergences {
         let (pa, pb) = self.outcomes(sc, scen_a, scen_b);
         let (ps, _) = pairs(&pa, &pb);
         let ra: Vec<Reads> = pa.iter().map(|o| reads(&self.sa, o)).collect();
