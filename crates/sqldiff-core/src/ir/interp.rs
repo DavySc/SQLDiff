@@ -1111,6 +1111,11 @@ fn successors(cfg: &Cfg, v: NodeId) -> Vec<NodeId> {
 /// interpreter cannot evaluate and whose cycle holds anything but plain
 /// statements: only a statement with no transaction action leaves the log
 /// of a path as it was, entry for entry, whatever happens in the loop.
+///
+/// This also rests on the profile rows, not on the graph: a plain statement
+/// can only fail after the fault in a doomed transaction, and no row for
+/// that failure undoes anything. A row that rolled back a scope or the
+/// whole transaction for such a failure would break the guard.
 fn unsafe_loops(cfg: &Cfg) -> Vec<bool> {
     let comp = components(cfg);
     let ncomp = comp.iter().max().map_or(0, |m| *m as usize + 1);
