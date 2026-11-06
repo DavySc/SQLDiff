@@ -1403,6 +1403,11 @@ impl<'h> Progress<'h> {
 
     fn tick(&self) {
         let n = self.done.fetch_add(1, Ordering::Relaxed) + 1;
+        // The worker threads free most of what they allocate, and the
+        // allocator keeps it; give it back now and then, not once at the end.
+        if n % 16 == 0 {
+            crate::mem::release();
+        }
         match &self.hooks.progress {
             Some(f) => f(n, self.total),
             None if n % 50 == 0 || n == self.total => eprintln!("checked {n}/{}", self.total),
