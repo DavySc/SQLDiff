@@ -998,7 +998,9 @@ fn convert_files(
         }
         (Some(_), None) => {
             return Err(
-                "an increment needs an output folder: its results are kept there".to_string(),
+                "an increment needs the result store of an output folder (-o): it cannot run \
+                 without one"
+                    .to_string(),
             )
         }
         _ => None,

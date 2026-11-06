@@ -362,16 +362,13 @@ impl Plan {
                 definers.entry(d.name.as_str()).or_default().push(f);
             }
         }
-        let dflt = format!("{}.", default_schema(from).to_lowercase());
         let mut uses: Vec<BTreeSet<&str>> = Vec::new();
         let mut edges: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); scans.len()];
         for (f, s) in scans.iter().enumerate() {
             let mut u: BTreeSet<&str> = BTreeSet::new();
             for m in s.mentions.iter().chain(s.bare.iter()) {
-                // A bare name means the default schema only.
-                if s.bare.contains(m) && !s.mentions.contains(m) && !m.starts_with(&dflt) {
-                    continue;
-                }
+                // A bare name was keyed in the default schema when scanned,
+                // so it matches only an object there.
                 if let Some((name, ds)) = definers.get_key_value(m.as_str()) {
                     let others: Vec<usize> = ds.iter().copied().filter(|&d| d != f).collect();
                     if !others.is_empty() {
