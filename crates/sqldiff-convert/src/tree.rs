@@ -159,6 +159,27 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
+/// The part of a report that varies between runs of the same input.
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct RunInfo {
+    /// Wall-clock seconds the conversion took.
+    pub seconds: f64,
+    /// One entry per file, in report order.
+    pub files: Vec<RunFile>,
+}
+
+/// How one file's check went in this run.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct RunFile {
+    pub path: String,
+    /// Wall-clock seconds spent on the file's check (0 for a stored one).
+    pub seconds: f64,
+    /// The check came from the result store (an exact key matched) instead
+    /// of being run in this run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reused: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct FileReport {
     pub path: String,
@@ -166,11 +187,6 @@ pub struct FileReport {
     /// points into no unit.
     pub status: Status,
     pub counts: crate::Counts,
-    pub seconds: f64,
-    /// The check came from the result store (an exact key matched) instead
-    /// of being run in this run.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub reused: bool,
     /// False when this run did not check the file and no stored result
     /// matches it (an increment left it out): every unit is then not
     /// converted (`plan.not-checked`).
@@ -323,6 +339,13 @@ pub struct Report {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub base_statements: Vec<crate::base::StatementReport>,
     pub files: Vec<FileReport>,
+    /// What differs between two runs of the same input by design: how long
+    /// each file took and whether its check came from the result store.
+    /// Everything else in the report is a function of the input alone, so
+    /// two reports of the same tree are identical once `run` is removed
+    /// (`tests/determinism.rs`).
+    #[serde(default)]
+    pub run: RunInfo,
     /// Files that could not be read as text.
     pub unreadable: Vec<String>,
     pub totals: Totals,
@@ -418,7 +441,6 @@ pub struct Totals {
     pub files_by_status: std::collections::BTreeMap<&'static str, usize>,
     #[serde(deserialize_with = "by_status")]
     pub units: std::collections::BTreeMap<&'static str, usize>,
-    pub seconds: f64,
     /// Units marked impossible to convert automatically, by feature id: a
     /// part of the `not converted` units, which they stay.
     #[serde(default)]
@@ -736,12 +758,17 @@ fn convert_kept(
         c.store.gc(live);
     }
     let mut files = Vec::new();
+    let mut run_files = Vec::new();
     let mut outputs = Vec::new();
     let mut conversions = Vec::new();
     for (input, (c, secs)) in inputs.iter().zip(results) {
         let (text, lines) = annotate(&c);
-        let mut f = file_report(&input.rel, &input.text, &c, &lines, secs);
-        f.reused = reused.get(files.len()).copied().unwrap_or(false);
+        run_files.push(RunFile {
+            path: input.rel.clone(),
+            seconds: (secs * 1000.0).round() / 1000.0,
+            reused: reused.get(files.len()).copied().unwrap_or(false),
+        });
+        let mut f = file_report(&input.rel, &input.text, &c, &lines);
         f.checked = !unchecked.get(files.len()).copied().unwrap_or(false);
         f.output_hash = crate::review::file_hash(&text);
         mark_accepted(&mut f, input, &c, &a.deployment);
@@ -766,13 +793,17 @@ fn convert_kept(
             .map(|b| b.statements.clone())
             .unwrap_or_default(),
         totals: {
-            let mut t = totals(&files, started.elapsed().as_secs_f64());
+            let mut t = totals(&files);
             t.files_not_checked = files.iter().filter(|f| !f.checked).count();
             t.progress = progress;
             t
         },
         deployment: deployment_report(&a.deployment, &conversions),
         files,
+        run: RunInfo {
+            seconds: (started.elapsed().as_secs_f64() * 100.0).round() / 100.0,
+            files: run_files,
+        },
         unreadable,
         ledger: None,
     };
@@ -1145,6 +1176,13 @@ fn convert_files(
     // of the whole tree: taken from the store when its key matches exactly,
     // else built and stored for the next run.
     let tree_key = cache.map(|c| tree_key(c, a, out, inputs, ledger, base));
+    // Which stored things this run builds again to compare: a function of
+    // the tree's key and the store's run count, never of the clock.
+    let run_n = cache.map_or(0, |c| c.store.run_count());
+    let seed = match (cache, &tree_key) {
+        (Some(c), Some(k)) if !c.fresh => crate::store::seed_of(k, run_n),
+        _ => 0,
+    };
     let loaded = match (cache, &tree_key) {
         (Some(c), Some(k)) if !c.fresh => c.store.get_tree(k),
         _ => None,
@@ -1152,16 +1190,7 @@ fn convert_files(
     let state = match loaded {
         Some(st) => {
             hooks.stop_if_cancelled()?;
-            if let Some(why) = verify_tree_state(
-                &st,
-                crate::store::seed(),
-                a,
-                out,
-                inputs,
-                jobs,
-                ledger,
-                base,
-            ) {
+            if let Some(why) = verify_tree_state(&st, seed, a, out, inputs, jobs, ledger, base) {
                 if let Some(c) = cache {
                     c.store.clear();
                 }
@@ -1180,7 +1209,7 @@ fn convert_files(
                         store: &c.store,
                         key: k,
                         read: !c.fresh,
-                        seed: crate::store::seed(),
+                        seed,
                     })
                 }
                 _ => None,
@@ -1321,7 +1350,7 @@ fn convert_files(
                 .filter(|(_, k)| k.as_ref().is_some_and(|k| c.store.has(k)))
                 .map(|(i, _)| (i, inputs[i].text.len()))
                 .collect();
-            crate::store::pick(&present, crate::store::seed())
+            crate::store::pick(&present, seed)
         }
         _ => Default::default(),
     };
@@ -1405,6 +1434,10 @@ fn convert_files(
         .collect::<Result<_, _>>()?;
     *reused = done.iter().map(|d| d.2).collect();
     *unchecked = done.iter().map(|d| d.3).collect();
+    // Only a run that went to its end counts: a stopped one writes nothing.
+    if let Some(c) = cache.filter(|c| !c.fresh) {
+        c.store.record_run(run_n);
+    }
     Ok(done.into_iter().map(|(h, s, _, _)| (h, s)).collect())
 }
 
@@ -2231,7 +2264,7 @@ fn line_start(s: &str, at: usize) -> usize {
     s[..at.min(s.len())].rfind('\n').map_or(0, |i| i + 1)
 }
 
-fn file_report(rel: &str, input: &str, c: &Conversion, lines: &[usize], secs: f64) -> FileReport {
+fn file_report(rel: &str, input: &str, c: &Conversion, lines: &[usize]) -> FileReport {
     let mut status = c
         .units
         .iter()
@@ -2303,8 +2336,6 @@ fn file_report(rel: &str, input: &str, c: &Conversion, lines: &[usize], secs: f6
         path: rel.to_string(),
         status,
         counts: c.counts.clone(),
-        seconds: (secs * 1000.0).round() / 1000.0,
-        reused: false,
         checked: true,
         units,
         converted_units,
@@ -2636,10 +2667,9 @@ const ORDER: [Status; 6] = [
     Status::NotConverted,
 ];
 
-fn totals(files: &[FileReport], seconds: f64) -> Totals {
+fn totals(files: &[FileReport]) -> Totals {
     let mut t = Totals {
         files: files.len(),
-        seconds: (seconds * 100.0).round() / 100.0,
         ..Totals::default()
     };
     let mut reasons: std::collections::HashMap<String, usize> = Default::default();
@@ -2789,11 +2819,7 @@ fn proof_lines(r: &Report) -> Option<(String, Option<String>)> {
 
 pub fn summary(r: &Report) -> String {
     let mut s = String::new();
-    let _ = writeln!(
-        s,
-        "{} files, {} → {}, {:.1} s",
-        r.totals.files, r.from, r.to, r.totals.seconds
-    );
+    let _ = writeln!(s, "{} files, {} → {}", r.totals.files, r.from, r.to);
     let _ = writeln!(s, "{:<20} {:>6} {:>8}", "status", "files", "units");
     for st in ORDER {
         let _ = writeln!(

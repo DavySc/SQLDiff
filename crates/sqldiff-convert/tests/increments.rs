@@ -100,14 +100,7 @@ fn path(p: &str) -> Select {
 fn plain(v: &mut serde_json::Value) {
     match v {
         serde_json::Value::Object(m) => {
-            for k in [
-                "seconds",
-                "reused",
-                "checked",
-                "progress",
-                "files_not_checked",
-                "out",
-            ] {
+            for k in ["run", "checked", "progress", "files_not_checked", "out"] {
                 m.remove(k);
             }
             m.values_mut().for_each(plain);
