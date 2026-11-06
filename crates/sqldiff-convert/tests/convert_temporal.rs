@@ -207,10 +207,6 @@ fn what_has_no_exact_equivalent_is_refused() {
         ),
         (base(cols, "SYSTEM_VERSIONING = OFF"), "without history"),
         (
-            base(&cols.replace("ROW START", "ROW START HIDDEN"), on),
-            "HIDDEN",
-        ),
-        (
             base(&cols.replace("ROW START NOT NULL", "ROW START NULL"), on),
             "13587",
         ),
@@ -272,6 +268,38 @@ fn a_finite_retention_period_is_an_assumption() {
         assert!(n.text.contains(shown), "{}", n.text);
         assert!(!c.output.contains("HISTORY_RETENTION"), "{}", c.output);
     }
+}
+
+/// HIDDEN period columns convert with ASM-HIDDEN-PERIOD-COLUMN: the keyword
+/// goes, the columns stay ordinary ones, and the note says so.
+#[test]
+fn hidden_period_columns_are_an_assumption() {
+    let cols = "f DATETIME2 GENERATED ALWAYS AS ROW START HIDDEN NOT NULL, e DATETIME2 GENERATED ALWAYS AS ROW END HIDDEN NOT NULL";
+    let c = pg(&format!(
+        "CREATE TABLE s.t (k INT NOT NULL PRIMARY KEY, {cols}, PERIOD FOR SYSTEM_TIME (f, e)) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = s.h));
+"
+    ));
+    let u = &c.units[0];
+    assert_eq!(
+        rules_only(u),
+        Status::Assumptions,
+        "{:?}
+{}",
+        u.notes,
+        c.output
+    );
+    assert!(
+        u.notes.iter().any(|n| n.rule == "ASM-HIDDEN-PERIOD-COLUMN"),
+        "{:?}",
+        u.notes
+    );
+    assert!(!c.output.to_uppercase().contains("HIDDEN"), "{}", c.output);
+    assert!(
+        c.output
+            .contains("f timestamp DEFAULT '-infinity' NOT NULL"),
+        "{}",
+        c.output
+    );
 }
 
 #[test]
