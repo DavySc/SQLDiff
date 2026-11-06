@@ -530,6 +530,7 @@ dependencies = [
 name = "sqldiff-convert"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "regex",
  "rowan",
  "serde",

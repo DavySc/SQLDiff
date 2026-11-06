@@ -332,17 +332,34 @@ fn a_damaged_tree_state_is_a_miss() {
     convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
     assert_eq!(want, tree_of(&f.out("o")));
     for p in states(&f.out("o")) {
-        serde_json::from_slice::<serde_json::Value>(&std::fs::read(p).unwrap()).unwrap();
+        read_state(&p);
     }
+}
+
+/// A stored tree state is gzip-compressed JSON.
+fn read_state(p: &Path) -> serde_json::Value {
+    let mut json = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::GzDecoder::new(std::fs::File::open(p).unwrap()),
+        &mut json,
+    )
+    .unwrap();
+    serde_json::from_slice(&json).unwrap()
+}
+
+fn write_state(p: &Path, v: &serde_json::Value) {
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    std::io::Write::write_all(&mut enc, &serde_json::to_vec(v).unwrap()).unwrap();
+    std::fs::write(p, enc.finish().unwrap()).unwrap();
 }
 
 /// A state that no longer matches what its tree builds: the first file's
 /// draft text is replaced, the key kept.
 fn tamper(out: &Path) {
     let p = states(out).remove(0);
-    let mut st: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+    let mut st = read_state(&p);
     st["drafts"][0]["raw"]["text"] = "-- tampered\n".into();
-    std::fs::write(&p, serde_json::to_vec(&st).unwrap()).unwrap();
+    write_state(&p, &st);
 }
 
 #[test]
