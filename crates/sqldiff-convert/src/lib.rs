@@ -235,6 +235,77 @@ pub struct Conversion {
     pub template: Option<TemplateInfo>,
 }
 
+/// What the cross-file passes (`callees::resolve`, `base::Base::flag`) read
+/// and change of a checked file: its units, their counts, and whether
+/// something in it names no unit (`unplaced`, `unproven`), which keeps the
+/// file from counting as converted. A pass that works on this alone does
+/// not need the file's output or engine reports, so those can stay in the
+/// result store while the passes run.
+#[derive(Debug, Clone, Default)]
+pub struct Core {
+    pub units: Vec<Unit>,
+    pub counts: Counts,
+    /// `unplaced` or `unproven` of the conversion is not empty.
+    pub blocked: bool,
+}
+
+impl Core {
+    /// Moves the units of `c` out into a core; [`Core::restore`] puts them back.
+    pub fn take(c: &mut Conversion) -> Core {
+        Core {
+            units: std::mem::take(&mut c.units),
+            counts: c.counts.clone(),
+            blocked: !c.unproven.is_empty() || !c.unplaced.is_empty(),
+        }
+    }
+
+    /// Puts the units and counts back into the conversion they came from.
+    pub fn restore(self, c: &mut Conversion) {
+        c.units = self.units;
+        c.counts = self.counts;
+    }
+}
+
+/// A checked file as the cross-file passes see it: a [`Conversion`], or
+/// just its [`Core`].
+pub trait Cored {
+    fn units(&self) -> &[Unit];
+    fn units_mut(&mut self) -> &mut Vec<Unit>;
+    /// Something in the file names no unit; see [`Core::blocked`].
+    fn blocked(&self) -> bool;
+    fn set_counts(&mut self, counts: Counts);
+}
+
+impl Cored for Conversion {
+    fn units(&self) -> &[Unit] {
+        &self.units
+    }
+    fn units_mut(&mut self) -> &mut Vec<Unit> {
+        &mut self.units
+    }
+    fn blocked(&self) -> bool {
+        !self.unproven.is_empty() || !self.unplaced.is_empty()
+    }
+    fn set_counts(&mut self, counts: Counts) {
+        self.counts = counts;
+    }
+}
+
+impl Cored for Core {
+    fn units(&self) -> &[Unit] {
+        &self.units
+    }
+    fn units_mut(&mut self) -> &mut Vec<Unit> {
+        &mut self.units
+    }
+    fn blocked(&self) -> bool {
+        self.blocked
+    }
+    fn set_counts(&mut self, counts: Counts) {
+        self.counts = counts;
+    }
+}
+
 /// Dialect pairs with rules.
 pub fn supported(from: Dialect, to: Dialect) -> bool {
     matches!(
@@ -882,9 +953,9 @@ pub fn splice_unit(
     Ok(())
 }
 
-pub(crate) fn recount(c: &mut Conversion) {
+pub(crate) fn recount<C: Cored>(c: &mut C) {
     let mut counts = Counts::default();
-    for u in &c.units {
+    for u in c.units() {
         *match u.status {
             Status::Converted => &mut counts.converted,
             Status::Assumptions => &mut counts.assumptions,
@@ -897,7 +968,7 @@ pub(crate) fn recount(c: &mut Conversion) {
             counts.impossible += 1;
         }
     }
-    c.counts = counts;
+    c.set_counts(counts);
 }
 
 /// Every top-level unit kept as a comment, for a pair without rules.
@@ -1029,6 +1100,32 @@ mod tests {
             .notes
             .iter()
             .any(|n| n.rule == "internal-error" && n.status == Status::NotConverted)));
+    }
+
+    #[test]
+    fn a_core_carries_the_units_out_and_back_and_recounts_like_the_conversion() {
+        let text = "CREATE TABLE t (a int NOT NULL)\nGO\nSELECT TOP 1 a FROM t\nGO\n";
+        let mut c = convert(text, Dialect::Tsql, Dialect::Postgres).unwrap();
+        let before = serde_json::to_string(&c).unwrap();
+        let mut core = Core::take(&mut c);
+        assert!(c.units.is_empty() && !core.units.is_empty());
+        assert_eq!(
+            core.blocked,
+            c.blocked(),
+            "blocked is read before the units leave"
+        );
+        // A change through the core is counted like one on the conversion.
+        core.units[0].status = Status::NotConverted;
+        recount(&mut core);
+        let mut direct = convert(text, Dialect::Tsql, Dialect::Postgres).unwrap();
+        direct.units[0].status = Status::NotConverted;
+        recount(&mut direct);
+        core.restore(&mut c);
+        assert_eq!(
+            serde_json::to_string(&c).unwrap(),
+            serde_json::to_string(&direct).unwrap()
+        );
+        assert_ne!(serde_json::to_string(&c).unwrap(), before);
     }
 
     #[test]
