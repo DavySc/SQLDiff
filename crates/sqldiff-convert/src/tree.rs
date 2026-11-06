@@ -641,6 +641,7 @@ fn convert_kept(
         outputs.push(text);
         conversions.push(c);
     }
+    crate::mem::release();
     let report = Report {
         from: a.from.id().to_string(),
         to: a.to.id().to_string(),
@@ -683,11 +684,8 @@ pub fn write(tree: &Tree, out: &Path) -> Result<(PathBuf, PathBuf), String> {
     for (f, text) in tree.report.files.iter().zip(&tree.outputs) {
         write_under(out, &f.path, text.as_bytes())?;
     }
-    let json = write_under(
-        out,
-        "conversion-report.json",
-        (serde_json::to_string_pretty(&tree.report).unwrap() + "\n").as_bytes(),
-    )?;
+    crate::mem::release();
+    let json = write_json_under(out, "conversion-report.json", &tree.report)?;
     let md = write_under(
         out,
         "conversion-report.md",
@@ -705,6 +703,29 @@ pub fn inside(rel: &str) -> bool {
         && rel
             .split('/')
             .all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// Writes `value` to `out/rel` as pretty JSON and a newline, straight to the
+/// file: the report of a large tree is hundreds of megabytes, which built as
+/// one string doubled the run's size at its last step. The bytes are the same
+/// as `to_string_pretty(value) + "\n"`.
+pub(crate) fn write_json_under<T: Serialize>(
+    out: &Path,
+    rel: &str,
+    value: &T,
+) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let dest = dest_under(out, rel)?;
+    if let Some(p) = dest.parent() {
+        std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    }
+    let file = std::fs::File::create(&dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    let mut w = std::io::BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut w, value).map_err(|e| format!("{}: {e}", dest.display()))?;
+    w.write_all(b"\n")
+        .and_then(|()| w.flush())
+        .map_err(|e| format!("{}: {e}", dest.display()))?;
+    Ok(dest)
 }
 
 /// Writes `bytes` to `out/rel`, creating the directories between. Refuses a
@@ -785,6 +806,7 @@ fn convert_files(
     let mut drafts = parallel(jobs, inputs, |i| {
         crate::rewrite_in_tree(&i.text, a.from, a.to, source.as_deref(), Some(&claims))
     });
+    crate::mem::release();
     // Hand-written output replaces the rules' before anything is checked,
     // so it is checked like theirs and the target catalog has it.
     if let Some(l) = ledger {
@@ -923,6 +945,7 @@ fn convert_files(
         progress.tick();
         Some((c, secs, false))
     });
+    crate::mem::release();
     if let Some(msg) = mismatch.into_inner().unwrap() {
         if let Some(c) = cache {
             c.store.clear();

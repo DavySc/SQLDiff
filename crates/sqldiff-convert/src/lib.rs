@@ -24,6 +24,7 @@ pub mod gate;
 pub mod impossible;
 pub mod instances;
 pub mod job;
+pub mod mem;
 pub mod names;
 mod out;
 pub mod queue;
