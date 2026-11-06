@@ -54,6 +54,12 @@ pub struct Options {
     /// (`sqldiff_convert` units). When set, cross-dialect statement pairing
     /// pairs only statements the anchors link (`equiv::Anchor`).
     pub anchors: Vec<crate::equiv::Anchor>,
+    /// A conversion check only: the converter ran with
+    /// `--temporal-historyless` (ASM-TEMPORAL-HISTORYLESS). A T-SQL table
+    /// with HIDDEN period columns and system versioning is a plain table
+    /// on side B, so its history writes (`facts::writes_in`) and period
+    /// columns have no counterpart there.
+    pub historyless: bool,
 }
 
 impl Default for Options {
@@ -70,6 +76,7 @@ impl Default for Options {
             proof: crate::proof::Settings::default(),
             observer: crate::observer::Observer::default(),
             anchors: Vec::new(),
+            historyless: false,
         }
     }
 }
@@ -149,8 +156,9 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     // One catalog per side serves binding and statement equivalence.
     let view_a = catalog_view(a.dialect, &opts.catalog_a, &opts.facts_a);
     let view_b = catalog_view(b.dialect, &opts.catalog_b, &opts.facts_b);
-    let schema_a = equiv::schema::Schema::from_view(&view_a);
-    let schema_b = equiv::schema::Schema::from_view(&view_b);
+    let mut schema_a = equiv::schema::Schema::from_view(&view_a);
+    let mut schema_b = equiv::schema::Schema::from_view(&view_b);
+    schema_a.list_stars_with(&mut schema_b);
     let mut eq = equiv::Outcome::default();
     let mut txn_unknown = Vec::new();
     // What the same-dialect comparison vouches for (`coverage::unreceipted`).
@@ -242,7 +250,7 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
             findings.push(rules::analysis::to_finding(&ab, &h, v));
         }
     } else {
-        findings.extend(pair_writes(&aa, &ab));
+        findings.extend(pair_writes(&aa, &ab, opts.historyless));
         for (side, schema) in [(&aa, &schema_a), (&ab, &schema_b)] {
             for h in lint::all_hits(side) {
                 findings.push(lint::to_finding(side, &h));
@@ -514,13 +522,13 @@ fn in_error_handler(node: &sqldiff_syntax::SyntaxNode) -> bool {
 /// EXCEPTION block that records a failure covers several CATCH blocks that
 /// each record it, so how often and in what order they occur is not compared
 /// here (the behavioural diff compares the error paths themselves).
-fn pair_writes(a: &Analyzed, b: &Analyzed) -> Vec<Finding> {
+fn pair_writes(a: &Analyzed, b: &Analyzed, historyless: bool) -> Vec<Finding> {
     // A T-SQL trigger for several events became one PostgreSQL function per
     // event, each with the trigger's writes: pair them per function.
     if let Some(fns) = crate::equiv::trigger_functions(a, b) {
         let mut out: Vec<Finding> = Vec::new();
         for f in &fns {
-            for x in pair_writes_in(a, b, Some(f)) {
+            for x in pair_writes_in(a, b, Some(f), historyless) {
                 if !out.iter().any(|y| y.fingerprint == x.fingerprint) {
                     out.push(x);
                 }
@@ -528,7 +536,7 @@ fn pair_writes(a: &Analyzed, b: &Analyzed) -> Vec<Finding> {
         }
         return out;
     }
-    pair_writes_in(a, b, None)
+    pair_writes_in(a, b, None, historyless)
 }
 
 /// `pair_writes` with side B's writes limited to those inside `within`.
@@ -536,6 +544,7 @@ fn pair_writes_in(
     a: &Analyzed,
     b: &Analyzed,
     within: Option<&sqldiff_syntax::SyntaxNode>,
+    historyless: bool,
 ) -> Vec<Finding> {
     // MERGE and INSERT ... ON CONFLICT are both upserts.
     let key = |w: &facts::Write| {
@@ -552,7 +561,7 @@ fn pair_writes_in(
             .unwrap_or_default()
     };
     let split = |x: &Analyzed| -> (Vec<facts::Write>, Vec<facts::Write>) {
-        facts::writes(x)
+        facts::writes_in(x, historyless)
             .into_iter()
             .filter(|w| {
                 x.side == Side::A

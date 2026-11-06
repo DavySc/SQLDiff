@@ -50,6 +50,7 @@ impl Fixture {
 
     fn args(&self, catalogs: &[&str]) -> tree::Args {
         tree::Args {
+            rules: Default::default(),
             src: self.dir.join("src"),
             from: Dialect::Tsql,
             to: Dialect::Postgres,

@@ -35,6 +35,7 @@ impl Fixture {
 
     fn convert(&self, deployment: Profile) -> Tree {
         let a = tree::Args {
+            rules: Default::default(),
             src: self.dir.clone(),
             from: Dialect::Tsql,
             to: Dialect::Postgres,

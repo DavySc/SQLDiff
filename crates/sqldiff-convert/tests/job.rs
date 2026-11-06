@@ -35,6 +35,7 @@ impl Fixture {
     fn job(&self, out: &str) -> Job {
         Job {
             tree: tree::Args {
+                rules: Default::default(),
                 src: self.dir.join("src"),
                 from: Dialect::Tsql,
                 to: Dialect::Postgres,

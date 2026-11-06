@@ -284,6 +284,7 @@ impl Catalog {
                         identity: false,
                         has_default: false,
                         generated: false,
+                        hidden: false,
                         collation: c.collation.clone(),
                     })
                     .collect();

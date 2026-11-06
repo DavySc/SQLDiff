@@ -285,6 +285,8 @@ pub struct Column {
     /// A period column of a T-SQL system-versioned table (`GENERATED ALWAYS
     /// AS ROW START|END`).
     pub period: bool,
+    /// `HIDDEN` (T-SQL): `SELECT *` and `t.*` leave the column out.
+    pub hidden: bool,
     /// What a string literal compared with this column converts to.
     pub target: Option<Target>,
     /// A collation the column states.
@@ -340,6 +342,11 @@ pub struct Schema {
     /// tables and views, columns, keys, indexes, routines), by lower case.
     /// Two spellings under one key are names that differ only in letter case.
     spellings: HashMap<String, std::collections::BTreeSet<String>>,
+    /// A `*` is compared as the columns it returns, listed from this
+    /// schema's tables (hidden ones left out), not as one term: set on both
+    /// sides of a comparison when either has a table with HIDDEN columns
+    /// (`Schema::list_stars_with`).
+    pub list_stars: bool,
 }
 
 /// The SQL Server catalog views in `sys_catalog.sql`.
@@ -550,6 +557,24 @@ impl Schema {
         s
     }
 
+    /// Whether a table has a HIDDEN column (T-SQL period column).
+    pub fn hides_columns(&self) -> bool {
+        self.tables
+            .values()
+            .any(|t| t.columns.iter().any(|c| c.hidden))
+    }
+
+    /// Both sides of a comparison list their stars when either side has a
+    /// table with HIDDEN columns: T-SQL's `*` leaves them out and
+    /// PostgreSQL's returns every column, so the two stars are only the same
+    /// when the columns they return are.
+    pub fn list_stars_with(&mut self, other: &mut Schema) {
+        if self.hides_columns() || other.hides_columns() {
+            self.list_stars = true;
+            other.list_stars = true;
+        }
+    }
+
     /// The facts equivalence needs from one side's catalog (DDL, bundles and
     /// adapter catalogs, as the binder sees them).
     pub fn from_view(view: &CatalogView) -> Schema {
@@ -611,6 +636,7 @@ impl Schema {
                     not_null: !c.nullable,
                     identity: c.identity,
                     generated: c.generated,
+                    hidden: c.hidden,
                     period: t.versioning.as_ref().is_some_and(|v| {
                         c.name.eq_ignore_ascii_case(&v.start) || c.name.eq_ignore_ascii_case(&v.end)
                     }),

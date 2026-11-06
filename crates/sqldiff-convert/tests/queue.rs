@@ -29,6 +29,7 @@ impl Fixture {
 
     fn convert(&self) -> (Tree, Vec<tree::Input>) {
         let a = tree::Args {
+            rules: Default::default(),
             src: self.dir.join("src"),
             from: Dialect::Tsql,
             to: Dialect::Postgres,

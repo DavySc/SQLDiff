@@ -560,9 +560,9 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
 id = "ASM-HIDDEN-PERIOD-COLUMN"
-statement = "No code reads a table with HIDDEN period columns through SELECT * or writes it through an INSERT without a column list (T-SQL leaves hidden columns out of both; the converted table has them as ordinary columns)."
+statement = "No code reads a table with HIDDEN period columns through SELECT *, t.*, INSERT … SELECT * or a view defined with *, or writes it through an INSERT without a column list (T-SQL leaves hidden columns out of all of these; the converted table has them as ordinary columns, so the star returns them and an INSERT without a column list fills the columns by position, shifting its values into the period columns unless those come last)."
 discharge = "deployment"
-fact = "How the table is read and written: every SELECT and INSERT on it names its columns."
+fact = "How the table is read and written: every SELECT, INSERT and view on it names its columns."
 sites = ["sqldiff-convert/src/tsql/temporal.rs"]
 
 [[assumption]]
@@ -1133,6 +1133,13 @@ id = "ASM-TEMPORAL-HISTORY"
 statement = "The history table exists with the table's columns, by name and type in the same order."
 discharge = "catalog"
 fact = "The history table's definition."
+sites = ["sqldiff-convert/src/tsql/temporal.rs"]
+
+[[assumption]]
+id = "ASM-TEMPORAL-HISTORYLESS"
+statement = "With --temporal-historyless, a system-versioned table whose two period columns are HIDDEN is converted to a plain table that keeps no history: no code reads its history table, names its period columns or uses FOR SYSTEM_TIME on it (those references do not bind or are refused on the target), nothing relies on the period start and end values, and the table is never switched out of versioning (ALTER TABLE … SYSTEM_VERSIONING / PERIOD FOR SYSTEM_TIME is refused). History support for it is future work."
+discharge = "deployment"
+fact = "That nothing reads or relies on the table's history or its period columns, and that losing the history is acceptable for this deployment."
 sites = ["sqldiff-convert/src/tsql/temporal.rs"]
 
 [[assumption]]

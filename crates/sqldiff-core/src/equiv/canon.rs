@@ -404,6 +404,9 @@ pub struct Canon<'a> {
     /// an unqualified PostgreSQL call may then be the conversion of a T-SQL
     /// `dbo` function (`user_fn`).
     pub other: Option<Dialect>,
+    /// The select list of the query lowered last, when its `*` items were
+    /// written out (`visible_star`); `None` when it was lowered as written.
+    listed: Option<Vec<SelItem>>,
     /// Table names of the statement being lowered (see `Item::names`).
     pub names: Vec<(String, Option<String>)>,
     /// Bit and boolean columns of derived tables (`sub:alias`), by name: a
@@ -779,6 +782,7 @@ impl<'a> Canon<'a> {
             known_bytes: Vec::new(),
             stored_values: false,
             other: None,
+            listed: None,
             names: Vec::new(),
             output: None,
             rows: false,
@@ -5198,7 +5202,10 @@ impl<'a> Canon<'a> {
             .map(|(k, ty)| {
                 let t = n("ocol", vec![a(k.to_string())]);
                 let t = match ctx {
-                    QCtx::Set => n("item", vec![t, a(names[k].clone().unwrap_or_default())]),
+                    QCtx::Set => n(
+                        "item",
+                        vec![t, a(names.get(k).cloned().flatten().unwrap_or_default())],
+                    ),
                     _ => t,
                 };
                 (t, *ty)
@@ -5224,7 +5231,38 @@ impl<'a> Canon<'a> {
     fn query_body(&mut self, s: &Select, ctx: QCtx) -> R<Parts> {
         let from = self.push_from(&s.from)?;
         let mut items = Vec::new();
-        for it in &s.items {
+        let mut listed = Vec::new();
+        let mut select_items = &s.items;
+        // T-SQL `*` and `t.*` leave HIDDEN columns out, PostgreSQL's do not:
+        // where the comparison has such a table, each side's star is
+        // replaced by the columns it returns (`visible_star`).
+        if ctx != QCtx::Exists {
+            let mut changed = false;
+            for it in &s.items {
+                match (&it.expr, self.visible_star(&it.expr)?) {
+                    (Expr::Star(_), Some(cols)) if it.assign.is_none() && it.alias.is_none() => {
+                        changed = true;
+                        for (table, col) in cols {
+                            let mut item = it.clone();
+                            item.expr = Expr::Name(vec![table, col]);
+                            listed.push(item);
+                        }
+                    }
+                    (Expr::Star(_), Some(_)) => {
+                        return Err(
+                            "a * with an alias or assignment over a table with HIDDEN columns"
+                                .into(),
+                        );
+                    }
+                    _ => listed.push(it.clone()),
+                }
+            }
+            if changed {
+                select_items = &listed;
+            }
+        }
+        let was_listed = std::ptr::eq(select_items, &listed);
+        for it in select_items {
             if it.assign.is_some() && ctx != QCtx::Into {
                 return Err("assignment in a SELECT list here is not supported".into());
             }
@@ -5334,6 +5372,7 @@ impl<'a> Canon<'a> {
                     .collect(),
             )
         };
+        self.listed = was_listed.then(|| listed.clone());
         Ok((
             vec![
                 distinct,
@@ -5347,6 +5386,66 @@ impl<'a> Canon<'a> {
             ],
             items,
         ))
+    }
+
+    /// A `*` or `t.*` item of the query being lowered, written out as the
+    /// (source, column) names it stands for, when `Schema::list_stars` says
+    /// the comparison has a table with HIDDEN columns (T-SQL leaves them out
+    /// of `*`, PostgreSQL has no hidden columns). Each side lists its own
+    /// catalog's columns, hidden ones left out, in FROM order, so a star
+    /// equals the list of the columns it returns and nothing else. `None`
+    /// keeps the star as one term: no listing, or a source whose columns the
+    /// catalog does not give. On the T-SQL side a star that reaches a hidden
+    /// column but cannot be listed is refused, as it would return columns
+    /// the engine cannot name.
+    fn visible_star(&self, e: &Expr) -> R<Option<Vec<(String, String)>>> {
+        let Expr::Star(q) = e else { return Ok(None) };
+        if !self.schema.list_stars {
+            return Ok(None);
+        }
+        let Some(scope) = self.scopes.last() else {
+            return Ok(None);
+        };
+        let table_of = |b: &Binding| {
+            if b.derived.is_some() {
+                return None;
+            }
+            self.schema
+                .table(Self::base_table(&b.table))
+                .filter(|t| t.complete && !t.columns.is_empty())
+        };
+        let hides = |b: &Binding| table_of(b).is_some_and(|t| t.columns.iter().any(|c| c.hidden));
+        let want = q.as_ref().map(|q| {
+            let last = q.rsplit('.').next().unwrap_or(q);
+            lc(&sqldiff_syntax::ast::unquote(last))
+        });
+        let picked: Vec<&Binding> = scope
+            .iter()
+            .filter(|b| want.as_ref().map_or(true, |w| &b.key == w))
+            .collect();
+        let tsql_hides = self.d == Dialect::Tsql && scope.iter().any(hides);
+        if picked.is_empty() || picked.iter().any(|b| table_of(b).is_none()) {
+            if tsql_hides {
+                return Err(
+                    "a * next to a table with HIDDEN columns whose sources are not all tables with known columns"
+                        .into(),
+                );
+            }
+            return Ok(None);
+        }
+        let mut cols = Vec::new();
+        for b in picked {
+            let Some(t) = table_of(b) else {
+                return Ok(None);
+            };
+            cols.extend(
+                t.columns
+                    .iter()
+                    .filter(|c| !c.hidden)
+                    .map(|c| (b.key.clone(), c.name.clone())),
+            );
+        }
+        Ok(Some(cols))
     }
 
     /// The ORDER BY keys include a unique key of the only table in FROM.
@@ -6195,7 +6294,19 @@ impl<'a> Canon<'a> {
     }
 
     fn resultset(&mut self, q: &Select) -> R<Term> {
+        self.listed = None;
         let (mut parts, items) = self.query_parts(q, QCtx::Set)?;
+        // The select list as lowered: the query's own, or with its `*` items
+        // written out.
+        let listed = if q.set_ops.is_empty() {
+            self.listed.take()
+        } else {
+            None
+        };
+        let source_items = match &listed {
+            Some(l) if l.len() == items.len() => l,
+            _ => &q.items,
+        };
         let decl = &self.unit.ret_cols;
         let mut item_terms = Vec::new();
         if !decl.is_empty() {
@@ -6220,10 +6331,10 @@ impl<'a> Canon<'a> {
         } else {
             // The names a client receives (decision 1); derived tables and
             // subqueries keep folded names, which nothing outside observes.
-            let named = items.len() == q.items.len();
+            let named = items.len() == source_items.len();
             item_terms = items
                 .into_iter()
-                .zip(q.items.iter().map(Some).chain(std::iter::repeat(None)))
+                .zip(source_items.iter().map(Some).chain(std::iter::repeat(None)))
                 .map(|((t, _), it)| match (named, it, t.kids()) {
                     (true, Some(it), [expr, _]) => {
                         let name = match (&it.alias, &it.expr) {
@@ -6330,6 +6441,9 @@ impl<'a> Canon<'a> {
                 "INSERT without a column list into a table with an identity or computed column"
                     .into(),
             );
+        }
+        if t.columns.iter().any(|c| c.hidden) {
+            return Err("INSERT without a column list into a table with a HIDDEN column".into());
         }
         if !t.complete || t.columns.is_empty() {
             return Err(

@@ -22,6 +22,13 @@ pub struct Write {
 /// Writes to tables that hold durable state (temporary tables excluded), in
 /// document order.
 pub fn writes(a: &Analyzed) -> Vec<Write> {
+    writes_in(a, false)
+}
+
+/// [`writes`]; with `historyless` (the conversion ran with
+/// `--temporal-historyless`) a T-SQL table with HIDDEN period columns does
+/// not write a history table: its conversion has none.
+pub fn writes_in(a: &Analyzed, historyless: bool) -> Vec<Write> {
     let d = a.dialect();
     let mut out = Vec::new();
     for node in a.root.descendants() {
@@ -30,7 +37,9 @@ pub fn writes(a: &Analyzed) -> Vec<Write> {
         }
         let kind = stmt_kind(&node, d);
         if d == sqldiff_syntax::Dialect::Tsql {
-            if let Some(target) = history_table(&node) {
+            if let Some(target) =
+                history_table(&node).filter(|_| !(historyless && hidden_period(&node)))
+            {
                 out.push(Write {
                     node,
                     kind: StmtKind::Insert,
@@ -121,6 +130,19 @@ fn pg_temp_before(node: &SyntaxNode, target: &[String], d: sqldiff_syntax::Diale
                 .is_some_and(|t| t.text().eq_ignore_ascii_case(name))
             && !toks.get(4).is_some_and(|t| t.text() == ".")
     })
+}
+
+/// A `CREATE TABLE` whose period columns are both `GENERATED ALWAYS AS ROW
+/// START|END HIDDEN`.
+fn hidden_period(node: &SyntaxNode) -> bool {
+    let toks: Vec<String> = ast::sig_tokens(node)
+        .map(|t| t.text().to_ascii_uppercase())
+        .collect();
+    let hidden = |end: &str| {
+        toks.windows(3)
+            .any(|w| w[0] == "ROW" && w[1] == end && w[2] == "HIDDEN")
+    };
+    hidden("START") && hidden("END")
 }
 
 /// T-SQL `CREATE TABLE … WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = h))`:

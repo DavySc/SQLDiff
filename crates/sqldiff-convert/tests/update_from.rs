@@ -366,6 +366,7 @@ fn update_from_with_placeholder_assignments_is_refused_not_a_panic() {
     let def: sqldiff_source::pack::TemplateSyntax =
         serde_json::from_value(serde_json::json!({ "open": "<%", "close": "%>" })).unwrap();
     let a = tree::Args {
+        rules: Default::default(),
         src: dir.clone(),
         from: Dialect::Tsql,
         to: Dialect::Postgres,

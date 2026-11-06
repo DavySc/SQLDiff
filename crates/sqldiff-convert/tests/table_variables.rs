@@ -217,6 +217,7 @@ fn the_clash_check_spans_the_files_of_a_tree() {
     )
     .unwrap();
     let a = sqldiff_convert::tree::Args {
+        rules: Default::default(),
         src: src.clone(),
         from: Dialect::Tsql,
         to: Dialect::Postgres,

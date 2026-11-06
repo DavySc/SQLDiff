@@ -17,6 +17,11 @@
 //!   (`BEFORE UPDATE OF` fires on the SET list, not on changed values);
 //! - Msg 13545: no TRUNCATE.
 //!
+//! `--temporal-historyless` (`RuleOptions::temporal_historyless`) is the
+//! opt-in way out for tables whose period columns are both HIDDEN: a plain
+//! table, no history (`ASM-TEMPORAL-HISTORYLESS`); history support for them
+//! is future work.
+//!
 //! Db2 for i has native system-period temporal tables, but which clock its
 //! row-begin values read, their precision and how ADD VERSIONING matches the
 //! history table's columns are not verified on IBM i yet, so Db2 refuses.
@@ -33,6 +38,10 @@ pub(super) struct Temporal {
     digits: u32,
     /// The history table name as written.
     history: Vec<T>,
+    /// `--temporal-historyless`: the table became a plain table without the
+    /// period columns, the history table and the triggers
+    /// (`ASM-TEMPORAL-HISTORYLESS`); `versioning` is not called for it.
+    pub(super) historyless: bool,
 }
 
 const DB2_REASON: &str = "system-versioned (temporal) table: Db2 for i has system-period temporal tables (ROW BEGIN/ROW END, PERIOD SYSTEM_TIME, ALTER TABLE … ADD VERSIONING), but which clock its row-begin values read (transaction or statement, local or UTC), their precision and how it matches the history table's columns are not verified on IBM i yet; no rule until a probe run settles them";
@@ -42,6 +51,14 @@ impl Cx<'_> {
     /// returns the table without them: period columns lose `GENERATED ALWAYS
     /// AS ROW START|END` and become `NOT NULL DEFAULT '-infinity'`, the PERIOD
     /// item and the SYSTEM_VERSIONING option go.
+    ///
+    /// With `--temporal-historyless` (`RuleOptions`) and both period columns
+    /// HIDDEN, the period columns go as well and the table is the plain table
+    /// the caller converts like any other (`Temporal::historyless`, no
+    /// history table, no triggers), under `ASM-TEMPORAL-HISTORYLESS`. Any
+    /// other item that names a period column refuses the table. Otherwise a
+    /// HIDDEN period column keeps its place as an ordinary column under
+    /// `ASM-HIDDEN-PERIOD-COLUMN`.
     pub(super) fn temporal(&mut self, ts: &[T]) -> R<(Temporal, Vec<T>)> {
         if self.db2() {
             return no(DB2_REASON);
@@ -59,6 +76,7 @@ impl Cx<'_> {
 
         // The table options: SYSTEM_VERSIONING out, the rest kept.
         let mut history = None;
+        let mut retention_period = None;
         let mut tail: Vec<T> = Vec::new();
         let mut i = close + 1;
         while i < ts.len() {
@@ -78,13 +96,7 @@ impl Cx<'_> {
                 {
                     let (h, retention) = versioning_option(trimmed(opt), true)?;
                     history = Some(h);
-                    if let Some(r) = retention {
-                        self.note(
-                            Status::Assumptions,
-                            "ASM-HISTORY-RETENTION",
-                            &format!("SQL Server hides history rows older than {r} from FOR SYSTEM_TIME queries at once and deletes them in the background; the converted table keeps every history row visible until a scheduled job (pg_cron or the like) deletes those whose period end is older than {r} (UTC), or the history grows without bound."),
-                        );
-                    }
+                    retention_period = retention;
                     self.step_ts("tsql.temporal.versioning-option", opt);
                 } else {
                     kept.push(opt);
@@ -109,7 +121,8 @@ impl Cx<'_> {
 
         // The column list: PERIOD out, period columns rewritten.
         let mut period = None;
-        let mut gen: Vec<(String, bool, u32)> = Vec::new();
+        let mut gen: Vec<(String, bool, u32, bool)> = Vec::new();
+        let mut period_items: Vec<usize> = Vec::new();
         let mut any_hidden = false;
         let mut items: Vec<Vec<T>> = Vec::new();
         for item in split_commas(&ts[open + 1..close]) {
@@ -160,7 +173,8 @@ impl Cx<'_> {
                         "tsql.temporal.period-column",
                     ));
                     it.extend(item[at + len..].iter().cloned());
-                    gen.push((col, is_start, digits));
+                    gen.push((col, is_start, digits, hidden));
+                    period_items.push(items.len());
                     items.push(it);
                 }
                 None => items.push(item.to_vec()),
@@ -171,7 +185,7 @@ impl Cx<'_> {
         };
         let find = |name: &str, want_start: bool| {
             gen.iter()
-                .find(|(c, s, _)| c.eq_ignore_ascii_case(name) && *s == want_start)
+                .find(|(c, s, _, _)| c.eq_ignore_ascii_case(name) && *s == want_start)
                 .map(|g| g.2)
         };
         let (Some(d1), Some(d2)) = (find(&start, true), find(&end, false)) else {
@@ -181,11 +195,78 @@ impl Cx<'_> {
             return no("period columns of different types: no rule yet");
         }
 
+        let historyless = self.options.temporal_historyless && gen.iter().all(|g| g.3);
+        if historyless {
+            // The period columns go; nothing else of the table may name them,
+            // or the table would not be valid without them.
+            for (n, it) in items.iter().enumerate() {
+                if period_items.contains(&n) {
+                    continue;
+                }
+                if let Some(t) = it.iter().find(|t| {
+                    matches!(t.k, IDENT | QUOTED_IDENT) && {
+                        let w = tsql_unquote(&t.s);
+                        w.eq_ignore_ascii_case(&start) || w.eq_ignore_ascii_case(&end)
+                    }
+                }) {
+                    return no(format!(
+                        "historyless system-versioned table: {} also names the period column {}, which the table loses",
+                        if sig(it).first().is_some_and(|&f| constraint_item(&it[f])) {
+                            "a constraint"
+                        } else {
+                            "a column"
+                        },
+                        t.s
+                    ));
+                }
+            }
+            for &n in &period_items {
+                self.step_ts("tsql.temporal.historyless", &items[n]);
+            }
+            let history_name = self.expr(&history).trim().to_string();
+            self.note(
+                Status::Assumptions,
+                "ASM-TEMPORAL-HISTORYLESS",
+                &format!("History support is future work: this table is converted without history. The HIDDEN period columns {start} and {end}, the PERIOD FOR SYSTEM_TIME item, the history table {history_name} and the versioning triggers are left out, so the PostgreSQL table keeps no history. SELECT * and an INSERT without a column list see the same columns as in T-SQL. Code that reads the history table, names {start} or {end} or uses FOR SYSTEM_TIME does not bind or is refused on the converted tables; nothing may rely on the period values."),
+            );
+            let mut out: Vec<T> = ts[..=open].to_vec();
+            let mut first = true;
+            for (n, it) in items.into_iter().enumerate() {
+                if period_items.contains(&n) {
+                    continue;
+                }
+                if !first {
+                    let at = it.first().map_or(0, |t| t.pos.0);
+                    out.push(T::made(COMMA, ",", at, "tsql.temporal.table"));
+                }
+                first = false;
+                out.extend(it);
+            }
+            out.push(ts[close].clone());
+            out.extend(tail);
+            return Ok((
+                Temporal {
+                    start,
+                    end,
+                    digits: d1,
+                    history,
+                    historyless: true,
+                },
+                out,
+            ));
+        }
+        if let Some(r) = retention_period {
+            self.note(
+                Status::Assumptions,
+                "ASM-HISTORY-RETENTION",
+                &format!("SQL Server hides history rows older than {r} from FOR SYSTEM_TIME queries at once and deletes them in the background; the converted table keeps every history row visible until a scheduled job (pg_cron or the like) deletes those whose period end is older than {r} (UTC), or the history grows without bound."),
+            );
+        }
         if any_hidden {
             self.note(
                 Status::Assumptions,
                 "ASM-HIDDEN-PERIOD-COLUMN",
-                &format!("The period columns {start} and {end} are HIDDEN in T-SQL: SELECT * and an INSERT without a column list leave them out. PostgreSQL has no hidden columns, so the converted table returns them from SELECT * and an INSERT without a column list may leave them out (they have a default); code that reads or writes the table that way must name its columns."),
+                &format!("The period columns {start} and {end} are HIDDEN in T-SQL: SELECT *, t.* and an INSERT without a column list leave them out. PostgreSQL has no hidden columns, so the converted table has them as ordinary columns: SELECT *, t.*, INSERT … SELECT * and a view defined with * return them, and an INSERT without a column list fills the columns by position, so its values shift into the period columns unless those come last. Code that reads or writes the table that way must name its columns."),
             );
         }
         let mut out: Vec<T> = ts[..=open].to_vec();
@@ -204,6 +285,7 @@ impl Cx<'_> {
                 end,
                 digits: d1,
                 history,
+                historyless: false,
             },
             out,
         ))
@@ -374,6 +456,51 @@ CREATE TRIGGER {} BEFORE TRUNCATE ON {table}
 }
 
 impl Cx<'_> {
+    /// Whether `--temporal-historyless` converts the catalog table `t`
+    /// without history: it is system-versioned and both period columns are
+    /// HIDDEN (see [`Temporal::historyless`]).
+    fn historyless(&self, t: &sqldiff_core::catalog::Table) -> bool {
+        self.options.temporal_historyless
+            && t.versioning.as_ref().is_some_and(|v| {
+                [&v.start, &v.end].into_iter().all(|p| {
+                    t.columns
+                        .iter()
+                        .any(|c| c.hidden && c.name.eq_ignore_ascii_case(p))
+                })
+            })
+    }
+
+    /// With `--temporal-historyless`: the table of the tree whose history
+    /// table is the CREATE TABLE `name_t`, when that table is converted
+    /// without history. The history table is then not converted: nothing
+    /// writes it, so a plain table of that name would look like a history
+    /// that reads as empty, while SQL Server's holds the old rows.
+    pub(super) fn history_of_historyless(&self, name_t: &[T]) -> Option<String> {
+        if !self.options.temporal_historyless {
+            return None;
+        }
+        let cat = self.catalog?;
+        let strip = |mut p: Vec<String>| {
+            if p.len() == 2 && p[0].eq_ignore_ascii_case("dbo") {
+                p.remove(0);
+            }
+            p.into_iter()
+                .map(|x| x.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        };
+        let name = strip(name_parts(name_t)?);
+        cat.tables
+            .iter()
+            .filter(|t| self.historyless(t))
+            .find(|t| {
+                t.versioning
+                    .as_ref()
+                    .and_then(|v| v.history.clone())
+                    .is_some_and(|h| strip(h) == name)
+            })
+            .map(|t| t.display())
+    }
+
     /// ALTER TABLE on a table the tree creates system-versioned, in the four
     /// forms a data load uses to write period values (WWI
     /// DeactivateTemporalTablesBeforeDataLoad and Reactivate…):
@@ -463,9 +590,16 @@ impl Cx<'_> {
             }
             let idents: Vec<Ident> = parts.iter().map(|p| Ident::plain(p.clone())).collect();
             let t = &cat.tables[table_position(Dialect::Tsql, cat, &idents)?];
-            t.versioning.clone()
+            if self.historyless(t) {
+                return Some(None);
+            }
+            Some(t.versioning.clone())
         });
         let table = self.expr(&name_t).trim().to_string();
+        if found == Some(None) {
+            return no(format!("ALTER TABLE {table} … SYSTEM_VERSIONING / PERIOD FOR SYSTEM_TIME: with --temporal-historyless the CREATE TABLE became a plain table without history triggers (ASM-TEMPORAL-HISTORYLESS), so there is nothing to switch"));
+        }
+        let found = found.flatten();
         let Some(v) = found else {
             return no(format!("ALTER TABLE {table} … SYSTEM_VERSIONING / PERIOD FOR SYSTEM_TIME: the tree has no CREATE TABLE {table} with PERIOD FOR SYSTEM_TIME and SYSTEM_VERSIONING = ON, so which history triggers the converted table has is not known; no rule"));
         };

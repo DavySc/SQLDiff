@@ -109,6 +109,9 @@ impl CheckInput<'_> {
         k.field("trim", &[self.trim as u8]);
         k.field("helpers", format!("{:?}", self.helpers).as_bytes());
         k.field("text", self.text.as_bytes());
+        // Also inside the draft's canonical text; a result checked from a
+        // draft of the other mode is never reused.
+        k.field("rules", format!("{:?}", self.draft.options()).as_bytes());
         k.field("draft", self.draft.canonical().as_bytes());
         k.field("source", self.source.unwrap_or("none").as_bytes());
         k.field("target", self.target.unwrap_or("none").as_bytes());

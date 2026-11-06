@@ -117,6 +117,11 @@ pub struct Column {
     /// columns, PostgreSQL GENERATED ALWAYS AS (expr).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub generated: bool,
+    /// T-SQL `GENERATED ALWAYS AS ROW START|END HIDDEN`: `SELECT *`, `t.*`
+    /// and an INSERT without a column list leave the column out; naming it
+    /// reads it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collation: Option<String>,
 }

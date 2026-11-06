@@ -2128,6 +2128,7 @@ fn prepare(
     };
     let job = Job {
         tree: tree::Args {
+            rules: Default::default(),
             src,
             from,
             to,
