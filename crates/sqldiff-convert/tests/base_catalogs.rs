@@ -281,7 +281,7 @@ fn a_tree_object_replaces_every_base_object_of_its_name() {
     // The tree's `orders` (no schema) is dbo's; its `p` has another
     // parameter count, so the base `p` would otherwise stay as an overload.
     let tree_ddl = "CREATE TABLE orders (order_id int, region int);\nGO\nCREATE PROCEDURE p @a int, @b int AS SELECT 1;\nGO\nALTER TABLE q_t ADD x int;\n";
-    let cat: Catalog = base::over(&base, [tree_ddl].into_iter(), d, "tree".into(), None);
+    let cat: Catalog = base::over(&base, [tree_ddl].into_iter(), d, "tree".into(), None, 1);
     let orders: Vec<_> = cat
         .tables
         .iter()
@@ -304,6 +304,7 @@ fn a_tree_object_replaces_every_base_object_of_its_name() {
         d,
         "tree".into(),
         None,
+        4,
     );
     let view = sqldiff_core::catalog::CatalogView::new(d, &[&cat]);
     let sqldiff_core::catalog::Lookup::Found(t) = view.table(&[Ident::plain("orders")]) else {

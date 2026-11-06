@@ -1012,8 +1012,9 @@ pub(crate) fn build_tree_state(
                 a.from,
                 crate::base::origin(&a.src.display().to_string(), &b.files),
                 None,
+                jobs,
             ),
-            None => catalog(texts, a.from, &a.src, None),
+            None => catalog(texts, a.from, &a.src, None, jobs),
         })
     });
     // The temporary table names the whole tree's table variables claim, so
@@ -1090,8 +1091,9 @@ pub(crate) fn build_tree_state(
                 a.to,
                 crate::base::origin(&out.display().to_string(), b.target_files()),
                 None,
+                jobs,
             ),
-            None => catalog(texts, a.to, out, None),
+            None => catalog(texts, a.to, out, None, jobs),
         };
         // Tables whose CREATE TABLE was refused for a part of it stand in
         // for binding, without that part; what uses them is flagged below.
@@ -1683,8 +1685,9 @@ fn convert_templates(
                 a.from,
                 crate::base::origin(&a.src.display().to_string(), &b.files),
                 stem,
+                jobs,
             ),
-            None => catalog(texts, a.from, &a.src, stem),
+            None => catalog(texts, a.from, &a.src, stem, jobs),
         })
     });
 
@@ -1777,8 +1780,9 @@ fn convert_templates(
                 a.to,
                 crate::base::origin(&out.display().to_string(), b.target_files()),
                 stem,
+                jobs,
             ),
-            None => catalog(texts, a.to, out, stem),
+            None => catalog(texts, a.to, out, stem, jobs),
         })];
     }
     hooks.stop_if_cancelled()?;
@@ -2036,6 +2040,29 @@ pub fn parallel<T: Sync, R: Send>(jobs: usize, items: &[T], f: impl Fn(&T) -> R 
         .collect()
 }
 
+/// Parses the texts on `jobs` threads and hands each parse to `f` in text
+/// order, on the calling thread. Texts are parsed a few per thread at a
+/// time, so only that many parses are alive at once.
+pub fn each_parsed<'a>(
+    texts: impl Iterator<Item = &'a str>,
+    dialect: Dialect,
+    jobs: usize,
+    mut f: impl FnMut(&sqldiff_syntax::Parse),
+) {
+    let jobs = jobs.max(1);
+    let texts: Vec<&str> = texts.collect();
+    let step = if jobs == 1 { 1 } else { jobs * 4 };
+    for chunk in texts.chunks(step) {
+        if jobs == 1 {
+            f(&sqldiff_syntax::parse(chunk[0], dialect));
+            continue;
+        }
+        for p in parallel(jobs, chunk, |t| sqldiff_syntax::parse(t, dialect)) {
+            f(&p);
+        }
+    }
+}
+
 /// The objects every text defines. With a stand-in `stem` (templates), an
 /// object whose name holds a stand-in and that more than one file defines
 /// is left out: those files are different instances' tables or routines,
@@ -2045,25 +2072,27 @@ pub fn catalog<'a>(
     dialect: Dialect,
     origin: &Path,
     stem: Option<&str>,
+    jobs: usize,
 ) -> Catalog {
     let mut cat = Catalog {
         origin: origin.display().to_string(),
         ..Catalog::default()
     };
+    // Parsing is independent per text and runs on `jobs` threads; the
+    // catalog is folded in text order, one text after the other, because a
+    // view or an ALTER reads what the earlier texts defined.
     let Some(stem) = stem else {
-        for t in texts {
-            let root = sqldiff_syntax::parse(t, dialect).syntax();
-            ddl::load_tree(&mut cat, &root, dialect);
-        }
+        each_parsed(texts, dialect, jobs, |p| {
+            ddl::load_tree(&mut cat, &p.syntax(), dialect)
+        });
         return cat;
     };
     let mut per_file: Vec<Catalog> = Vec::new();
-    for t in texts {
+    each_parsed(texts, dialect, jobs, |p| {
         let mut c = Catalog::default();
-        let root = sqldiff_syntax::parse(t, dialect).syntax();
-        ddl::load_tree(&mut c, &root, dialect);
+        ddl::load_tree(&mut c, &p.syntax(), dialect);
         per_file.push(c);
-    }
+    });
     let templated = |schema: &Option<String>, name: &str| {
         let full = format!("{}.{name}", schema.as_deref().unwrap_or("")).to_ascii_lowercase();
         full.contains(stem).then_some(full)

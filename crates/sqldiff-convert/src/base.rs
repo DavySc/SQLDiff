@@ -434,6 +434,7 @@ pub fn prepare(
         from,
         Path::new(&format!("base catalogs {}", names.join(", "))),
         None,
+        jobs,
     );
     if !b.is_empty() {
         let names_b: Vec<&str> = b.iter().map(|f| f.path.as_str()).collect();
@@ -442,6 +443,7 @@ pub fn prepare(
             to,
             Path::new(&format!("base catalogs {}", names_b.join(", "))),
             None,
+            jobs,
         );
         return Ok(Base {
             source,
@@ -474,6 +476,7 @@ pub fn prepare(
         to,
         Path::new(&target_origin),
         None,
+        jobs,
     );
 
     // An object the rules wrote no definition for (its statement not
@@ -815,21 +818,22 @@ pub fn over<'a>(
     d: Dialect,
     origin: String,
     stem: Option<&str>,
+    jobs: usize,
 ) -> Catalog {
     let mut cat = base.clone();
     cat.origin = origin;
     let own = match stem {
         None => {
             let mut own = Catalog::default();
-            for t in texts {
-                let root = sqldiff_syntax::parse(t, d).syntax();
+            crate::tree::each_parsed(texts, d, jobs, |p| {
+                let root = p.syntax();
                 ddl::load_tree(&mut own, &root, d);
                 ddl::load_tree(&mut cat, &root, d);
-            }
+            });
             own
         }
         Some(_) => {
-            let own = crate::tree::catalog(texts, d, Path::new(""), stem);
+            let own = crate::tree::catalog(texts, d, Path::new(""), stem, jobs);
             cat.extend(d, &own);
             own
         }
