@@ -1176,8 +1176,9 @@ fn convert_files(
     let tree_key = cache.map(|c| tree_key(c, a, out, inputs, ledger, base));
     // Which stored things this run builds again to compare: a function of
     // the tree's key and the store's run count, never of the clock.
+    let run_n = cache.map_or(0, |c| c.store.run_count());
     let seed = match (cache, &tree_key) {
-        (Some(c), Some(k)) if !c.fresh => crate::store::seed_of(k, c.store.next_run()),
+        (Some(c), Some(k)) if !c.fresh => crate::store::seed_of(k, run_n),
         _ => 0,
     };
     let loaded = match (cache, &tree_key) {
@@ -1431,6 +1432,10 @@ fn convert_files(
         .collect::<Result<_, _>>()?;
     *reused = done.iter().map(|d| d.2).collect();
     *unchecked = done.iter().map(|d| d.3).collect();
+    // Only a run that went to its end counts: a stopped one writes nothing.
+    if let Some(c) = cache.filter(|c| !c.fresh) {
+        c.store.record_run(run_n);
+    }
     Ok(done.into_iter().map(|(h, s, _, _)| (h, s)).collect())
 }
 

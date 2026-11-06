@@ -586,17 +586,23 @@ pub fn seed_of(tree: &TreeKey, run: u64) -> u64 {
 const RUN_COUNTER: &str = ".sqldiff/run-counter";
 
 impl Store {
-    /// The number of this run (0 for the first) and records the next one.
-    /// An unreadable or unwritable counter reads as 0: the seed is then the
-    /// same on every run, which is still deterministic.
-    pub fn next_run(&self) -> u64 {
-        let Ok(path) = crate::tree::dest_under(&self.out, RUN_COUNTER) else {
-            return 0;
-        };
-        let n = std::fs::read_to_string(&path)
+    /// How many runs this store has completed (0 for none). Reads only: a
+    /// run that stops early leaves the folder as it was.
+    pub fn run_count(&self) -> u64 {
+        crate::tree::dest_under(&self.out, RUN_COUNTER)
             .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|t| t.trim().parse::<u64>().ok())
-            .unwrap_or(0);
+            .unwrap_or(0)
+    }
+
+    /// Records that run number `n` (a value of [`run_count`](Self::run_count))
+    /// is complete. An unwritable counter reads as 0: the seed is then the
+    /// same on every run, which is still deterministic.
+    pub fn record_run(&self, n: u64) {
+        let Ok(path) = crate::tree::dest_under(&self.out, RUN_COUNTER) else {
+            return;
+        };
         if let Some(dir) = path.parent() {
             if std::fs::create_dir_all(dir).is_ok() {
                 let tmp = path.with_extension(format!("tmp{}", std::process::id()));
@@ -607,7 +613,6 @@ impl Store {
                 }
             }
         }
-        n
     }
 }
 

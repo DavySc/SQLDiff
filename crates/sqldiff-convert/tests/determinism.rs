@@ -121,7 +121,8 @@ fn plain(v: &mut serde_json::Value, dir: &str) {
 }
 
 /// Every file under `dir` except the store, relative, with its text; JSON
-/// reports without what may differ, markdown reports left out.
+/// reports without what may differ (markdown reports compared whole, the
+/// folder spelt `<dir>`).
 fn tree_of(dir: &Path, root: &Path) -> Vec<(String, String)> {
     let mut v = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -141,9 +142,6 @@ fn tree_of(dir: &Path, root: &Path) -> Vec<(String, String)> {
                 continue;
             }
             let text = std::fs::read_to_string(&p).unwrap();
-            if rel.ends_with(".md") {
-                continue;
-            }
             let text = if rel.ends_with(".json") {
                 let mut j: serde_json::Value = serde_json::from_str(&text).unwrap();
                 plain(&mut j, &dir.display().to_string());
@@ -241,5 +239,21 @@ fn the_re_check_seed_is_not_the_clock() {
     assert_ne!(
         sqldiff_convert::store::seed_of(&key, 3),
         sqldiff_convert::store::seed_of(&key, 4)
+    );
+}
+
+#[test]
+fn a_run_cancelled_before_it_starts_leaves_the_folder_as_it_was() {
+    use std::sync::{atomic::AtomicBool, Arc};
+    let f = Fixture::new("cancel");
+    let hooks = Hooks {
+        progress: None,
+        cancel: Some(Arc::new(AtomicBool::new(true))),
+    };
+    let _ = convert_into(&f.job("c", 1, Select::default()), &hooks);
+    let o = f.out("c");
+    assert!(
+        !o.join(".sqldiff").join("run-counter").exists(),
+        "a cancelled run recorded itself"
     );
 }

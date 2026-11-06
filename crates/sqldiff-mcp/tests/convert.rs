@@ -280,9 +280,6 @@ fn one_file_or_text_converts_like_a_tree_of_one() {
     let mut tf = t["files"][0].clone();
     tf.as_object_mut().unwrap().remove("omitted_units");
     let mut of = one["file"].clone();
-    for v in [&mut tf, &mut of] {
-        v.as_object_mut().unwrap().remove("seconds");
-    }
     // The tree listing counts plainly converted units; the file lists them.
     assert_eq!(
         tf.as_object_mut()
