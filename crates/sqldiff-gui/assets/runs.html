@@ -150,7 +150,7 @@ details.group .run { padding-left: 32px; }
 </header>
 <main><div class="col">
   <div class="tabs" role="tablist" aria-label="Kind of run"><button type="button" role="tab" data-tab="conv" class="on" aria-selected="true">Convert a tree</button><button type="button" role="tab" data-tab="instf" aria-selected="false">Check template instances</button><button type="button" role="tab" data-tab="driftf" aria-selected="false">Check template drift</button><button type="button" role="tab" data-tab="chgf" aria-selected="false">Review a branch</button><button type="button" role="tab" data-tab="batchf" aria-selected="false">Mass conversion</button></div>
-  <form class="form" id="conv" autocomplete="off">
+  <form class="form" id="conv" autocomplete="off" novalidate>
     <div class="field"><span>Source</span><input type="text" id="src" placeholder="Folder of SQL files, or one file" aria-label="Source folder or file" spellcheck="false"><button type="button" class="outline" data-browse="src" data-near="out" data-next="out">Browse…</button></div>
     <div class="field"><span>Output</span><input type="text" id="out" placeholder="Empty or new folder for the converted tree" aria-label="Output folder" spellcheck="false"><button type="button" class="outline" data-browse="out" data-near="src" data-next="go">Browse…</button></div>
     <div class="field"><span>Dialects</span><span class="pick"><select id="from" aria-label="Source dialect"></select>→<select id="to" aria-label="Target dialect"></select></span><span></span></div>
@@ -619,7 +619,12 @@ async function post(url, body) {
 function increment() {
   const list = (id) => $(id).value.split(",").map((x) => x.trim()).filter(Boolean);
   const n = $("i-next").value.trim();
-  if (n !== "" && !/^\d+$/.test(n)) throw new Error("Next groups must be a whole number (0 or more), or empty for the whole tree.");
+  if ($("i-next").validity.badInput || (n !== "" && !/^\d+$/.test(n))) {
+    // The section may be collapsed: open it so the message has something to point at.
+    $("incr").open = true;
+    $("i-next").focus();
+    throw new Error("Next groups must be a whole number (0 or more), or empty for the whole tree.");
+  }
   return { next: n === "" ? null : parseInt(n, 10), schemas: list("i-schemas"), objects: list("i-objects"), paths: list("i-paths"), changed: $("i-changed").checked };
 }
 // The plan of the tree: the groups of files in the order an increment takes them.
