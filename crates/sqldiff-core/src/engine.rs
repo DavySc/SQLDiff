@@ -417,6 +417,21 @@ pub fn what_if(
     crate::ir::behaviour::what_if(&aa, &ab, side, line, kind, &env)
 }
 
+/// Measurement only (perf plan W6): how many lockstep pair-states the
+/// behaviour explorer would need for each routine pair of `a` and `b`.
+/// Nothing calls this on the diff path.
+pub fn pair_states(
+    a: &Artifact,
+    b: &Artifact,
+    opts: &Options,
+    max_states: usize,
+) -> Vec<crate::ir::behaviour::PairRow> {
+    let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
+    let ab = Analyzed::new(b, Side::B, opts.excerpt_lines);
+    let env = crate::ir::behaviour::Env::from_options(opts);
+    crate::ir::behaviour::pair_states(&aa, &ab, &env, max_states)
+}
+
 /// Transaction overlay brackets of both sides (design §6.2).
 pub fn overlay(a: &Artifact, b: &Artifact) -> crate::ir::overlay::Overlay {
     let aa = Analyzed::new(a, Side::A, 1);
