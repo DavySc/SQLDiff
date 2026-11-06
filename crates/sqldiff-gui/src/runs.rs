@@ -2144,6 +2144,7 @@ fn prepare(
         overwrite: spec.overwrite,
         discard_edits: false,
         fresh: false,
+        select: Default::default(),
         instances,
         queue_all: false,
         // The GUI does not start the proof checker yet.

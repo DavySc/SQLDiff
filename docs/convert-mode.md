@@ -66,6 +66,22 @@ The MCP server runs the same engine (`sqldiff_convert::tree`): `convert_tree` ta
 
 On WideWorldImporters (336 files, 58,610 lines, 4 cores): PostgreSQL in 9 s, Db2 for i in 25 s. 33 files convert completely for each target; most of the rest carry assumptions, dynamic SQL or tables that need types without a rule, whose dependants then do not bind.
 
+### Large trees in increments: plan, `--next`, resume
+
+A tree too large to check in one sitting is checked in increments, and every run reports how much is done.
+
+```sh
+sqldiff convert SRC -o OUT --to postgres --plan        # writes OUT/.sqldiff/plan.json, converts nothing
+sqldiff convert SRC -o OUT --to postgres --next 50 --overwrite   # check the next 50 groups of files
+sqldiff convert SRC -o OUT --to postgres --next 0 --overwrite    # check nothing, report what the store covers
+```
+
+**The plan** (`plan.json`) lists, per file, the objects it defines (tables, views, types, functions, procedures, triggers) and the objects of other files it names, and puts the files in groups ordered so that what a file uses comes first: types, tables, views, functions, procedures, triggers, then scripts and data files, as far as the uses allow. Files that use each other in a cycle form one group. The order is only a scheduling aid: every check still binds against the catalogs of the whole tree. Uses are read from the file's identifier chains (`schema.name`; a bare name matches an object in the default schema), so a name inside dynamic SQL string is not seen and a column named like a table can add a use; a missed use can put a file later than ideal and an invented one can join groups, neither can change a result.
+
+**Choosing an increment.** `--next N` takes the next N groups, in plan order, that still have a file not checked; `--schema S`, `--object NAME` (that object and what it uses that is not checked yet), `--path GLOB` (`*`, `**`, `?`) and `--changed` (every file without a matching stored result) can be repeated and combined; their files add up. With none, the run is one increment holding everything. An increment needs `-o` and the whole tree's catalogs: not with `--template` or `--no-catalog`.
+
+**Nothing is claimed that was not checked.** A file outside the increment is taken from the result store (`OUT/.sqldiff/results`) when its key matches exactly (the same key and sampled re-checks as a resumed run), and otherwise is **not checked**: all its units are `not converted` with the rule `plan.not-checked`, `checked` is false in its report row, and `totals.files_not_checked` counts it. It keeps the exit code at 1, so an increment never makes a tree look more converted than a full run. The whole-tree passes (base catalogs, calls to converted functions, table stand-ins, totals, the review queue) run again over every file after each increment, so a caller whose function is not checked yet is `not proven` until that file is checked. `totals.progress` (and the `increment:` line of the summary) gives files, lines and groups checked and the next group in plan order. When the last file is checked, the files and reports are those of a full run (checked on WideWorldImporters in seven increments of 50 groups, and in the test `increments`). `--fresh` ignores the store, so with it only the increment's files count as checked.
+
 ### Mass conversion in the GUI
 
 The Runs page's *Mass conversion* tab converts several source trees into several target dialects as one batch. Each source and target is an ordinary conversion run (what `sqldiff convert` runs) into `OUT/<source folder name>/<target>`, with its own review, done gate and run sheet; the runs go one after another, and a source is not converted into its own dialect. Every run is checked before any starts (paths, rules for the pair, packs, output folders that are not empty without *Replace files*, two sources with one folder name, a run writing where another reads or a running run writes), and the batch starts all or none. The summary matrix shows, per source and target, that run's own totals and done gate (`sqldiff review-status`), never a count made up for the batch. *Cancel all* stops every run that has not finished: queued runs never start, and a running one stops before writing. The batch's sheet is a script (sh or PowerShell) of its runs' commands in the same order, exiting with the worst of their exit codes; `crates/sqldiff-cli/tests/gui_parity.rs` runs it through the shell and compares the trees with the batch's.

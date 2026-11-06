@@ -61,6 +61,7 @@ impl Fixture {
             overwrite,
             discard_edits: false,
             fresh,
+            select: Default::default(),
             instances: None,
             queue_all: false,
             proof: Default::default(),

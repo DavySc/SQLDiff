@@ -26,6 +26,7 @@ pub mod instances;
 pub mod job;
 pub mod names;
 mod out;
+pub mod plan;
 pub mod queue;
 mod refused;
 pub mod review;
@@ -778,6 +779,56 @@ fn check_one(input: &str, draft: Draft, opts: &Options) -> Conversion {
         output_check,
         unplaced,
         unproven,
+        template: None,
+    };
+    recount(&mut c);
+    c
+}
+
+/// Rule of the note on a unit of a file that was not checked in this run
+/// (an increment that left it out, with no stored result that matches).
+pub const NOT_CHECKED: &str = "plan.not-checked";
+
+/// What a file that was not checked comes out as: its draft with every unit
+/// not converted, so no total, gate or queue can read it as converted. The
+/// engine never ran on it. Reports are empty.
+pub(crate) fn not_checked(input: &str, draft: Draft) -> Conversion {
+    let Draft { from, to, raw, .. } = draft;
+    let (li, lo) = (LineIndex::new(input), LineIndex::new(&raw.text));
+    let (ui, uo) = (U16Index::new(input), U16Index::new(&raw.text));
+    let units: Vec<Unit> = raw
+        .units
+        .into_iter()
+        .map(|u| Unit {
+            status: Status::NotConverted,
+            notes: vec![Note {
+                status: Status::NotConverted,
+                rule: NOT_CHECKED.into(),
+                text: "This file was not checked in this run, and no stored result matches it."
+                    .into(),
+            }],
+            trace: u.trace,
+            src: span(input, &li, &ui, u.src),
+            out: span(&raw.text, &lo, &uo, u.out),
+            findings: Vec::new(),
+            output_findings: Vec::new(),
+            checked: Status::NotConverted,
+            written: u.written,
+        })
+        .collect();
+    let empty = |d: Dialect| {
+        sqldiff_core::check(&Artifact::new("converted.sql", d, ""), &Options::default())
+    };
+    let mut c = Conversion {
+        from: from.id().to_string(),
+        to: to.id().to_string(),
+        output: raw.text,
+        units,
+        counts: Counts::default(),
+        report: empty(to),
+        output_check: empty(to),
+        unplaced: Vec::new(),
+        unproven: vec!["the file was not checked in this run".to_string()],
         template: None,
     };
     recount(&mut c);
