@@ -619,7 +619,8 @@ async function post(url, body) {
 function increment() {
   const list = (id) => $(id).value.split(",").map((x) => x.trim()).filter(Boolean);
   const n = $("i-next").value.trim();
-  return { next: n === "" ? null : Math.max(0, parseInt(n, 10) || 0), schemas: list("i-schemas"), objects: list("i-objects"), paths: list("i-paths"), changed: $("i-changed").checked };
+  if (n !== "" && !/^\d+$/.test(n)) throw new Error("Next groups must be a whole number (0 or more), or empty for the whole tree.");
+  return { next: n === "" ? null : parseInt(n, 10), schemas: list("i-schemas"), objects: list("i-objects"), paths: list("i-paths"), changed: $("i-changed").checked };
 }
 // The plan of the tree: the groups of files in the order an increment takes them.
 $("plan-go").addEventListener("click", async () => {
@@ -656,7 +657,9 @@ $("conv").addEventListener("submit", async (e) => {
       packs: $("pack").value.trim() ? [$("pack").value.trim()] : [], instances: $("inst").value.trim() || null,
       increment: increment(),
     });
-    $("overwrite").checked = false;
+    // The next increment goes into the same folder, so the tick stays while one is chosen.
+    const inc = increment();
+    $("overwrite").checked = $("overwrite").checked && (inc.next !== null || inc.schemas.length > 0 || inc.objects.length > 0 || inc.paths.length > 0 || inc.changed);
   } catch (e) { $("err").textContent = e.message; }
   $("go").disabled = false;
   refresh();
