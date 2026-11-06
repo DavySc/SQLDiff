@@ -1114,6 +1114,8 @@ fn convert_files(
         }
         None => {
             let mut st = build_tree_state(a, out, inputs, jobs, ledger, base);
+            // A job stopped while it built writes nothing into the folder.
+            hooks.stop_if_cancelled()?;
             if let (Some(c), Some(k)) = (cache, &tree_key) {
                 st.key = k.as_str().to_string();
                 if let Err(e) = c.store.put_tree(k, &st) {
