@@ -18,6 +18,7 @@
 //! base catalogs: a false alarm, never a miss; names inside dynamic SQL
 //! strings are not seen.
 
+use serde::{Deserialize, Serialize};
 use sqldiff_core::catalog::{ddl, key, Catalog, Column, DataType, Ident};
 use sqldiff_core::tokens::{close_paren, of_node, qualified, split_commas, texts, Tok};
 use sqldiff_core::Dialect;
@@ -32,6 +33,7 @@ pub const STAND_IN: &str = "ASM-TABLE-STAND-IN";
 pub const REFUSED_COLUMN: &str = "tree.refused-column";
 
 /// One refused table and what was left out of its stand-in.
+#[derive(Serialize, Deserialize)]
 struct StandIn {
     key: Key,
     /// `schema.name` as written.
@@ -58,7 +60,7 @@ struct StandIn {
     exposes: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct StandIns {
     tables: Vec<StandIn>,
 }

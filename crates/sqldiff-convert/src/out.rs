@@ -1,9 +1,11 @@
 //! Output text with the units written into it.
 
+use serde::{Deserialize, Serialize};
+
 use crate::{Note, Step};
 
 /// A unit before verification: byte ranges in input and output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RawUnit {
     pub src: (usize, usize),
     pub out: (usize, usize),
@@ -14,7 +16,7 @@ pub(crate) struct RawUnit {
     pub written: Option<crate::Written>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub(crate) struct Out {
     pub text: String,
     pub units: Vec<RawUnit>,
