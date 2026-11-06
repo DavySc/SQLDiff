@@ -196,15 +196,46 @@ fn editing_a_procedure_body_checks_that_file_again() {
     // The catalogs hold signatures only, so the other files keep their keys
     // (up to two of them are re-checked as the sample).
     assert!(r.iter().filter(|(_, x)| *x).count() >= 1, "{r:?}");
-    // The edit is in the output, and the old result is still stored.
+    // The edit is in the output, and the result of the file as it was is
+    // gone (`Store::gc`): no later run of this tree can use it.
     assert!(tree_of(&f.out("o"))
         .iter()
         .any(|(n, t)| n == "sub/p.sql" && t.contains("= 2")));
-    assert_eq!(results(&f.out("o")).len(), 5);
+    assert_eq!(results(&f.out("o")).len(), 4);
     // The tree is what a fresh run gives.
     let resumed = tree_of(&f.out("o"));
     convert_into(&f.job("o", true, true), &Hooks::default()).unwrap();
     assert_eq!(resumed, tree_of(&f.out("o")));
+}
+
+#[test]
+fn an_increment_keeps_the_results_of_the_files_outside_it() {
+    let f = Fixture::standard("gcincr");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    let before = results(&f.out("o"));
+    assert_eq!(before.len(), 4);
+    let mut j = f.job("o", true, false);
+    j.select = sqldiff_convert::plan::Select {
+        next: Some(1),
+        ..Default::default()
+    };
+    convert_into(&j, &Hooks::default()).unwrap();
+    let mut after = results(&f.out("o"));
+    let mut before = before;
+    before.sort();
+    after.sort();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn a_file_that_is_not_a_result_is_left_in_the_results_folder() {
+    let f = Fixture::standard("gcother");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    let other = f.out("o").join(".sqldiff/results/notes.txt");
+    std::fs::write(&other, "mine").unwrap();
+    f.write("a.sql", "CREATE TABLE t (a int NOT NULL, b int NULL);\n");
+    convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
+    assert!(other.is_file());
 }
 
 #[test]
