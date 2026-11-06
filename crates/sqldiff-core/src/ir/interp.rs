@@ -411,6 +411,11 @@ impl Explorer {
         }
     }
 
+    /// The fault-free scenario this explorer ran.
+    pub fn base_scenario(&self) -> &Scenario {
+        &self.base
+    }
+
     /// The outcomes of the fault-free scenario.
     pub fn base(&self) -> &[Outcome] {
         &self.outs

@@ -681,17 +681,27 @@ fn convert_kept(
         )?,
     };
     let mut results = results;
+    // The cross-file passes work on the units alone (`Core`): what they read
+    // and change of a file is its units, counts and whether something in it
+    // names no unit.
+    let mut cores: Vec<crate::Core> = results
+        .iter_mut()
+        .map(|(c, _)| crate::Core::take(c))
+        .collect();
     if let Some(b) = &base {
         let files: Vec<(&str, &str)> = inputs
             .iter()
             .map(|i| (i.rel.as_str(), i.text.as_str()))
             .collect();
-        b.flag(&files, results.iter_mut().map(|(c, _)| c), a.from);
+        b.flag(&files, cores.iter_mut(), a.from);
     }
     // A call to a converted user function holds when the function's own
     // conversion does.
-    let mut convs: Vec<&mut Conversion> = results.iter_mut().map(|(c, _)| c).collect();
-    crate::callees::resolve(inputs, &mut convs, a.from);
+    let mut refs: Vec<&mut crate::Core> = cores.iter_mut().collect();
+    crate::callees::resolve(inputs, &mut refs, a.from);
+    for ((c, _), core) in results.iter_mut().zip(cores) {
+        core.restore(c);
+    }
     let mut files = Vec::new();
     let mut outputs = Vec::new();
     let mut conversions = Vec::new();
