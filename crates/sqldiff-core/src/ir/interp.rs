@@ -556,7 +556,8 @@ pub fn explore(cfg: &Cfg, sc: &Scenario) -> Vec<Outcome> {
 ///   step function reads the log's length, the summary of a loop with an
 ///   unknown condition ([`Interp::digest`]), would then differ by those
 ///   entries, so such a merge is refused when a loop that holds a commit,
-///   rollback, raise or any other transaction action is reachable;
+///   rollback, raise or any other transaction action is reachable from the
+///   node or from a statement the run will resume at;
 /// * what the path recorded on the way (the *history*: sets of profile
 ///   rows, assumptions, temporary reads, partial writes) already holds what
 ///   the fault-free path had recorded, so the union of the replay's history
@@ -926,7 +927,13 @@ impl Explorer {
             match p.same_run(b, spent) {
                 // A loop's summary compares the log's length, which counts
                 // the failing statement's entries on the fault-free side only.
-                Some(shifted) if !(shifted && self.unsafe_loop[*node]) => {}
+                // The run may also resume at a statement a handler body has no
+                // edge to (`HandlerDone { resume }`): the loops reachable from
+                // there count too.
+                Some(shifted)
+                    if !(shifted
+                        && (self.unsafe_loop[*node]
+                            || p.resume.iter().any(|&r| self.unsafe_loop[r]))) => {}
                 _ => continue,
             }
             let outs = &self.outs[k.outs as usize..k.outs_end as usize];
