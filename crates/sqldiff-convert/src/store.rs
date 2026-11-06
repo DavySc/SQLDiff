@@ -199,6 +199,15 @@ struct Entry {
     conversion: serde_json::Value,
 }
 
+/// A result file is named by its key: 64 hex digits.
+fn is_key(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A temporary result file older than this belongs to a write that was
+/// killed, not to one in flight.
+const STALE_TMP: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// What a draft file holds.
 #[derive(Deserialize)]
 struct DraftEntry {
@@ -371,8 +380,8 @@ impl Store {
     /// Removes every stored result whose key is not in `live`: the results
     /// of files as they were before an edit, or of another build of the
     /// program, which no later run of this tree can use. Files that are not
-    /// results (a result being written, which has a temporary name) are left
-    /// alone. Returns how many were removed.
+    /// results are left alone, except a temporary file of a killed write
+    /// older than an hour. Returns how many were removed.
     pub fn gc(&self, live: &std::collections::HashSet<String>) -> usize {
         let Ok(dir) = crate::tree::dest_under(&self.out, DIR) else {
             return 0;
@@ -381,10 +390,20 @@ impl Store {
         for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             let Some(key) = name.strip_suffix(".json") else {
+                // A write killed before its rename leaves `<key>.tmp<pid>-…`;
+                // one that old is no write in flight.
+                let stale = name.split_once(".tmp").is_some_and(|(k, _)| is_key(k))
+                    && e.metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > STALE_TMP);
+                if stale && std::fs::remove_file(e.path()).is_ok() {
+                    removed += 1;
+                }
                 continue;
             };
-            let is_key = key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit());
-            if is_key && !live.contains(key) && std::fs::remove_file(e.path()).is_ok() {
+            if is_key(key) && !live.contains(key) && std::fs::remove_file(e.path()).is_ok() {
                 removed += 1;
             }
         }

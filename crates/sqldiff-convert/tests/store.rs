@@ -239,6 +239,29 @@ fn a_file_that_is_not_a_result_is_left_in_the_results_folder() {
 }
 
 #[test]
+fn a_write_killed_long_ago_is_swept_but_one_in_flight_is_not() {
+    let f = Fixture::standard("gctmp");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    let dir = f.out("o").join(".sqldiff/results");
+    let key = "ab".repeat(32);
+    let old = dir.join(format!("{key}.tmp1-ThreadId(2)"));
+    let fresh = dir.join(format!("{key}.tmp2-ThreadId(3)"));
+    std::fs::write(&old, "x").unwrap();
+    std::fs::write(&fresh, "x").unwrap();
+    let two_hours = std::time::Duration::from_secs(7200);
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - two_hours)
+        .unwrap();
+    f.write("a.sql", "CREATE TABLE t (a int NOT NULL, b int NULL);\n");
+    convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
+    assert!(!old.exists(), "a stale temporary file stays");
+    assert!(fresh.exists(), "a recent temporary file was removed");
+}
+
+#[test]
 fn editing_a_table_checks_every_file_again() {
     let f = Fixture::standard("table");
     convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
