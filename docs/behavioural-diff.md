@@ -44,9 +44,20 @@ comparing it costs the size of the routine. A run merges only when its fault is 
 cannot run again from there, and only into a fault-free tick at the same
 statement with the same step count and the same number of paths started, so
 the step and path budgets cut both runs at the same place and a budget-cut
-statement is still reported as not proven. A state that differs in anything
-the rest of the run reads (or in history a later statement could read, such as
-temporary tables) is not merged and runs on to its end.
+statement is still reported as not proven. In a transaction the fault-free
+path has a log entry for the failing statement's write and the faulted one
+has none; the logs are compared without those entries and the positions
+savepoints and scopes keep in them are counted without them, so a script in
+one transaction merges like a script of autocommitted statements (a merge
+into a path that still has such entries is refused when a loop with an
+unknown condition and a commit, rollback or raise in it can be reached,
+because its summary reads the log's length). A read of a temporary table
+that only the fault-free path made, by a statement that cannot run again, is
+not carried over. A state that differs in anything else the rest of the run
+reads is not merged and runs on to its end. That includes the aborted
+transaction of PostgreSQL: after a failure every earlier write is undone and
+every later statement fails, so the outcome differs from the fault-free one
+in every key and there is no fault-free state to merge into.
 `tests/explorer.rs` compares every outcome with a full exploration, on the
 corpus and on generated routines (loops, handlers, savepoints, budget edges,
 data scripts), with merging active. Converting a script of 2000 `INSERT`

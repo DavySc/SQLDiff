@@ -245,10 +245,11 @@ struct State {
 impl State {
     /// Whether `self` and `b` are in the same *run state*: everything the
     /// step function reads, but for the slots of the effects `spent` (which
-    /// no statement can write again, and which no pending-write log entry
-    /// names). The fields are all listed, so a new one must be put on one
-    /// side or the other.
-    fn same_run(&self, b: &State, spent: &[usize]) -> bool {
+    /// no statement can write again) and the log entries that name them,
+    /// which `b` may have and `self` must not. The fields are all listed, so
+    /// a new one must be put on one side or the other. `None`: not the same;
+    /// `Some(shifted)`: the same, `shifted` when `b`'s log has such entries.
+    fn same_run(&self, b: &State, spent: &[usize]) -> Option<bool> {
         let State {
             depth,
             caller_depth,
@@ -300,8 +301,6 @@ impl State {
             || *xact_abort_local != b.xact_abort_local
             || *implicit != b.implicit
             || *temp != b.temp
-            || *scopes != b.scopes
-            || *savepoints != b.savepoints
             || *resume != b.resume
             || *caught != b.caught
             || *last_error != b.last_error
@@ -313,35 +312,80 @@ impl State {
             || *durability_unknown != b.durability_unknown
             || *steps != b.steps
             || live.len() != b.live.len()
-            || log.len() != b.log.len()
             || !b.faults_done.is_empty()
         {
-            return false;
+            return None;
         }
+        // The logs: `b`'s (the fault-free path's) may hold entries for the
+        // failing statement's effects, which `self`'s does not; without them
+        // the two are equal. A marker into a log (a savepoint or scope) is a
+        // position in it, so `b`'s markers are counted without those entries.
         let named = |l: &Log| matches!(l, Log::Effect(k) if spent.contains(k));
-        if log.iter().zip(&b.log).any(|(x, y)| {
-            named(x)
-                || named(y)
-                || match (x, y) {
-                    (Log::Effect(i), Log::Effect(j)) => i != j,
-                    (Log::Temp(s, a), Log::Temp(t, c)) => s != t || a != c,
-                    _ => true,
-                }
-        }) {
-            return false;
+        if log.iter().any(named) {
+            return None;
         }
-        live.iter()
+        let shifted = b.log.iter().any(named);
+        let mut upto = Vec::with_capacity(b.log.len() + 1);
+        upto.push(0usize);
+        let mut mine = log.iter();
+        for y in &b.log {
+            let n = upto[upto.len() - 1];
+            if named(y) {
+                upto.push(n);
+                continue;
+            }
+            let same = match (mine.next(), y) {
+                (Some(Log::Effect(i)), Log::Effect(j)) => i == j,
+                (Some(Log::Temp(s, a)), Log::Temp(t, c)) => s == t && a == c,
+                _ => false,
+            };
+            if !same {
+                return None;
+            }
+            upto.push(n + 1);
+        }
+        if mine.next().is_some() {
+            return None;
+        }
+        let marks = |a: &[usize], b: &[usize]| {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| upto.get(*y) == Some(x))
+        };
+        if scopes.len() != b.scopes.len()
+            || savepoints.len() != b.savepoints.len()
+            || scopes.iter().zip(&b.scopes).any(|(x, y)| x.0 != y.0)
+            || savepoints
+                .iter()
+                .zip(&b.savepoints)
+                .any(|(x, y)| x.0 != y.0)
+        {
+            return None;
+        }
+        let ms = |v: &[(ScopeId, usize)]| v.iter().map(|x| x.1).collect::<Vec<_>>();
+        let mv = |v: &[(String, usize)]| v.iter().map(|x| x.1).collect::<Vec<_>>();
+        if !marks(&ms(scopes), &ms(&b.scopes)) || !marks(&mv(savepoints), &mv(&b.savepoints)) {
+            return None;
+        }
+        let same = live
+            .iter()
             .zip(&b.live)
             .enumerate()
-            .all(|(i, (x, y))| x == y || spent.contains(&i))
+            .all(|(i, (x, y))| x == y || spent.contains(&i));
+        same.then_some(shifted)
     }
 
     /// Whether what `b` (a path of the fault-free run) had recorded is also
     /// in the history of `self`, so that the union of `self`'s history and
-    /// the fault-free outcome's is `self`'s outcome's.
-    fn history_covers(&self, b: &State) -> bool {
+    /// the fault-free outcome's is `self`'s outcome's. A read of a temporary
+    /// table that `b` made and `self` did not (the failing statement's own,
+    /// or one whose state the fault changed) is let go when `gone(node)`:
+    /// the statement cannot run again, so the rest of the run cannot make
+    /// that read again, and [`Explorer::patch`] leaves what `b` had made out
+    /// of the fault-free outcome's.
+    fn history_covers(&self, b: &State, gone: &dyn Fn(NodeId) -> bool) -> bool {
         b.partial.is_subset(&self.partial)
-            && b.temp_reads.is_subset(&self.temp_reads)
+            && b.temp_reads
+                .iter()
+                .all(|r| self.temp_reads.contains(r) || gone(r.0))
             && b.rows.is_subset(&self.rows)
             && b.assumptions.is_subset(&self.assumptions)
             && b.untested.is_subset(&self.untested)
@@ -502,11 +546,24 @@ pub fn explore(cfg: &Cfg, sc: &Scenario) -> Vec<Outcome> {
 ///   state* (everything the step function reads: [`State::same_run`]), but
 ///   for the slots of the failing statement's effects;
 /// * those effects are final: no statement of theirs can run again, and no
-///   pending-write log entry names them (nothing then reads their slots);
+///   pending-write log entry of the replay names them (nothing then reads
+///   their slots). The fault-free path's log may hold entries for them (the
+///   failing statement ran there and did not in the replay); the logs are
+///   then equal without those entries, and the positions that savepoints
+///   and scopes keep in the log are equal once counted without them. What
+///   a later commit or rollback does to those entries is only the
+///   fault-free side's slots, which the merge replaces. The one place the
+///   step function reads the log's length, the summary of a loop with an
+///   unknown condition ([`Interp::digest`]), would then differ by those
+///   entries, so such a merge is refused when a loop that holds a commit,
+///   rollback, raise or any other transaction action is reachable;
 /// * what the path recorded on the way (the *history*: sets of profile
 ///   rows, assumptions, temporary reads, partial writes) already holds what
 ///   the fault-free path had recorded, so the union of the replay's history
-///   and the fault-free outcome's is exactly the replay's outcome's.
+///   and the fault-free outcome's is exactly the replay's outcome's. Temporary
+///   reads are the exception: a read the fault-free path made and the replay
+///   did not (the failing statement's own) is let go when its statement can
+///   not run again, so the fault-free outcome cannot make it again either.
 ///
 /// What the step function does not read is history; it only reaches the
 /// outcome, and [`Explorer::patch`] composes it exactly.
@@ -525,6 +582,12 @@ pub struct Explorer {
     /// Strongly connected component of each node, numbered so that a node
     /// can reach another only from a component with a larger number.
     comp: Vec<u32>,
+    /// Per node: whether a loop with an unknown condition that a commit,
+    /// rollback or raise can sit in is reachable from it.
+    unsafe_loop: Vec<bool>,
+    /// Whether any step of the fault-free run starts in a doomed transaction:
+    /// if none does, a doomed replay cannot merge into it.
+    base_doomed: bool,
     /// The statements that have a durable effect with each key id.
     key_nodes: Vec<Vec<NodeId>>,
     merges: std::cell::Cell<usize>,
@@ -574,6 +637,7 @@ impl Explorer {
         let mut open: Vec<usize> = Vec::new();
         let mut every = 1;
         let mut t = 0;
+        let mut base_doomed = false;
         while let Some(n) = m.next_node() {
             if t % every == 0 {
                 if checkpoints.len() == MAX_CHECKPOINTS {
@@ -590,7 +654,10 @@ impl Explorer {
             }
             first.entry(n).or_insert(t);
             let (steps, small) = match &m.cur {
-                Some((_, st)) => (st.steps, small_hash(st)),
+                Some((_, st)) => {
+                    base_doomed |= st.doomed;
+                    (st.steps, small_hash(st))
+                }
                 None => (0, 0),
             };
             let work = m.work.len() as u32;
@@ -636,6 +703,8 @@ impl Explorer {
             }
         }
         Explorer {
+            unsafe_loop: unsafe_loops(cfg),
+            base_doomed,
             comp: components(cfg),
             keys,
             base,
@@ -760,7 +829,8 @@ impl Explorer {
         let mut cursor: Option<(usize, Machine)> = None;
         let mut tries = 0;
         while m.next_node().is_some() {
-            if tries < MAX_MERGE_TRIES {
+            let doomed = m.cur.as_ref().is_some_and(|(_, p)| p.doomed);
+            if tries < MAX_MERGE_TRIES && (self.base_doomed || !doomed) {
                 if let Some(merged) = self.try_merge(
                     cfg,
                     it,
@@ -816,6 +886,9 @@ impl Explorer {
         if !gone(*node) || !p.resume.iter().all(|&r| gone(r)) {
             return None;
         }
+        // A statement that cannot run again from here: what it read before
+        // cannot be read again.
+        let unreachable = |n: NodeId| c(*node) < c(n) && p.resume.iter().all(|&r| c(r) < c(n));
         let small = small_hash(p);
         let sum = (m.work.len() + m.outs.len()) as u32;
         let cands = self.at.get(&(*node, p.steps))?;
@@ -847,8 +920,14 @@ impl Explorer {
             }
             cm.next_node()?;
             let (bn, b) = cm.cur.as_ref()?;
-            if bn != node || !p.same_run(b, spent) || !p.history_covers(b) {
+            if bn != node || !p.history_covers(b, &unreachable) {
                 continue;
+            }
+            match p.same_run(b, spent) {
+                // A loop's summary compares the log's length, which counts
+                // the failing statement's entries on the fault-free side only.
+                Some(shifted) if !(shifted && self.unsafe_loop[*node]) => {}
+                _ => continue,
             }
             let outs = &self.outs[k.outs as usize..k.outs_end as usize];
             return Some(self.patch(it, outs, p, b, spent));
@@ -924,8 +1003,16 @@ impl Explorer {
                 rows.extend(o.rows.iter().cloned());
                 let mut untested = p.untested.clone();
                 untested.extend(o.untested.iter().cloned());
+                // Reads the fault-free path had made that this replay did not
+                // were made at statements that cannot run again (see
+                // `history_covers`), so they are not in `o` for a later read.
                 let mut temp_reads = p.temp_reads.clone();
-                temp_reads.extend(o.temp_reads.iter().cloned());
+                temp_reads.extend(
+                    o.temp_reads
+                        .iter()
+                        .filter(|r| !b.temp_reads.contains(*r))
+                        .cloned(),
+                );
                 let mut signature = p.signature.clone();
                 signature.extend(o.signature[b.signature.len()..].iter().cloned());
                 let mut imprecise = p.imprecise.clone();
@@ -980,7 +1067,6 @@ fn small_hash(st: &State) -> u64 {
         st.xact_abort,
         st.xact_abort_local,
         st.implicit,
-        st.log.len(),
         st.scopes.len(),
     )
         .hash(&mut h);
@@ -1002,19 +1088,62 @@ fn small_hash(st: &State) -> u64 {
 /// Strongly connected components of the control-flow graph, numbered in
 /// the order Tarjan's algorithm completes them: every edge leads to a
 /// component with a smaller number or to the same one.
+fn successors(cfg: &Cfg, v: NodeId) -> Vec<NodeId> {
+    let node = cfg.node(v);
+    let mut out: Vec<NodeId> = node.succ.iter().map(|(_, t)| *t).collect();
+    for (_, r) in &node.routes {
+        out.push(r.resume);
+        if let Some(h) = &r.handler {
+            out.push(h.entry);
+        }
+    }
+    out
+}
+
+/// For each node, whether it can reach (or is in) a loop whose condition the
+/// interpreter cannot evaluate and whose cycle holds anything but plain
+/// statements: only a statement with no transaction action leaves the log
+/// of a path as it was, entry for entry, whatever happens in the loop.
+fn unsafe_loops(cfg: &Cfg) -> Vec<bool> {
+    let comp = components(cfg);
+    let ncomp = comp.iter().max().map_or(0, |m| *m as usize + 1);
+    let mut bad = vec![false; ncomp];
+    let mut has_test = vec![false; ncomp];
+    for (v, n) in cfg.nodes.iter().enumerate() {
+        let c = comp[v] as usize;
+        match &n.op {
+            Op::Test { is_loop: true, .. } => has_test[c] = true,
+            Op::Stmt(s) if s.action != Action::None => bad[c] = true,
+            Op::Stmt(_) => {}
+            // Scope ends and handler returns also run when an error leaves.
+            Op::Leave(_) | Op::Enter(_) | Op::Test { .. } | Op::Entry | Op::Nop => {}
+            _ => bad[c] = true,
+        }
+    }
+    let mut reach: Vec<bool> = (0..ncomp).map(|c| has_test[c] && bad[c]).collect();
+    // Components are numbered so that edges go to smaller numbers.
+    let mut by_comp: Vec<Vec<NodeId>> = vec![Vec::new(); ncomp];
+    for v in 0..cfg.nodes.len() {
+        by_comp[comp[v] as usize].push(v);
+    }
+    for c in 0..ncomp {
+        if reach[c] {
+            continue;
+        }
+        reach[c] = by_comp[c].iter().any(|&v| {
+            successors(cfg, v)
+                .iter()
+                .any(|&w| comp[w] as usize != c && reach[comp[w] as usize])
+        });
+    }
+    (0..cfg.nodes.len())
+        .map(|v| reach[comp[v] as usize])
+        .collect()
+}
+
 fn components(cfg: &Cfg) -> Vec<u32> {
     let n = cfg.nodes.len();
-    let succ = |v: NodeId| -> Vec<NodeId> {
-        let node = cfg.node(v);
-        let mut out: Vec<NodeId> = node.succ.iter().map(|(_, t)| *t).collect();
-        for (_, r) in &node.routes {
-            out.push(r.resume);
-            if let Some(h) = &r.handler {
-                out.push(h.entry);
-            }
-        }
-        out
-    };
+    let succ = |v: NodeId| -> Vec<NodeId> { successors(cfg, v) };
     const NONE: u32 = u32::MAX;
     let mut index = vec![NONE; n];
     let mut low = vec![0u32; n];
