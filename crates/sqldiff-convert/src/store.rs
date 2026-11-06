@@ -376,12 +376,11 @@ impl Store {
     /// does not name its own key, is a miss.
     pub fn get_tree(&self, key: &TreeKey) -> Option<TreeState> {
         let path = crate::tree::dest_under(&self.out, &Self::tree_rel(key)).ok()?;
+        let packed = std::fs::read(path).ok()?;
         let mut json = Vec::new();
-        std::io::Read::read_to_end(
-            &mut flate2::read::GzDecoder::new(std::fs::File::open(path).ok()?),
-            &mut json,
-        )
-        .ok()?;
+        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&packed[..]), &mut json)
+            .ok()?;
+        drop(packed);
         let st: TreeState = serde_json::from_slice(&json).ok()?;
         drop(json);
         (st.key == key.0).then_some(st)
