@@ -339,7 +339,7 @@ pub fn convert_with(
 /// set by the person running the conversion. They are part of a [`Draft`],
 /// so the key of a stored result (`store::CheckInput`) differs when one is
 /// switched.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleOptions {
     /// T-SQL → PostgreSQL: a system-versioned table whose period columns
     /// are both HIDDEN becomes a plain table without the period columns,
@@ -349,11 +349,29 @@ pub struct RuleOptions {
     pub temporal_historyless: bool,
 }
 
+/// A dialect as its stable id, for the stored tree state (`store::TreeState`).
+mod dialect_id {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use sqldiff_core::Dialect;
+
+    pub fn serialize<S: Serializer>(d: &Dialect, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(d.id())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Dialect, D::Error> {
+        let id = String::deserialize(d)?;
+        id.parse()
+            .map_err(|_| serde::de::Error::custom(format!("unknown dialect {id}")))
+    }
+}
+
 /// The rules' output before it is checked. Lets a caller convert many files
 /// first and then check each one against catalogs built from all of them.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Draft {
+    #[serde(with = "dialect_id")]
     from: Dialect,
+    #[serde(with = "dialect_id")]
     to: Dialect,
     /// The options the rules ran with.
     options: RuleOptions,

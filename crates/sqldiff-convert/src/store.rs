@@ -32,6 +32,9 @@ use crate::Conversion;
 /// Where results live, below the output directory.
 pub const DIR: &str = ".sqldiff/results";
 /// Where a mismatch writes its diagnostic bundle.
+/// The state of the whole tree that the per-file checks start from.
+pub const TREE_DIR: &str = ".sqldiff/tree";
+
 pub const MISMATCH_DIR: &str = ".sqldiff/mismatch";
 
 /// A 256-bit content hash, in hex.
@@ -116,6 +119,63 @@ impl CheckInput<'_> {
         k.field("source", self.source.unwrap_or("none").as_bytes());
         k.field("target", self.target.unwrap_or("none").as_bytes());
         k.finish()
+    }
+}
+
+/// Everything a tree run builds before the first file is checked: the source
+/// catalog, the rules' draft of every file (hand-written output applied),
+/// the target catalog with the stand-in tables, and the stand-ins. Each of
+/// them is a function of the whole tree, so the state is stored under one
+/// key made from all of it ([`TreeKey`]): a tree with the same key has the
+/// same state, and any edit anywhere gives another key.
+#[derive(Serialize, Deserialize)]
+pub struct TreeState {
+    pub key: String,
+    pub source: Option<Catalog>,
+    pub drafts: Vec<crate::Draft>,
+    pub target: Option<Catalog>,
+    pub stand_ins: crate::refused::StandIns,
+}
+
+impl TreeState {
+    /// Whether two states serialise to the same bytes.
+    pub fn same_as(&self, other: &TreeState) -> bool {
+        serde_json::to_vec(self).ok() == serde_json::to_vec(other).ok()
+    }
+}
+
+/// The key of a [`TreeState`]: the exact SHA-256 of everything the state is
+/// built from, as named, length-prefixed fields.
+pub struct TreeKey(String);
+
+impl TreeKey {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Builds a [`TreeKey`]; the caller names every input of the state.
+pub struct TreeKeyBuilder(KeyBuilder);
+
+impl Default for TreeKeyBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TreeKeyBuilder {
+    pub fn new() -> Self {
+        let mut k = KeyBuilder::new();
+        k.field("format", b"tree-1");
+        TreeKeyBuilder(k)
+    }
+
+    pub fn field(&mut self, name: &str, bytes: &[u8]) {
+        self.0.field(name, bytes);
+    }
+
+    pub fn finish(self) -> TreeKey {
+        TreeKey(self.0.finish().0)
     }
 }
 
@@ -278,9 +338,40 @@ impl Store {
 
     /// Empties the store (after a mismatch).
     pub fn clear(&self) {
-        if let Ok(p) = crate::tree::dest_under(&self.out, DIR) {
-            let _ = std::fs::remove_dir_all(p);
+        for d in [DIR, TREE_DIR] {
+            if let Ok(p) = crate::tree::dest_under(&self.out, d) {
+                let _ = std::fs::remove_dir_all(p);
+            }
         }
+    }
+
+    fn tree_rel(key: &TreeKey) -> String {
+        format!("{TREE_DIR}/{}.json", key.0)
+    }
+
+    /// The stored state of a tree. A file that does not read back whole, or
+    /// does not name its own key, is a miss.
+    pub fn get_tree(&self, key: &TreeKey) -> Option<TreeState> {
+        let path = crate::tree::dest_under(&self.out, &Self::tree_rel(key)).ok()?;
+        let st: TreeState = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        (st.key == key.0).then_some(st)
+    }
+
+    /// Stores the state of a tree and drops the states of other trees: only
+    /// the last one is of use to a resumed run.
+    pub fn put_tree(&self, key: &TreeKey, st: &TreeState) -> Result<(), String> {
+        let bytes = serde_json::to_vec(st).map_err(|e| e.to_string())?;
+        let dest = crate::tree::dest_under(&self.out, &Self::tree_rel(key))?;
+        if let Some(p) = dest.parent() {
+            let _ = std::fs::remove_dir_all(p);
+            std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        }
+        let tmp = dest.with_extension(format!("tmp{}", std::process::id()));
+        std::fs::write(&tmp, &bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &dest).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("{}: {e}", dest.display())
+        })
     }
 
     /// Writes what a mismatch found, for whoever looks into it.

@@ -199,7 +199,7 @@ pub const BASE_SUSPECT: &str = "ASM-BASE-SUSPECT";
 /// letter case as the dialect compares, and the dialect's default schema for
 /// an unqualified name. Without a default schema (Db2 for i), an unqualified
 /// name may be any schema's.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct Key {
     pub(crate) routine: bool,
     pub(crate) schema: Option<String>,

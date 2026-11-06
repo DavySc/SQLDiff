@@ -870,24 +870,117 @@ pub(crate) fn dest_under(out: &Path, rel: &str) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
-/// Converts plain SQL files: rules with the source catalog of the whole
-/// tree, then a check of every draft against both trees' catalogs.
+/// The key of the tree state: every input of the catalogs, the drafts and
+/// the stand-ins, named. Anything that reaches them but is missing here
+/// would let a stale state through, so the list is the contract: the
+/// running build, the dialects and rule options, the source and output
+/// folder (they are quoted in the catalogs' origins), every file's path and
+/// text, the review ledger (hand-written output replaces drafts) and the base
+/// catalogs.
+fn tree_key(
+    c: &Cache,
+    a: &Args,
+    out: &Path,
+    inputs: &[Input],
+    ledger: Option<&crate::review::Ledger>,
+    base: Option<&crate::base::Base>,
+) -> crate::store::TreeKey {
+    let mut k = crate::store::TreeKeyBuilder::new();
+    k.field("build", c.build.as_bytes());
+    k.field("from", a.from.id().as_bytes());
+    k.field("to", a.to.id().as_bytes());
+    k.field("rules", format!("{:?}", a.rules).as_bytes());
+    k.field("catalogs", &[!a.no_catalog as u8]);
+    k.field("src", a.src.display().to_string().as_bytes());
+    k.field("out", out.display().to_string().as_bytes());
+    for i in inputs {
+        k.field("path", i.rel.as_bytes());
+        k.field("text", i.text.as_bytes());
+    }
+    k.field("ledger", format!("{ledger:?}").as_bytes());
+    match base {
+        Some(b) => {
+            k.field(
+                "base.source",
+                crate::store::catalog_digest(&b.source).as_bytes(),
+            );
+            k.field(
+                "base.target",
+                crate::store::catalog_digest(&b.target).as_bytes(),
+            );
+            k.field(
+                "base.files",
+                format!("{:?}", (&b.files, &b.files_b)).as_bytes(),
+            );
+            k.field("base.hash", format!("{:?}", b.hash).as_bytes());
+        }
+        None => k.field("base", b"none"),
+    }
+    k.finish()
+}
+
+/// The re-check of a stored tree state, as for stored results: every run
+/// builds again the rules' draft of one file in 50 (at least one) from the
+/// stored source catalog and compares it with the stored one, and one run in
+/// ten builds the whole state again and compares all of it, byte for byte as
+/// it serialises. `None` when they agree, else why not.
 #[allow(clippy::too_many_arguments)]
-fn convert_files(
+pub(crate) fn verify_tree_state(
+    st: &crate::store::TreeState,
+    seed: u64,
     a: &Args,
     out: &Path,
     inputs: &[Input],
     jobs: usize,
     ledger: Option<&crate::review::Ledger>,
     base: Option<&crate::base::Base>,
-    hooks: &Hooks,
-    finish: &Finish,
-    cache: Option<&Cache>,
-    reused: &mut Vec<bool>,
-    select: Option<&crate::plan::Select>,
-    unchecked: &mut Vec<bool>,
-    progress: &mut Option<crate::plan::Progress>,
-) -> Result<Vec<(Held, f64)>, String> {
+) -> Option<String> {
+    let wrong = |what: &str| {
+        Some(format!(
+            "the stored tree state ({what}) differs from one built again from the same \
+             input; its store is emptied: run again"
+        ))
+    };
+    if st.drafts.len() != inputs.len() || st.source.is_some() == a.no_catalog {
+        return wrong("its shape");
+    }
+    if seed % 10 == 0 {
+        let mut fresh = build_tree_state(a, out, inputs, jobs, ledger, base);
+        fresh.key = st.key.clone();
+        return (!st.same_as(&fresh)).then(|| {
+            "the stored tree state differs from one built again from the same input; \
+             its store is emptied: run again"
+                .to_string()
+        });
+    }
+    let source = st.source.as_ref();
+    let claims = crate::table_vars::Claims::of(
+        inputs.iter().map(|i| (i.rel.as_str(), i.text.as_str())),
+        a.from,
+    );
+    let all: Vec<(usize, usize)> = (0..inputs.len()).map(|i| (i, 0)).collect();
+    for idx in crate::store::pick(&all, seed) {
+        let i = &inputs[idx];
+        let mut d = crate::rewrite_in_tree(&i.text, a.from, a.to, source, Some(&claims), a.rules);
+        if let Some(l) = ledger {
+            hand_written_draft(l, i, &mut d);
+        }
+        if d.canonical() != st.drafts[idx].canonical() {
+            return wrong(&format!("the draft of {}", i.rel));
+        }
+    }
+    None
+}
+
+/// Builds the state the checks start from. See [`tree_key`].
+pub(crate) fn build_tree_state(
+    a: &Args,
+    out: &Path,
+    inputs: &[Input],
+    jobs: usize,
+    ledger: Option<&crate::review::Ledger>,
+    base: Option<&crate::base::Base>,
+) -> crate::store::TreeState {
     // Catalogs from the whole tree, so names defined in other files bind:
     // the source catalog also lets the rules see other files' procedures.
     // Base catalogs go under the tree's objects.
@@ -929,10 +1022,6 @@ fn convert_files(
             hand_written_draft(l, i, d);
         }
     }
-    let mut opts = Options {
-        helpers: a.helpers.clone(),
-        ..Options::default()
-    };
     let files: Vec<(&str, &str)> = inputs
         .iter()
         .map(|i| (i.rel.as_str(), i.text.as_str()))
@@ -960,7 +1049,96 @@ fn convert_files(
             a.to,
             Some(&source),
         );
-        opts.facts_a = vec![source];
+        return crate::store::TreeState {
+            key: String::new(),
+            source: Some(Arc::try_unwrap(source).unwrap_or_else(|a| (*a).clone())),
+            drafts,
+            target: Some(target),
+            stand_ins,
+        };
+    }
+    crate::store::TreeState {
+        key: String::new(),
+        source: None,
+        drafts,
+        target: None,
+        stand_ins,
+    }
+}
+
+/// Converts plain SQL files: rules with the source catalog of the whole
+/// tree, then a check of every draft against both trees' catalogs.
+#[allow(clippy::too_many_arguments)]
+fn convert_files(
+    a: &Args,
+    out: &Path,
+    inputs: &[Input],
+    jobs: usize,
+    ledger: Option<&crate::review::Ledger>,
+    base: Option<&crate::base::Base>,
+    hooks: &Hooks,
+    finish: &Finish,
+    cache: Option<&Cache>,
+    reused: &mut Vec<bool>,
+    select: Option<&crate::plan::Select>,
+    unchecked: &mut Vec<bool>,
+    progress: &mut Option<crate::plan::Progress>,
+) -> Result<Vec<(Held, f64)>, String> {
+    // What the checks start from (catalogs, drafts, stand-ins) is a function
+    // of the whole tree: taken from the store when its key matches exactly,
+    // else built and stored for the next run.
+    let tree_key = cache.map(|c| tree_key(c, a, out, inputs, ledger, base));
+    let loaded = match (cache, &tree_key) {
+        (Some(c), Some(k)) if !c.fresh => c.store.get_tree(k),
+        _ => None,
+    };
+    let state = match loaded {
+        Some(st) => {
+            hooks.stop_if_cancelled()?;
+            if let Some(why) = verify_tree_state(
+                &st,
+                crate::store::seed(),
+                a,
+                out,
+                inputs,
+                jobs,
+                ledger,
+                base,
+            ) {
+                if let Some(c) = cache {
+                    c.store.clear();
+                }
+                return Err(why);
+            }
+            st
+        }
+        None => {
+            let mut st = build_tree_state(a, out, inputs, jobs, ledger, base);
+            // A job stopped while it built writes nothing into the folder.
+            hooks.stop_if_cancelled()?;
+            if let (Some(c), Some(k)) = (cache, &tree_key) {
+                st.key = k.as_str().to_string();
+                if let Err(e) = c.store.put_tree(k, &st) {
+                    eprintln!("sqldiff: tree state not stored: {e}");
+                }
+            }
+            st
+        }
+    };
+    crate::mem::release();
+    let crate::store::TreeState {
+        source,
+        drafts,
+        target,
+        stand_ins,
+        ..
+    } = state;
+    let mut opts = Options {
+        helpers: a.helpers.clone(),
+        ..Options::default()
+    };
+    if let (Some(source), Some(target)) = (source, target) {
+        opts.facts_a = vec![Arc::new(source)];
         opts.facts_b = vec![Arc::new(target)];
     }
     // Pass 2: check every draft, or take its stored result when the key of
@@ -2905,4 +3083,74 @@ pub fn dir_hash(dir: &Path) -> Result<String, String> {
         h.update(Sha256::digest(&bytes));
     }
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+#[cfg(test)]
+mod tree_state_tests {
+    use super::*;
+
+    fn args(src: &Path) -> Args {
+        Args {
+            rules: Default::default(),
+            src: src.to_path_buf(),
+            from: Dialect::Tsql,
+            to: Dialect::Postgres,
+            jobs: Some(1),
+            no_catalog: false,
+            template: None,
+            extensions: extensions(Vec::new()),
+            helpers: Vec::new(),
+            deployment: Default::default(),
+            catalogs: Vec::new(),
+            catalogs_b: Vec::new(),
+        }
+    }
+
+    /// The re-check of a stored tree state: a state built from the tree
+    /// passes; a changed draft is found on every run; a changed catalog only
+    /// by the run that builds everything again (one in ten, by the seed).
+    #[test]
+    fn the_recheck_of_a_tree_state_finds_what_differs() {
+        let dir = std::env::temp_dir().join(format!("sqldiff-treestate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.sql"), "CREATE TABLE t (a int NOT NULL);\n").unwrap();
+        std::fs::write(
+            src.join("p.sql"),
+            "CREATE PROCEDURE dbo.p AS\nBEGIN\n  UPDATE dbo.t SET a = 1;\nEND\n",
+        )
+        .unwrap();
+        let a = args(&src);
+        let (inputs, _) = read(&a).unwrap();
+        let out = dir.join("out");
+        let build = || build_tree_state(&a, &out, &inputs, 1, None, None);
+        let check = |st: &crate::store::TreeState, seed| {
+            verify_tree_state(st, seed, &a, &out, &inputs, 1, None, None)
+        };
+        // Seed 0 builds everything again, seed 1 samples a draft.
+        let st = build();
+        assert_eq!(check(&st, 0), None);
+        assert_eq!(check(&st, 1), None);
+        // Round trip through the store's format.
+        let back: crate::store::TreeState =
+            serde_json::from_slice(&serde_json::to_vec(&st).unwrap()).unwrap();
+        assert!(back.same_as(&st));
+        assert_eq!(check(&back, 0), None);
+        for (i, d) in st.drafts.iter().enumerate() {
+            assert_eq!(d.canonical(), back.drafts[i].canonical());
+        }
+        // A changed catalog: only the full rebuild sees it.
+        let mut bad = build();
+        bad.source.as_mut().unwrap().origin = "elsewhere".to_string();
+        assert!(check(&bad, 0).is_some());
+        assert_eq!(check(&bad, 1), None);
+        // A changed draft: both do.
+        let mut bad: crate::store::TreeState =
+            serde_json::from_slice(&serde_json::to_vec(&st).unwrap()).unwrap();
+        bad.drafts.swap(0, 1);
+        assert!(check(&bad, 0).is_some());
+        assert!(check(&bad, 1).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

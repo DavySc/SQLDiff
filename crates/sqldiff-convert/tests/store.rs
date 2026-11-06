@@ -276,3 +276,97 @@ fn a_directory_holding_only_the_store_is_empty_for_a_resume() {
     convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
     assert!(reused(&f.out("o")).iter().any(|(_, r)| *r));
 }
+
+fn states(out: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(out.join(".sqldiff/tree"))
+        .map(|d| d.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default()
+}
+
+fn modified(p: &Path) -> std::time::SystemTime {
+    std::fs::metadata(p).unwrap().modified().unwrap()
+}
+
+#[test]
+fn a_resume_takes_the_state_of_the_tree_from_the_store() {
+    let f = Fixture::standard("treestate");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    let first = states(&f.out("o"));
+    assert_eq!(first.len(), 1);
+    let before = modified(&first[0]);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
+    // The same state, not written again.
+    assert_eq!(states(&f.out("o")), first);
+    assert_eq!(modified(&first[0]), before);
+    // And the tree is what a fresh run gives.
+    let resumed = tree_of(&f.out("o"));
+    convert_into(&f.job("o", true, true), &Hooks::default()).unwrap();
+    assert_eq!(resumed, tree_of(&f.out("o")));
+}
+
+#[test]
+fn an_edit_anywhere_gives_a_new_tree_state_and_drops_the_old_one() {
+    let f = Fixture::standard("treeedit");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    let old = states(&f.out("o"));
+    // A change that touches no catalog and no other file's draft.
+    f.write("b.sql", "SELECT TOP 2 a FROM t;\n");
+    convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
+    let new = states(&f.out("o"));
+    assert_eq!(new.len(), 1);
+    assert_ne!(new, old);
+    let edited = tree_of(&f.out("o"));
+    convert_into(&f.job("o", true, true), &Hooks::default()).unwrap();
+    assert_eq!(edited, tree_of(&f.out("o")));
+}
+
+#[test]
+fn a_damaged_tree_state_is_a_miss() {
+    let f = Fixture::standard("treedamaged");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    let want = tree_of(&f.out("o"));
+    for p in states(&f.out("o")) {
+        std::fs::write(p, b"{ not json").unwrap();
+    }
+    convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
+    assert_eq!(want, tree_of(&f.out("o")));
+    for p in states(&f.out("o")) {
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(p).unwrap()).unwrap();
+    }
+}
+
+/// A state that no longer matches what its tree builds: the first file's
+/// draft text is replaced, the key kept.
+fn tamper(out: &Path) {
+    let p = states(out).remove(0);
+    let mut st: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+    st["drafts"][0]["raw"]["text"] = "-- tampered\n".into();
+    std::fs::write(&p, serde_json::to_vec(&st).unwrap()).unwrap();
+}
+
+#[test]
+fn a_tree_state_that_a_rebuild_contradicts_fails_the_run_and_empties_the_store() {
+    // One file: the sample is that file.
+    let f = Fixture::new("treemismatch", &[("p.sql", PROC)]);
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    tamper(&f.out("o"));
+    let err = convert_into(&f.job("o", true, false), &Hooks::default())
+        .err()
+        .expect("a mismatch fails the run");
+    assert!(err.contains("stored tree state"), "{err}");
+    assert!(states(&f.out("o")).is_empty() && results(&f.out("o")).is_empty());
+    // The next run works, from nothing.
+    convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
+    assert_eq!(states(&f.out("o")).len(), 1);
+}
+
+#[test]
+fn fresh_does_not_read_the_tree_state() {
+    let f = Fixture::new("treefresh", &[("p.sql", PROC)]);
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    let want = tree_of(&f.out("o"));
+    tamper(&f.out("o"));
+    convert_into(&f.job("o", true, true), &Hooks::default()).unwrap();
+    assert_eq!(want, tree_of(&f.out("o")));
+}
