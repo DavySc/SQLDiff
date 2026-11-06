@@ -3,6 +3,9 @@
 //! handlers and transaction behaviour come from the semantic IR
 //! (`crate::ir`).
 
+use std::collections::HashMap;
+
+use rowan::{TextRange, TextSize};
 use sqldiff_syntax::{ast, SyntaxKind, SyntaxNode};
 
 use crate::artifact::Analyzed;
@@ -24,6 +27,7 @@ pub struct Write {
 pub fn writes(a: &Analyzed) -> Vec<Write> {
     let d = a.dialect();
     let mut out = Vec::new();
+    let mut temps = TempTables::default();
     for node in a.root.descendants() {
         if node.kind() != SyntaxKind::STATEMENT {
             continue;
@@ -59,7 +63,8 @@ pub fn writes(a: &Analyzed) -> Vec<Write> {
         } else {
             Default::default()
         };
-        let durable = |p: &[String]| !is_temp_target(p) && !pg_temp_before(&node, p, d);
+        let mut durable =
+            |p: &[String]| !is_temp_target(p) && !pg_temp_before(&node, p, d, &mut temps);
         for (k, p) in before.into_iter().filter(|(_, p)| durable(p)) {
             out.push(Write {
                 upsert: k == StmtKind::Merge,
@@ -88,11 +93,53 @@ pub fn writes(a: &Analyzed) -> Vec<Write> {
     out
 }
 
+/// The `CREATE TEMP TABLE name` statements of each scope (routine, or the
+/// whole script), found once per scope: the start of the first with each
+/// name, lower-cased.
+#[derive(Default)]
+struct TempTables(HashMap<TextRange, HashMap<String, TextSize>>);
+
+impl TempTables {
+    fn first(&mut self, scope: &SyntaxNode, name: &str) -> Option<TextSize> {
+        self.0
+            .entry(scope.text_range())
+            .or_insert_with(|| {
+                let mut first: HashMap<String, TextSize> = HashMap::new();
+                for c in scope
+                    .descendants()
+                    .filter(|c| c.kind() == SyntaxKind::STATEMENT)
+                {
+                    let toks: Vec<_> = ast::sig_tokens(&c).take(5).collect();
+                    let up = |i: usize| toks.get(i).map(|t| t.text().to_ascii_uppercase());
+                    if up(0).as_deref() == Some("CREATE")
+                        && matches!(up(1).as_deref(), Some("TEMP" | "TEMPORARY"))
+                        && up(2).as_deref() == Some("TABLE")
+                        && !toks.get(4).is_some_and(|t| t.text() == ".")
+                    {
+                        if let Some(t) = toks.get(3) {
+                            first
+                                .entry(t.text().to_ascii_lowercase())
+                                .or_insert(c.text_range().start());
+                        }
+                    }
+                }
+                first
+            })
+            .get(&name.to_ascii_lowercase())
+            .copied()
+    }
+}
+
 /// PostgreSQL: a one-part `target` that a `CREATE TEMP TABLE target`
 /// earlier in the same routine (or script) created. PostgreSQL looks in
 /// `pg_temp` first, so the write goes to that temporary table, as a write to
 /// `#t` does in T-SQL.
-fn pg_temp_before(node: &SyntaxNode, target: &[String], d: sqldiff_syntax::Dialect) -> bool {
+fn pg_temp_before(
+    node: &SyntaxNode,
+    target: &[String],
+    d: sqldiff_syntax::Dialect,
+    temps: &mut TempTables,
+) -> bool {
     let [name] = target else {
         return false;
     };
@@ -107,20 +154,7 @@ fn pg_temp_before(node: &SyntaxNode, target: &[String], d: sqldiff_syntax::Diale
         return false;
     };
     let at = node.text_range().start();
-    scope.descendants().any(|c| {
-        if c.kind() != SyntaxKind::STATEMENT || c.text_range().start() >= at {
-            return false;
-        }
-        let toks: Vec<_> = ast::sig_tokens(&c).take(5).collect();
-        let up = |i: usize| toks.get(i).map(|t| t.text().to_ascii_uppercase());
-        up(0).as_deref() == Some("CREATE")
-            && matches!(up(1).as_deref(), Some("TEMP" | "TEMPORARY"))
-            && up(2).as_deref() == Some("TABLE")
-            && toks
-                .get(3)
-                .is_some_and(|t| t.text().eq_ignore_ascii_case(name))
-            && !toks.get(4).is_some_and(|t| t.text() == ".")
-    })
+    temps.first(&scope, name).is_some_and(|start| start < at)
 }
 
 /// T-SQL `CREATE TABLE … WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = h))`:

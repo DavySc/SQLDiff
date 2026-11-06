@@ -26,7 +26,10 @@ use std::rc::Rc;
 use sqldiff_syntax::{ast, Dialect, SyntaxNode};
 
 use super::cfg::{Cfg, Effect, NodeId};
-use super::interp::{Exit, Explorer, Fate, Fault, Outcome, Routed, Scenario, TempState};
+use super::delta::scan_differing;
+use super::interp::{
+    Effects, Exit, Explorer, Fate, Fault, KeyUniverse, Outcome, Routed, Scenario, TempState,
+};
 use super::profile::ErrorKind;
 use super::witness::{PathStep, ScenarioInfo, ScenarioKind, SideOutcome, WhatIf, Witness};
 use crate::artifact::Analyzed;
@@ -391,31 +394,97 @@ fn continues(o: &Outcome) -> bool {
         && !matches!(o.exit, Exit::Raised(_))
 }
 
-/// Keys of the effects whose fate differs between two outcomes (including
-/// effects that ran in only one), in key order.
-fn differing<'o>(a: &'o BTreeMap<Rc<str>, Fate>, b: &'o BTreeMap<Rc<str>, Fate>) -> Vec<&'o str> {
+/// The slots on which two shared fate arrays differ, remembered per pair of
+/// arrays: an outcome that merged into the fault-free run shares that
+/// run's array, so comparing two of them starts from this and costs the
+/// slots they changed.
+#[derive(Default)]
+struct DiffCache {
+    #[allow(clippy::type_complexity)]
+    pairs: RefCell<Vec<(Rc<Vec<u8>>, Rc<Vec<u8>>, Rc<Vec<u32>>)>>,
+}
+
+impl DiffCache {
+    fn of(&self, a: &Rc<Vec<u8>>, b: &Rc<Vec<u8>>) -> Rc<Vec<u32>> {
+        let mut c = self.pairs.borrow_mut();
+        if let Some((_, _, d)) = c
+            .iter()
+            .find(|(x, y, _)| Rc::ptr_eq(x, a) && Rc::ptr_eq(y, b))
+        {
+            return d.clone();
+        }
+        let d = Rc::new(scan_differing(a, b));
+        if c.len() >= 64 {
+            c.clear();
+        }
+        c.push((a.clone(), b.clone(), d.clone()));
+        d
+    }
+}
+
+const NO_POS: u32 = u32::MAX;
+
+/// What the diff of two sides' outcomes looks up for every key, by effect
+/// slot, and the differences of shared fate arrays already found.
+struct Align {
+    dc: DiffCache,
+    /// Document-order position of the first effect with each key on each
+    /// side (`NO_POS` for none).
+    pos_a: Vec<u32>,
+    pos_b: Vec<u32>,
+}
+
+impl Align {
+    fn new(keys: &KeyUniverse, sa: &SideIr, sb: &SideIr) -> Align {
+        let pos = |s: &SideIr| -> Vec<u32> {
+            keys.names()
+                .iter()
+                .map(|k| s.at.get(&**k).map_or(NO_POS, |&(p, _)| p as u32))
+                .collect()
+        };
+        Align {
+            dc: DiffCache::default(),
+            pos_a: pos(sa),
+            pos_b: pos(sb),
+        }
+    }
+}
+
+enum Differing {
+    /// Effect slots, when both outcomes number their effects alike.
+    Slots(Vec<usize>),
+    Names(Vec<Rc<str>>),
+}
+
+/// The effects whose fate differs between two outcomes (including effects
+/// that ran in only one), in no particular order.
+fn differing(a: &Effects, b: &Effects, al: &Align) -> Differing {
+    if let Some(v) = a.differing(b, &|x, y| al.dc.of(x, y)) {
+        return Differing::Slots(v);
+    }
+    // Not over the same keys: compare by name.
     let mut out = Vec::new();
     let (mut ia, mut ib) = (a.iter().peekable(), b.iter().peekable());
     loop {
         match (ia.peek(), ib.peek()) {
-            (None, None) => return out,
+            (None, None) => return Differing::Names(out),
             (Some(&(ka, fa)), Some(&(kb, fb))) if ka == kb => {
                 if fa != fb {
-                    out.push(&**ka);
+                    out.push(ka.clone());
                 }
                 ia.next();
                 ib.next();
             }
             (Some(&(ka, _)), Some(&(kb, _))) if ka < kb => {
-                out.push(&**ka);
+                out.push(ka.clone());
                 ia.next();
             }
             (Some(&(ka, _)), None) => {
-                out.push(&**ka);
+                out.push(ka.clone());
                 ia.next();
             }
             (_, Some(&(kb, _))) => {
-                out.push(&**kb);
+                out.push(kb.clone());
                 ib.next();
             }
         }
@@ -437,6 +506,7 @@ fn reads(s: &SideIr, o: &Outcome) -> Reads {
 /// that already has the divergence from another outcome pair only counts it,
 /// and writing the text for every pair of a branchy routine was most of the
 /// work.
+#[allow(clippy::too_many_arguments)]
 fn diff(
     sa: &SideIr,
     sb: &SideIr,
@@ -445,6 +515,7 @@ fn diff(
     (oa, ra): (&Outcome, &Reads),
     (ob, rb): (&Outcome, &Reads),
     need: &dyn Fn(&str, &str) -> bool,
+    al: &Align,
 ) -> Vec<Div> {
     let text = |rule: &str, anchor: &str, f: &dyn Fn() -> String| {
         if need(rule, anchor) {
@@ -525,33 +596,69 @@ fn diff(
     }
     // 2. Effects that ran on both sides with different fates; the first of
     // each kind in document order is reported.
-    type First<'k> = Option<((usize, usize), &'k str, Option<Fate>, Option<Fate>)>;
+    type First = Option<((usize, usize), String, Option<Fate>, Option<Fate>)>;
     let (mut first_fate, mut first_control): (First, First) = (None, None);
-    for k in differing(&oa.effects, &ob.effects) {
-        if Some(k) == fault_key {
-            continue;
-        }
-        let (Some(&(ia, _)), Some(&(ib, _))) = (sa.at.get(k), sb.at.get(k)) else {
-            continue;
+    {
+        // Slot by slot when both outcomes number their effects alike; the
+        // position of each key in both sides is looked up once per pair.
+        let fault_slot = fault_key.and_then(|k| oa.effects.index_of(k));
+        let mut consider = |ia: usize, ib: usize, name: &dyn Fn() -> String, fa, fb| {
+            let slot = match (fa, fb) {
+                (Some(_), Some(_)) => &mut first_fate,
+                _ => &mut first_control,
+            };
+            if !matches!(slot, Some((o, ..)) if *o <= (ia, ib)) {
+                *slot = Some(((ia, ib), name(), fa, fb));
+            }
         };
-        let (fa, fb) = (oa.effects.get(k).copied(), ob.effects.get(k).copied());
-        let slot = match (fa, fb) {
-            (Some(_), Some(_)) => &mut first_fate,
-            _ => &mut first_control,
-        };
-        if !matches!(slot, Some((o, ..)) if *o <= (ia, ib)) {
-            *slot = Some(((ia, ib), k, fa, fb));
+        match differing(&oa.effects, &ob.effects, al) {
+            Differing::Slots(v) => {
+                for i in v {
+                    if Some(i) == fault_slot {
+                        continue;
+                    }
+                    let (ia, ib) = (al.pos_a[i], al.pos_b[i]);
+                    if ia == NO_POS || ib == NO_POS {
+                        continue;
+                    }
+                    consider(
+                        ia as usize,
+                        ib as usize,
+                        &|| oa.effects.name(i).to_string(),
+                        oa.effects.fate_at(i),
+                        ob.effects.fate_at(i),
+                    );
+                }
+            }
+            Differing::Names(v) => {
+                for k in v {
+                    let k = &*k;
+                    if Some(k) == fault_key {
+                        continue;
+                    }
+                    let (Some(&(ia, _)), Some(&(ib, _))) = (sa.at.get(k), sb.at.get(k)) else {
+                        continue;
+                    };
+                    consider(
+                        ia,
+                        ib,
+                        &|| k.to_string(),
+                        oa.effects.get(k).copied(),
+                        ob.effects.get(k).copied(),
+                    );
+                }
+            }
         }
     }
     let fate_diffs: Vec<_> = first_fate
         .map(|(_, k, fa, fb)| {
-            let ran_before = oa.before_fault.contains(k) || ob.before_fault.contains(k);
-            (k.to_string(), fa, fb, ran_before)
+            let ran_before = oa.before_fault.contains(&k) || ob.before_fault.contains(&k);
+            (k, fa, fb, ran_before)
         })
         .into_iter()
         .collect();
     let control_diffs: Vec<_> = first_control
-        .map(|(_, k, fa, fb)| (k.to_string(), fa, fb))
+        .map(|(_, k, fa, fb)| (k, fa, fb))
         .into_iter()
         .collect();
     let scenario_rule = |before: bool| match sc {
@@ -890,7 +997,7 @@ fn side_outcome(s: &SideIr, o: &Outcome) -> SideOutcome {
         exit: exit_phrase(o),
         ..SideOutcome::default()
     };
-    for (k, f) in &o.effects {
+    for (k, f) in o.effects.iter() {
         let p = if &**k == super::interp::CALLER {
             "the caller's earlier work".to_string()
         } else {
@@ -906,7 +1013,7 @@ fn side_outcome(s: &SideIr, o: &Outcome) -> SideOutcome {
     let rolled: Vec<String> = o
         .effects
         .iter()
-        .filter(|(k, f)| **f == Fate::Undone && o.before_fault.contains(*k))
+        .filter(|(k, f)| **f == Fate::Undone && o.before_fault.contains(k))
         .map(|(k, _)| {
             if &**k == super::interp::CALLER {
                 "the caller's earlier work".to_string()
@@ -1054,6 +1161,9 @@ struct Collector<'x, 'a> {
     /// resume from.
     xa: RefCell<Vec<Rc<Explorer>>>,
     xb: RefCell<Vec<Rc<Explorer>>>,
+    al: Align,
+    /// The effect keys of both sides, which both sides' runs number alike.
+    keys: KeyUniverse,
     /// Some scenario had no outcome on a side, or an outcome or finding
     /// that is not exact (see [`Behaviour::txn_compared`]).
     incomplete: bool,
@@ -1076,9 +1186,12 @@ impl<'x, 'a> Collector<'x, 'a> {
         ra: Option<SyntaxNode>,
         rb: Option<SyntaxNode>,
     ) -> Self {
+        let (sa, sb) = (SideIr::new(a, b, ra), SideIr::new(b, a, rb));
+        let keys = KeyUniverse::of(&[&sa.cfg, &sb.cfg]);
+        let al = Align::new(&keys, &sa, &sb);
         let mut c = Collector {
-            sa: SideIr::new(a, b, ra),
-            sb: SideIr::new(b, a, rb),
+            sa,
+            sb,
             env,
             splits: Vec::new(),
             out: Behaviour::default(),
@@ -1086,6 +1199,8 @@ impl<'x, 'a> Collector<'x, 'a> {
             contract_at: HashMap::new(),
             xa: RefCell::new(Vec::new()),
             xb: RefCell::new(Vec::new()),
+            al,
+            keys,
             incomplete: false,
             prior: HashSet::new(),
             salt: String::new(),
@@ -1110,7 +1225,12 @@ impl<'x, 'a> Collector<'x, 'a> {
 
     /// The fault-free run of `cfg` under the environment of `sc` (the
     /// scenario without its faults), made once per environment.
-    fn explorer(cache: &RefCell<Vec<Rc<Explorer>>>, cfg: &Cfg, sc: &Scenario) -> Rc<Explorer> {
+    fn explorer(
+        cache: &RefCell<Vec<Rc<Explorer>>>,
+        cfg: &Cfg,
+        sc: &Scenario,
+        keys: &KeyUniverse,
+    ) -> Rc<Explorer> {
         let env = Scenario {
             faults: Vec::new(),
             ..sc.clone()
@@ -1119,7 +1239,7 @@ impl<'x, 'a> Collector<'x, 'a> {
         if let Some(x) = c.iter().find(|x| *x.base_scenario() == env) {
             return x.clone();
         }
-        let x = Rc::new(Explorer::new(cfg, &env));
+        let x = Rc::new(Explorer::in_universe(cfg, &env, keys));
         c.push(x.clone());
         x
     }
@@ -1131,8 +1251,8 @@ impl<'x, 'a> Collector<'x, 'a> {
         scen_b: &Scenario,
     ) -> (Vec<Outcome>, Vec<Outcome>) {
         let (ca, cb) = (&self.sa.cfg, &self.sb.cfg);
-        let mut pa = Self::explorer(&self.xa, ca, scen_a).explore(ca, scen_a);
-        let mut pb = Self::explorer(&self.xb, cb, scen_b).explore(cb, scen_b);
+        let mut pa = Self::explorer(&self.xa, ca, scen_a, &self.keys).explore(ca, scen_a);
+        let mut pb = Self::explorer(&self.xb, cb, scen_b, &self.keys).explore(cb, scen_b);
         if let Kind::Fault { key, .. } = sc {
             // Only paths that reach the failing statement belong to the scenario.
             let reached = |o: &Outcome| o.fault_hit || o.effects.contains_key(key.as_str());
@@ -1151,9 +1271,18 @@ impl<'x, 'a> Collector<'x, 'a> {
         let rb: Vec<Reads> = pb.iter().map(|o| reads(&self.sb, o)).collect();
         ps.iter().any(|&(i, j)| {
             let (a, b) = ((&pa[i], &ra[i]), (&pb[j], &rb[j]));
-            diff(&self.sa, &self.sb, &self.splits, sc, a, b, &|_, _| false)
-                .iter()
-                .any(|x| x.rule == d.rule && x.anchor == d.anchor)
+            diff(
+                &self.sa,
+                &self.sb,
+                &self.splits,
+                sc,
+                a,
+                b,
+                &|_, _| false,
+                &self.al,
+            )
+            .iter()
+            .any(|x| x.rule == d.rule && x.anchor == d.anchor)
         })
     }
 
@@ -1194,7 +1323,7 @@ impl<'x, 'a> Collector<'x, 'a> {
                     && !self.seen.contains(&(rule.to_string(), anchor.to_string()))
             };
             let (a, b) = ((oa, &ra[i]), (ob, &rb[j]));
-            let ds = diff(&self.sa, &self.sb, &self.splits, &sc, a, b, &need);
+            let ds = diff(&self.sa, &self.sb, &self.splits, &sc, a, b, &need, &self.al);
             for d in ds {
                 if here.contains(&(d.rule, d.anchor.clone())) {
                     continue;
