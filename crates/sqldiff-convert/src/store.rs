@@ -568,11 +568,47 @@ fn mix(seed: u64, i: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// A different number on every run.
-pub fn seed() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64)
+/// The seed of the re-check samples of one run: a function of the tree's
+/// key and of how many runs this store has seen, never of the clock, so the
+/// same tree and store history always re-check the same files. The counter
+/// makes successive runs of an unchanged tree cover different files over
+/// time. A seed never changes a result: it only decides which stored ones
+/// are built again to be compared.
+pub fn seed_of(tree: &TreeKey, run: u64) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in tree.as_str().bytes() {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    mix(h, run)
+}
+
+/// The file holding the run counter of a store.
+const RUN_COUNTER: &str = ".sqldiff/run-counter";
+
+impl Store {
+    /// The number of this run (0 for the first) and records the next one.
+    /// An unreadable or unwritable counter reads as 0: the seed is then the
+    /// same on every run, which is still deterministic.
+    pub fn next_run(&self) -> u64 {
+        let Ok(path) = crate::tree::dest_under(&self.out, RUN_COUNTER) else {
+            return 0;
+        };
+        let n = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| t.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if let Some(dir) = path.parent() {
+            if std::fs::create_dir_all(dir).is_ok() {
+                let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+                if std::fs::write(&tmp, (n + 1).to_string()).is_ok()
+                    && std::fs::rename(&tmp, &path).is_err()
+                {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+        }
+        n
+    }
 }
 
 #[cfg(test)]
