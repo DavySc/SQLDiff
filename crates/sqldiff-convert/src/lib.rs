@@ -400,7 +400,7 @@ impl Draft {
             .units
             .iter()
             .all(|u| ok(input, u.src) && ok(&self.raw.text, u.out))
-            && self.plain.as_ref().is_none_or(|p| p.well_formed(input))
+            && self.plain.as_ref().map_or(true, |p| p.well_formed(input))
     }
 
     /// The options the rules ran with.
