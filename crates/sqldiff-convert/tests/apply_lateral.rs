@@ -90,3 +90,43 @@ fn db2_for_i_has_no_rule_yet() {
     let o = db2(&src).output;
     assert!(o.to_ascii_uppercase().contains("CROSS APPLY"), "{o}");
 }
+
+#[test]
+fn a_table_on_the_right_is_a_plain_join() {
+    let o = pg(&view(
+        "SELECT p.Id FROM dbo.P p
+CROSS APPLY dbo.C c",
+    ))
+    .output;
+    assert!(
+        o.contains(
+            "FROM P p
+CROSS JOIN C c"
+        ),
+        "{o}"
+    );
+    assert!(!o.contains("LATERAL"), "{o}");
+    let o = pg(&view(
+        "SELECT p.Id FROM dbo.P p
+OUTER APPLY dbo.C AS c
+WHERE p.Id > 0",
+    ))
+    .output;
+    assert!(
+        o.contains(
+            "LEFT JOIN C AS c ON TRUE
+WHERE p.Id > 0"
+        ),
+        "{o}"
+    );
+}
+
+#[test]
+fn a_table_with_hints_is_left_as_written() {
+    let o = pg(&view(
+        "SELECT p.Id FROM dbo.P p
+CROSS APPLY dbo.C c WITH (NOLOCK)",
+    ))
+    .output;
+    assert!(o.to_ascii_uppercase().contains("CROSS APPLY"), "{o}");
+}
