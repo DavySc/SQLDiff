@@ -5,7 +5,8 @@
 use sqldiff_syntax::{ast as cst, Dialect, SyntaxKind, SyntaxNode};
 
 use super::ast::{
-    parse_stmt_lowered, parse_stmt_output, tokens, Expr, Output, Parser, Stmt, Tok, Type, K,
+    parse_stmt_lowered, parse_stmt_output, tokens_shared as tokens, Expr, Output, Parser, Stmt,
+    Tok, Type, K,
 };
 use super::cursor::{CursorLoop, CursorOp};
 use super::schema::Ty;
@@ -623,7 +624,7 @@ fn assign_loop(c: &SyntaxNode, u: &mut Unit) -> bool {
         return false;
     };
     let rt = tokens(rec);
-    let r = match rt.as_slice() {
+    let r = match &rt[..] {
         [n, ty] if n.kind == K::Word && ty.up == "RECORD" => n.up.clone(),
         _ => return false,
     };
@@ -641,7 +642,7 @@ fn assign_loop(c: &SyntaxNode, u: &mut Unit) -> bool {
         return false;
     }
     let ct = tokens(cond);
-    let query = match ct.as_slice() {
+    let query = match &ct[..] {
         [v, kw, rest @ ..] if v.kind == K::Word && v.up == r && kw.up == "IN" => rest,
         _ => return false,
     };
@@ -654,7 +655,7 @@ fn assign_loop(c: &SyntaxNode, u: &mut Unit) -> bool {
         if st.kind() != STATEMENT {
             return false;
         }
-        match tokens(&st).as_slice() {
+        match &tokens(&st)[..] {
             [v, op, rec, dot, col]
                 if v.kind == K::Word
                     && op.text == ":="
@@ -696,7 +697,7 @@ fn assign_loop(c: &SyntaxNode, u: &mut Unit) -> bool {
     }
     u.stmts.push(LStmt {
         node: c.clone(),
-        toks: tokens(c),
+        toks: tokens(c).to_vec(),
         ast: Ok(Stmt::Select(sel)),
         from_declare: false,
         msg: None,
@@ -909,8 +910,9 @@ fn routine_ddl(c: &SyntaxNode) -> bool {
 fn recheck_after_add(c: &SyntaxNode, d: Dialect) -> bool {
     use super::ddl::{self, Ddl};
     let toks: Vec<Tok> = tokens(c)
-        .into_iter()
+        .iter()
         .filter(|t| t.kind != K::Semi)
+        .cloned()
         .collect();
     let word = |i: usize, w: &str| toks.get(i).is_some_and(|t| t.kind == K::Word && t.up == w);
     if !(word(0, "ALTER") && word(1, "TABLE")) {
@@ -1534,7 +1536,7 @@ fn others_handler(block: &SyntaxNode) -> Option<SyntaxNode> {
     let ts = tokens(&cond);
     (cond.kind() == SyntaxKind::CONDITION
         && body.kind() == SyntaxKind::BRANCH
-        && matches!(ts.as_slice(), [t] if t.kind == K::Word && t.up == "OTHERS"))
+        && matches!(&ts[..], [t] if t.kind == K::Word && t.up == "OTHERS"))
     .then_some(body)
 }
 
@@ -1758,8 +1760,9 @@ fn catch_writes(c: &SyntaxNode, u: &mut Unit) -> Option<String> {
 /// T-SQL `THROW;`, PL/pgSQL `RAISE;`: the caught error raised again.
 fn rethrow(c: &SyntaxNode, d: Dialect) -> bool {
     let ts: Vec<Tok> = tokens(c)
-        .into_iter()
+        .iter()
         .filter(|t| t.kind != K::Semi)
+        .cloned()
         .collect();
     match (d, ts.as_slice()) {
         (Dialect::Tsql, [t]) => t.kind == K::Word && t.up == "THROW",
@@ -2044,7 +2047,7 @@ fn rows_stmt(n: &SyntaxNode, d: Dialect) -> Option<&'static str> {
     let t = tokens(n);
     let mut depth = 0i32;
     let mut top: Vec<&Tok> = Vec::new();
-    for x in &t {
+    for x in t.iter() {
         match x.kind {
             K::LParen => depth += 1,
             K::RParen => depth -= 1,
@@ -2140,8 +2143,9 @@ fn loop_stmt(c: &SyntaxNode, u: &mut Unit) {
 fn jump(c: &SyntaxNode, u: &mut Unit) -> bool {
     let d = u.dialect;
     let toks: Vec<Tok> = tokens(c)
-        .into_iter()
+        .iter()
         .filter(|t| t.kind != K::Semi)
+        .cloned()
         .collect();
     let Some(first) = toks.first().filter(|t| t.kind == K::Word) else {
         return false;
@@ -2268,7 +2272,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         }
         u.stmts.push(LStmt {
             node: c.clone(),
-            toks: tokens(c),
+            toks: tokens(c).to_vec(),
             ast,
             from_declare: false,
             msg,
@@ -2393,7 +2397,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
             }
             u.stmts.push(LStmt {
                 node: c.clone(),
-                toks,
+                toks: toks.to_vec(),
                 ast,
                 from_declare,
                 msg: None,
@@ -2596,7 +2600,7 @@ fn result_open(c: &SyntaxNode, u: &mut Unit) -> bool {
     });
     u.stmts.push(LStmt {
         node: c.clone(),
-        toks,
+        toks: toks.to_vec(),
         ast,
         from_declare: false,
         msg: None,
@@ -2668,7 +2672,7 @@ fn cursor_stmt(c: &SyntaxNode, u: &mut Unit) -> bool {
     };
     u.stmts.push(LStmt {
         node: c.clone(),
-        toks: tokens(c),
+        toks: tokens(c).to_vec(),
         ast: Err("a cursor statement".into()),
         from_declare: false,
         msg: None,
@@ -2898,7 +2902,7 @@ fn by_severity(c: &SyntaxNode, u: &mut Unit, ast: Result<Stmt, String>, m: Msg, 
     let cond = Expr::Bin(">".into(), Box::new(sev), Box::new(Expr::Num("10".into())));
     let stmt = |error: bool| LStmt {
         node: c.clone(),
-        toks: tokens(c),
+        toks: tokens(c).to_vec(),
         ast: ast.clone(),
         from_declare: false,
         msg: Some(Msg { error, ..m.clone() }),
@@ -2930,8 +2934,9 @@ type Lowered = (Result<Stmt, String>, Option<Msg>);
 fn message(c: &SyntaxNode, d: Dialect) -> Option<Lowered> {
     use super::ast::Expr;
     let toks: Vec<Tok> = tokens(c)
-        .into_iter()
+        .iter()
         .filter(|t| t.kind != K::Semi)
+        .cloned()
         .collect();
     let level = toks.get(1).map(|t| t.up.as_str());
     let rest = match (d, toks.first().map(|t| t.up.as_str())) {
@@ -3297,7 +3302,7 @@ fn pg_declaration(s: &SyntaxNode, u: &mut Unit) {
     });
     u.stmts.push(LStmt {
         node: s.clone(),
-        toks,
+        toks: toks.to_vec(),
         ast,
         from_declare: true,
         msg: None,
