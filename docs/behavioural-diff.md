@@ -93,6 +93,43 @@ those no input can produce (the same condition, decided once on each path, with
 two values; a condition decided more than once, as a loop test is, never rules
 a pair out), and a divergence that does not hold for all of them is "unknown".
 
+### Path joining
+
+When the other side of a comparison makes no decision (its CFG has no
+`Test::Unknown` and no `Test::NoRows` node, so every scenario has one path
+with an empty signature), a side's fault-free exploration drops a path that
+reaches a node with several predecessors in the same state as an earlier path
+whose subtree is finished. "State" is every field of `State` but `steps`, the
+trace, the signature and the names of row-count tests (`run_key`): the
+run state *and* the history that reaches an outcome (`partial`, `temp_reads`,
+`raised`, `rows`, `assumptions`, `untested`, `imprecise`, `cut`). Two such
+paths run on identically, so the outcomes they would make are equal in every
+field a comparison reads; only `trace` and `signature` differ, and the
+other side's empty signature makes `pairs` pair every combination whatever
+the signatures are. Dropping duplicates therefore leaves the set of distinct
+comparison results, and with it every verdict and the text of every finding
+(the first outcome pair showing a divergence is the earlier path's), as it
+was.
+
+* The step budget: the dropped path has used at least as many steps as the
+  earlier one, or the earlier subtree was not cut by the step budget, so its
+  continuation fits wherever the earlier one did. The path budget counts
+  outcomes, so dropped paths free it: more of the routine is explored, and a
+  routine still over the budget cuts different branches than before.
+* A run with joining is bounded like one without: after 200,000 ticks it
+  stops forking (an `imprecise` path budget cut). The memo holds at most
+  10,000 entries; a full memo only stops *making* entries (a re-run makes
+  none, and sees an entry absent before its arrival either way), so the size
+  of the memo never changes where a re-run forks.
+* The memo belongs to the `Explorer` and is shared with its checkpoints; an
+  entry is visible from the tick its subtree finished, so a re-run from a
+  checkpoint drops the same paths. No tick on the segment of a dropped path
+  is a merge target for a fault replay: the joined tick and every tick opened
+  after the entry's arrival (their outcome slices lack the dropped
+  continuation, which is the earlier path's). The
+  replay itself does not join. Joining is a property of the pair: the same
+  routine against another counterpart may explore differently.
+
 ## Structured witnesses
 
 `Report.witnesses` holds one `Witness` per behavioural finding, by fingerprint:
