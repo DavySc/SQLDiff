@@ -177,7 +177,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.sequence` | `converter` | engine |  | `sqldiff-draft/src/tsql.rs` |
 | `tsql.sequence-cache` | `converter` | engine |  | `sqldiff-draft/src/tsql.rs` |
 | `tsql.server-metadata` | `converter` | engine |  | `sqldiff-draft/src/tsql.rs` |
-| `tsql.sqlcmd-include` | `converter` | engine |  | `sqldiff-convert/src/lib.rs`<br>`sqldiff-draft/src/tsql.rs` |
+| `tsql.sqlcmd-include` | `converter` | engine |  | `sqldiff-convert/src/check.rs`<br>`sqldiff-draft/src/tsql.rs` |
 | `tsql.stmt.break` | `converter` | engine |  | `sqldiff-draft/src/tsql.rs` |
 | `tsql.stmt.continue` | `converter` | engine |  | `sqldiff-draft/src/tsql.rs` |
 | `tsql.stmt.create-role` | `converter` | engine |  | `sqldiff-draft/src/tsql.rs` |

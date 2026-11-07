@@ -170,8 +170,8 @@ routine refuse (`tsql.rs`, `claims.clash`), the refusal depends on the table
 name and the routine, not on whether that routine is written with or without
 exception blocks, so the same refusal is in both whole-file drafts and in
 `draft.canonical()`, and the key changes. This argument is a claim, not a
-proof: PR 3 adds a test (a second file whose table variable takes the same
-name, with and without exception blocks) and any case where the whole-file
+proof: `tests/store.rs` has the case (a second file whose clash is lifted by
+an edit of another file) and any case where the whole-file
 drafts stay equal but the mix differs is a hole in the existing keys to fix
 before anything else.
 
@@ -191,8 +191,8 @@ no type reachable from `Draft` has a hand-written lossy `Debug` (or
 2. Separate the check code from `tree.rs` (a `sqldiff-check` crate) and the
    producers (`tsql`, `tok`, `table_vars`) into `sqldiff-draft`. No change in
    behaviour.
-3. Store the mix with the result, two fingerprints, closure tests, and the
-   tests that an edit in each place invalidates exactly what it should: an
+3. (Done, step 7.) Store the mix with the result, two fingerprints, closure
+   tests, and the tests that an edit in each place invalidates exactly what it should: an
    edit to `tsql` that changes only the mix, an edit to a pass-1-only file
    outside `tsql` (`refused.rs`), an edit to `ir` (drafts kept, results not),
    and the claims case above. This is the behaviour change.
@@ -240,3 +240,54 @@ without_continuation, with_plain_routines}` and `rewrite_in_tree*` are
 `pub`, and the places in `sqldiff-convert` that call into the draft crate are
 now visible as `sqldiff_draft::` paths (PR 3 turns that into a test: only
 the listed call sites may name the draft crate).
+
+## Step 7: two fingerprints, and the mix stored with the result (PR 3)
+
+This is the behaviour change of the plan.
+
+- `build.rs` writes two hashes. `ENGINE_FINGERPRINT` covers every crate
+  (`FINGERPRINTED_CRATES`) and keys the tree state, the stored drafts and the
+  instance cache, as before. `CHECK_FINGERPRINT` covers the same sources and
+  settings *except* the draft-only crates (`DRAFT_ONLY`: `sqldiff-draft`;
+  `CHECK_FINGERPRINTED_CRATES`) and keys the stored results. Everything the
+  check reads stays in it: syntax, catalog, model, equiv, units, core,
+  source and convert itself.
+- A result's key holds the draft by text (`Draft::canonical`), so an edit to
+  draft code that changes a draft changes the key, and one that leaves every
+  draft alone keeps the result: the expensive part (the check) is reused
+  after a rule tweak that does not change the output.
+- The one draft the key does not hold is the *mix* (`check::Mix`): the
+  routines written without exception blocks and the draft that came out,
+  which pass 2 builds through the `rebuild` callback and keeps only if it
+  beats both whole-file drafts. The mix is stored with the result **whenever
+  it was built**, also when it lost, because a mix that lost can win after an
+  edit of the draft code and the other way round. On reuse the mix is built
+  again (draft cost only, no check) and compared; a difference is a miss,
+  and a recorded mix with no `rebuild` available (a run under a review
+  ledger) is a miss too. The sampled re-check also compares the mix.
+  A result also records whether a mix could be tried when it was made
+  (`mix_tried`): not under a review ledger, where drafts are not built
+  again. A result stored without a try is not taken by a run that can try
+  one (it is checked again), so removing the ledger cannot bring back a
+  result that never had its mix looked at. A result stored by an older
+  build has key format 3 and is never found.
+- Cargo and tests enforce the boundary. `tests/engine_fingerprint.rs`
+  asserts that the check set is the converter's closure minus
+  `sqldiff-draft`, that the draft crate does not depend on core, convert or
+  source, and that only `sqldiff-convert` links it. `tests/stage_boundary.rs`
+  lists the files of `sqldiff-convert/src` that may name the draft crate or
+  call its entry points (`base.rs`, `lib.rs`, `refused.rs`, `template.rs`,
+  `tree.rs`; test modules left out): `check.rs`, `store.rs`, `review.rs` and
+  the rest must not.
+- Not claimed: the tree state and the stored drafts keep the full
+  fingerprint, because pass 1 (the catalog fold, `refused.rs`, claims) still
+  runs inside `tree.rs` and calls the draft code. A rule edit still rebuilds
+  them. Moving that is a later step and needs its own stage list.
+
+Tests: `tree::mix_reuse` (real mixes, through a test-only marker
+`check::FORCE_MIX` because no corpus input builds one: stored, reused,
+missed when the rebuilt draft differs, missed across a review ledger both
+ways, and the re-check failing on a mix that differs), `tests/store.rs` (a stored mix the code no longer builds is a miss;
+a clash lifted by an edit of another file changes the other file's stored
+result and equals a fresh run), `tests/engine_fingerprint.rs`,
+`tests/stage_boundary.rs`.

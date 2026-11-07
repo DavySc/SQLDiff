@@ -766,6 +766,7 @@ fn convert_kept(
         (Some(fresh), Some(o), None) => Some(Cache {
             store: crate::store::Store::of(o),
             build: crate::instances::build_hash()?,
+            check_build: crate::instances::check_build_hash(),
             fresh,
         }),
         _ => None,
@@ -834,7 +835,7 @@ fn convert_kept(
         let mut c = match held {
             Held::Whole(c) => *c,
             Held::Stored { key, .. } => match cache.as_ref().and_then(|c| c.store.get(&key)) {
-                Some(c) => c,
+                Some((c, ..)) => c,
                 None => {
                     return Err(format!(
                         "the stored result {} is gone or unreadable; run again",
@@ -1443,7 +1444,7 @@ fn convert_files(
             |(i, d)| {
                 Some(
                     crate::store::CheckInput {
-                        build: &c.build,
+                        build: &c.check_build,
                         from: a.from,
                         to: a.to,
                         trim: false,
@@ -1533,8 +1534,45 @@ fn convert_files(
         if hooks.cancelled() {
             return None;
         }
+        let rebuild = |plain_at: &[usize]| {
+            let claims = claims.get_or_init(|| {
+                sqldiff_draft::table_vars::Claims::of(
+                    inputs.iter().map(|i| (i.rel.as_str(), i.text.as_str())),
+                    a.from,
+                )
+            });
+            crate::rewrite_in_tree_plain(
+                &input.text,
+                a.from,
+                a.to,
+                opts.facts_a.first().map(|c| c.as_ref()),
+                Some(claims),
+                a.rules,
+                plain_at,
+            )
+        };
+        // Hand-written output replaces the rules' draft: not built again.
+        let rebuild: Option<crate::Rebuild> = ledger.is_none().then_some(&rebuild);
+        // A stored result is taken only if the mix of draft variants built
+        // for it is still what the draft code builds: the draft code is not
+        // part of the result's fingerprint (`CHECK_FINGERPRINT`), so a mix
+        // that lost before can win now, or the other way. A mix is built
+        // again from the stored routines (pass-1 cost, no check) and
+        // compared; anything else is a miss and the file is checked again.
         let stored = match (cache, key) {
-            (Some(c), Some(k)) if !c.fresh => c.store.get(k).map(|r| (c, k, r)),
+            (Some(c), Some(k)) if !c.fresh => c.store.get(k).and_then(|(r, mix, tried)| {
+                let same = match (&mix, rebuild) {
+                    // No mix was built. That says something only if one
+                    // could have been tried; a result stored under a
+                    // review ledger could not, so a run without one
+                    // checks the file again.
+                    (None, Some(_)) => tried,
+                    (None, None) => true,
+                    (Some(m), Some(rb)) => rb(&m.plain_at).canonical() == m.draft,
+                    (Some(_), None) => false,
+                };
+                same.then_some((c, k, r, mix))
+            }),
             _ => None,
         };
         if stored.is_none() && in_increment.as_ref().is_some_and(|m| !m[idx]) {
@@ -1597,7 +1635,7 @@ fn convert_files(
                     _ => Held::Whole(Box::new(c)),
                 }
             };
-        if let Some((_, k, conv)) = &stored {
+        if let Some((_, k, conv, _)) = &stored {
             if !sample.contains(&idx) {
                 let mut conv = conv.clone();
                 finish.apply(&mut conv);
@@ -1607,33 +1645,14 @@ fn convert_files(
             }
         }
         let t = Instant::now();
-        let rebuild = |plain_at: &[usize]| {
-            let claims = claims.get_or_init(|| {
-                sqldiff_draft::table_vars::Claims::of(
-                    inputs.iter().map(|i| (i.rel.as_str(), i.text.as_str())),
-                    a.from,
-                )
-            });
-            crate::rewrite_in_tree_plain(
-                &input.text,
-                a.from,
-                a.to,
-                opts.facts_a.first().map(|c| c.as_ref()),
-                Some(claims),
-                a.rules,
-                plain_at,
-            )
-        };
-        // Hand-written output replaces the rules' draft: not built again.
-        let rebuild: Option<crate::Rebuild> = ledger.is_none().then_some(&rebuild);
-        let mut c = crate::check_with(&input.text, draft, &opts, rebuild);
+        let (mut c, mix) = crate::check_with_mix(&input.text, draft, &opts, rebuild);
         // Shared but whole while it is compared and stored; trimmed after.
         finish.share(&mut c);
         let secs = t.elapsed().as_secs_f64();
-        if let Some((cc, k, old)) = &stored {
+        if let Some((cc, k, old, old_mix)) = &stored {
             let mut old = old.clone();
             finish.share(&mut old);
-            if !crate::store::compare(&old, &c) {
+            if !crate::store::compare(&old, &c) || *old_mix != mix {
                 cc.store.bundle(k, &old, &c);
                 mismatch.lock().unwrap().push(format!(
                     "{}: the stored result {} differs from a fresh check of the same input; \
@@ -1647,7 +1666,7 @@ fn convert_files(
         }
         let mut in_store = false;
         if let (Some(cc), Some(k)) = (cache, key) {
-            match cc.store.put(k, &c) {
+            match cc.store.put(k, &c, mix.as_ref(), rebuild.is_some()) {
                 Ok(()) => in_store = true,
                 Err(e) => eprintln!("sqldiff: result not stored: {e}"),
             }
@@ -1695,7 +1714,10 @@ enum Held {
 /// The result store of this run and what every key holds besides the file.
 struct Cache {
     store: crate::store::Store,
+    /// The whole engine's fingerprint: keys the tree state and drafts.
     build: String,
+    /// The check stage's: keys the results (`CHECK_FINGERPRINT`).
+    check_build: String,
     /// Reuse nothing; store every result again.
     fresh: bool,
 }
@@ -3512,7 +3534,7 @@ pub fn dir_hash(dir: &Path) -> Result<String, String> {
 mod tree_state_tests {
     use super::*;
 
-    fn args(src: &Path) -> Args {
+    pub(super) fn args(src: &Path) -> Args {
         Args {
             rules: Default::default(),
             src: src.to_path_buf(),
@@ -3699,5 +3721,271 @@ mod tree_state_tests {
         store.drop_drafts();
         assert!(!out.join(".sqldiff").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A stored result and the mix of draft variants built for it. No input of
+/// the corpora builds a mix, so these tests use the test-only marker
+/// `check::FORCE_MIX`, which has the check try one (kept only if it scores
+/// better, as always).
+#[cfg(test)]
+mod mix_reuse {
+    use super::*;
+    use crate::job::{convert_into, Job};
+
+    const TABLES: &str = "CREATE TABLE dbo.A (Id int NOT NULL PRIMARY KEY, Qty int NOT NULL);
+CREATE TABLE dbo.B (Id int NOT NULL PRIMARY KEY, Qty int NOT NULL);
+";
+    const PROCS: &str = "CREATE PROCEDURE dbo.First @Id int AS
+BEGIN
+    INSERT dbo.A (Id, Qty) VALUES (@Id, 1);
+    UPDATE dbo.B SET Qty = Qty + 1 WHERE Id = @Id;
+END;
+GO
+CREATE PROCEDURE dbo.Second @Id int AS
+BEGIN
+    INSERT dbo.B (Id, Qty) VALUES (@Id, 1);
+    UPDATE dbo.A SET Qty = Qty + 1 WHERE Id = @Id;
+END;
+";
+
+    struct Fixture {
+        dir: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(name: &str, marker: bool) -> Fixture {
+            let dir =
+                std::env::temp_dir().join(format!("sqldiff-mix-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(dir.join("src/tables.sql"), TABLES).unwrap();
+            let procs = if marker {
+                format!("{PROCS}\n{}\n", crate::check::FORCE_MIX)
+            } else {
+                PROCS.to_string()
+            };
+            std::fs::write(dir.join("src/procs.sql"), procs).unwrap();
+            Fixture { dir }
+        }
+
+        fn out(&self) -> PathBuf {
+            self.dir.join("o")
+        }
+
+        fn run(&self, first: bool) {
+            let job = Job {
+                tree: Args {
+                    src: self.dir.join("src"),
+                    recheck: Recheck::None,
+                    ..super::tree_state_tests::args(&self.dir.join("src"))
+                },
+                out: self.out(),
+                overwrite: !first,
+                discard_edits: false,
+                fresh: false,
+                select: Default::default(),
+                instances: None,
+                queue_all: false,
+                proof: Default::default(),
+                row_counts: false,
+            };
+            convert_into(&job, &Default::default()).unwrap();
+        }
+
+        /// The stored result files, parsed.
+        fn results(&self) -> Vec<(PathBuf, serde_json::Value)> {
+            let dir = self.out().join(".sqldiff/results");
+            let mut v: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .map(|e| {
+                    let raw = std::fs::read(e.path()).unwrap();
+                    (e.path(), serde_json::from_slice(&raw[65..]).unwrap())
+                })
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        }
+
+        /// The result with a mix, if exactly one has.
+        fn with_mix(&self) -> Option<(PathBuf, serde_json::Value)> {
+            let mut m: Vec<_> = self
+                .results()
+                .into_iter()
+                .filter(|(_, e)| !e["mix"].is_null())
+                .collect();
+            (m.len() == 1).then(|| m.remove(0))
+        }
+
+        fn write(&self, p: &Path, v: &serde_json::Value) {
+            std::fs::write(p, crate::store::framed(&serde_json::to_vec(v).unwrap())).unwrap();
+        }
+
+        fn reused(&self, file: &str) -> bool {
+            let r: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(self.out().join("conversion-report.json")).unwrap(),
+            )
+            .unwrap();
+            r["run"]["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["path"] == file)
+                .unwrap_or_else(|| panic!("no {file} in the report"))["reused"]
+                .as_bool()
+                .unwrap_or(false)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn a_mix_that_was_built_is_stored_with_the_result_and_reused() {
+        let f = Fixture::new("stored", true);
+        f.run(true);
+        let (_, e) = f
+            .with_mix()
+            .expect("one result holds the mix that was built");
+        assert_eq!(e["mix_tried"], true);
+        assert!(e["mix"]["plain_at"].is_array());
+        assert!(e["mix"]["draft"].as_str().is_some_and(|d| !d.is_empty()));
+        // The mix is stored whether it won or lost; an untouched rerun takes
+        // the result as stored.
+        f.run(false);
+        assert!(f.reused("procs.sql"));
+        // A file the marker is not in builds no mix.
+        let g = Fixture::new("none", false);
+        g.run(true);
+        assert!(g.with_mix().is_none());
+        assert!(g.results().iter().all(|(_, e)| e["mix_tried"] == true));
+    }
+
+    #[test]
+    fn a_stored_mix_that_the_draft_code_builds_differently_is_a_miss() {
+        let f = Fixture::new("changed", true);
+        f.run(true);
+        let (p, mut e) = f.with_mix().unwrap();
+        let built = e["mix"]["draft"].clone();
+        e["mix"]["draft"] = "-- a draft the code no longer builds".into();
+        f.write(&p, &e);
+        f.run(false);
+        assert!(
+            !f.reused("procs.sql"),
+            "reused with a mix the code does not build"
+        );
+        // Stored again as the code builds it.
+        assert_eq!(f.with_mix().unwrap().1["mix"]["draft"], built);
+        f.run(false);
+        assert!(f.reused("procs.sql"));
+    }
+
+    #[test]
+    fn a_result_stored_under_a_review_ledger_is_not_taken_without_one_and_the_other_way() {
+        let f = Fixture::new("ledger", true);
+        f.run(true);
+        assert!(f.with_mix().is_some());
+        // A run under a (here empty) ledger builds no drafts again, so it
+        // cannot use a result that records a mix.
+        let ledger = f.out().join(crate::review::LEDGER_FILE);
+        std::fs::write(&ledger, "").unwrap();
+        f.run(false);
+        assert!(!f.reused("procs.sql"), "a mix was taken under a ledger");
+        assert!(f.with_mix().is_none());
+        // Only the checked file was stored again, without a try; the other
+        // result had no mix to doubt and stayed.
+        assert_eq!(
+            f.results()
+                .iter()
+                .filter(|(_, e)| e["mix_tried"] == false)
+                .count(),
+            1
+        );
+        // Without the ledger the result stored under it says nothing about
+        // a mix: the file is checked again and the mix is found.
+        std::fs::remove_file(&ledger).unwrap();
+        f.run(false);
+        assert!(!f.reused("procs.sql"), "a result without a try was taken");
+        assert!(f.with_mix().is_some());
+        f.run(false);
+        assert!(f.reused("procs.sql"));
+    }
+
+    #[test]
+    fn the_recheck_compares_the_mix_as_well_as_the_result() {
+        // A result that says no mix was built where a fresh check builds
+        // one: same draft, same conversion, only the mix differs. The
+        // re-check (`--recheck all`) must fail the run on it.
+        let f = Fixture::new("recheck", true);
+        f.run(true);
+        let (p, mut e) = f.with_mix().unwrap();
+        e["mix"] = serde_json::Value::Null;
+        f.write(&p, &e);
+        let job = Job {
+            tree: Args {
+                recheck: Recheck::All,
+                ..super::tree_state_tests::args(&f.dir.join("src"))
+            },
+            out: f.out(),
+            overwrite: true,
+            discard_edits: false,
+            fresh: false,
+            select: Default::default(),
+            instances: None,
+            queue_all: false,
+            proof: Default::default(),
+            row_counts: false,
+        };
+        let err = convert_into(&job, &Default::default())
+            .err()
+            .expect("a mix that differs fails the re-check");
+        assert!(err.contains("differs from a fresh check"), "{err}");
+    }
+
+    #[test]
+    fn a_stored_review_conversion_follows_the_same_mix_rules() {
+        // `convert_for_review_stored` shares the result store with a run:
+        // it takes a result with its mix when it can build the mix again,
+        // and under a review ledger (no rebuild) it takes none.
+        let f = Fixture::new("review", true);
+        f.run(true);
+        assert!(f.with_mix().is_some());
+        let args = Args {
+            recheck: Recheck::None,
+            ..super::tree_state_tests::args(&f.dir.join("src"))
+        };
+        let review = || {
+            let (inputs, unreadable) = read(&args).unwrap();
+            let t =
+                convert_for_review_stored(&args, &inputs, unreadable, &f.out(), &Hooks::default())
+                    .unwrap();
+            t.report
+                .run
+                .files
+                .iter()
+                .find(|x| x.path == "procs.sql")
+                .unwrap()
+                .reused
+        };
+        assert!(
+            review(),
+            "an untouched review did not reuse the stored result"
+        );
+        assert!(f.with_mix().is_some());
+        let ledger = f.out().join(crate::review::LEDGER_FILE);
+        std::fs::write(&ledger, "").unwrap();
+        assert!(
+            !review(),
+            "a review under a ledger took a result with a mix"
+        );
+        assert!(f.with_mix().is_none());
+        std::fs::remove_file(&ledger).unwrap();
+        assert!(!review(), "a review took a result stored without a try");
+        assert!(f.with_mix().is_some());
+        assert!(review());
     }
 }

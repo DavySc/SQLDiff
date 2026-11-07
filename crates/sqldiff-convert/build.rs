@@ -25,6 +25,11 @@ const CRATES: &[&str] = &[
     "sqldiff-convert",
 ];
 
+/// Crates only the draft stage runs. A stored result is not keyed by their
+/// code (its draft is, by text, and the mix is rebuilt and compared on
+/// reuse: see `check::Mix`), so [`CHECK_FINGERPRINT`] leaves them out.
+const DRAFT_ONLY: &[&str] = &["sqldiff-draft"];
+
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -65,34 +70,53 @@ fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let crates_dir = manifest.parent().unwrap().to_path_buf();
     let root = crates_dir.parent().unwrap().to_path_buf();
+    // The whole-engine fingerprint (tree state, drafts) and the one of the
+    // check (results): the second leaves out the draft-only crates.
     let mut h = Sha256::new();
-    let mut put = |label: &str, bytes: &[u8]| {
-        h.update((label.len() as u64).to_le_bytes());
-        h.update(label.as_bytes());
-        h.update((bytes.len() as u64).to_le_bytes());
-        h.update(bytes);
+    let mut hc = Sha256::new();
+    let mut put = |label: &str, bytes: &[u8], in_check: bool| {
+        for h in [&mut h].into_iter().chain(in_check.then_some(&mut hc)) {
+            h.update((label.len() as u64).to_le_bytes());
+            h.update(label.as_bytes());
+            h.update((bytes.len() as u64).to_le_bytes());
+            h.update(bytes);
+        }
     };
-    let mut files: Vec<PathBuf> = Vec::new();
+    // (path, belongs to the check stage)
+    let mut files: Vec<(PathBuf, bool)> = Vec::new();
     for c in CRATES {
-        walk(&crates_dir.join(c), &mut files);
+        let mut v = Vec::new();
+        walk(&crates_dir.join(c), &mut v);
+        let in_check = !DRAFT_ONLY.contains(c);
+        files.extend(v.into_iter().map(|p| (p, in_check)));
     }
-    let mut extra: Vec<PathBuf> = Vec::new();
-    for f in &files {
+    let mut extra: Vec<(PathBuf, bool)> = Vec::new();
+    for (f, in_check) in &files {
         println!("cargo:rerun-if-changed={}", f.display());
         if f.extension().is_some_and(|e| e == "rs") {
             if let Ok(t) = std::fs::read_to_string(f) {
-                includes(f, &t, &mut extra);
+                let mut inc = Vec::new();
+                includes(f, &t, &mut inc);
+                extra.extend(inc.into_iter().map(|p| (p, *in_check)));
             }
         }
     }
     // Compile-time includes that live outside the crates' own folders.
-    extra.retain(|p| !CRATES.iter().any(|c| p.starts_with(crates_dir.join(c))));
+    extra.retain(|(p, _)| !CRATES.iter().any(|c| p.starts_with(crates_dir.join(c))));
     extra.sort();
-    extra.dedup();
-    for p in extra.iter() {
+    // A file that both stages include counts for the check.
+    extra.dedup_by(|b, a| {
+        if a.0 == b.0 {
+            a.1 |= b.1;
+            true
+        } else {
+            false
+        }
+    });
+    for (p, _) in extra.iter() {
         println!("cargo:rerun-if-changed={}", p.display());
     }
-    for p in files.iter().chain(extra.iter()) {
+    for (p, in_check) in files.iter().chain(extra.iter()) {
         let rel = p
             .strip_prefix(&root)
             .map(|r| r.to_string_lossy().replace('\\', "/"))
@@ -100,18 +124,22 @@ fn main() {
         // Line ends do not count: a Windows checkout is the same engine.
         let bytes = std::fs::read(p).unwrap_or_default();
         let bytes: Vec<u8> = bytes.iter().copied().filter(|b| *b != b'\r').collect();
-        put(&rel, &bytes);
+        put(&rel, &bytes, *in_check);
     }
     let lock = root.join("Cargo.lock");
     println!("cargo:rerun-if-changed={}", lock.display());
-    put("Cargo.lock", &std::fs::read(&lock).unwrap_or_default());
+    put(
+        "Cargo.lock",
+        &std::fs::read(&lock).unwrap_or_default(),
+        true,
+    );
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let version = std::process::Command::new(rustc)
         .arg("-vV")
         .output()
         .map(|o| o.stdout)
         .unwrap_or_default();
-    put("rustc", &version);
+    put("rustc", &version, true);
     for key in [
         "TARGET",
         "PROFILE",
@@ -119,22 +147,29 @@ fn main() {
         "DEBUG",
         "CARGO_CFG_TARGET_FEATURE",
     ] {
-        put(key, std::env::var(key).unwrap_or_default().as_bytes());
+        put(key, std::env::var(key).unwrap_or_default().as_bytes(), true);
     }
     let mut features: Vec<String> = std::env::vars()
         .filter(|(k, _)| k.starts_with("CARGO_FEATURE_"))
         .map(|(k, _)| k)
         .collect();
     features.sort();
-    put("features", features.join(",").as_bytes());
+    put("features", features.join(",").as_bytes(), true);
     let digest: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let check_digest: String = hc.finalize().iter().map(|b| format!("{b:02x}")).collect();
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("fingerprint.rs");
     let list: Vec<String> = CRATES.iter().map(|c| format!("{c:?}")).collect();
+    let check_list: Vec<String> = CRATES
+        .iter()
+        .filter(|c| !DRAFT_ONLY.contains(c))
+        .map(|c| format!("{c:?}"))
+        .collect();
     std::fs::write(
         out,
         format!(
-            "/// Hash of the sources and settings that decide a conversion result.\npub const ENGINE_FINGERPRINT: &str = {digest:?};\n/// The workspace crates it covers.\npub const FINGERPRINTED_CRATES: &[&str] = &[{}];\n",
-            list.join(", ")
+            "/// Hash of the sources and settings that decide a conversion result.\npub const ENGINE_FINGERPRINT: &str = {digest:?};\n/// The workspace crates it covers.\npub const FINGERPRINTED_CRATES: &[&str] = &[{}];\n/// The same for the check stage, which leaves out the draft-only crates: what a stored result is keyed by (its draft is in the key by text).\npub const CHECK_FINGERPRINT: &str = {check_digest:?};\n/// The workspace crates it covers.\npub const CHECK_FINGERPRINTED_CRATES: &[&str] = &[{}];\n",
+            list.join(", "),
+            check_list.join(", ")
         ),
     )
     .unwrap();

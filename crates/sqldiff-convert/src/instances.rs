@@ -708,6 +708,16 @@ pub(crate) fn build_hash() -> Result<String, String> {
     Ok(crate::ENGINE_FINGERPRINT.to_string())
 }
 
+/// What decides a stored *result*: the fingerprint of the check stage
+/// (`CHECK_FINGERPRINT`), which leaves out the draft-only crates. The
+/// result's key holds the draft by text, and the part of the draft the key
+/// does not hold (the mix) is stored with the result and rebuilt on reuse
+/// (`check::Mix`), so an edit to draft code alone cannot make a stale
+/// result count.
+pub(crate) fn check_build_hash() -> String {
+    crate::CHECK_FINGERPRINT.to_string()
+}
+
 /// Everything an instance's checks read besides the instance itself.
 fn run_fingerprint(
     a: &Args,
