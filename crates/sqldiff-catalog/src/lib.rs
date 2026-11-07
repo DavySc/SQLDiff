@@ -9,6 +9,7 @@
 
 pub mod builtins;
 pub mod ddl;
+pub mod tokens;
 pub mod types;
 
 use serde::{Deserialize, Serialize};
@@ -363,6 +364,158 @@ impl Trigger {
     }
 }
 
+/// Positions of a catalog's tables and routines by name key, so a name is
+/// found without scanning (and without a `String` per element) and a bulk
+/// load is linear. Valid only while the catalog changes through this index
+/// (`put_table`, `put_routine`) or in ways that keep every name; the list
+/// order is the catalog's own, the index never reorders anything.
+#[derive(Debug, Clone, Default)]
+pub struct NameIndex {
+    tables: std::collections::BTreeMap<String, Vec<usize>>,
+    routines: std::collections::BTreeMap<String, Vec<usize>>,
+}
+
+impl NameIndex {
+    /// The index of `cat` as it is now.
+    pub fn new(dialect: Dialect, cat: &Catalog) -> NameIndex {
+        let mut ix = NameIndex::default();
+        for (i, t) in cat.tables.iter().enumerate() {
+            ix.tables.entry(key(dialect, &t.name)).or_default().push(i);
+        }
+        for (i, r) in cat.routines.iter().enumerate() {
+            ix.routines
+                .entry(key(dialect, &r.name))
+                .or_default()
+                .push(i);
+        }
+        ix
+    }
+
+    /// [`Catalog::put_table`], through the index.
+    pub fn put_table(&mut self, dialect: Dialect, cat: &mut Catalog, t: Table) {
+        let k = table_identity(dialect, &t);
+        let same: Vec<usize> = self
+            .tables
+            .get(&k.1)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&i| table_identity(dialect, &cat.tables[i]) == k)
+            .collect();
+        if same.is_empty() {
+            self.tables.entry(k.1).or_default().push(cat.tables.len());
+            cat.tables.push(t);
+            return;
+        }
+        // A replaced table moves to the end, as `Catalog::put_table` does.
+        remove_at(&same, &mut cat.tables);
+        shift_after_removal(&mut self.tables, &same);
+        self.tables.entry(k.1).or_default().push(cat.tables.len());
+        cat.tables.push(t);
+    }
+
+    /// [`Catalog::put_routine`], through the index.
+    pub fn put_routine(&mut self, dialect: Dialect, cat: &mut Catalog, r: Routine) {
+        let k = routine_identity(dialect, &r);
+        let same: Vec<usize> = self
+            .routines
+            .get(&k.1)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&i| routine_identity(dialect, &cat.routines[i]) == k)
+            .collect();
+        if same.is_empty() {
+            self.routines
+                .entry(k.1)
+                .or_default()
+                .push(cat.routines.len());
+            cat.routines.push(r);
+            return;
+        }
+        remove_at(&same, &mut cat.routines);
+        shift_after_removal(&mut self.routines, &same);
+        self.routines
+            .entry(k.1)
+            .or_default()
+            .push(cat.routines.len());
+        cat.routines.push(r);
+    }
+
+    /// [`table_position`] without the scan.
+    pub fn table_position(&self, d: Dialect, cat: &Catalog, parts: &[Ident]) -> Option<usize> {
+        let (schema, name) = match parts {
+            [n] => (None, n),
+            [s, n] => (Some(s), n),
+            _ => return None,
+        };
+        self.tables
+            .get(&name.key(d))?
+            .iter()
+            .copied()
+            .find(|&i| schema_matches(d, cat.tables[i].schema.as_deref(), schema))
+    }
+
+    /// Positions of the routines named `name` (a key), in list order.
+    fn routines_named(&self, name: &str) -> &[usize] {
+        self.routines.get(name).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// Removes the elements at `gone` (ascending positions) from `v`.
+fn remove_at<T>(gone: &[usize], v: &mut Vec<T>) {
+    let mut at = 0;
+    let mut next = gone.iter().peekable();
+    v.retain(|_| {
+        let keep = next.peek() != Some(&&at);
+        if !keep {
+            next.next();
+        }
+        at += 1;
+        keep
+    });
+}
+
+/// Brings positions up to date after the elements at `gone` (ascending) were
+/// removed from the list: a position moves down by the removed ones before it.
+fn shift_after_removal(map: &mut std::collections::BTreeMap<String, Vec<usize>>, gone: &[usize]) {
+    for list in map.values_mut() {
+        list.retain(|i| gone.binary_search(i).is_err());
+        for i in list.iter_mut() {
+            *i -= gone.partition_point(|&g| g < *i);
+        }
+    }
+    map.retain(|_, l| !l.is_empty());
+}
+
+/// What makes two tables the same one: the schema and name keys.
+fn table_identity(dialect: Dialect, t: &Table) -> (Option<String>, String) {
+    (
+        t.schema.as_deref().map(|s| key(dialect, s)),
+        key(dialect, &t.name),
+    )
+}
+
+/// What makes two routines the same one: schema and name keys, parameter
+/// count, and in PostgreSQL the parameter types too (its routines are
+/// identified by them; lengths, precision and scale are not part of it).
+fn routine_identity(dialect: Dialect, r: &Routine) -> (Option<String>, String, usize, Vec<String>) {
+    let types = if dialect == Dialect::Postgres {
+        r.call_params(dialect)
+            .iter()
+            .map(|p| p.data_type.base.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (
+        r.schema.as_deref().map(|s| key(dialect, s)),
+        key(dialect, &r.name),
+        r.params.len(),
+        types,
+    )
+}
+
 impl Catalog {
     pub fn is_empty(&self) -> bool {
         self.tables.is_empty()
@@ -401,65 +554,34 @@ impl Catalog {
 
     /// Adds or replaces a table (same schema and name).
     pub fn put_table(&mut self, dialect: Dialect, t: Table) {
-        let k = (
-            t.schema.as_deref().map(|s| key(dialect, s)),
-            key(dialect, &t.name),
-        );
-        self.tables.retain(|x| {
-            (
-                x.schema.as_deref().map(|s| key(dialect, s)),
-                key(dialect, &x.name),
-            ) != k
-        });
+        let k = table_identity(dialect, &t);
+        self.tables.retain(|x| table_identity(dialect, x) != k);
         self.tables.push(t);
     }
 
+    /// Adds or replaces a routine. Overloads are kept apart by parameter
+    /// count, and in PostgreSQL by the parameter types too.
     pub fn put_routine(&mut self, dialect: Dialect, r: Routine) {
-        // Overloads are kept apart by parameter count, and in PostgreSQL by
-        // the parameter types too (its routines are identified by them).
-        let types = |r: &Routine| -> Vec<String> {
-            if dialect != Dialect::Postgres {
-                return Vec::new();
-            }
-            r.call_params(dialect)
-                .iter()
-                // Lengths, precision and scale are not part of it.
-                .map(|p| p.data_type.base.clone())
-                .collect()
-        };
-        let k = (
-            r.schema.as_deref().map(|s| key(dialect, s)),
-            key(dialect, &r.name),
-            r.params.len(),
-            types(&r),
-        );
-        self.routines.retain(|x| {
-            (
-                x.schema.as_deref().map(|s| key(dialect, s)),
-                key(dialect, &x.name),
-                x.params.len(),
-                types(x),
-            ) != k
-        });
+        let k = routine_identity(dialect, &r);
+        self.routines.retain(|x| routine_identity(dialect, x) != k);
         self.routines.push(r);
     }
 
     pub fn extend(&mut self, dialect: Dialect, other: &Catalog) {
+        let mut ix = NameIndex::new(dialect, self);
         for t in &other.tables {
-            self.put_table(dialect, t.clone());
+            ix.put_table(dialect, self, t.clone());
         }
         for r in &other.routines {
-            self.put_routine(dialect, r.clone());
+            ix.put_routine(dialect, self, r.clone());
         }
         for t in &other.triggers {
             self.put_trigger(t.clone());
         }
+        let mut known: std::collections::HashSet<String> =
+            self.schemas.iter().map(|x| key(dialect, x)).collect();
         for s in &other.schemas {
-            if !self
-                .schemas
-                .iter()
-                .any(|x| key(dialect, x) == key(dialect, s))
-            {
+            if known.insert(key(dialect, s)) {
                 self.schemas.push(s.clone());
             }
         }
@@ -518,6 +640,10 @@ pub struct CatalogView {
     pub supplied: bool,
     /// Origins of the supplied catalogs, for witnesses.
     pub origins: Vec<String>,
+    /// Name positions in `catalog` as built, and the sizes they were built
+    /// for: a catalog edited afterwards is searched by scanning instead.
+    index: NameIndex,
+    indexed: (usize, usize),
 }
 
 impl CatalogView {
@@ -530,11 +656,15 @@ impl CatalogView {
                 origins.push(c.origin.clone());
             }
         }
+        let index = NameIndex::new(dialect, &catalog);
+        let indexed = (catalog.tables.len(), catalog.routines.len());
         CatalogView {
             dialect,
             supplied: !sources.is_empty(),
             catalog,
             origins,
+            index,
+            indexed,
         }
     }
 
@@ -585,7 +715,13 @@ impl CatalogView {
             [s, _] => Some(s),
             _ => return Lookup::OutOfScope,
         };
-        if let Some(i) = table_position(self.dialect, &self.catalog, parts) {
+        let found = if self.indexed.0 == self.catalog.tables.len() {
+            self.index
+                .table_position(self.dialect, &self.catalog, parts)
+        } else {
+            table_position(self.dialect, &self.catalog, parts)
+        };
+        if let Some(i) = found {
             return Lookup::Found(&self.catalog.tables[i]);
         }
         match schema {
@@ -603,12 +739,20 @@ impl CatalogView {
             _ => return Lookup::OutOfScope,
         };
         let k = name.key(d);
-        let found: Vec<&Routine> = self
-            .catalog
-            .routines
-            .iter()
-            .filter(|r| key(d, &r.name) == k && schema_matches(d, r.schema.as_deref(), schema))
-            .collect();
+        let found: Vec<&Routine> = if self.indexed.1 == self.catalog.routines.len() {
+            self.index
+                .routines_named(&k)
+                .iter()
+                .map(|&i| &self.catalog.routines[i])
+                .filter(|r| schema_matches(d, r.schema.as_deref(), schema))
+                .collect()
+        } else {
+            self.catalog
+                .routines
+                .iter()
+                .filter(|r| key(d, &r.name) == k && schema_matches(d, r.schema.as_deref(), schema))
+                .collect()
+        };
         if !found.is_empty() {
             return Lookup::Found(found);
         }
@@ -664,6 +808,91 @@ mod tests {
         assert!(matches!(
             ts.table(&[Ident::plain("sales"), Ident::plain("stock")]),
             Lookup::NoSchema(_)
+        ));
+    }
+
+    /// Putting through the index gives the same catalog, in the same order,
+    /// as the plain puts: a replaced table moves to the end, overloads stay.
+    #[test]
+    fn indexed_puts_equal_plain_puts() {
+        for d in [Dialect::Tsql, Dialect::Postgres, Dialect::Db2i] {
+            let order = [
+                (None, "a"),
+                (Some("s"), "b"),
+                (None, "A"),
+                (None, "c"),
+                (Some("s"), "b"),
+                (None, "a"),
+                (Some("S"), "b"),
+                (None, "c"),
+            ];
+            let table = |n: usize| {
+                let (s, name) = order[n];
+                let mut t = Table::new(s.map(String::from), name.to_string(), TableKind::Table);
+                t.star_outputs = n % 2 == 0; // tells the puts apart
+                t
+            };
+            let (mut plain, mut via) = (Catalog::default(), Catalog::default());
+            let mut ix = NameIndex::new(d, &via);
+            for n in 0..order.len() {
+                plain.put_table(d, table(n));
+                ix.put_table(d, &mut via, table(n));
+                assert_eq!(
+                    format!("{:?}", plain.tables),
+                    format!("{:?}", via.tables),
+                    "{d:?} {n}"
+                );
+            }
+            let (f1, f2) = (ddl::load("CREATE FUNCTION f(p int) RETURNS int AS 'x'; CREATE FUNCTION f(p text) RETURNS int AS 'x'; CREATE FUNCTION f(p int) RETURNS int AS 'y'; CREATE FUNCTION f(a int, b int) RETURNS int AS 'z';", d, "t"), Catalog::default());
+            let _ = f2;
+            let (mut plain, mut via) = (Catalog::default(), Catalog::default());
+            let mut ix = NameIndex::new(d, &via);
+            for r in f1.routines.iter().chain(&f1.routines) {
+                plain.put_routine(d, r.clone());
+                ix.put_routine(d, &mut via, r.clone());
+                assert_eq!(
+                    format!("{:?}", plain.routines),
+                    format!("{:?}", via.routines),
+                    "{d:?}"
+                );
+            }
+            // Lookups through the view agree with a scan.
+            let v = CatalogView::new(d, &[&plain]);
+            for r in &plain.routines {
+                let Lookup::Found(found) = v.routines(&[Ident::new(r.name.clone(), true)]) else {
+                    continue;
+                };
+                let scan: Vec<&Routine> = plain
+                    .routines
+                    .iter()
+                    .filter(|x| key(d, &x.name) == key(d, &r.name))
+                    .collect();
+                assert_eq!(found.len(), scan.len(), "{d:?} {}", r.name);
+            }
+        }
+    }
+
+    /// A catalog of thousands of tables loads in linear time: the old
+    /// replace-by-scan made this quadratic (and allocated per element).
+    #[test]
+    fn a_large_catalog_loads_and_looks_up_fast() {
+        let n = 20_000;
+        let ddl: String = (0..n)
+            .map(|i| format!("CREATE TABLE s{}.t{i} (id int);\n", i % 7))
+            .collect();
+        let c = ddl::load(&ddl, Dialect::Tsql, "big");
+        assert_eq!(c.tables.len(), n);
+        let v = CatalogView::new(Dialect::Tsql, &[&c]);
+        for i in (0..n).step_by(997) {
+            let parts = [
+                Ident::plain(format!("s{}", i % 7)),
+                Ident::plain(format!("t{i}")),
+            ];
+            assert!(matches!(v.table(&parts), Lookup::Found(_)), "t{i}");
+        }
+        assert!(matches!(
+            v.table(&[Ident::plain("s0"), Ident::plain("nope")]),
+            Lookup::NotFound
         ));
     }
 }

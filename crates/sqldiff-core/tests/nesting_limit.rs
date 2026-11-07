@@ -138,3 +138,29 @@ fn a_long_else_if_chain_is_still_compared() {
     );
     assert_eq!(r.verdict(), Verdict::Different, "{:?}", r.unknown_reasons);
 }
+
+/// One nest past the limit is one diagnostic, not one "expected END" for
+/// each of the statements around it.
+#[test]
+fn a_nest_past_the_limit_is_reported_once() {
+    let n = 1100;
+    let text = format!(
+        "CREATE PROCEDURE dbo.p AS\n{}SELECT 1;\n{}",
+        "BEGIN\n".repeat(n),
+        "END\n".repeat(n)
+    );
+    let r = run(text.clone(), text.replace("SELECT 1", "SELECT 2"));
+    let deep = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.message.contains("nesting too deep"))
+        .count();
+    // One for each side; no "expected END" noise.
+    assert!(deep >= 1, "{:?}", r.diagnostics.len());
+    assert!(
+        r.diagnostics.len() <= 4,
+        "{} diagnostics: {:?}",
+        r.diagnostics.len(),
+        r.diagnostics.iter().take(3).collect::<Vec<_>>()
+    );
+}

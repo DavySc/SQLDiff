@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 /// `sqldiff-convert`'s path dependencies (a test checks it).
 const CRATES: &[&str] = &[
     "sqldiff-syntax",
+    "sqldiff-catalog",
     "sqldiff-core",
     "sqldiff-source",
     "sqldiff-convert",

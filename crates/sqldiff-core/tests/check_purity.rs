@@ -70,8 +70,8 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ),
     ("sqldiff-core/src/assumptions.rs", &["OnceLock"]),
     ("sqldiff-syntax/src/abstract_syntax.rs", &["thread_local!"]),
-    ("sqldiff-core/src/catalog/builtins.rs", &["OnceLock"]),
-    ("sqldiff-core/src/catalog/ddl.rs", &["fs::"]),
+    ("sqldiff-catalog/src/builtins.rs", &["OnceLock"]),
+    ("sqldiff-catalog/src/ddl.rs", &["fs::"]),
     ("sqldiff-core/src/engine.rs", &["Mutex", "OnceLock"]),
     (
         "sqldiff-core/src/equiv/canon.rs",
@@ -125,7 +125,12 @@ fn scan(dir: &Path, root: &Path, out: &mut BTreeMap<String, BTreeSet<&'static st
 fn the_check_reads_nothing_outside_its_arguments() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut found = BTreeMap::new();
-    for krate in ["sqldiff-core", "sqldiff-convert", "sqldiff-syntax"] {
+    for krate in [
+        "sqldiff-core",
+        "sqldiff-convert",
+        "sqldiff-syntax",
+        "sqldiff-catalog",
+    ] {
         scan(&root.join(krate).join("src"), &root, &mut found);
     }
     let allowed: BTreeMap<&str, BTreeSet<&str>> = ALLOWED
