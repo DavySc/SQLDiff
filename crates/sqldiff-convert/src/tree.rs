@@ -643,6 +643,30 @@ pub fn convert_for_review(
     convert_kept(a, inputs, unreadable, out, hooks, true, None, None)
 }
 
+/// [`convert_for_review`] keeping each file's checked result in the store of
+/// `out` and reusing the ones whose key matches, as [`convert_stored`] does.
+/// The result of a trimmed conversion is the same as a whole one (`trim` is
+/// part of the stored key), so a review of a tree that was converted before
+/// costs lookups, not a new check.
+pub fn convert_for_review_stored(
+    a: &Args,
+    inputs: &[Input],
+    unreadable: Vec<String>,
+    out: &Path,
+    hooks: &Hooks,
+) -> Result<Tree, String> {
+    convert_kept(
+        a,
+        inputs,
+        unreadable,
+        Some(out),
+        hooks,
+        true,
+        Some(false),
+        None,
+    )
+}
+
 /// What is kept of each file as it is checked: its notes, shared with the
 /// tree's (`shared::Pool`), and with `trim` only what a review reads of the
 /// engine's reports.

@@ -128,3 +128,34 @@ fn equal_notes_share_their_text() {
     // a.sql and b.sql rest on the same assumptions.
     assert!(pairs > 0);
 }
+
+#[test]
+fn a_stored_review_conversion_reuses_results_and_equals_the_whole_one() {
+    let d = tree_dir();
+    let out = d.join("out-for-review");
+    let mut a = args(&d);
+    a.recheck = tree::Recheck::None;
+    let (inputs, unreadable) = tree::read(&a).unwrap();
+    let whole = tree::convert(&a, &inputs, unreadable.clone(), None).unwrap();
+    let hooks = tree::Hooks::default();
+    let first =
+        tree::convert_for_review_stored(&a, &inputs, unreadable.clone(), &out, &hooks).unwrap();
+    let second = tree::convert_for_review_stored(&a, &inputs, unreadable, &out, &hooks).unwrap();
+    let reused = second.report.run.files.iter().filter(|f| f.reused).count();
+    let _ = std::fs::remove_dir_all(&d);
+    // Only the output folder differs: the whole one wrote nothing.
+    let mut r = report(&first);
+    r.as_object_mut().unwrap().remove("out");
+    assert_eq!(r, report(&whole));
+    assert_eq!(first.outputs, whole.outputs);
+    assert!(
+        !first.report.run.files.iter().any(|f| f.reused),
+        "the first run checks every file"
+    );
+    assert_eq!(
+        reused,
+        second.report.run.files.len(),
+        "the second run reuses every file"
+    );
+    assert_eq!(second.outputs, whole.outputs);
+}
