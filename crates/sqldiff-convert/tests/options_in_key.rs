@@ -175,3 +175,40 @@ fn the_converter_sets_only_the_fields_that_are_in_the_key_or_recorded() {
         }
     }
 }
+
+/// A constant field must not be set after the `Options` is built either:
+/// `opts.alignment_bound = Some(1)` or `opts.flips.insert(..)` would change a
+/// check without touching the key.
+#[test]
+fn the_constant_fields_are_never_assigned_later() {
+    // `proof` is also a field of reports and units, so it counts only on a
+    // receiver named like options.
+    let re = regex::Regex::new(
+        r"\.(excerpt_lines|flips|declared|observer|work_budgets|alignment_bound)\s*(=[^=]|\.insert|\.push|\.extend)|\b\w*opt\w*\.proof\s*(=[^=]|\.insert|\.push|\.extend)",
+    )
+    .unwrap();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = vec![dir.clone()];
+    let mut seen = 0;
+    while let Some(d) = files.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                files.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                seen += 1;
+                let text =
+                    without_comments(&without_test_modules(&std::fs::read_to_string(&p).unwrap()));
+                if let Some(m) = re.find(&text) {
+                    panic!(
+                        "{}: `{}` sets a field the result key treats as constant; \
+                         put it in the key (or record it) and reclassify it in tests/options_in_key.rs",
+                        p.display(),
+                        m.as_str()
+                    );
+                }
+            }
+        }
+    }
+    assert!(seen > 5, "no sources scanned");
+}

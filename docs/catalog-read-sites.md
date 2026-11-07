@@ -13,6 +13,10 @@ Inventory for the recorded-catalog-reads series (performance plan W4.3). It list
 | B2 | `sqldiff-core/src/bind/query.rs` | `fn unknown_column_in(` | `Origin` | Reason text. |
 | B3 | `sqldiff-core/src/bind/query.rs` | `fn resolve_call(` | `Routines(parts)`, `RoutinesAuthoritative(kind)`, `Origin` | Overloads in catalog order; the file-local routines are a `LocalView`, not a read. |
 | B4 | `sqldiff-core/src/bind/query.rs` | `fn unresolved_bare(` | `Origin` | Reason text. |
+| B5 | `sqldiff-core/src/bind/query.rs` | `fn pseudo_sources(` | `Table(parts)` | The table a trigger fires on, for `inserted` and `deleted`. |
+| B6 | `sqldiff-core/src/bind/query.rs` | `fn lookup_table_silent(` | `Table(parts)` | `self.input.view.table`: the same lookup as `table_ref`, without the reason text. |
+| B7 | `sqldiff-core/src/bind/mod.rs` | `fn lookup_table_quiet(` | `Table(parts)` | `view.table(parts)` for a caller outside the query binder. |
+| S1 | `sqldiff-equiv/src/equiv/canon.rs` | `fn visible_star(` | `StarView(lower name)`, `HiddenTables` (the `list_stars` flag) | Reads the public fields `Schema::star_views` and `Schema::list_stars`. |
 | E1 | `sqldiff-core/src/engine.rs` | `view_a.supplied` | `Supplied` per side | A8: field reads. Today the key tells `none` from a catalog; once digests leave the key, `supplied` stays in it. |
 | A1 | `sqldiff-equiv/src/equiv/schema.rs` | `pub fn hides_columns(` | `HiddenTables` per side, plus `SchemaTables` for each counterpart | Runs for every file (`list_stars_with`, `mirrored`). If this falls back to `WholeCatalog`, the series buys nothing. |
 | A2 | `sqldiff-equiv/src/equiv/edit.rs` | `fn typed_class(` | `ColumnNamed(name)` | Scans `schema.tables()` (deduplicated set) for a column of that name. |
@@ -29,6 +33,16 @@ Inventory for the recorded-catalog-reads series (performance plan W4.3). It list
 | A8 | `sqldiff-equiv/src/equiv/schema.rs` | `sources: view.origins.clone()` | `Origin`, `Supplied` | `Schema::catalog()` is `None` when nothing was supplied; origins reach witnesses. |
 | A9 | `sqldiff-convert/src/check.rs` | `fn check_with_mix(` | the union of the reads of every `check_one` inside, the losing variants included | The result is the best of two or three checks. A catalog edit that flips which variant wins must not replay clean. The pass-1 reads inside `rebuild` are covered by rebuilding the mix against the current catalog on reuse. |
 | P1 | `sqldiff-draft/src/tsql.rs` | `catalog: Option<&'a sqldiff_equiv::catalog::Catalog>` | pass 1 `SourceReads` (sandbox only until Phase B) | `Cx` holds the whole-tree source catalog directly. |
+| P3 | `sqldiff-draft/src/tsql.rs` | `fn catalog_table(` | pass 1 `SourceReads` (sandbox only until Phase B) | a table of the source catalog by name (dynamic SQL, column owners). |
+| P4 | `sqldiff-draft/src/tsql.rs` | `fn column_owners(` | pass 1 `SourceReads` (sandbox only until Phase B) | the owners of a column name among catalog tables. |
+| P5 | `sqldiff-draft/src/tsql.rs` | `fn routine_in<'c>(` | pass 1 `SourceReads` (sandbox only until Phase B) | callee routine lookup (`callee`, `callee_returns_status`). |
+| P6 | `sqldiff-draft/src/tsql.rs` | `fn type_catalog(` | pass 1 `SourceReads` (sandbox only until Phase B) | the catalog for type inference (`own_table`, `entry_table`). |
+| P7 | `sqldiff-draft/src/tsql/bits.rs` | `fn bits_possible(` | pass 1 `SourceReads` (sandbox only until Phase B) | bit columns of catalog tables. |
+| P8 | `sqldiff-draft/src/tsql/temporal.rs` | `fn history_check(` | pass 1 `SourceReads` (sandbox only until Phase B) | temporal tables of the catalog. |
+| P9 | `sqldiff-draft/src/tsql/temporal.rs` | `fn history_of_historyless(` | pass 1 `SourceReads` (sandbox only until Phase B) | history table of a historyless table. |
+| P10 | `sqldiff-draft/src/tsql/temporal.rs` | `pub(super) fn alter_versioning(` | pass 1 `SourceReads` (sandbox only until Phase B) | versioning of a catalog table. |
+| P11 | `sqldiff-draft/src/tsql/paging.rs` | `fn not_null_key(` | pass 1 `SourceReads` (sandbox only until Phase B) | key nullability for paging. |
+| P12 | `sqldiff-draft/src/tsql/trigger.rs` | `pub(super) fn drop_trigger(` | pass 1 `SourceReads` (sandbox only until Phase B) | trigger by name (`triggers_named`). |
 | P2 | `sqldiff-draft/src/tsql.rs` | `local: std::cell::OnceCell<sqldiff_equiv::catalog::Catalog>` | none (the file's own DDL) | Not an external input: built from the file's text. |
 | T1 | `sqldiff-convert/src/tree.rs` | `opts.facts_a.first().map(\|c\| c.as_ref())` | pass 1 handle | Pass 1 reads the catalog back out of `Options`; it should hold the tree state's own `Arc<Catalog>`. |
 
@@ -118,6 +132,27 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 | `sqldiff-convert/src/plan.rs` | driver | 1 |
 | `sqldiff-draft/src/tsql/trigger.rs` | pass 1 | 1 |
 | `sqldiff-equiv/src/equiv/mod.rs` | check | 3 |
+
+### schema fields
+
+`\.(star_views|list_stars)\b`: `StarView(lower name)`. `Schema::star_views` and `list_stars` are public fields: a read of either is a read of the catalog.
+
+| file | stage | count |
+|---|---|---|
+| `sqldiff-equiv/src/equiv/canon.rs` | check | 2 |
+| `sqldiff-equiv/src/equiv/schema.rs` | check | 7 |
+
+### pass 1 catalog
+
+`\bself\.catalog\b|\btype_catalog\(\)|\btable_position\(|\b(cat|c)\.(tables|routines)\b`: Pass 1 (`sqldiff-draft`) holds the source catalog directly. Counted in `sqldiff-draft/src` only. Sandbox-only until Phase B: `SourceReads`.
+
+| file | stage | count |
+|---|---|---|
+| `sqldiff-draft/src/tsql.rs` | pass 1 | 15 |
+| `sqldiff-draft/src/tsql/bits.rs` | pass 1 | 2 |
+| `sqldiff-draft/src/tsql/paging.rs` | pass 1 | 1 |
+| `sqldiff-draft/src/tsql/temporal.rs` | pass 1 | 10 |
+| `sqldiff-draft/src/tsql/trigger.rs` | pass 1 | 1 |
 
 ### view type
 

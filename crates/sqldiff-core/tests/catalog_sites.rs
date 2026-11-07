@@ -182,11 +182,27 @@ const DOORS: &[(&str, &str, &str)] = &[
         "`TriggersNamed`, `TriggersOn`, `TriggersRunning`.",
     ),
     (
+        "schema fields",
+        r"\.(star_views|list_stars)\b",
+        "`StarView(lower name)`. `Schema::star_views` and `list_stars` are public fields: a read of either is a read of the catalog.",
+    ),
+    (
+        "pass 1 catalog",
+        r"\bself\.catalog\b|\btype_catalog\(\)|\btable_position\(|\b(cat|c)\.(tables|routines)\b",
+        "Pass 1 (`sqldiff-draft`) holds the source catalog directly. Counted in `sqldiff-draft/src` only. Sandbox-only until Phase B: `SourceReads`.",
+    ),
+    (
         "view type",
         r"\bCatalogView\b",
         "Where a bare `CatalogView` is held. Check crates hold a `RecordingView` or a `LocalView` after PR 2a.",
     ),
 ];
+
+/// Whether a door counts in a file. The pass 1 door is about `sqldiff-draft`
+/// only; its pattern is too common elsewhere.
+fn door_applies(name: &str, rel: &str) -> bool {
+    name != "pass 1 catalog" || rel.starts_with("sqldiff-draft/src")
+}
 
 /// One read site: where it is, what it reads, the query it becomes.
 struct Site {
@@ -225,6 +241,34 @@ const SITES: &[Site] = &[
         anchor: "fn unresolved_bare(",
         query: "`Origin`",
         note: "Reason text.",
+    },
+    Site {
+        id: "B5",
+        file: "sqldiff-core/src/bind/query.rs",
+        anchor: "fn pseudo_sources(",
+        query: "`Table(parts)`",
+        note: "The table a trigger fires on, for `inserted` and `deleted`.",
+    },
+    Site {
+        id: "B6",
+        file: "sqldiff-core/src/bind/query.rs",
+        anchor: "fn lookup_table_silent(",
+        query: "`Table(parts)`",
+        note: "`self.input.view.table`: the same lookup as `table_ref`, without the reason text.",
+    },
+    Site {
+        id: "B7",
+        file: "sqldiff-core/src/bind/mod.rs",
+        anchor: "fn lookup_table_quiet(",
+        query: "`Table(parts)`",
+        note: "`view.table(parts)` for a caller outside the query binder.",
+    },
+    Site {
+        id: "S1",
+        file: "sqldiff-equiv/src/equiv/canon.rs",
+        anchor: "fn visible_star(",
+        query: "`StarView(lower name)`, `HiddenTables` (the `list_stars` flag)",
+        note: "Reads the public fields `Schema::star_views` and `Schema::list_stars`.",
     },
     Site {
         id: "E1",
@@ -339,6 +383,76 @@ const SITES: &[Site] = &[
         note: "`Cx` holds the whole-tree source catalog directly.",
     },
     Site {
+        id: "P3",
+        file: "sqldiff-draft/src/tsql.rs",
+        anchor: "fn catalog_table(",
+        query: "pass 1 `SourceReads` (sandbox only until Phase B)",
+        note: "a table of the source catalog by name (dynamic SQL, column owners).",
+    },
+    Site {
+        id: "P4",
+        file: "sqldiff-draft/src/tsql.rs",
+        anchor: "fn column_owners(",
+        query: "pass 1 `SourceReads` (sandbox only until Phase B)",
+        note: "the owners of a column name among catalog tables.",
+    },
+    Site {
+        id: "P5",
+        file: "sqldiff-draft/src/tsql.rs",
+        anchor: "fn routine_in<'c>(",
+        query: "pass 1 `SourceReads` (sandbox only until Phase B)",
+        note: "callee routine lookup (`callee`, `callee_returns_status`).",
+    },
+    Site {
+        id: "P6",
+        file: "sqldiff-draft/src/tsql.rs",
+        anchor: "fn type_catalog(",
+        query: "pass 1 `SourceReads` (sandbox only until Phase B)",
+        note: "the catalog for type inference (`own_table`, `entry_table`).",
+    },
+    Site {
+        id: "P7",
+        file: "sqldiff-draft/src/tsql/bits.rs",
+        anchor: "fn bits_possible(",
+        query: "pass 1 `SourceReads` (sandbox only until Phase B)",
+        note: "bit columns of catalog tables.",
+    },
+    Site {
+        id: "P8",
+        file: "sqldiff-draft/src/tsql/temporal.rs",
+        anchor: "fn history_check(",
+        query: "pass 1 `SourceReads` (sandbox only until Phase B)",
+        note: "temporal tables of the catalog.",
+    },
+    Site {
+        id: "P9",
+        file: "sqldiff-draft/src/tsql/temporal.rs",
+        anchor: "fn history_of_historyless(",
+        query: "pass 1 `SourceReads` (sandbox only until Phase B)",
+        note: "history table of a historyless table.",
+    },
+    Site {
+        id: "P10",
+        file: "sqldiff-draft/src/tsql/temporal.rs",
+        anchor: "pub(super) fn alter_versioning(",
+        query: "pass 1 `SourceReads` (sandbox only until Phase B)",
+        note: "versioning of a catalog table.",
+    },
+    Site {
+        id: "P11",
+        file: "sqldiff-draft/src/tsql/paging.rs",
+        anchor: "fn not_null_key(",
+        query: "pass 1 `SourceReads` (sandbox only until Phase B)",
+        note: "key nullability for paging.",
+    },
+    Site {
+        id: "P12",
+        file: "sqldiff-draft/src/tsql/trigger.rs",
+        anchor: "pub(super) fn drop_trigger(",
+        query: "pass 1 `SourceReads` (sandbox only until Phase B)",
+        note: "trigger by name (`triggers_named`).",
+    },
+    Site {
         id: "P2",
         file: "sqldiff-draft/src/tsql.rs",
         anchor: "local: std::cell::OnceCell<sqldiff_equiv::catalog::Catalog>",
@@ -391,6 +505,31 @@ const SCHEMA_METHODS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Every `impl` block of `ty` in the crate sources (inherent and trait
+/// impls, with generics): `(file, header)` of each, in file order.
+fn impl_blocks_of(ty: &str, dir: &str) -> Vec<(String, String)> {
+    let re = Regex::new(&format!(
+        r"(?m)^\s*impl(?:<[^>]*>)?\s+(?:[\w:<>]+\s+for\s+)?(?:&\s*)?{ty}\b[^{{]*\{{"
+    ))
+    .unwrap();
+    let root = crates_dir();
+    let mut files = Vec::new();
+    rs_files(&root.join(dir), &mut files);
+    let mut out = Vec::new();
+    for p in files {
+        let text = without_comments(&without_test_modules(&std::fs::read_to_string(&p).unwrap()));
+        let rel = p
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        for m in re.find_iter(&text) {
+            out.push((rel.clone(), m.as_str().trim().to_string()));
+        }
+    }
+    out
+}
+
 fn pub_fns_of_impl(file: &str, header: &str) -> Vec<String> {
     let text = std::fs::read_to_string(crates_dir().join(file)).unwrap();
     let start = text
@@ -400,6 +539,50 @@ fn pub_fns_of_impl(file: &str, header: &str) -> Vec<String> {
     let body = &body[..block_end(body)];
     let re = Regex::new(r"(?m)^    pub fn (\w+)").unwrap();
     re.captures_iter(body).map(|c| c[1].to_string()).collect()
+}
+
+/// A second `impl` of a catalog reader (a `Deref`, a trait impl, another
+/// inherent block) is a way in the method lists above do not see.
+#[test]
+fn the_catalog_readers_have_no_other_impl_blocks() {
+    let all = [
+        "sqldiff-catalog/src",
+        "sqldiff-core/src",
+        "sqldiff-equiv/src",
+        "sqldiff-model/src",
+        "sqldiff-draft/src",
+        "sqldiff-convert/src",
+    ];
+    for (ty, allowed) in [
+        (
+            "CatalogView",
+            vec![("sqldiff-catalog/src/lib.rs", "impl CatalogView {")],
+        ),
+        (
+            "Schema",
+            vec![
+                ("sqldiff-equiv/src/equiv/schema.rs", "impl Schema {"),
+                (
+                    "sqldiff-equiv/src/rules/rewrite.rs",
+                    "impl Facts for Schema {",
+                ),
+            ],
+        ),
+    ] {
+        let mut got = Vec::new();
+        for dir in all {
+            got.extend(impl_blocks_of(ty, dir));
+        }
+        let want: Vec<(String, String)> = allowed
+            .iter()
+            .map(|(f, h)| (f.to_string(), h.to_string()))
+            .collect();
+        assert_eq!(
+            got, want,
+            "another `impl` of `{ty}`: it can open the catalog without a query; \
+             classify its methods in tests/catalog_sites.rs"
+        );
+    }
 }
 
 #[test]
@@ -458,6 +641,9 @@ fn door_counts() -> BTreeMap<(String, String), usize> {
             let text =
                 without_comments(&without_test_modules(&std::fs::read_to_string(&p).unwrap()));
             for (name, re, _) in DOORS {
+                if !door_applies(name, &rel) {
+                    continue;
+                }
                 let n = Regex::new(re).unwrap().find_iter(&text).count();
                 if n > 0 {
                     counts.insert((name.to_string(), rel.clone()), n);

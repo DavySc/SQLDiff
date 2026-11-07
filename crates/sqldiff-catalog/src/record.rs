@@ -70,6 +70,9 @@ pub enum Query {
     /// The family a view typed from its source belongs to: the view and
     /// every non-view table its `source_table` names, with their columns.
     ViewFamily(String),
+    /// Whether a lower-case view name is a view whose `*` is read through
+    /// (`Schema::star_views`, with `list_stars`: `visible_star`).
+    StarView(String),
     /// The PostgreSQL spellings of a lower-case name over schemas, routines,
     /// tables, columns, keys and indexes.
     Spellings(String),
