@@ -1690,11 +1690,7 @@ impl Ctx<'_> {
                         };
                         named
                             && match &b.src {
-                                Src::Base(t, _) => self
-                                    .schema
-                                    .table(t)
-                                    .and_then(|t| t.column(&col))
-                                    .is_some_and(|c| c.ty.fam == Fam::Char),
+                                Src::Base(t, _) => self.base_may_be_char(t, &col),
                                 Src::Derived(cols) => cols.iter().any(|(n, _)| *n == col),
                                 Src::Nulls => false,
                             }
@@ -1705,6 +1701,27 @@ impl Ctx<'_> {
             Expr::Subquery(_) => true,
             _ => false,
         }
+    }
+
+    /// Whether column `col` of the table read `table` (a key as
+    /// [`Self::column`] takes it) may be `char(n)`. A table function's column
+    /// is typed by its WITH schema; a temporal read (`t FOR SYSTEM_TIME AS OF
+    /// x`) by the catalog of `t`. A view, or a table or column the catalog
+    /// does not type, counts as may-be.
+    fn base_may_be_char(&self, table: &str, col: &str) -> bool {
+        if let Some(schema) = self.func_schema.get(table) {
+            return schema
+                .iter()
+                .find(|(c, _)| c == col)
+                .map_or(true, |(_, t)| {
+                    Ty::from_type(t, self.d, false).fam == Fam::Char
+                });
+        }
+        let base = table.split(' ').next().unwrap_or(table);
+        self.schema
+            .table(base)
+            .and_then(|t| t.column(col))
+            .map_or(true, |c| c.ty.fam == Fam::Char)
     }
 
     fn var_may_be_char(&self, key: &str) -> bool {

@@ -120,23 +120,32 @@ fn query_verdict(d: Dialect, ty: &str, a: &str, b: &str) -> Verdict {
 /// condition on `varchar(6)` is judged (the control).
 #[test]
 fn wrappers_that_keep_the_char_type() {
+    // PostgreSQL evaluates a query inside a routine (a bare SELECT is not
+    // run), so each wrapper is checked as `row` checks the bare column; the
+    // varchar(6) control shows the check would see a wrong Different.
     let pg = [
         "COALESCE(c, 'x') LIKE",
         "NULLIF(c, 'q') LIKE",
         "CASE WHEN id > 0 THEN c END LIKE",
         "(SELECT c FROM t t2 WHERE t2.id = t.id) LIKE",
         "GREATEST(c, 'a') LIKE",
+        "c || '' LIKE",
+        "concat(c, '') LIKE",
     ];
     let mut bad = Vec::new();
     for w in pg {
-        let v = query_verdict(
-            Dialect::Postgres,
-            "char(6)",
-            &format!("{w} 'abc'"),
-            &format!("{w} 'zzzzzzz'"),
-        );
-        if matches!(v, Verdict::Different) {
+        let body = |pat: &str| {
+            format!("CREATE FUNCTION g(p_id integer) RETURNS integer LANGUAGE plpgsql AS $$ DECLARE r integer; BEGIN SELECT count(*) INTO r FROM t WHERE id = p_id AND c = 'abc' AND {w} {pat}; RETURN r; END $$;")
+        };
+        let (d, _) = pair("char(6)", body);
+        if matches!(d, Verdict::Different) {
             bad.push(format!("pg {w}"));
+        }
+        // A scalar subquery is refused whatever its type, so it has no
+        // control.
+        let (d, _) = pair("varchar(6)", body);
+        if !w.starts_with("(SELECT") && !matches!(d, Verdict::Different) {
+            bad.push(format!("pg control not judged: {w} ({d:?})"));
         }
     }
     let ms = [
@@ -163,5 +172,65 @@ fn wrappers_that_keep_the_char_type() {
     if matches!(v, Verdict::Different) {
         bad.push("tsql c + 'x' LIKE".into());
     }
+    assert!(bad.is_empty(), "shown Different:\n{}", bad.join("\n"));
+}
+
+/// A char(n) column read through a temporal read or a view is as padded as
+/// the bare column.
+#[test]
+fn char_columns_through_temporal_reads_and_views() {
+    let temporal = "CREATE TABLE t (id int PRIMARY KEY, c char(6) NOT NULL, vf datetime2 GENERATED ALWAYS AS ROW START NOT NULL, vt datetime2 GENERATED ALWAYS AS ROW END NOT NULL, PERIOD FOR SYSTEM_TIME (vf, vt)) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.th));";
+    let view = "CREATE TABLE t (id int PRIMARY KEY, c char(6) NOT NULL); CREATE VIEW v AS SELECT id, c FROM t;";
+    let cases = [
+        (
+            Dialect::Tsql,
+            temporal,
+            "CREATE PROCEDURE p @id int AS BEGIN SELECT id FROM t FOR SYSTEM_TIME AS OF '2020-01-01' WHERE id = @id AND c = 'abc' AND PAT LIKE c; END",
+        ),
+        (
+            Dialect::Tsql,
+            view,
+            "CREATE PROCEDURE p @id int AS BEGIN SELECT id FROM v WHERE id = @id AND c = 'abc' AND PAT LIKE c; END",
+        ),
+        (
+            Dialect::Postgres,
+            view,
+            "CREATE FUNCTION g(p_id integer) RETURNS integer LANGUAGE plpgsql AS $$ DECLARE r integer; BEGIN SELECT count(*) INTO r FROM v WHERE id = p_id AND c = 'abc' AND c LIKE PAT; RETURN r; END $$;",
+        ),
+    ];
+    let mut bad = Vec::new();
+    for (d, ddl, body) in cases {
+        let opts = Options {
+            catalog_a: vec![Artifact::new("catalog.sql", d, ddl)],
+            catalog_b: vec![Artifact::new("catalog.sql", d, ddl)],
+            ..Options::default()
+        };
+        let a = body.replace("PAT", "'abc'");
+        let b = body.replace("PAT", "'zzzzzzz'");
+        let v = diff(
+            &Artifact::new("a.sql", d, a),
+            &Artifact::new("b.sql", d, b),
+            &opts,
+        )
+        .verdict();
+        if matches!(v, Verdict::Different) {
+            bad.push(format!("{d:?}: {body}"));
+        }
+    }
+    // The temporal control: the same read of a varchar(6) column is judged.
+    let ddl = temporal.replace("char(6)", "varchar(6)");
+    let opts = Options {
+        catalog_a: vec![Artifact::new("catalog.sql", Dialect::Tsql, &ddl)],
+        catalog_b: vec![Artifact::new("catalog.sql", Dialect::Tsql, &ddl)],
+        ..Options::default()
+    };
+    let body = cases[0].2;
+    let v = diff(
+        &Artifact::new("a.sql", Dialect::Tsql, body.replace("PAT", "'abc'")),
+        &Artifact::new("b.sql", Dialect::Tsql, body.replace("PAT", "'zzzzzzz'")),
+        &opts,
+    )
+    .verdict();
+    assert!(matches!(v, Verdict::Different), "temporal control: {v:?}");
     assert!(bad.is_empty(), "shown Different:\n{}", bad.join("\n"));
 }
