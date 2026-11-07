@@ -4692,6 +4692,14 @@ impl Ctx<'_> {
         };
         let too_long = || V::Err(format!("value too long for column {col}"));
         match (ty.fam, &v) {
+            // A shorter value in a fixed-length column is blank-padded by
+            // both dialects, and the evaluator keeps values unpadded. What
+            // reads the padding (LIKE, a concatenation) would answer for an
+            // unpadded value, so the store is refused, as a cast to `char(n)`
+            // of a shorter value is.
+            (Fam::Char, V::Str(s)) if ty.len.is_some_and(|l| s.chars().count() < l as usize) => {
+                rej()
+            }
             (Fam::VarChar | Fam::Char, V::Str(s)) => match ty.len {
                 Some(l) if s.chars().count() > l as usize => {
                     let kept: String = s.chars().take(l as usize).collect();
@@ -5136,6 +5144,22 @@ mod tests {
         // Blanks inside or in front are ordinary characters.
         assert_eq!(like(" abc", " a%", true), Some(true));
         assert_eq!(like("a bc", "a_bc", true), Some(true));
+    }
+
+    #[test]
+    fn a_shorter_value_is_not_stored_unpadded_in_a_fixed_length_column() {
+        let schema = Schema::default().with_ddl(
+            "CREATE TABLE t (c char(6) NOT NULL, v varchar(6) NOT NULL);",
+            Dialect::Tsql,
+        );
+        let mut c = Ctx::new(Dialect::Tsql, &schema);
+        let s = |x: &str| V::Str(x.into());
+        // char(6): a full-length value is stored, a shorter one (which both
+        // dialects pad, and LIKE would then see the padding) is refused.
+        assert!(matches!(c.store("t", "c", s("abcdef")), Ok(V::Str(x)) if x == "abcdef"));
+        assert!(c.store("t", "c", s("abc")).is_err());
+        // varchar(6) keeps it as it is.
+        assert!(matches!(c.store("t", "v", s("abc")), Ok(V::Str(x)) if x == "abc"));
     }
 
     #[test]
