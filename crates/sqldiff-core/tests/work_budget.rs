@@ -3,7 +3,6 @@
 //! "not proven" (`equiv.budget`) on the routine's statements, never as
 //! equal; a normal routine never meets the budget.
 
-use sqldiff_core::ir::behaviour::with_work_budgets;
 use sqldiff_core::{diff, Artifact, Dialect, Options, Report, Verdict};
 
 const ROUTINE: &str = "CREATE PROCEDURE dbo.adjust @Item int, @Delta int AS
@@ -19,11 +18,14 @@ END
 GO
 ";
 
-fn run() -> Report {
+fn run(budgets: Option<(u64, u64)>) -> Report {
     diff(
         &Artifact::new("a.sql", Dialect::Tsql, ROUTINE.to_string()),
         &Artifact::new("b.sql", Dialect::Tsql, ROUTINE.to_string()),
-        &Options::default(),
+        &Options {
+            work_budgets: budgets,
+            ..Options::default()
+        },
     )
 }
 
@@ -36,25 +38,25 @@ fn budget_findings(r: &Report) -> usize {
 
 #[test]
 fn a_routine_within_budget_has_no_budget_finding() {
-    assert_eq!(budget_findings(&run()), 0);
+    assert_eq!(budget_findings(&run(None)), 0);
 }
 
 #[test]
 fn a_routine_over_its_routine_budget_is_not_proven() {
-    let r = with_work_budgets(2, u64::MAX, run);
+    let r = run(Some((2, u64::MAX)));
     assert!(budget_findings(&r) > 0, "{:#?}", r.findings);
 }
 
 #[test]
 fn a_routine_over_the_file_budget_is_not_proven() {
-    let r = with_work_budgets(u64::MAX, 2, run);
+    let r = run(Some((u64::MAX, 2)));
     assert!(budget_findings(&r) > 0, "{:#?}", r.findings);
 }
 
 #[test]
 fn the_same_input_stops_at_the_same_place() {
-    let a = with_work_budgets(3, u64::MAX, run);
-    let b = with_work_budgets(3, u64::MAX, run);
+    let a = run(Some((3, u64::MAX)));
+    let b = run(Some((3, u64::MAX)));
     let key = |r: &Report| {
         r.findings
             .iter()

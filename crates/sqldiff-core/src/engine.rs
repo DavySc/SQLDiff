@@ -66,6 +66,11 @@ pub struct Options {
     /// per finding is quadratic on a script with thousands of writes. For
     /// callers that never read them (`sqldiff_convert`).
     pub skip_witnesses: bool,
+    /// Lower the behaviour model's counted work budgets to (per routine
+    /// pair, per file) `diff` calls; `None` keeps the built-in ones. For
+    /// tests that need a budget to run out. The budgets are counts, never
+    /// times, so a result stays a function of the input.
+    pub work_budgets: Option<(u64, u64)>,
 }
 
 impl Default for Options {
@@ -84,6 +89,7 @@ impl Default for Options {
             anchors: Vec::new(),
             historyless: false,
             skip_witnesses: false,
+            work_budgets: None,
         }
     }
 }

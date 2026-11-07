@@ -284,6 +284,8 @@ pub struct Env {
     pub commit_level: Option<String>,
     /// Build no witnesses (`Options::skip_witnesses`).
     pub skip_witnesses: bool,
+    /// Budgets lowered by `Options::work_budgets` (routine, file).
+    pub work_budgets: Option<(u64, u64)>,
 }
 
 /// Assumptions whose flip changes the scenarios (and so is re-run, not relabelled).
@@ -297,6 +299,7 @@ impl Env {
             xact_abort: flips.get("ASM-TSQL-CALLER-XACT-ABORT-OFF") == Some(&false),
             commit_level: None,
             skip_witnesses: false,
+            work_budgets: None,
         }
     }
 
@@ -308,6 +311,7 @@ impl Env {
                 .get("ASM-DB2-COMMIT-LEVEL")
                 .and_then(|t| crate::ledger::declared_commit_level(t)),
             skip_witnesses: opts.skip_witnesses,
+            work_budgets: opts.work_budgets,
             ..Env::from_flips(&opts.flips)
         }
     }
@@ -1195,6 +1199,10 @@ struct Collector<'x, 'a> {
     /// `diff` calls spent by this routine pair, and whether a budget ran out.
     spent: Cell<u64>,
     out_of_budget: Cell<bool>,
+    /// `diff` calls spent by the whole file so far (shared by its routine
+    /// pairs), and the budgets in force (routine, file).
+    file_spent: Rc<Cell<u64>>,
+    budgets: (u64, u64),
 }
 
 /// The (rule, anchor) of divergences found.
@@ -1211,23 +1219,6 @@ const FLIPPED_MAX: usize = 4096;
 const ROUTINE_DIFFS: u64 = 1 << 21;
 const FILE_DIFFS: u64 = 1 << 23;
 
-thread_local! {
-    /// The `diff` calls spent by the file being checked on this thread;
-    /// `analyze` starts it at zero.
-    static FILE_SPENT: Cell<u64> = const { Cell::new(0) };
-    /// The budgets in force on this thread (routine, file); tests lower them.
-    static BUDGETS: Cell<(u64, u64)> = const { Cell::new((ROUTINE_DIFFS, FILE_DIFFS)) };
-}
-
-/// Runs `f` with the work budgets of this thread set to `routine` and
-/// `file` diff calls, for tests that need a small budget to run out.
-pub fn with_work_budgets<T>(routine: u64, file: u64, f: impl FnOnce() -> T) -> T {
-    let old = BUDGETS.replace((routine, file));
-    let r = f();
-    BUDGETS.set(old);
-    r
-}
-
 impl<'x, 'a> Collector<'x, 'a> {
     fn new(
         a: &'x Analyzed<'a>,
@@ -1235,7 +1226,9 @@ impl<'x, 'a> Collector<'x, 'a> {
         env: Env,
         ra: Option<SyntaxNode>,
         rb: Option<SyntaxNode>,
+        file_spent: Rc<Cell<u64>>,
     ) -> Self {
+        let env_budgets = env.work_budgets.unwrap_or((ROUTINE_DIFFS, FILE_DIFFS));
         let (sa, sb) = (SideIr::new(a, b, ra), SideIr::new(b, a, rb));
         let keys = KeyUniverse::of(&[&sa.cfg, &sb.cfg]);
         let al = Align::new(&keys, &sa, &sb);
@@ -1259,6 +1252,8 @@ impl<'x, 'a> Collector<'x, 'a> {
             flipped: RefCell::new(HashMap::new()),
             spent: Cell::new(0),
             out_of_budget: Cell::new(false),
+            file_spent,
+            budgets: env_budgets,
         };
         c.splits = splits(&c.sa, &c.sb, true);
         c.splits.extend(splits(&c.sb, &c.sa, false));
@@ -1268,14 +1263,14 @@ impl<'x, 'a> Collector<'x, 'a> {
     /// Spends one `diff` call; false (and the routine marked as cut by its
     /// budget) when the routine's or the file's allowance is used up.
     fn spend(&self) -> bool {
-        let file = FILE_SPENT.get();
-        let (routine_max, file_max) = BUDGETS.get();
+        let file = self.file_spent.get();
+        let (routine_max, file_max) = self.budgets;
         if self.spent.get() >= routine_max || file >= file_max {
             self.out_of_budget.set(true);
             return false;
         }
         self.spent.set(self.spent.get() + 1);
-        FILE_SPENT.set(file + 1);
+        self.file_spent.set(file + 1);
         true
     }
 
@@ -1388,6 +1383,13 @@ impl<'x, 'a> Collector<'x, 'a> {
         scen_a: Scenario,
         scen_b: Scenario,
     ) -> (Vec<Outcome>, Vec<Outcome>) {
+        // Nothing left to spend: the scenario is not even explored (that is
+        // the other cost of a branchy routine), and the routine is reported
+        // as not proven.
+        if self.spent.get() >= self.budgets.0 || self.file_spent.get() >= self.budgets.1 {
+            self.out_of_budget.set(true);
+            return (Vec::new(), Vec::new());
+        }
         let (pa, pb) = self.outcomes(&sc, &scen_a, &scen_b);
         self.cut_a
             .extend(pa.iter().flat_map(|o| o.cut.iter().copied()));
@@ -1953,7 +1955,8 @@ fn meet(a: &Analyzed, b: &Analyzed) -> Option<Meeting> {
 /// budgets. A routine that meets none is not analysed, and a transaction
 /// statement inside it stays unproven.
 pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
-    FILE_SPENT.set(0);
+    // The `diff` calls all routine pairs of this file share.
+    let file_spent = Rc::new(Cell::new(0));
     let Some(m) = meet(a, b) else {
         // At most one routine on each side: `routines_of` picks it, so a
         // setup `DO` block beside it is not mistaken for it.
@@ -1966,6 +1969,7 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
             rb.first().cloned(),
             "",
             &HashSet::new(),
+            &file_spent,
         );
         // Transaction statements are compared only inside a routine both
         // sides hold exactly once.
@@ -2002,6 +2006,7 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
             Some(y.clone()),
             &format!("{name}|"),
             &prior,
+            &file_spent,
         );
         prior.extend(r.findings.iter().map(|f| f.fingerprint.clone()));
         all_compared &= r.txn_compared;
@@ -2039,8 +2044,9 @@ fn analyze_pair(
     rb: Option<SyntaxNode>,
     salt: &str,
     prior: &HashSet<String>,
+    file_spent: &Rc<Cell<u64>>,
 ) -> Behaviour {
-    let mut c = Collector::new(a, b, env.clone(), ra, rb);
+    let mut c = Collector::new(a, b, env.clone(), ra, rb, file_spent.clone());
     c.salt = salt.to_string();
     c.prior = prior.clone();
     c.faults();
@@ -2153,7 +2159,7 @@ pub fn what_if(
             }
         }
     };
-    let mut c = Collector::new(a, b, env.clone(), ra, rb);
+    let mut c = Collector::new(a, b, env.clone(), ra, rb, Rc::new(Cell::new(0)));
     let (this, other) = if on_a { (&c.sa, &c.sb) } else { (&c.sb, &c.sa) };
     let mut notes = Vec::new();
     let empty = |notes: Vec<String>, text: String| WhatIf {
