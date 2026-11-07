@@ -243,17 +243,17 @@ p01, p02, p07, p09 (both pairs), p04, p05, p11 (pg~db2i) and p12 (tsql~db2i).
 The rest are listed in `crates/sqldiff-corpus/known-failing.toml` (cardinality
 and binding work, WP1/WP10).
 
-## Identified conditions (report only)
+## Identified conditions
 
 Aligned merging would treat an `IF` of one routine and an `IF` of the other
-as one decision. Today `pairs()` (exact matching of path signatures) and
+as one decision. `pairs()` (exact matching of path signatures) and
 `feasible()` (pruning of a pair by a condition decided both ways) already do
 that when the folded text of two conditions is equal (`norm_cond`). Equal
 text is not the same fact: `@x` and `p_x` hold equal values only if every
 assignment that reaches them agrees.
 
-`equiv/identity.rs` decides it and **only reports**; nothing on the diff
-path reads the result (`sqldiff_core::identity`, the `identity` example).
+`equiv/identity.rs` decides it (`sqldiff_core::identity`, the `identity`
+example); between different dialects the explorer reads the result (below).
 A pair of conditions is identified when the `ctl-if` / `ctl-while` items are
 paired and proven equal, the term is a function of the inputs (no clock,
 random value, sequence or row count), and every parameter and local it reads
@@ -269,5 +269,24 @@ end the fact. The scope is fault-free runs only.
 `identity SRC OUT FROM TO` prints one line per routine pair, one per paired
 condition (class `value`, `state`, `rows` or `no` with the reason and the
 assumptions) and one per folded text the explorer treats as one decision
-(`e2`, identified or not). The next step makes the explorer use it: a text
-match that is not identified falls back to all combinations.
+(`e2`, identified or not).
+
+### What the explorer does with it (across dialects)
+
+`ir::behaviour::mark_unidentified` keeps a condition's folded text as a match
+between the sides only when every condition with that text, on either side,
+is in an identified pair with a condition of the same text on the other
+side. The tests of every other text are marked (`interp::opaque_cond`): the
+marker names the side, so no signature of A equals one of B by them. Then
+`pairs()` does not find the same set of paths and falls back to all
+combinations (a divergence is Different only if every combination shows it,
+otherwise Unknown), and `feasible()` keeps every pair, because the two sides
+no longer decide the same condition. Verdicts can only get stricter; no
+assumption is added. The marker is stripped wherever a condition is shown
+(`interp::plain_cond`).
+
+Not covered, and unchanged: row-count tests (`no rows from <statement>`) are
+named by the paired statement, not by text; a diff of two files of the same
+dialect does not run the identity analysis and still matches by text; and the
+analysis covers fault-free runs only, so under a fault scenario an identified
+condition is matched by its text as before.

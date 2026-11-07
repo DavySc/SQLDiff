@@ -287,6 +287,13 @@ pub struct Env {
     pub skip_witnesses: bool,
     /// Budgets lowered by `Options::work_budgets` (routine, file).
     pub work_budgets: Option<(u64, u64)>,
+    /// The condition pairs (start offset on side A, on side B) the identity
+    /// analysis proved to be the same fact about the input
+    /// (`equiv::identity`, perf plan W6c E2). `None`: no analysis ran for
+    /// this pair of files, and equal condition text is matched as before.
+    /// `Some`: `pairs()` and `feasible()` match a condition's text across
+    /// the sides only when every condition with that text is in such a pair.
+    pub identified: Option<std::sync::Arc<BTreeSet<(usize, usize)>>>,
 }
 
 /// Assumptions whose flip changes the scenarios (and so is re-run, not relabelled).
@@ -301,6 +308,7 @@ impl Env {
             commit_level: None,
             skip_witnesses: false,
             work_budgets: None,
+            identified: None,
         }
     }
 
@@ -313,6 +321,7 @@ impl Env {
                 .and_then(|t| crate::ledger::declared_commit_level(t)),
             skip_witnesses: opts.skip_witnesses,
             work_budgets: opts.work_budgets,
+            identified: None,
             ..Env::from_flips(&opts.flips)
         }
     }
@@ -922,7 +931,7 @@ fn path_text(o: &Outcome) -> String {
         .map(|(c, b)| {
             format!(
                 "`{}` is {}",
-                c.to_lowercase(),
+                super::interp::plain_cond(c).to_lowercase(),
                 if *b { "true" } else { "false" }
             )
         })
@@ -976,7 +985,7 @@ fn scenario_info(sa: &SideIr, sb: &SideIr, sc: &Kind, env: &Env, oa: &Outcome) -
             .signature
             .iter()
             .map(|(c, v)| PathStep {
-                condition: c.to_lowercase(),
+                condition: super::interp::plain_cond(c).to_lowercase(),
                 value: *v,
             })
             .collect(),
@@ -1103,6 +1112,66 @@ fn other_temps(x: &Analyzed, other: &Analyzed) -> HashSet<String> {
         crate::classify::temp_table_names(&other.root)
     } else {
         HashSet::new()
+    }
+}
+
+/// The unknown tests of a graph by folded condition text (`norm_cond`), with
+/// the start offset of each.
+fn tests_by_text(c: &Cfg) -> BTreeMap<String, Vec<usize>> {
+    let mut m: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for n in &c.nodes {
+        if let super::cfg::Op::Test {
+            test: super::cfg::Test::Unknown(t),
+            ..
+        } = &n.op
+        {
+            // A test with no source position cannot be identified.
+            let at = n
+                .syntax
+                .as_ref()
+                .map_or(usize::MAX, |s| sqldiff_syntax::ast::sig_range(s).0);
+            m.entry(norm_cond(t)).or_default().push(at);
+        }
+    }
+    m
+}
+
+/// Perf plan W6c, E2: `pairs()` and `feasible()` treat two conditions with
+/// the same folded text as one decision. That is only right when the text is
+/// the same fact about the input on both sides. A text keeps matching only
+/// if every condition with it, on either side, is in a pair `done` holds
+/// with a condition of the same text on the other side; the tests of every
+/// other text are marked (`opaque_cond`), so no signature of A equals one of
+/// B by them: the exact pairing falls back to all combinations (the verdict
+/// is then capped unless all combinations agree) and `feasible` keeps the
+/// pair. Verdicts only get stricter.
+fn mark_unidentified(a: &mut Cfg, b: &mut Cfg, done: &BTreeSet<(usize, usize)>) {
+    let (ta, tb) = (tests_by_text(a), tests_by_text(b));
+    let ident: BTreeSet<&String> = ta
+        .iter()
+        .filter(|(text, xs)| {
+            tb.get(*text).is_some_and(|ys| {
+                xs.iter()
+                    .all(|x| ys.iter().any(|y| done.contains(&(*x, *y))))
+                    && ys
+                        .iter()
+                        .all(|y| xs.iter().any(|x| done.contains(&(*x, *y))))
+            })
+        })
+        .map(|(t, _)| t)
+        .collect();
+    for (cfg, is_a) in [(a, true), (b, false)] {
+        for n in &mut cfg.nodes {
+            if let super::cfg::Op::Test {
+                test: super::cfg::Test::Unknown(t),
+                ..
+            } = &mut n.op
+            {
+                if !ident.contains(&norm_cond(t)) {
+                    *t = super::interp::opaque_cond(t, is_a);
+                }
+            }
+        }
     }
 }
 
@@ -1267,7 +1336,10 @@ impl<'x, 'a> Collector<'x, 'a> {
         file_spent: Rc<Cell<u64>>,
     ) -> Self {
         let env_budgets = env.work_budgets.unwrap_or((ROUTINE_DIFFS, FILE_DIFFS));
-        let (sa, sb) = (SideIr::new(a, b, ra), SideIr::new(b, a, rb));
+        let (mut sa, mut sb) = (SideIr::new(a, b, ra), SideIr::new(b, a, rb));
+        if let Some(done) = &env.identified {
+            mark_unidentified(&mut sa.cfg, &mut sb.cfg, done);
+        }
         let keys = KeyUniverse::of(&[&sa.cfg, &sb.cfg]);
         let al = Align::new(&keys, &sa, &sb);
         let mut c = Collector {
