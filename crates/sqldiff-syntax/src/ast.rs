@@ -72,7 +72,36 @@ pub fn ends_with_inferred_terminator(node: &SyntaxNode) -> bool {
 }
 
 /// Text range of the significant part of a node (without leading/trailing trivia).
+///
+/// Found from both ends of the subtree: the first significant token going
+/// forward from the node's first token, the last going backward from its
+/// last, instead of walking every token to find the last.
 pub fn sig_range(node: &SyntaxNode) -> (usize, usize) {
+    // `first_token`/`last_token` follow the first/last child only, so a node
+    // that ends (or starts) in an empty node has none: then every token is
+    // walked.
+    let (Some(first_tok), Some(last_tok)) = (node.first_token(), node.last_token()) else {
+        return sig_range_walking(node);
+    };
+    let within = |t: &SyntaxToken| t.parent_ancestors().any(|a| a == *node);
+    let first = std::iter::successors(Some(first_tok), |t| t.next_token().filter(&within))
+        .find(|t| is_significant(t.kind()));
+    let Some(first) = first else {
+        let r = node.text_range();
+        return (r.start().into(), r.end().into());
+    };
+    let last = std::iter::successors(Some(last_tok), |t| t.prev_token().filter(&within))
+        .find(|t| is_significant(t.kind()))
+        .unwrap_or_else(|| first.clone());
+    (
+        first.text_range().start().into(),
+        last.text_range().end().into(),
+    )
+}
+
+/// The definition by walking every significant token: the fallback of
+/// [`sig_range`] (`tests/sig_range.rs` compares the two).
+fn sig_range_walking(node: &SyntaxNode) -> (usize, usize) {
     let mut toks = sig_tokens(node);
     let Some(first) = toks.next() else {
         let r = node.text_range();
