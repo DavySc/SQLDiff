@@ -129,9 +129,17 @@ pub fn canonical_commit_level(level: &str) -> String {
 
 /// Findings for declarations that contradict what a side's source states.
 pub fn contradictions(sides: &[&Analyzed], opts: &Options) -> Vec<Finding> {
+    let found: Vec<(&Analyzed, Vec<Discharge>)> =
+        sides.iter().map(|a| (*a, discharges(a))).collect();
+    contradictions_in(&found, opts)
+}
+
+/// [`contradictions`] over discharges already read from each side (reading
+/// them lowers the side's routine).
+pub fn contradictions_in(found: &[(&Analyzed, Vec<Discharge>)], opts: &Options) -> Vec<Finding> {
     let mut out = Vec::new();
-    for a in sides {
-        for d in discharges(a) {
+    for (a, discharged) in found {
+        for d in discharged {
             let Some(text) = opts.declared.get(&d.id) else {
                 continue;
             };

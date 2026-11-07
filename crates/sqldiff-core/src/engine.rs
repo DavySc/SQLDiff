@@ -354,9 +354,15 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         }
     }
 
-    findings.extend(crate::ledger::contradictions(&[&aa, &ab], opts));
-    let mut discharged = crate::ledger::discharges(&aa);
-    discharged.extend(crate::ledger::discharges(&ab));
+    // Each side's discharges once: reading them lowers the side's routine.
+    let (dis_a, dis_b) = (
+        crate::ledger::discharges(&aa),
+        crate::ledger::discharges(&ab),
+    );
+    let found = [(&aa, dis_a), (&ab, dis_b)];
+    findings.extend(crate::ledger::contradictions_in(&found, opts));
+    let [(_, mut discharged), (_, dis_b)] = found;
+    discharged.extend(dis_b);
 
     if let Some(why) = crate::coverage::uncovered(&aa, &ab) {
         unknown_reasons.push(why);
