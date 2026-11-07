@@ -1,6 +1,6 @@
 # Idiom rules (design section 8, milestone M6)
 
-Rules are data: S-expression files in `crates/sqldiff-core/profiles/rules/`, loaded by `rules::rule::RuleSet`. Packs can add rule files with `RuleSet::load` (wiring them into pack loading is a follow-up).
+Rules are data: S-expression files in `crates/sqldiff-equiv/profiles/rules/`, loaded by `rules::rule::RuleSet`. Packs can add rule files with `RuleSet::load` (wiring them into pack loading is a follow-up).
 
 | File | What |
 |---|---|

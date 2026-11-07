@@ -277,7 +277,7 @@ mod tests {
     fn the_structural_diff_vouches_for_every_token() {
         let (x, y) = sides(PROC, &PROC.replace("SELECT 2", "select   2"));
         let (a, b) = (Analyzed::new(&x, Side::A, 1), Analyzed::new(&y, Side::B, 1));
-        let td = crate::treediff::diff(&a, &b);
+        let td = crate::treediff::diff(&a, &b, crate::normalize::DEFAULT_ALIGNMENT_BOUND);
         assert!(td.findings.is_empty());
         assert_eq!(unreceipted(&a, &b, &td.receipts, &[]), None);
     }

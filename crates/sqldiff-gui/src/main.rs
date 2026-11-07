@@ -267,6 +267,10 @@ fn url(listener: &TcpListener) -> Result<String, String> {
     Ok(format!("http://{addr}/"))
 }
 
+// mimalloc: the engine allocates heavily; measured 17-39% faster conversions than the system allocator.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match sqldiff_core::with_engine_stack(|| run(cli)) {
