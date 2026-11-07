@@ -287,18 +287,14 @@ pub const DEFAULT_ALIGNMENT_BOUND: usize = LCS_WORK;
 /// of the shorter length. Beyond the bound the middle stays unmatched and
 /// the flag is false: the pairs are then a common subsequence but not a
 /// longest one. The answer depends only on the inputs.
-pub fn lcs_pairs_checked<T: PartialEq>(a: &[T], b: &[T]) -> (Vec<(usize, usize)>, bool) {
+pub fn lcs_pairs_checked<T: Ord>(a: &[T], b: &[T]) -> (Vec<(usize, usize)>, bool) {
     lcs_pairs_bounded(a, b, LCS_WORK)
 }
 
 /// [`lcs_pairs_checked`] with the exact-alignment bound (the product of the
 /// lengths once the common start and end are matched) given by the caller.
 /// A lower bound only makes more alignments inexact.
-pub fn lcs_pairs_bounded<T: PartialEq>(
-    a: &[T],
-    b: &[T],
-    work: usize,
-) -> (Vec<(usize, usize)>, bool) {
+pub fn lcs_pairs_bounded<T: Ord>(a: &[T], b: &[T], work: usize) -> (Vec<(usize, usize)>, bool) {
     let (n, m) = (a.len(), b.len());
     if n.saturating_mul(m) <= LCS_CELLS {
         return (lcs_table(a, b, 0, 0), true);
@@ -327,21 +323,70 @@ pub fn lcs_pairs_bounded<T: PartialEq>(
 
 /// [`lcs_pairs_checked`] for callers that only show the pairs: past the
 /// bound they get the partial alignment.
-pub fn lcs_pairs<T: PartialEq>(a: &[T], b: &[T]) -> Vec<(usize, usize)> {
+pub fn lcs_pairs<T: Ord>(a: &[T], b: &[T]) -> Vec<(usize, usize)> {
     lcs_pairs_checked(a, b).0
 }
 
 /// The pairs of a longest common subsequence, or `None` when the lists are
 /// past the bound and only part of them could be aligned. For callers that
 /// report what is left over as added, removed or moved.
-pub fn lcs_pairs_exact<T: PartialEq>(a: &[T], b: &[T], work: usize) -> Option<Vec<(usize, usize)>> {
+pub fn lcs_pairs_exact<T: Ord>(a: &[T], b: &[T], work: usize) -> Option<Vec<(usize, usize)>> {
     let (p, exact) = lcs_pairs_bounded(a, b, work);
     exact.then_some(p)
 }
 
 /// LCS length of `a` against every prefix of `b` (`b.len() + 1` values), read
 /// forward or, with `rev`, over both slices reversed.
-fn lcs_row<T: PartialEq>(a: &[T], b: &[T], rev: bool) -> Vec<u32> {
+///
+/// Bit-parallel (Crochemore et al., Hyyro): bit `j` of `v` is 0 where the
+/// LCS length grows between prefixes `j` and `j + 1` of `b`, so one item of
+/// `a` updates 64 columns per word, and the values are the running count of
+/// zero bits. The values are those of [`lcs_row_scalar`] exactly; the cuts
+/// Hirschberg picks from them, and so the pairs, do not change.
+fn lcs_row<T: Ord>(a: &[T], b: &[T], rev: bool) -> Vec<u32> {
+    let m = b.len();
+    let words = m.div_ceil(64);
+    // Where each item occurs in `b`, in the direction read.
+    let mut at: std::collections::BTreeMap<&T, Vec<u32>> = std::collections::BTreeMap::new();
+    for j in 0..m {
+        let y = if rev { &b[m - 1 - j] } else { &b[j] };
+        at.entry(y).or_default().push(j as u32);
+    }
+    let mut v = vec![!0u64; words];
+    let mut mask = vec![0u64; words];
+    for i in 0..a.len() {
+        let x = if rev { &a[a.len() - 1 - i] } else { &a[i] };
+        // No match: the row does not change.
+        let Some(pos) = at.get(x) else { continue };
+        for &p in pos {
+            mask[(p >> 6) as usize] |= 1u64 << (p & 63);
+        }
+        let mut carry = false;
+        for w in 0..words {
+            let vw = v[w];
+            let (sum, c1) = vw.overflowing_add(vw & mask[w]);
+            let (sum, c2) = sum.overflowing_add(carry as u64);
+            carry = c1 | c2;
+            v[w] = sum | (vw & !mask[w]);
+        }
+        for &p in pos {
+            mask[(p >> 6) as usize] = 0;
+        }
+    }
+    let mut out = vec![0u32; m + 1];
+    let mut zeros = 0u32;
+    for j in 0..m {
+        if (v[j >> 6] >> (j & 63)) & 1 == 0 {
+            zeros += 1;
+        }
+        out[j + 1] = zeros;
+    }
+    out
+}
+
+/// The row by the plain recurrence: the reference for [`lcs_row`].
+#[cfg(test)]
+fn lcs_row_scalar<T: Ord>(a: &[T], b: &[T], rev: bool) -> Vec<u32> {
     let m = b.len();
     let mut prev = vec![0u32; m + 1];
     let mut cur = vec![0u32; m + 1];
@@ -363,11 +408,26 @@ fn lcs_row<T: PartialEq>(a: &[T], b: &[T], rev: bool) -> Vec<u32> {
 /// Appends the pairs of a longest common subsequence of `a` and `b`, offset
 /// by `(oa, ob)`, in order: split `a` in half, find where `b` is best cut
 /// from the scores of both halves, and align each side on its own.
-fn hirschberg<T: PartialEq>(a: &[T], b: &[T], oa: usize, ob: usize, out: &mut Vec<(usize, usize)>) {
+fn hirschberg<T: Ord>(a: &[T], b: &[T], oa: usize, ob: usize, out: &mut Vec<(usize, usize)>) {
+    hirschberg_with(a, b, oa, ob, out, LCS_CELLS / 16, lcs_row);
+}
+
+/// [`hirschberg`] with the size at which a piece gets a table and the row
+/// function as parameters (tests lower the first and compare the second with
+/// the scalar one).
+fn hirschberg_with<T: Ord>(
+    a: &[T],
+    b: &[T],
+    oa: usize,
+    ob: usize,
+    out: &mut Vec<(usize, usize)>,
+    base: usize,
+    row: fn(&[T], &[T], bool) -> Vec<u32>,
+) {
     if a.is_empty() || b.is_empty() {
         return;
     }
-    if a.len().saturating_mul(b.len()) <= LCS_CELLS / 16 {
+    if a.len().saturating_mul(b.len()) <= base {
         out.extend(lcs_table(a, b, oa, ob));
         return;
     }
@@ -382,8 +442,8 @@ fn hirschberg<T: PartialEq>(a: &[T], b: &[T], oa: usize, ob: usize, out: &mut Ve
         return;
     }
     let mid = a.len() / 2;
-    let left = lcs_row(&a[..mid], b, false);
-    let right = lcs_row(&a[mid..], b, true);
+    let left = row(&a[..mid], b, false);
+    let right = row(&a[mid..], b, true);
     let m = b.len();
     // The first cut of `b` with the best total; the same on every run.
     let mut cut = 0;
@@ -395,8 +455,8 @@ fn hirschberg<T: PartialEq>(a: &[T], b: &[T], oa: usize, ob: usize, out: &mut Ve
             cut = j;
         }
     }
-    hirschberg(&a[..mid], &b[..cut], oa, ob, out);
-    hirschberg(&a[mid..], &b[cut..], oa + mid, ob + cut, out);
+    hirschberg_with(&a[..mid], &b[..cut], oa, ob, out, base, row);
+    hirschberg_with(&a[mid..], &b[cut..], oa + mid, ob + cut, out, base, row);
 }
 
 /// The table walk of [`lcs_pairs`] over the whole of both slices; the pairs
@@ -485,6 +545,87 @@ mod lcs_tests {
         let mut out = Vec::new();
         hirschberg(&b, &a, 0, 0, &mut out);
         assert_eq!(out, vec![(0, 0), (1_299_001, 1), (1_299_002, 3)]);
+    }
+
+    /// A fixed-seed generator: the same cases on every run.
+    struct Lcg(u64);
+    impl Lcg {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    fn seq(rng: &mut Lcg, len: usize, alphabet: u64) -> Vec<u32> {
+        (0..len).map(|_| rng.below(alphabet) as u32).collect()
+    }
+
+    /// Lengths around the 64-bit word boundaries, and empty sides.
+    const LENS: [usize; 14] = [0, 1, 2, 31, 63, 64, 65, 127, 128, 129, 191, 192, 193, 300];
+
+    /// The bit-parallel row has the values of the plain recurrence, forward
+    /// and reversed, for every word-boundary length and small alphabets
+    /// (many ties and repeats).
+    #[test]
+    fn bit_rows_equal_the_scalar_rows() {
+        let mut rng = Lcg(0x5eed);
+        for &n in &LENS {
+            for &m in &LENS {
+                for alphabet in [1u64, 2, 3, 10, 1000] {
+                    let (a, b) = (seq(&mut rng, n, alphabet), seq(&mut rng, m, alphabet));
+                    for rev in [false, true] {
+                        assert_eq!(
+                            lcs_row(&a, &b, rev),
+                            lcs_row_scalar(&a, &b, rev),
+                            "n={n} m={m} alphabet={alphabet} rev={rev}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Hirschberg with the bit rows picks the same pairs as with the scalar
+    /// rows, with the table size lowered so small inputs split (down to
+    /// pieces of one item: the shape that once never ended).
+    #[test]
+    fn hirschberg_pairs_do_not_change_with_the_bit_rows() {
+        let mut rng = Lcg(0xfeed);
+        for base in [0usize, 1, 6, 40] {
+            for case in 0..600u64 {
+                let alphabet = [1u64, 2, 3, 10][(case % 4) as usize];
+                let n = rng.below(70) as usize;
+                let m = rng.below(200) as usize;
+                let (a, b) = (seq(&mut rng, n, alphabet), seq(&mut rng, m, alphabet));
+                let (mut got, mut want) = (Vec::new(), Vec::new());
+                hirschberg_with(&a, &b, 0, 0, &mut got, base, lcs_row);
+                hirschberg_with(&a, &b, 0, 0, &mut want, base, lcs_row_scalar);
+                assert_eq!(got, want, "base={base} case={case} n={n} m={m}");
+                assert_eq!(got.len(), lcs_len(&a, &b));
+            }
+        }
+    }
+
+    /// Both sides of the table limit: the same pairs as the plain table walk
+    /// at exactly `LCS_CELLS` cells and one past it (Hirschberg's cuts can
+    /// differ from the walk on ties, which is why the bound is not moved,
+    /// but the length is always the longest).
+    #[test]
+    fn around_the_table_limit_the_pairs_are_a_longest_subsequence() {
+        let mut rng = Lcg(0xbeef);
+        for (n, m) in [(4_000usize, 4_000usize), (4_000, 4_001), (3_999, 4_001)] {
+            let (a, b) = (seq(&mut rng, n, 50), seq(&mut rng, m, 50));
+            let (pairs, exact) = lcs_pairs_checked(&a, &b);
+            assert!(exact);
+            assert!(is_common(&a, &b, &pairs));
+            assert_eq!(pairs.len(), lcs_len(&a, &b));
+            if n * m <= LCS_CELLS {
+                assert_eq!(pairs, lcs_table(&a, &b, 0, 0));
+            }
+        }
     }
 
     #[test]
