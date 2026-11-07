@@ -23,10 +23,9 @@ ROOT = os.path.dirname(HERE)
 # Per-file limits where the default is wrong: name prefix -> (seconds, MB).
 # Every entry needs the measurement that justifies it.
 OVERRIDES = {
-    # 20,000 `SELECT 1` lines checked as Db2 for i: 20 s and 2.05 GB on main
-    # (audit h02). The ceiling is raised so the gate does not flap at it; the
-    # memory is a finding for the performance plan, not accepted behaviour.
-    "n_h02": (120, 3072),
+    # R1 shape that finishes but slowly: 94 s and 1 GB on main (4 cores), so the
+    # default 120 s would flap on a slower runner. Fixed by R1, then drop this.
+    "j_branches_14": (240, 2048),
 }
 
 # Shapes that still run too long or take too much memory, each with the row of
@@ -34,14 +33,19 @@ OVERRIDES = {
 # that fixes it, measured on main at 4 cores. The normal run skips them (it
 # would only spend CI minutes being killed); `--known-open` runs only them and
 # fails when one now passes, so the entry is removed in the PR that fixes it.
+# An entry that finishes (slowly) rather than being killed is a tuple
+# (reason, seconds, MB): the limits it is known to break, used in that mode.
 KNOWN_OPEN = {
-    "a_procs_50x20": "R1: IF-guarded writes per routine, 53 s",
     "a_procs_50x200": "R1: killed at 120 s, 937 MB",
     "a_procs_200x20": "R1: killed at 120 s",
     "a_procs_500x20": "R1: killed at 120 s",
     "g_tables_5000": "catalog loading is quadratic, killed at 120 s",
-    "j_branches_14": "R1: nested IF/ELSE depth 14, 109 s, 1 GB",
     "k_seq_ifs_200": "R1: sequential IF-guarded writes, killed at 120 s",
+    "n_h02_select_no_from_db2i": (
+        "findings of unterminated SELECTs span to the end of the file, so excerpts "
+        "grow as n^2/2 lines: 10k lines 4 s / 542 MB, 20k lines 17 s / 2 GB (audit h02)",
+        10, 512,
+    ),
     "n_h04_nested_while": "R2: 4000 nested WHILE, killed at 120 s, 2.3 GB (audit h04)",
 }
 
@@ -107,6 +111,9 @@ def main():
             if a.only not in name:
                 continue
             known = next((r for k, r in KNOWN_OPEN.items() if name.startswith(k + ".")), None)
+            known_limits = None
+            if isinstance(known, tuple):
+                known, *known_limits = known
             if known and not a.known_open:
                 print(f"{name:32} skipped (known open: {known})")
                 continue
@@ -114,8 +121,10 @@ def main():
                 continue
             secs, mb = a.timeout, a.rss_mb
             for prefix, (s, m) in OVERRIDES.items():
-                if name.startswith(prefix):
+                if name.startswith(prefix + "."):
                     secs, mb = s, m
+            if a.known_open and known_limits:
+                secs, mb = known_limits
             out = os.path.join(work, "out", name)
             dialect = "db2i" if "db2i" in name else "tsql"
             result, wall, peak = run(a.sqldiff, f, out, secs, mb, dialect)

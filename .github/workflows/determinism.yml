@@ -27,4 +27,5 @@ jobs:
       - run: cargo build --release -p sqldiff-cli
       - run: python3 scripts/determinism-corpus.py
       # The known-open hang shapes with the full time limit.
-      - run: python3 scripts/hang-gate.py --known-open --timeout 120
+      - if: always()
+        run: python3 scripts/hang-gate.py --known-open --timeout 120

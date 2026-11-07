@@ -84,7 +84,7 @@ w("n_h03_union_all_12k.sql", "INSERT INTO t (a) SELECT 0" + "".join(f" UNION ALL
 w("n_h04_nested_while.sql", "WHILE 1=1 " * 4000 + "\n")
 w("n_s01_deep_parens.sql", "SELECT " + "(" * 3000 + "1" + ")" * 3000 + ";\n")
 w("n_s02_long_or_chain.sql", "SELECT * FROM t WHERE a=0" + "".join(f" OR a={k}" for k in range(1, 10000)) + ";\n")
-w("n_s03_nested_begin.sql", "BEGIN " * 8000 + "SELECT 1" + " END" * 8000 + "\n")
+w("n_s03_nested_begin.sql", "BEGIN " * 8000 + "SELECT 1;" + " END" * 8000 + "\n")
 for name, text in [("p01_unterminated_quote", "SELECT '"), ("p02_routine_no_body", "CREATE PROCEDURE p"),
                    ("p03_insert_alone", "INSERT"), ("p04_set_alone", "SET"), ("p05_set_no_value", "SET @a ="),
                    ("p06_declare_alone", "DECLARE"), ("p07_create_alone", "CREATE"), ("p08_print_alone", "PRINT")]:
