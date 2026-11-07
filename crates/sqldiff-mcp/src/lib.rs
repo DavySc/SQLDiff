@@ -1508,7 +1508,6 @@ impl Server {
                     p.1.store(total, Ordering::Relaxed);
                 })
             }),
-            ..Default::default()
         };
         let worker_args = args.clone();
         let handle = std::thread::Builder::new()
