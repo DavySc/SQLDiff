@@ -497,6 +497,10 @@ fn recheck_none_trusts_the_store_and_says_so() {
     assert!(w.tree.report.run.files.iter().all(|r| r.reused));
     let summary = tree::summary(&w.tree.report);
     assert!(summary.contains("unverified reuse"), "{summary}");
+    assert!(
+        tree::markdown(&w.tree.report).contains("Unverified reuse"),
+        "the markdown report says it too"
+    );
     // The default and `all` do not claim it.
     let ok = convert_into(&f.job("o", true, true), &Hooks::default()).unwrap();
     assert!(!tree::summary(&ok.tree.report).contains("unverified reuse"));
@@ -531,7 +535,12 @@ fn the_recheck_mode_never_changes_the_output() {
         for (_, text) in &mut t {
             *text = text
                 .lines()
-                .filter(|l| !l.contains("\"recheck\":") && !l.starts_with("unverified reuse"))
+                .filter(|l| {
+                    !l.contains("\"recheck\":")
+                        && !l.starts_with("unverified reuse")
+                        && !l.starts_with("**Unverified reuse")
+                        && !l.trim().is_empty()
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
         }
@@ -546,4 +555,21 @@ fn the_recheck_mode_never_changes_the_output() {
         convert_into(&with_recheck(f.job("o", true, false), r), &Hooks::default()).unwrap();
         assert_eq!(want, plain(&f.out("o")), "{}", r.label());
     }
+}
+
+#[test]
+fn recheck_none_says_so_when_only_the_tree_state_was_reused() {
+    let f = Fixture::standard("recheckstateonly");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    // No per-file result is left to reuse; the tree state still is.
+    for p in results(&f.out("o")) {
+        std::fs::remove_file(p).unwrap();
+    }
+    let w = convert_into(
+        &with_recheck(f.job("o", true, false), tree::Recheck::None),
+        &Hooks::default(),
+    )
+    .unwrap();
+    assert!(w.tree.report.run.files.iter().all(|r| !r.reused));
+    assert!(tree::summary(&w.tree.report).contains("unverified reuse"));
 }

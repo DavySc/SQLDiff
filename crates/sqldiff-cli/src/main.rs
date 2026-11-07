@@ -214,7 +214,7 @@ enum Command {
         /// checks one stored file in 50 each run, chosen from the tree and
         /// the store's run count; `all` checks every stored result and
         /// draft and the whole tree state; `none` trusts the store, and the
-        /// summary and report say the reuse was not verified.
+        /// summary and both reports say the reuse was not verified.
         #[arg(long, value_name = "MODE", default_value = "sample")]
         recheck: sqldiff_convert::tree::Recheck,
         /// Only plan: read SRC, find which file defines and uses which

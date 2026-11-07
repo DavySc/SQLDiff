@@ -2880,6 +2880,9 @@ fn proof_lines(r: &Report) -> Option<(String, Option<String>)> {
     Some((first, second))
 }
 
+/// The summary line of a run under `--recheck none`.
+const UNVERIFIED_REUSE: &str = "unverified reuse: --recheck none; nothing taken from the store in this run (results, drafts, tree state) was built again to compare";
+
 pub fn summary(r: &Report) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "{} files, {} → {}", r.totals.files, r.from, r.to);
@@ -2900,11 +2903,11 @@ pub fn summary(r: &Report) -> String {
     if !r.unreadable.is_empty() {
         let _ = writeln!(s, "{:<20} {:>6}", "unreadable", r.unreadable.len());
     }
-    if r.run.recheck == Recheck::None && r.run.files.iter().any(|f| f.reused) {
-        let _ = writeln!(
-            s,
-            "unverified reuse: --recheck none; the stored results taken in this run were not built again to compare"
-        );
+    // Whatever the run took from the store (results, drafts, the tree
+    // state) was not built again to compare, so say so on every run in this
+    // mode, whether or not a per-file result happened to be reused.
+    if r.run.recheck == Recheck::None {
+        let _ = writeln!(s, "{UNVERIFIED_REUSE}");
     }
     if let Some(p) = &r.totals.progress {
         let _ = writeln!(
@@ -3006,6 +3009,12 @@ pub fn markdown(r: &Report) -> String {
         s,
         "A file counts as converted only when every unit in it is: no assumption, no decision, nothing found by the engine's diff or by checking the output on its own (binding, leftover source syntax, target limits).\n"
     );
+    if r.run.recheck == Recheck::None {
+        let _ = writeln!(
+            s,
+            "**Unverified reuse (`--recheck none`):** anything this run took from the result store was trusted as stored, not built again to compare.\n"
+        );
+    }
     let _ = writeln!(s, "```\n{}```\n", summary(r));
     if let Some(p) = &r.totals.proof {
         proof_markdown(&mut s, r, p);
