@@ -80,12 +80,14 @@ pub struct Redactor {
 }
 
 /// Spans no term may match inside: placeholders, and hex runs of 16 or
-/// more characters (fingerprints, content hashes, snapshot ids).
+/// more characters (fingerprints, content hashes, snapshot ids). A
+/// placeholder is opaque even when a word character follows it: a term
+/// matches anywhere, so `obj` inside `objects` becomes `TERM_xxxxxxxxects`.
 fn opaque() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"\b(?:(?:OBJ|SCHEMA|PATH|WI|HELPER|RULE|PACK|TERM)_[0-9A-F]{8}(?:\.[a-z0-9]{1,4})?|[0-9a-fA-F]{16,})\b",
+            r"\b(?:(?:OBJ|SCHEMA|PATH|WI|HELPER|RULE|PACK|TERM)_[0-9A-F]{8}(?:\.[a-z0-9]{1,4}\b)?|[0-9a-fA-F]{16,}\b)",
         )
         .expect("opaque pattern compiles")
     })
