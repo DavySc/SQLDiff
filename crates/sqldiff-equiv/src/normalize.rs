@@ -371,6 +371,16 @@ fn hirschberg<T: PartialEq>(a: &[T], b: &[T], oa: usize, ob: usize, out: &mut Ve
         out.extend(lcs_table(a, b, oa, ob));
         return;
     }
+    // One item of `a` against a long `b`: the table walk pairs it with its
+    // first match (it skips `b` items until one equals it), or with nothing.
+    // Without this case `mid` is 0 and the second call gets the same slices
+    // again, forever.
+    if a.len() == 1 {
+        if let Some(j) = b.iter().position(|y| *y == a[0]) {
+            out.push((oa, ob + j));
+        }
+        return;
+    }
     let mid = a.len() / 2;
     let left = lcs_row(&a[..mid], b, false);
     let right = lcs_row(&a[mid..], b, true);
@@ -458,6 +468,23 @@ mod lcs_tests {
     fn is_common(a: &[u32], b: &[u32], p: &[(usize, usize)]) -> bool {
         p.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1)
             && p.iter().all(|&(i, j)| a[i] == b[j])
+    }
+
+    /// One item of `a` against more than a table's worth of `b` used to
+    /// recurse on the same slices without end (and out of memory).
+    #[test]
+    fn a_single_item_against_a_very_long_other_side_ends() {
+        let a: Vec<u32> = vec![1, 3, 4, 9];
+        let mut b: Vec<u32> = vec![1];
+        b.extend(1_000..1_300_000u32);
+        b.extend([3, 9]);
+        let mut out = Vec::new();
+        hirschberg(&a, &b, 0, 0, &mut out);
+        assert_eq!(out, vec![(0, 0), (1, 1_299_001), (3, 1_299_002)]);
+        // And the mirror image: the long side is `a`.
+        let mut out = Vec::new();
+        hirschberg(&b, &a, 0, 0, &mut out);
+        assert_eq!(out, vec![(0, 0), (1_299_001, 1), (1_299_002, 3)]);
     }
 
     #[test]
