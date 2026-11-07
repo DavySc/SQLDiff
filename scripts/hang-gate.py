@@ -37,7 +37,6 @@ OVERRIDES = {}
 # one alignment can still use up to LCS_WORK cells.
 KNOWN_OPEN = {
     "j_branches_16": "R1: nested IF/ELSE is 2^depth through the alignment; depth 14 takes 70 s and 1 GB (guarded in the normal run)",
-    "a_procs_50x200": "R1: 50 routines of 200 IF-guarded writes, killed at 300 s",
     "a_procs_200x20": (
         "R1: 0.6 s per routine of 20 IF-guarded writes, 118 s for 200 routines",
         60,
