@@ -48,7 +48,6 @@ KNOWN_OPEN = {
         "grow as n^2/2 lines: 10k lines 4 s / 542 MB, 20k lines 17 s / 2 GB (audit h02)",
         10, 512,
     ),
-    "n_h04_nested_while": "R2: 4000 nested WHILE, killed at 120 s, 2.3 GB (audit h04)",
 }
 
 
