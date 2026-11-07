@@ -1,6 +1,6 @@
 # Literal-conversion probes
 
-These are the engine checks behind `crates/sqldiff-core/src/equiv/literal.rs`, which models how a string literal converts when it is compared with, or cast to, a typed value.
+These are the engine checks behind `crates/sqldiff-equiv/src/equiv/literal.rs`, which models how a string literal converts when it is compared with, or cast to, a typed value.
 
 - `mssql.sql`: SQL Server 2022. Run it with `sqlcmd -I -W -h -1`. Some lines fail on purpose, to show that a conversion is rejected.
 - `postgres.sql`: PostgreSQL 18.6. Run it with `psql -At`.

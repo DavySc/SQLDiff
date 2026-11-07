@@ -74,18 +74,21 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("sqldiff-catalog/src/ddl.rs", &["fs::"]),
     ("sqldiff-core/src/engine.rs", &["Mutex", "OnceLock"]),
     (
-        "sqldiff-core/src/equiv/canon.rs",
+        "sqldiff-equiv/src/equiv/canon.rs",
         &["Mutex", "OnceLock", "thread_local!"],
     ),
-    ("sqldiff-core/src/equiv/compare.rs", &["thread_local!"]),
+    ("sqldiff-equiv/src/equiv/compare.rs", &["thread_local!"]),
     (
-        "sqldiff-core/src/equiv/edit.rs",
+        "sqldiff-equiv/src/equiv/edit.rs",
         &["OnceCell", "env::var", "thread_local!"],
     ),
-    ("sqldiff-core/src/equiv/eval.rs", &["env::var"]),
-    ("sqldiff-core/src/equiv/geography.rs", &["env::var", "fs::"]),
-    ("sqldiff-core/src/equiv/mod.rs", &["OnceCell", "env::var"]),
-    ("sqldiff-core/src/equiv/schema.rs", &["OnceLock", "fs::"]),
+    ("sqldiff-equiv/src/equiv/eval.rs", &["env::var"]),
+    (
+        "sqldiff-equiv/src/equiv/geography.rs",
+        &["env::var", "fs::"],
+    ),
+    ("sqldiff-equiv/src/equiv/mod.rs", &["OnceCell", "env::var"]),
+    ("sqldiff-equiv/src/equiv/schema.rs", &["OnceLock", "fs::"]),
     ("sqldiff-core/src/format/tests.rs", &["fs::"]),
     ("sqldiff-core/src/ir/behaviour.rs", &["OnceCell"]),
     ("sqldiff-model/src/profile.rs", &["OnceLock"]),
@@ -131,6 +134,7 @@ fn the_check_reads_nothing_outside_its_arguments() {
         "sqldiff-syntax",
         "sqldiff-model",
         "sqldiff-catalog",
+        "sqldiff-equiv",
     ] {
         scan(&root.join(krate).join("src"), &root, &mut found);
     }
