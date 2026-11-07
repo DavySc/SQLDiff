@@ -576,7 +576,7 @@ fn verify(
 fn engine_check(before: &str, after: &str, dialect: Dialect, opts: &Options) -> Option<String> {
     let a = Artifact::new("input", dialect, before);
     let report = crate::diff(&a, &Artifact::new("formatted", dialect, after), opts);
-    if report.verdict == Verdict::Equal && report.findings.is_empty() {
+    if report.verdict() == Verdict::Equal && report.findings.is_empty() {
         return None;
     }
     let rules = |r: &crate::Report| -> Vec<String> {
@@ -585,13 +585,13 @@ fn engine_check(before: &str, after: &str, dialect: Dialect, opts: &Options) -> 
         v
     };
     let base = crate::diff(&a, &Artifact::new("formatted", dialect, before), opts);
-    if base.verdict == report.verdict && rules(&base) == rules(&report) {
+    if base.verdict() == report.verdict() && rules(&base) == rules(&report) {
         return None;
     }
     let what = report
         .findings
         .first()
-        .map_or(report.verdict.label().to_string(), |f| f.rule.clone());
+        .map_or(report.verdict().label().to_string(), |f| f.rule.clone());
     Some(format!(
         "the engine does not find the output equal ({what})"
     ))

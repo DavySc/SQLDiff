@@ -44,22 +44,7 @@ pub enum Source {
     Default,
 }
 
-/// A fact the object's own source states, so the matching default is not
-/// an assumption for that side.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Discharge {
-    pub id: String,
-    pub side: Side,
-    pub line: usize,
-    /// The statement that states it, e.g. `SET XACT_ABORT ON`.
-    pub cite: String,
-    /// The stated value, where the fact has one (a commit level).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
-    /// Byte range of the statement.
-    #[serde(skip)]
-    pub range: (usize, usize),
-}
+pub use crate::model::Discharge;
 
 /// Facts one side's source states about its own environment.
 pub fn discharges(a: &Analyzed) -> Vec<Discharge> {
@@ -321,7 +306,7 @@ pub fn ledger_by(
             raw.clone()
         };
         relabel(&mut r, &other);
-        let v = r.verdict;
+        let v = r.verdict();
         out.push(Entry {
             text: asm
                 .map(|x| x.text.clone())
@@ -334,7 +319,7 @@ pub fn ledger_by(
                 .collect(),
             reruns,
             verdict_if_flipped: Some(v),
-            flips_verdict: v != report.verdict,
+            flips_verdict: v != report.verdict(),
             id,
             status,
             source,
