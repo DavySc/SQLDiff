@@ -1623,16 +1623,11 @@ impl Server {
         };
         let fresh = reload()?;
         let before = self.config_state();
-        let same_dir = fresh.data_dir == self.config.data_dir;
-        let store = if same_dir {
-            None
-        } else {
-            Some(Store::from_config(&fresh).map_err(|e| e.0)?)
-        };
+        // Rebuild the review store from the fresh configuration before assigning anything, so
+        // an unresolvable data key is refused exactly as at startup and leaves the old state.
+        let store = Store::from_config(&fresh).map_err(|e| e.0)?;
         self.config = fresh;
-        if let Some(st) = store {
-            self.store = st;
-        }
+        self.store = store;
         let after = self.config_state();
         let changed = before != after;
         let text = format!(

@@ -815,10 +815,7 @@ impl Live {
             .arg("--isolated")
             .arg("--config")
             .arg(config)
-            .env(
-                "SQLDIFF_DATA_DIR",
-                std::env::temp_dir().join(format!("sqldiff-mcp-live-{}", std::process::id())),
-            )
+            .env("SQLDIFF_DATA_DIR", config.parent().unwrap().join("data"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -879,6 +876,16 @@ fn engine_reports_fingerprints_and_reload_config_picks_up_an_edit() {
     assert_eq!(r["result"]["isError"], true, "{r}");
     let e3 = s.call("engine", json!({}));
     assert_eq!(result(&e3)["config"], result(&e2)["config"]);
+
+    // A data key that does not resolve is refused like at startup, and nothing changes.
+    write(
+        &cfg,
+        "excerpt_lines = 7\ndata_key = \"env:SQLDIFF_TEST_KEY_THAT_IS_NOT_SET\"\n",
+    );
+    let r = s.call("reload_config", json!({}));
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    let e4 = s.call("engine", json!({}));
+    assert_eq!(result(&e4)["config"], result(&e2)["config"]);
     s.finish();
     let _ = std::fs::remove_dir_all(&d);
 }
