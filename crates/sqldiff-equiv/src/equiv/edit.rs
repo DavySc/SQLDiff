@@ -1855,6 +1855,10 @@ impl<'x, 'a> Routine<'x, 'a> {
         let Some(fast) = side.fast.get(&i) else {
             return self.interacts_exact(n, &side.without(i), reach);
         };
+        SHARED_ANSWERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if fast.reach.is_some() {
+            REACH_ANSWERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let got = self.interacts_shared(n, side, fast, reach);
         if side.oracle {
             let want = self.interacts_exact(n, &side.without(i), reach);
@@ -2453,6 +2457,23 @@ impl<'r, 'x, 'a> TaintSweep<'r, 'x, 'a> {
             reach: None,
         }
     }
+}
+
+/// How many edit answers came from the shared sweeps, and how many of them
+/// from the reach sweep. Counted for tests only (the oracle tests assert a
+/// minimum so they cannot go vacuous if eligibility silently drops to zero);
+/// no output ever reads them.
+static SHARED_ANSWERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static REACH_ANSWERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `(answers from the shared sweeps, of them answered by the reach sweep)`
+/// so far in this process.
+#[doc(hidden)]
+pub fn shared_answer_counts() -> (usize, usize) {
+    (
+        SHARED_ANSWERS.load(std::sync::atomic::Ordering::Relaxed),
+        REACH_ANSWERS.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// How far the reach sweep may go before the remaining edits take the exact

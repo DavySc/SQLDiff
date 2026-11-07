@@ -7,7 +7,29 @@
 //! read and write side), jumps, and between 5 and 45 percent of the statements
 //! edited, in both directions and for both dialects.
 
+use sqldiff_core::equiv::edit::shared_answer_counts;
 use sqldiff_core::{diff, Artifact, Dialect, Options};
+use std::sync::Mutex;
+
+/// The tests share the process-wide answer counters, so they run one at a
+/// time: the difference of the counters around a test is then its own.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Fails unless the test got at least `shared` answers from the shared
+/// sweeps and `reach` of them from the reach sweep: an oracle that compares
+/// nothing proves nothing.
+fn expect_answers(before: (usize, usize), shared: usize, reach: usize) {
+    let after = shared_answer_counts();
+    let (got_shared, got_reach) = (after.0 - before.0, after.1 - before.1);
+    assert!(
+        got_shared >= shared && got_reach >= reach,
+        "the oracle compared {got_shared} shared answers ({got_reach} from the reach sweep), expected at least {shared} ({reach})"
+    );
+}
 
 struct Rng(u64);
 
@@ -177,6 +199,8 @@ fn routine(nodes: &[Node], edited: &[bool], b: bool, tsql: bool) -> String {
 fn shared_state_agrees_with_the_exact_scan() {
     // Every test in this binary needs it, and this is the only one.
     std::env::set_var("SQLDIFF_EDIT_ORACLE", "1");
+    let _guard = serial();
+    let before = shared_answer_counts();
     let mut rng = Rng(0x5eed);
     let mut compared = 0usize;
     for case in 0..60 {
@@ -215,6 +239,7 @@ fn shared_state_agrees_with_the_exact_scan() {
         }
     }
     assert!(compared > 200, "the generated cases produce findings");
+    expect_answers(before, 300, 80);
 }
 
 /// Fixed shapes for the sweep's wake-ups. The generator reaches them only by
@@ -225,6 +250,8 @@ fn shared_state_agrees_with_the_exact_scan() {
 #[test]
 fn sweep_wake_ups_agree_with_the_exact_scan() {
     std::env::set_var("SQLDIFF_EDIT_ORACLE", "1");
+    let _guard = serial();
+    let before = shared_answer_counts();
     let tsql = |k1: u32, k2: u32| {
         format!(
             "CREATE PROCEDURE dbo.r @p int, @q int AS\nBEGIN\nDECLARE @v2 int = 0;\nSET @q = (SELECT @p AS [*]);\nSET @v2 = @p + {k1};\nSELECT @q + {k2};\nEND\n"
@@ -281,6 +308,7 @@ fn sweep_wake_ups_agree_with_the_exact_scan() {
         }
     }
     assert!(answered > 0);
+    expect_answers(before, 10, 6);
 }
 
 /// The shapes the design review asked for that the generator reaches only by
@@ -292,6 +320,8 @@ fn sweep_wake_ups_agree_with_the_exact_scan() {
 #[test]
 fn status_only_one_sided_and_non_candidate_findings_agree_with_the_exact_scan() {
     std::env::set_var("SQLDIFF_EDIT_ORACLE", "1");
+    let _guard = serial();
+    let before = shared_answer_counts();
     // (declared default, [k1, k2, k3], extra statement in the routine)
     let tsql = |d: u32, k: [u32; 3], extra: bool| {
         let add = if extra { "SET @v3 = @p;\n" } else { "" };
@@ -336,4 +366,5 @@ fn status_only_one_sided_and_non_candidate_findings_agree_with_the_exact_scan() 
         }
     }
     assert!(answered > 0);
+    expect_answers(before, 80, 50);
 }
