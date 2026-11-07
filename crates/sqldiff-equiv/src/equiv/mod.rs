@@ -585,6 +585,49 @@ fn compare_units_within(
                     .iter()
                     .map(|(n, _)| (side.line_of(n), "construct")),
             );
+            // The whole range of the unit, first construct to last end:
+            // IF, WHILE, DECLARE, TRY and CATCH lines, a transaction inside
+            // a TRY, and every conversion unit in it are covered even when
+            // no list above names them.
+            // The routine around the header, when there is one: its end is
+            // the end of the unit (the lines after the last statement, like
+            // END TRY and CATCH, belong to it).
+            let routine = side
+                .root
+                .descendants()
+                .filter(|n| {
+                    n.kind() == sqldiff_syntax::SyntaxKind::ROUTINE && {
+                        let (rs, re) = cst::sig_range(n);
+                        rs <= hs && hs < re
+                    }
+                })
+                .min_by_key(|n| {
+                    let (rs, re) = cst::sig_range(n);
+                    re - rs
+                });
+            let nodes: Vec<&SyntaxNode> = u
+                .stmts
+                .iter()
+                .map(|s| &s.node)
+                .chain(u.tables.iter().map(|(n, _)| n))
+                .chain(u.ddl.iter().map(|(n, _)| n))
+                .chain(u.calls.iter().map(|(n, _)| n))
+                .chain(u.dynamic.iter().map(|(n, _)| n))
+                .chain(u.table_vars.iter().chain(&u.temp_drops).map(|(n, _)| n))
+                .chain(u.txn_stmts.iter().map(|(n, _)| n))
+                .chain(u.uncovered.iter().map(|(n, _)| n))
+                .chain(routine.as_ref())
+                .collect();
+            let mut first = lines.iter().map(|(l, _)| *l).min().unwrap_or(0);
+            let mut last = side.location(hs, he).end_line.max(first);
+            for n in nodes {
+                let loc = side.node_location(n);
+                first = first.min(loc.start_line);
+                last = last.max(loc.end_line);
+            }
+            out.unknown_reasons.push(format!(
+                "{name} lines {first}-{last}: everything in the routine or script segment is {why}"
+            ));
             let mut seen = std::collections::BTreeSet::new();
             for (l, what) in lines {
                 if seen.insert((l, what)) {
