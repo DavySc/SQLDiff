@@ -7,7 +7,7 @@ usage: real-code-gate.py [--sqldiff PATH] [--work DIR] [--only NAME]
 Sources and pinned commits: corpus/real-code/sources.json. Files that are not
 UTF-8 (UTF-16 exports) are skipped and counted.
 """
-import argparse, collections, json, os, shutil, subprocess, sys
+import argparse, collections, hashlib, json, os, shutil, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -22,7 +22,19 @@ def git(*args, cwd=None, hint=""):
         sys.exit(f"real-code gate: `git {' '.join(args)}` failed.{hint}")
 
 
+def vendored(src):
+    """A source kept in the repository: no network, bytes checked against sha256."""
+    dest = os.path.join(ROOT, src["local"])
+    for rel, want in src["sha256"].items():
+        got = hashlib.sha256(open(os.path.join(dest, rel), "rb").read()).hexdigest()
+        if got != want:
+            sys.exit(f"real-code gate: vendored {src['name']}/{rel} differs from the pinned upstream bytes ({got} != {want})")
+    return dest
+
+
 def fetch(src, work):
+    if src.get("local"):
+        return vendored(src)
     dest = os.path.join(work, src["name"])
     head = os.path.join(dest, ".git", "HEAD")
     if os.path.exists(head):
