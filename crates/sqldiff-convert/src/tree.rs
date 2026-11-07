@@ -1374,7 +1374,7 @@ fn convert_files(
     // the store when their key matches, else they are not checked.
     let in_increment: Option<Vec<bool>> = match (select, cache) {
         (Some(sel), Some(c)) => {
-            let plan = crate::plan::Plan::build(inputs, a.from);
+            let plan = crate::plan::Plan::build_with(inputs, a.from, jobs);
             let at: std::collections::BTreeMap<&str, usize> = plan
                 .files
                 .iter()
