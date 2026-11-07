@@ -59,12 +59,13 @@ fn main() {
         // because their folded text is equal. Identified only when every
         // condition with that text on either side sits in an identified pair
         // with a condition of the same text on the other side.
-        let ident = |a_start: usize, b_start: usize| {
-            reports
-                .iter()
-                .flat_map(|r| &r.rows)
-                .any(|c| c.a_start == a_start && c.b_start == b_start && c.class.identified())
-        };
+        let done: std::collections::HashSet<(usize, usize)> = reports
+            .iter()
+            .flat_map(|r| &r.rows)
+            .filter(|c| c.class.identified())
+            .map(|c| (c.a_start, c.b_start))
+            .collect();
+        let ident = |a_start: usize, b_start: usize| done.contains(&(a_start, b_start));
         for s in &shared {
             let ok = s.a.iter().all(|x| s.b.iter().any(|y| ident(*x, *y)))
                 && s.b.iter().all(|y| s.a.iter().any(|x| ident(*x, *y)));

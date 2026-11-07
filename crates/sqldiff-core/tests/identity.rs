@@ -8,15 +8,24 @@ use sqldiff_core::{Artifact, Dialect, Options};
 /// Classes of the paired conditions of `a` (T-SQL) against `b` (PostgreSQL),
 /// in the order of side A.
 fn classes(a: &str, b: &str) -> Vec<Class> {
+    reports(a, b, Dialect::Tsql, Dialect::Postgres)
+        .into_iter()
+        .flat_map(|r| r.rows.into_iter().map(|c| c.class))
+        .collect()
+}
+
+fn reports(
+    a: &str,
+    b: &str,
+    da: Dialect,
+    db: Dialect,
+) -> Vec<sqldiff_core::equiv::identity::UnitReport> {
     let a = a.to_string();
     let b = b.to_string();
     sqldiff_core::with_engine_stack(move || {
-        let aa = Artifact::new("a.sql", Dialect::Tsql, a);
-        let bb = Artifact::new("b.sql", Dialect::Postgres, b);
+        let aa = Artifact::new("a.sql", da, a);
+        let bb = Artifact::new("b.sql", db, b);
         sqldiff_core::identity(&aa, &bb, &Options::default())
-            .into_iter()
-            .flat_map(|r| r.rows.into_iter().map(|c| c.class))
-            .collect()
     })
 }
 
@@ -323,4 +332,101 @@ fn the_report_is_the_same_twice() {
         ),
     );
     assert_eq!(classes(&a, &b), classes(&a, &b));
+}
+
+#[test]
+fn a_backward_goto_is_a_loop_and_the_routine_is_refused() {
+    // Side A leaves the loop with n = 10, side B with n = 11; `IF @n = 10`
+    // must not be identified.
+    let body = |lim: u32| {
+        tsql(
+            "@x int",
+            &format!(
+                "DECLARE @n int = 0;\nagain:\nSET @n = @n + 1;\nIF @n < {lim} GOTO again;\nIF @n = 10 UPDATE t SET c = 1;"
+            ),
+        )
+    };
+    let r = reports(&body(10), &body(11), Dialect::Tsql, Dialect::Tsql);
+    assert!(
+        r.iter().all(|u| u.refused.is_some() && u.rows.is_empty()),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn a_condition_that_reads_a_record_field_is_state_not_identified() {
+    let pg_rec = |v: u32| {
+        format!(
+            "CREATE PROCEDURE public.p(p_x integer)\nLANGUAGE plpgsql AS $$\nDECLARE r t%ROWTYPE;\nBEGIN\nr.c := {v};\nIF r.c = 1 THEN UPDATE t SET c = 1; END IF;\nEND $$;\n"
+        )
+    };
+    let r = reports(&pg_rec(1), &pg_rec(2), Dialect::Postgres, Dialect::Postgres);
+    let rows: Vec<_> = r.iter().flat_map(|u| &u.rows).collect();
+    assert!(!rows.is_empty());
+    assert!(rows.iter().all(|c| !c.class.identified()), "{rows:?}");
+}
+
+#[test]
+fn state_identified_is_not_usable() {
+    assert!(!Class::State.identified());
+    assert!(Class::Value.identified());
+    assert!(Class::Rows.identified());
+    assert!(!Class::No("x".into()).identified());
+}
+
+#[test]
+fn a_fetch_into_variable_is_not_identified() {
+    let c = classes(
+        &tsql(
+            "@x int",
+            "DECLARE @n int = 0;\nDECLARE c CURSOR FOR SELECT id FROM t;\nOPEN c;\nFETCH NEXT FROM c INTO @n;\nIF @n = 1 UPDATE t SET c = 1;\nCLOSE c;\nDEALLOCATE c;",
+        ),
+        &pg(
+            "p_x integer",
+            "DECLARE v_n integer := 0; c CURSOR FOR SELECT id FROM t;",
+            "OPEN c;\nFETCH c INTO v_n;\nIF v_n = 1 THEN UPDATE t SET c = 1; END IF;\nCLOSE c;",
+        ),
+    );
+    assert!(c.iter().all(|x| !x.identified()), "{c:?}");
+}
+
+#[test]
+fn a_condition_that_can_raise_is_identified_only_when_both_sides_raise_alike() {
+    // Integer addition overflows alike on both sides: same value or same error.
+    let c = classes(
+        &tsql("@x int, @y int", "IF @x + @y > 5 UPDATE t SET c = 1;"),
+        &pg(
+            "p_x integer, p_y integer",
+            "",
+            "IF p_x + p_y > 5 THEN UPDATE t SET c = 1; END IF;",
+        ),
+    );
+    assert_eq!(first(&c), &Class::Value, "{c:?}");
+    // Division can raise (zero, and overflow of the minimum / -1) and is not a
+    // value head: never identified.
+    let c = classes(
+        &tsql("@x int, @y int", "IF @x / @y > 5 UPDATE t SET c = 1;"),
+        &pg(
+            "p_x integer, p_y integer",
+            "",
+            "IF p_x / p_y > 5 THEN UPDATE t SET c = 1; END IF;",
+        ),
+    );
+    not_identified(&c);
+}
+
+#[test]
+fn a_parameter_default_that_is_not_a_literal_is_not_identified() {
+    let c = classes(
+        &tsql(
+            "@d datetime2 = SYSDATETIME()",
+            "IF @d > '2020-01-01' UPDATE t SET c = 1;",
+        ),
+        &pg(
+            "p_d timestamp DEFAULT statement_timestamp()",
+            "",
+            "IF p_d > '2020-01-01' THEN UPDATE t SET c = 1; END IF;",
+        ),
+    );
+    not_identified(&c);
 }

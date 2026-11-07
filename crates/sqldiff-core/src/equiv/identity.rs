@@ -79,8 +79,11 @@ pub enum Class {
 }
 
 impl Class {
+    /// Usable by a consumer: identified by value or by the statement a row
+    /// test follows. A state-identified condition is not (it is equal only
+    /// if the database is equal at both points).
     pub fn identified(&self) -> bool {
-        !matches!(self, Class::No(_))
+        matches!(self, Class::Value | Class::Rows)
     }
 
     pub fn label(&self) -> &'static str {
@@ -370,6 +373,17 @@ impl<'a> Side<'a> {
         out
     }
 
+    /// The base variable of an assignment target that is not a bare name.
+    fn mentioned_target(&self, e: &Expr) -> BTreeSet<Var> {
+        let mut out = BTreeSet::new();
+        match e {
+            Expr::Name(p) => out.extend(p.first().and_then(|n| self.var_of(n))),
+            Expr::Var(n) => out.extend(self.var_of(n)),
+            _ => {}
+        }
+        out
+    }
+
     /// Variables the tokens may write with an assignment inside a data
     /// statement (`UPDATE t SET @v = c`, `SELECT @v = c FROM t`).
     fn token_writes(&self, toks: &[super::ast::Tok]) -> BTreeSet<Var> {
@@ -413,16 +427,26 @@ impl<'a> Side<'a> {
                 let mut kills: BTreeSet<Var> = self.token_writes(&s.toks);
                 match &s.ast {
                     Ok(st) if s.msg.is_none() && s.cursor.is_none() => {
-                        if let Some((Ok(t), _)) = st.assignment().map(|(t, v)| (var_expr(&t), v)) {
-                            if let Some(v) = self.var_of(&t) {
-                                plain = Some(v);
+                        if let Some((t, _)) = st.assignment() {
+                            match var_expr(&t) {
+                                Ok(n) => plain = self.var_of(&n),
+                                // `r.f := e`, `a[1] := e`: writes part of a
+                                // variable, which is unknown afterwards.
+                                Err(()) => kills.extend(self.mentioned_target(&t)),
                             }
                         }
                         match st {
                             Stmt::Declare { name, default, .. } => {
                                 if let Some(v) = self.var_of(name) {
                                     if default.is_none() {
-                                        out.push(Write::Implicit(v));
+                                        // PL/pgSQL initialises a variable at
+                                        // each entry to its block; a T-SQL
+                                        // DECLARE does not reset it in a loop.
+                                        if self.unit.dialect == Dialect::Tsql {
+                                            out.push(Write::Kill(v));
+                                        } else {
+                                            out.push(Write::Implicit(v));
+                                        }
                                     } else {
                                         plain = Some(v);
                                     }
@@ -947,6 +971,23 @@ fn bit_bool(x: super::schema::Ty, y: super::schema::Ty) -> bool {
     super::bit_bool(x, y)
 }
 
+/// A default that is a number, a string, NULL or a boolean: a value that does
+/// not depend on when or where the routine runs.
+fn literal_default(d: &str) -> bool {
+    let d = d
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+    let up = d.to_uppercase();
+    d.parse::<f64>().is_ok()
+        || (d.len() >= 2
+            && d.starts_with('\'')
+            && d.ends_with('\'')
+            && !d[1..d.len() - 1].contains('\''))
+        || matches!(up.as_str(), "NULL" | "TRUE" | "FALSE")
+}
+
 /// What the declared types and defaults of paired variables allow.
 fn variable_facts(ua: &Unit, ub: &Unit, sa: &Side<'_>) -> Vec<Result<Asms, String>> {
     let mut out: Vec<Result<Asms, String>> = vec![Err("not paired".to_string()); sa.names.len()];
@@ -961,6 +1002,9 @@ fn variable_facts(ua: &Unit, ub: &Unit, sa: &Side<'_>) -> Vec<Result<Asms, Strin
             }
             if x.default != y.default {
                 return Err("the parameter defaults differ".to_string());
+            }
+            if x.default.as_deref().is_some_and(|d| !literal_default(d)) {
+                return Err("a parameter default is not a literal".to_string());
             }
             if ua.dialect == ub.dialect {
                 return (x.decl == y.decl && x.ty.is_some())
@@ -1012,6 +1056,15 @@ fn variable_facts(ua: &Unit, ub: &Unit, sa: &Side<'_>) -> Vec<Result<Asms, Strin
     out
 }
 
+/// A label or `GOTO`: control flow the structured walk does not follow.
+fn jumps(u: &Unit) -> Option<String> {
+    let goto = |t: &[super::ast::Tok]| t.first().is_some_and(|f| f.up == "GOTO");
+    let hit = u.uncovered.iter().any(|(n, what)| {
+        what.contains("label") || goto(&tokens(n)) || tokens(n).iter().any(|t| t.up == "GOTO")
+    }) || u.stmts.iter().any(|s| goto(&s.toks));
+    hit.then(|| "a label or GOTO makes control flow the analysis does not follow".to_string())
+}
+
 /// The analysis of one routine pair. `pairs` are the item pairs
 /// `pair_items` chose.
 pub(super) fn analyze(
@@ -1033,6 +1086,11 @@ pub(super) fn analyze(
     rep.conds_a = count(ia);
     rep.conds_b = count(ib);
     if rep.conds_a == 0 && rep.conds_b == 0 {
+        return rep;
+    }
+    // A label with a GOTO is a loop the structured walk does not see.
+    if let Some(why) = jumps(ua).or_else(|| jumps(ub)) {
+        rep.refused = Some(why);
         return rep;
     }
     let both = (side(ua, ia), side(ub, ib));
