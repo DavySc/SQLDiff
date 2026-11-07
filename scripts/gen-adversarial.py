@@ -63,7 +63,7 @@ GO
 def ifs(k):
     if k==0: return "    UPDATE dbo.T SET Qty = Qty + 1 WHERE Id = 1;\n"
     return f"    IF @x > {k}\n    BEGIN\n{ifs(k-1)}    END\n    ELSE\n    BEGIN\n        UPDATE dbo.T SET Qty = Qty - {k} WHERE Id = {k};\n{ifs(k-1)}    END\n"
-for k in [6,10,14]:
+for k in [6,10,14,16]:
     w(f"j_branches_{k}.sql", schema+f"CREATE PROCEDURE dbo.PB @x int\nAS\nBEGIN\n{ifs(k)}END\nGO\n")
 # K. sequential IFs (not nested): 2^n paths if explored naively
 for n in [20,60,200]:

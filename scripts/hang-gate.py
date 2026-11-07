@@ -32,11 +32,7 @@ OVERRIDES = {}
 # An entry that finishes (slowly) rather than being killed is a tuple
 # (reason, seconds, MB): the limits it is known to break, used in that mode.
 KNOWN_OPEN = {
-    "j_branches_14": (
-        "R1: nested IF/ELSE depth 14, 77 to 99 s, 1 GB; time ~2.4x per doubling",
-        30,
-        2048,
-    ),
+    "j_branches_16": "R1: nested IF/ELSE is 2^depth through the alignment; depth 14 takes 70 s and 1 GB (guarded in the normal run)",
     "a_procs_50x200": "R1: 50 routines of 200 IF-guarded writes, killed at 300 s",
     "a_procs_200x20": (
         "R1: 0.6 s per routine of 20 IF-guarded writes, 118 s for 200 routines",
