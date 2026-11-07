@@ -283,3 +283,31 @@ fn padding_outside_like() {
         assert!(!matches!(v, Verdict::Different), "pg {w}: {v:?}");
     }
 }
+
+/// Numeric and date functions over columns that are not `char(n)` are
+/// judged, as before; their check must not refuse a value that cannot carry
+/// blank padding.
+#[test]
+fn numeric_and_date_functions_of_non_strings_are_judged() {
+    let d = Dialect::Tsql;
+    let ddl = "CREATE TABLE t (id int PRIMARY KEY, c char(6) NOT NULL, dt date NOT NULL, n int NOT NULL);";
+    let opts = Options {
+        catalog_a: vec![Artifact::new("catalog.sql", d, ddl)],
+        catalog_b: vec![Artifact::new("catalog.sql", d, ddl)],
+        ..Options::default()
+    };
+    for w in [
+        "YEAR(dt) = 2020",
+        "ABS(n) = 1",
+        "DATEADD(day, 1, dt) = '2020-01-02'",
+    ] {
+        let q = |w: &str| format!("SELECT id FROM t WHERE c = 'abc' AND {w};");
+        let v = diff(
+            &Artifact::new("a.sql", d, q(w)),
+            &Artifact::new("b.sql", d, q("1 = 0")),
+            &opts,
+        )
+        .verdict();
+        assert!(matches!(v, Verdict::Different), "{w}: {v:?}");
+    }
+}

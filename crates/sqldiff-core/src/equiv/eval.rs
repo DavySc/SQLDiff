@@ -2404,10 +2404,36 @@ impl Ctx<'_> {
         }
         // A function of a possible `char(n)` value (LEN, DATALENGTH, CONCAT,
         // SUBSTRING, UPPER, ...) depends on the blank padding the evaluator
-        // does not keep. Only those that hand a value on unchanged are exempt.
+        // does not keep. Exempt are the ones that hand a value on unchanged,
+        // and the numeric and date functions: they convert their argument to
+        // a number or a date, trailing blanks are ignored by that conversion
+        // in both dialects, and the result holds none of the argument's text.
+        // (The date part of DATEADD, DATEPART, ... is a name, not a value.)
         if !matches!(
             name.as_str(),
-            "COALESCE" | "ISNULL" | "NULLIF" | "IIF" | "GREATEST" | "LEAST"
+            "COALESCE"
+                | "ISNULL"
+                | "NULLIF"
+                | "IIF"
+                | "GREATEST"
+                | "LEAST"
+                | "ABS"
+                | "CEILING"
+                | "CEIL"
+                | "FLOOR"
+                | "ROUND"
+                | "SIGN"
+                | "SQRT"
+                | "POWER"
+                | "EXP"
+                | "YEAR"
+                | "MONTH"
+                | "DAY"
+                | "DATEADD"
+                | "DATEDIFF"
+                | "DATEDIFF_BIG"
+                | "DATEPART"
+                | "EOMONTH"
         ) && c.args.iter().any(|x| self.may_be_char(x, scopes))
         {
             return rej();
