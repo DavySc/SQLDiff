@@ -452,11 +452,7 @@ fn stand_in_flags_come_from_the_store_without_changing_the_output() {
     // Resumed: the flags are read, not computed; same files.
     for jobs in [1, 3] {
         run(&f, &c, "a", jobs, Select::default(), false);
-        same(
-            &base,
-            &tree_of(&f.out("a")),
-            "resumed with stored flags",
-        );
+        same(&base, &tree_of(&f.out("a")), "resumed with stored flags");
     }
     // A stored flag set that does not read back is computed again.
     for e in std::fs::read_dir(&flags).unwrap().flatten() {
