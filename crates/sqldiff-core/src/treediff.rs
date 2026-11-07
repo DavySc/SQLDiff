@@ -139,6 +139,8 @@ pub fn diff(a: &Analyzed, b: &Analyzed) -> TreeDiff {
         added: Vec::new(),
         hashes_a: all_hashes(&ua),
         hashes_b: all_hashes(&ub),
+        skipped_a: HashSet::new(),
+        skipped_b: HashSet::new(),
     };
     ctx.diff_lists(&ua, &ub);
     ctx.resolve_unpaired();
@@ -155,6 +157,11 @@ struct Ctx<'x, 'a> {
     /// twin exists on the other side may have moved.
     hashes_a: HashSet<String>,
     hashes_b: HashSet<String>,
+    /// Content hashes of the units in the stretches that were not aligned
+    /// (past the alignment bound), per side: a unit left without a twin
+    /// whose twin is among them may only have moved there.
+    skipped_a: HashSet<String>,
+    skipped_b: HashSet<String>,
 }
 
 fn all_hashes(units: &[Unit]) -> HashSet<String> {
@@ -198,6 +205,8 @@ impl Ctx<'_, '_> {
                     loc(self.b, gb),
                 );
                 self.out.findings.push(f);
+                self.skipped_a.extend(all_hashes(ga));
+                self.skipped_b.extend(all_hashes(gb));
             } else {
                 self.diff_gap(ga, gb);
             }
@@ -620,14 +629,35 @@ impl Ctx<'_, '_> {
         } else {
             (ChangeClass::Structural, Verdict::Unknown)
         };
+        // Its twin may be in a stretch that was not aligned: it may have
+        // moved there, so no counterpart is not shown.
+        let in_skipped = if removed {
+            self.skipped_b.contains(&u.full)
+        } else {
+            self.skipped_a.contains(&u.full)
+        };
+        let verdict = if in_skipped {
+            Verdict::Unknown
+        } else {
+            verdict
+        };
         let side = if removed { self.a } else { self.b };
         let (this, other) = if removed { ("A", "B") } else { ("B", "A") };
-        let witness = format!(
-            "Side {this} runs {} `{}` (line {}); side {other} has no counterpart.",
-            article(u.kind.label()),
-            side.snippet(&u.node, 80),
-            side.line_of(&u.node)
-        );
+        let witness = if in_skipped {
+            format!(
+                "Side {this} runs {} `{}` (line {}); side {other} has no counterpart outside a stretch of statements that was not aligned, where it may have moved to.",
+                article(u.kind.label()),
+                side.snippet(&u.node, 80),
+                side.line_of(&u.node)
+            )
+        } else {
+            format!(
+                "Side {this} runs {} `{}` (line {}); side {other} has no counterpart.",
+                article(u.kind.label()),
+                side.snippet(&u.node, 80),
+                side.line_of(&u.node)
+            )
+        };
         let rule = if removed {
             "stmt.removed"
         } else {

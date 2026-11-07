@@ -107,3 +107,39 @@ fn past_the_alignment_bound_the_script_is_unknown_not_guessed() {
     assert_eq!(count("align.bound"), 1);
     assert_eq!(r.verdict(), Verdict::Unknown);
 }
+
+/// A statement that moves into a stretch too large to align is not said to
+/// have no counterpart: it may be there. The gap is 2 100 x 2 101
+/// statements, past the bound of the similarity pairing, with no test hook.
+#[test]
+fn a_statement_moved_into_an_unaligned_stretch_is_not_called_removed() {
+    let g = 2_100;
+    let x = "UPDATE dbo.x SET c = 1 WHERE id = -1;\n".to_string();
+    let c = "UPDATE dbo.c SET c = 1 WHERE id = 1;\nUPDATE dbo.c SET c = 2 WHERE id = 2;\n";
+    let d = "UPDATE dbo.d SET c = 1 WHERE id = 1;\n";
+    let ga: String = (0..g)
+        .map(|i| format!("UPDATE dbo.t SET c = {i} WHERE id = {i};\n"))
+        .collect();
+    let gb: String = (0..g)
+        .map(|i| {
+            let s = format!("UPDATE dbo.t SET c = {} WHERE id = {i};\n", i + 1);
+            if i == g / 2 {
+                format!("{x}{s}")
+            } else {
+                s
+            }
+        })
+        .collect();
+    let r = diff(
+        &Artifact::new("a.sql", Dialect::Tsql, format!("{x}{c}{ga}{d}")),
+        &Artifact::new("b.sql", Dialect::Tsql, format!("{c}{gb}{d}")),
+        &Options::default(),
+    );
+    let count = |rule: &str| r.findings.iter().filter(|f| f.rule == rule).count();
+    assert_eq!(count("align.bound"), 1, "{:?}", r.findings);
+    // The statement is reported, but never as Different.
+    for f in r.findings.iter().filter(|f| f.rule.starts_with("stmt.")) {
+        assert_ne!(f.verdict, Verdict::Different, "{} {}", f.rule, f.witness);
+    }
+    assert_eq!(r.verdict(), Verdict::Unknown);
+}
