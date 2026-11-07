@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use sqldiff_syntax::Dialect;
 
 pub mod ids;
+pub mod impossible;
 pub mod out;
 pub mod shared;
 
@@ -263,4 +264,15 @@ pub fn kept_notes(note: &Note, old: &[Note]) -> Vec<Note> {
             .cloned(),
     );
     v
+}
+
+/// A unit's text as the trace's completeness rule compares it: without
+/// whitespace and statement terminators, in lower case. A unit whose input
+/// and output differ by more than that was rewritten, and its trace names at
+/// least one rule (checked in debug builds and by the corpus test).
+pub fn trace_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace() && *c != ';')
+        .flat_map(char::to_lowercase)
+        .collect()
 }

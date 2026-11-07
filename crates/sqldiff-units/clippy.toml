@@ -1,17 +1,8 @@
-# Determinism guard (perf plan W0): a HashMap/HashSet is a lookup table, never a
-# sequence. Iterating one needs `#[allow(clippy::disallowed_methods)]` plus a
-# comment saying why the order cannot reach an output.
-disallowed-methods = [
-    { path = "std::collections::HashMap::iter", reason = "hash iteration order is unspecified" },
-    { path = "std::collections::HashMap::iter_mut", reason = "hash iteration order is unspecified" },
-    { path = "std::collections::HashMap::keys", reason = "hash iteration order is unspecified" },
-    { path = "std::collections::HashMap::values", reason = "hash iteration order is unspecified" },
-    { path = "std::collections::HashMap::values_mut", reason = "hash iteration order is unspecified" },
-    { path = "std::collections::HashMap::into_keys", reason = "hash iteration order is unspecified" },
-    { path = "std::collections::HashMap::into_values", reason = "hash iteration order is unspecified" },
-    { path = "std::collections::HashMap::drain", reason = "hash iteration order is unspecified" },
-    { path = "std::collections::HashMap::retain", reason = "hash iteration order is unspecified" },
-    { path = "std::collections::HashSet::iter", reason = "hash iteration order is unspecified" },
-    { path = "std::collections::HashSet::drain", reason = "hash iteration order is unspecified" },
-    { path = "std::collections::HashSet::retain", reason = "hash iteration order is unspecified" },
+# Determinism guard (docs: perf plan W0). A hash container's iteration order
+# is unspecified, so these crates use BTreeMap/BTreeSet. Allow a HashMap only
+# for a hot lookup table, with `#[allow(clippy::disallowed_types)]` and a
+# comment saying why its order can never reach an output.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order is unspecified; use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "iteration order is unspecified; use BTreeSet" },
 ]

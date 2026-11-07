@@ -57,7 +57,7 @@ impl Claims {
                 .ancestors()
                 .find(|a| a.kind() == SyntaxKind::ROUTINE)
                 .and_then(|r| ast::routine_name(&r));
-            let table = sqldiff_core::classify::table_variable_table(routine.as_deref(), &var)
+            let table = sqldiff_equiv::classify::table_variable_table(routine.as_deref(), &var)
                 .to_lowercase();
             self.by_table.entry(table).or_insert(Claim {
                 file: file.to_string(),

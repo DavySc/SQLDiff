@@ -27,7 +27,7 @@
 //! history table's columns are not verified on IBM i yet, so Db2 refuses.
 
 use super::*;
-use sqldiff_core::catalog::{table_position, Ident};
+use sqldiff_equiv::catalog::{table_position, Ident};
 
 /// What `PERIOD FOR SYSTEM_TIME` and `SYSTEM_VERSIONING = ON (…)` say.
 pub(super) struct Temporal {
@@ -440,7 +440,7 @@ CREATE TRIGGER {} BEFORE TRUNCATE ON {table}
                 return no(format!("history table {history}: column {} at ordinal {} is {} in the table; SQL Server refuses it (Msg 13524)", b.name, n + 1, a.name));
             }
             // The type, not its spelling (`NVARCHAR (MAX)`, `nvarchar(max)`).
-            let ty = |c: &sqldiff_core::catalog::Column| {
+            let ty = |c: &sqldiff_equiv::catalog::Column| {
                 (
                     c.data_type.base.clone(),
                     c.data_type.args.clone(),
@@ -459,7 +459,7 @@ impl Cx<'_> {
     /// Whether `--temporal-historyless` converts the catalog table `t`
     /// without history: it is system-versioned and both period columns are
     /// HIDDEN (see [`Temporal::historyless`]).
-    fn historyless(&self, t: &sqldiff_core::catalog::Table) -> bool {
+    fn historyless(&self, t: &sqldiff_equiv::catalog::Table) -> bool {
         self.options.temporal_historyless
             && t.versioning.as_ref().is_some_and(|v| {
                 [&v.start, &v.end].into_iter().all(|p| {

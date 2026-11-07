@@ -14,14 +14,14 @@ use std::collections::BTreeMap;
 use sqldiff_syntax::{Dialect, SyntaxElement, SyntaxKind, SyntaxNode};
 use SyntaxKind::*;
 
-use sqldiff_core::catalog::ParamMode;
-use sqldiff_core::classify::{pg_rolls_back, rollback_rethrow};
+use sqldiff_equiv::catalog::ParamMode;
+use sqldiff_equiv::classify::{pg_rolls_back, rollback_rethrow};
 
-use crate::out::Out;
 use crate::tok::{
     find_word, matching, next_sig, prev_sig, sig, snake, split_commas, tokens, trimmed, T,
 };
-use crate::{Note, Status};
+use sqldiff_units::out::Out;
+use sqldiff_units::{Note, Status};
 
 mod bits;
 mod geography;
@@ -39,11 +39,11 @@ const CONTEXT: &str = "not-converted.context";
 /// SERVERPROPERTY, OBJECT_ID, …), so the review lists them as one group.
 const METADATA: &str = "tsql.server-metadata";
 
-/// The idiom rules (`sqldiff_core::rules`), for what the token rules refuse.
+/// The idiom rules (`sqldiff_equiv::rules`), for what the token rules refuse.
 mod rules {
-    pub use sqldiff_core::rules::convert::{convert_nodes, Options, Piece};
-    pub use sqldiff_core::rules::rewrite::NoFacts;
-    pub use sqldiff_core::rules::rule::{RuleSet, Status};
+    pub use sqldiff_equiv::rules::convert::{convert_nodes, Options, Piece};
+    pub use sqldiff_equiv::rules::rewrite::NoFacts;
+    pub use sqldiff_equiv::rules::rule::{RuleSet, Status};
 }
 
 /// The rule id of the per-statement exception blocks.
@@ -52,14 +52,14 @@ mod rules {
 /// which an exception block of [`CONTINUE_RULE`] re-raises.
 const CONTINUE_RERAISE: &str = "invalid_text_representation OR invalid_datetime_format OR datetime_field_overflow OR deadlock_detected OR serialization_failure OR lock_not_available OR undefined_table OR undefined_column OR undefined_function OR raise_exception OR query_canceled";
 
-pub(crate) const CONTINUE_RULE: &str = "tsql.txn.continue";
+pub const CONTINUE_RULE: &str = "tsql.txn.continue";
 
 thread_local! {
     static NO_CONTINUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Runs `f` with the exception blocks of [`continuation_points`] switched off.
-pub(crate) fn without_continuation<T>(f: impl FnOnce() -> T) -> T {
+pub fn without_continuation<T>(f: impl FnOnce() -> T) -> T {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -80,7 +80,7 @@ thread_local! {
 /// Runs `f` with the routines starting at the source offsets `at` (sorted)
 /// converted without the exception blocks of [`continuation_points`], the
 /// others as they would be: a variant chosen for each routine on its own.
-pub(crate) fn with_plain_routines<T>(at: &[usize], f: impl FnOnce() -> T) -> T {
+pub fn with_plain_routines<T>(at: &[usize], f: impl FnOnce() -> T) -> T {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -96,9 +96,9 @@ pub(crate) fn convert(
     root: &SyntaxNode,
     src: &str,
     to: Dialect,
-    catalog: Option<&sqldiff_core::catalog::Catalog>,
+    catalog: Option<&sqldiff_equiv::catalog::Catalog>,
     claims: &crate::table_vars::Claims,
-    options: crate::RuleOptions,
+    options: sqldiff_units::RuleOptions,
 ) -> Out {
     let mut cx = Cx {
         src,
@@ -194,8 +194,8 @@ pub(crate) fn convert(
     // layout, terminators and letter case) names at least one rule.
     #[cfg(debug_assertions)]
     for u in &out.units {
-        let a = crate::trace_text(src.get(u.src.0..u.src.1).unwrap_or(""));
-        let b = crate::trace_text(out.text.get(u.out.0..u.out.1).unwrap_or(""));
+        let a = sqldiff_units::trace_text(src.get(u.src.0..u.src.1).unwrap_or(""));
+        let b = sqldiff_units::trace_text(out.text.get(u.out.0..u.out.1).unwrap_or(""));
         assert!(
             a == b || !u.trace.is_empty(),
             "the rules rewrote {:?} as {:?} without a trace step",
@@ -235,7 +235,7 @@ struct Decl {
     src: (usize, usize),
     lines: Vec<String>,
     notes: Vec<Note>,
-    trace: Vec<crate::Step>,
+    trace: Vec<sqldiff_units::Step>,
 }
 
 /// PostgreSQL built-in type names (and their spellings) that an unqualified
@@ -396,9 +396,9 @@ struct Cx<'a> {
     /// Target dialect: PostgreSQL or Db2 for i.
     to: Dialect,
     /// The options this conversion runs with.
-    options: crate::RuleOptions,
+    options: sqldiff_units::RuleOptions,
     /// The source catalog of the whole tree being converted, when there is one.
-    catalog: Option<&'a sqldiff_core::catalog::Catalog>,
+    catalog: Option<&'a sqldiff_equiv::catalog::Catalog>,
     /// The temporary table names the tree's table variables claim, by the
     /// routine that first declared one: a table variable that would take
     /// another routine's name is refused.
@@ -435,7 +435,7 @@ struct Cx<'a> {
     /// Notes of the unit being converted.
     notes: Vec<Note>,
     /// The rewrites made in the unit being converted (`step`).
-    trace: Vec<crate::Step>,
+    trace: Vec<sqldiff_units::Step>,
     /// How many times `step` was called, deduplicated or not: lets the
     /// expression walk see whether a branch recorded its rewrite.
     stepped: usize,
@@ -505,10 +505,10 @@ struct Cx<'a> {
     /// The tables of the statement being converted, for column types.
     scope: Option<Scope>,
     /// Without a tree catalog: one read from this input, made when needed.
-    local: std::cell::OnceCell<sqldiff_core::catalog::Catalog>,
+    local: std::cell::OnceCell<sqldiff_equiv::catalog::Catalog>,
     /// The table variables and `#` tables this routine or script declared
     /// so far, for the types of their columns (names lower case).
-    own_tables: Vec<sqldiff_core::catalog::Table>,
+    own_tables: Vec<sqldiff_equiv::catalog::Table>,
     /// The BIT columns of the table being created or altered (lower case).
     bit_cols: Vec<String>,
     /// PostgreSQL: places where a bit meets a number with no exact rewrite.
@@ -564,8 +564,8 @@ fn no<T>(reason: impl Into<String>) -> R<T> {
 
 /// A refusal for a SQL Server-only feature the target has no counterpart
 /// for (`impossible`): still not converted, reported in its own bucket.
-fn impossible<T>(x: crate::impossible::Feature, why: impl AsRef<str>) -> R<T> {
-    no(crate::impossible::reason(x, why.as_ref()))
+fn impossible<T>(x: sqldiff_units::impossible::Feature, why: impl AsRef<str>) -> R<T> {
+    no(sqldiff_units::impossible::reason(x, why.as_ref()))
 }
 
 impl<'a> Cx<'a> {
@@ -593,7 +593,7 @@ impl<'a> Cx<'a> {
     }
 
     /// Records that `rule` rewrote the input bytes `span`: every rewrite
-    /// leaves a step, with or without a note (see `crate::Step`).
+    /// leaves a step, with or without a note (see `sqldiff_units::Step`).
     fn step(&mut self, rule: &str, span: (usize, usize)) {
         self.step_with(rule, span, None);
     }
@@ -601,7 +601,7 @@ impl<'a> Cx<'a> {
     /// `step` with what the rule was applied with.
     fn step_with(&mut self, rule: &str, span: (usize, usize), inst: Option<String>) {
         self.stepped += 1;
-        let st = crate::Step {
+        let st = sqldiff_units::Step {
             rule: rule.to_string(),
             start: span.0,
             end: span.1,
@@ -634,7 +634,7 @@ impl<'a> Cx<'a> {
         self.step(rule, Self::range(n));
     }
 
-    fn take_trace(&mut self) -> Vec<crate::Step> {
+    fn take_trace(&mut self) -> Vec<sqldiff_units::Step> {
         std::mem::take(&mut self.trace)
     }
 
@@ -738,7 +738,7 @@ impl<'a> Cx<'a> {
                 rule: rule.into(),
                 text: reason.to_string().into(),
             }],
-            vec![crate::Step {
+            vec![sqldiff_units::Step {
                 rule: rule.into(),
                 start: s,
                 end: e,
@@ -1603,7 +1603,7 @@ impl<'a> Cx<'a> {
         let trace = p
             .rules
             .iter()
-            .map(|r| crate::Step {
+            .map(|r| sqldiff_units::Step {
                 rule: r.clone(),
                 start: p.src.0,
                 end: p.src.1,
@@ -1698,7 +1698,7 @@ impl<'a> Cx<'a> {
     /// parameter order, which the text reads as `$1`, `$2`, ….
     #[allow(clippy::type_complexity)]
     fn dynamic_inner(&self, n: &SyntaxNode) -> Result<(String, Vec<Note>, Vec<String>), String> {
-        use sqldiff_core::equiv::dynamic::{self, Text};
+        use sqldiff_equiv::equiv::dynamic::{self, Text};
         if self.db2() {
             return Err(
                 "dynamic SQL: not converted for Db2 for i yet; use EXECUTE IMMEDIATE after review"
@@ -1733,8 +1733,9 @@ impl<'a> Cx<'a> {
         }
         // `$n` is put back where the converted parameter name stands: the
         // text may not use that name for anything else.
-        let words =
-            sqldiff_core::equiv::ast::tokens(&sqldiff_syntax::parse(&text, Dialect::Tsql).syntax());
+        let words = sqldiff_equiv::equiv::ast::tokens(
+            &sqldiff_syntax::parse(&text, Dialect::Tsql).syntax(),
+        );
         if let Some(q) = names.iter().find(|q| {
             words.iter().any(|w| {
                 w.text
@@ -1756,7 +1757,7 @@ impl<'a> Cx<'a> {
                 .get(1..)
                 .map(str::to_ascii_lowercase)
                 .unwrap_or_default();
-            let same = v.kind == sqldiff_core::equiv::ast::K::Var
+            let same = v.kind == sqldiff_equiv::equiv::ast::K::Var
                 && dynamic::declared_type(n, &var).is_some_and(|t| dynamic::same_type(&t, &q.ty));
             let conv = self.vars.get(&var).map(|x| x.name.clone());
             match (same, conv) {
@@ -1848,7 +1849,7 @@ impl<'a> Cx<'a> {
         }
         let sites: Vec<SyntaxNode> = scope
             .descendants()
-            .filter(sqldiff_core::equiv::dynamic::is_tsql)
+            .filter(sqldiff_equiv::equiv::dynamic::is_tsql)
             .collect();
         let known: Vec<bool> = sites
             .iter()
@@ -1869,7 +1870,7 @@ impl<'a> Cx<'a> {
             let mut from = Vec::new();
             for (d, ok) in sites.iter().zip(&known) {
                 if !*ok && runs(d, v) {
-                    from.extend(sqldiff_core::equiv::dynamic::tsql_text_sources(d)?);
+                    from.extend(sqldiff_equiv::equiv::dynamic::tsql_text_sources(d)?);
                 }
             }
             Some(from)
@@ -2467,7 +2468,7 @@ impl<'a> Cx<'a> {
             "ROLLBACK" => self.txn("ROLLBACK", &ts)?,
             "SAVE" if self.db2() => self.save(&ts)?,
             "SAVE" => return no("SAVE TRANSACTION: use SAVEPOINT, but a PL/pgSQL body cannot; use a nested BEGIN … EXCEPTION block"),
-            "EXEC" | "EXECUTE" if sqldiff_core::equiv::dynamic::is_tsql(n) => self.dynamic_exec(n)?,
+            "EXEC" | "EXECUTE" if sqldiff_equiv::equiv::dynamic::is_tsql(n) => self.dynamic_exec(n)?,
             "OPEN" | "FETCH" | "CLOSE" | "DEALLOCATE" if !self.db2() => {
                 self.cursor_stmt(n, &first, &ts)?
             }
@@ -2528,7 +2529,7 @@ impl<'a> Cx<'a> {
                 self.step_ts("tsql.stmt.truncate", &ts);
                 format!("{} RESTART IDENTITY", self.expr(&Self::body_toks(&ts)).trim_end())
             }
-            "USE" => return impossible(crate::impossible::DATABASE_LEVEL, self.pick(
+            "USE" => return impossible(sqldiff_units::impossible::DATABASE_LEVEL, self.pick(
                 "USE: connect to the other database instead; PostgreSQL cannot switch databases in a session",
                 "USE: Db2 for i has one database per system; use SET SCHEMA or qualify names with the library",
             )),
@@ -2536,7 +2537,7 @@ impl<'a> Cx<'a> {
                 "WAITFOR: PostgreSQL's pg_sleep waits a number of seconds; WAITFOR DELAY takes a time of day as text or datetime and WAITFOR TIME a clock time; no checked rule for converting the value",
                 "WAITFOR: Db2 for i SQL has no statement that waits; no rule",
             )),
-            "BEGIN" if w(1) == "ATOMIC" => return impossible(crate::impossible::IN_MEMORY_OLTP, "BEGIN ATOMIC WITH (…): the body of a natively compiled module, with its own isolation level and language; the target has no native compilation (convert it as an ordinary body by hand)"),
+            "BEGIN" if w(1) == "ATOMIC" => return impossible(sqldiff_units::impossible::IN_MEMORY_OLTP, "BEGIN ATOMIC WITH (…): the body of a natively compiled module, with its own isolation level and language; the target has no native compilation (convert it as an ordinary body by hand)"),
             "ALTER" if w(1) == "ROLE" && matches!(w(3).as_str(), "ADD" | "DROP") => return no(self.pick(
                 "ALTER ROLE … ADD/DROP MEMBER: PostgreSQL's forms are GRANT role TO member and REVOKE role FROM member, but the role and the database user it names map to PostgreSQL roles only by a decision about logins and users, which has no rule",
                 "ALTER ROLE … ADD/DROP MEMBER: Db2 for i has no database roles; grant to group profiles instead; no rule",
@@ -2549,8 +2550,8 @@ impl<'a> Cx<'a> {
                 "BULK INSERT: reads a file on the SQL Server host with its own field and row terminators, code page and format options; PostgreSQL's COPY has different file rules (single-character delimiters, one encoding), so there is no checked rule",
                 "BULK INSERT: reads a file on the SQL Server host; Db2 for i has no statement with the same file rules; no rule",
             )),
-            "ALTER" if crate::impossible::of_ddl(&[w(1).as_str(), w(2).as_str()]).is_some() => {
-                let x = crate::impossible::of_ddl(&[w(1).as_str(), w(2).as_str()]).unwrap();
+            "ALTER" if sqldiff_units::impossible::of_ddl(&[w(1).as_str(), w(2).as_str()]).is_some() => {
+                let x = sqldiff_units::impossible::of_ddl(&[w(1).as_str(), w(2).as_str()]).unwrap();
                 return impossible(x, format!("ALTER {} {}: SQL Server only; {} has nothing to convert it to", w(1), w(2), self.to.display_name()));
             }
             "REVERT" => return no("REVERT ends an EXECUTE AS context, which is not converted; no rule"),
@@ -3672,7 +3673,7 @@ impl<'a> Cx<'a> {
             let cname = tsql_unquote(&ts[c].s);
             let Some(col) = table.column(
                 Dialect::Tsql,
-                &sqldiff_core::catalog::Ident::plain(cname.clone()),
+                &sqldiff_equiv::catalog::Ident::plain(cname.clone()),
             ) else {
                 return no(format!(
                     "item {}: {cname} is not a column of the table",
@@ -4217,8 +4218,8 @@ impl<'a> Cx<'a> {
             })
     }
 
-    fn catalog_table(&self, name: &[String]) -> Option<&sqldiff_core::catalog::Table> {
-        use sqldiff_core::catalog::{table_position, Ident};
+    fn catalog_table(&self, name: &[String]) -> Option<&sqldiff_equiv::catalog::Table> {
+        use sqldiff_equiv::catalog::{table_position, Ident};
         let cat = self.type_catalog()?;
         let name = self.image_table(name);
         let parts: Vec<Ident> = match name {
@@ -4232,7 +4233,7 @@ impl<'a> Cx<'a> {
     /// How many of the DELETE's FROM tables have column `name`, by the
     /// source catalog; `None` without a catalog entry for every table.
     fn column_owners(&self, leaves: &[Leaf], name: &str) -> Option<usize> {
-        use sqldiff_core::catalog::{table_position, Ident};
+        use sqldiff_equiv::catalog::{table_position, Ident};
         let cat = self.catalog?;
         let mut n = 0;
         for l in leaves {
@@ -4268,7 +4269,7 @@ impl<'a> Cx<'a> {
 
     /// The type of column `col` of the catalog table named by `table`.
     fn target_col_dt(&self, table: &[T], col: &str) -> Option<Dt> {
-        use sqldiff_core::catalog::Ident;
+        use sqldiff_equiv::catalog::Ident;
         let parts: Vec<String> = table
             .iter()
             .filter(|t| matches!(t.k, IDENT | QUOTED_IDENT))
@@ -4292,7 +4293,7 @@ impl<'a> Cx<'a> {
     /// alias wins, as in T-SQL) or the table itself. `None` unless the
     /// statement's scope names exactly one table for it and knows its columns.
     fn scope_col_dt(&self, table: &[T], col: &str) -> Option<Dt> {
-        use sqldiff_core::catalog::Ident;
+        use sqldiff_equiv::catalog::Ident;
         let names: Vec<String> = table
             .iter()
             .filter(|t| matches!(t.k, IDENT | QUOTED_IDENT))
@@ -4967,7 +4968,7 @@ impl<'a> Cx<'a> {
         if trimmed(&ts[close + 1..]).iter().any(|t| t.sig()) {
             return no("table variable options after the column list");
         }
-        let name = sqldiff_core::classify::table_variable_table(self.routine.as_deref(), &v.s);
+        let name = sqldiff_equiv::classify::table_variable_table(self.routine.as_deref(), &v.s);
         let table = format!("{}.{name}", self.pick("pg_temp", "SESSION"));
         if self.tables.values().any(|t| t.eq_ignore_ascii_case(&table)) {
             return no(format!(
@@ -5312,7 +5313,7 @@ impl<'a> Cx<'a> {
                     && w[6] == "CONTAINS"
                     && matches!(w[7].as_str(), "MEMORY_OPTIMIZED_DATA" | "FILESTREAM")));
         if !storage {
-            return impossible(crate::impossible::DATABASE_LEVEL, self.pick(
+            return impossible(sqldiff_units::impossible::DATABASE_LEVEL, self.pick(
                 "ALTER DATABASE: database options and files are server configuration with no one-to-one PostgreSQL statement (ALTER DATABASE … SET, postgresql.conf); not converted",
                 "ALTER DATABASE: database options and files are server configuration with no Db2 for i statement; not converted",
             ));
@@ -5652,17 +5653,17 @@ impl<'a> Cx<'a> {
                 let refuse = |why: String| {
                     format!("the cursor loop writes {t}, which the cursor reads: a T-SQL cursor that is not STATIC may see the change, a PostgreSQL cursor reads the rows as of OPEN; declare it STATIC to convert it ({why})")
                 };
-                let Some(Ok((_, _, _, q))) = sqldiff_core::equiv::cursor::tsql_declaration(n)
+                let Some(Ok((_, _, _, q))) = sqldiff_equiv::equiv::cursor::tsql_declaration(n)
                 else {
                     return Err(refuse("the cursor declaration was not read".into()));
                 };
                 let nodes: Vec<&SyntaxNode> = conflicts.iter().map(|(x, _)| x).collect();
                 let targets: Vec<String> = vars.iter().map(|v| format!("@{v}")).collect();
                 let reqs =
-                    sqldiff_core::equiv::cursor::keyed_writes(&q, &nodes, &body, last, &targets)
+                    sqldiff_equiv::equiv::cursor::keyed_writes(&q, &nodes, &body, last, &targets)
                         .map_err(refuse)?;
                 for r in &reqs {
-                    use sqldiff_core::equiv::cursor::KeyKind;
+                    use sqldiff_equiv::equiv::cursor::KeyKind;
                     let (ok, need) = match r.kind {
                         KeyKind::Unique => (self.has_unique_key(&r.table, &r.cols), "unique on"),
                         KeyKind::Unindexed => (
@@ -5712,7 +5713,7 @@ impl<'a> Cx<'a> {
     /// in the OPEN's unit, so they move to the DECLARE's unit (to the OPEN's
     /// place when that unit is gone).
     fn query_steps_to_declare(&mut self, before: usize, plan: &CursorPlan) {
-        let moved: Vec<crate::Step> = self.trace.drain(before..).collect();
+        let moved: Vec<sqldiff_units::Step> = self.trace.drain(before..).collect();
         let (a, b) = plan.declare_at;
         let decl = self.decls.iter().position(|d| d.src == plan.declare_at);
         for mut st in moved {
@@ -6090,7 +6091,7 @@ impl<'a> Cx<'a> {
 
     /// The procedure `name` (as written, possibly qualified) in the source
     /// catalog, when exactly one matches. `dbo` and no schema are the same.
-    fn callee(&self, name: &str) -> Option<&'a sqldiff_core::catalog::Routine> {
+    fn callee(&self, name: &str) -> Option<&'a sqldiff_equiv::catalog::Routine> {
         Self::routine_in(self.catalog?, name)
     }
 
@@ -6103,9 +6104,9 @@ impl<'a> Cx<'a> {
     }
 
     fn routine_in<'c>(
-        cat: &'c sqldiff_core::catalog::Catalog,
+        cat: &'c sqldiff_equiv::catalog::Catalog,
         name: &str,
-    ) -> Option<&'c sqldiff_core::catalog::Routine> {
+    ) -> Option<&'c sqldiff_equiv::catalog::Routine> {
         let parts: Vec<String> = name.split('.').map(tsql_unquote).collect();
         let (schema, proc) = match parts.as_slice() {
             [p] => (None, p.clone()),
@@ -6117,7 +6118,7 @@ impl<'a> Cx<'a> {
                 .map(str::to_ascii_lowercase)
         };
         let mut hits = cat.routines.iter().filter(|r| {
-            r.kind == sqldiff_core::catalog::RoutineKind::Procedure
+            r.kind == sqldiff_equiv::catalog::RoutineKind::Procedure
                 && r.name.eq_ignore_ascii_case(&proc)
                 && norm(r.schema.as_deref()) == norm(schema.as_deref())
         });
@@ -6304,7 +6305,7 @@ impl<'a> Cx<'a> {
             _ => {
                 let words: Vec<String> = s[1..].iter().take(2).map(|&i| ts[i].up()).collect();
                 let words: Vec<&str> = words.iter().map(String::as_str).collect();
-                match crate::impossible::of_ddl(&words) {
+                match sqldiff_units::impossible::of_ddl(&words) {
                     Some(x) => impossible(
                         x,
                         format!(
@@ -6333,7 +6334,7 @@ impl<'a> Cx<'a> {
                 self.to.display_name()
             );
             return if t.is("COLUMNSTORE") {
-                impossible(crate::impossible::COLUMNSTORE, why)
+                impossible(sqldiff_units::impossible::COLUMNSTORE, why)
             } else {
                 no(why)
             };
@@ -7753,7 +7754,7 @@ impl<'a> Cx<'a> {
         let money = s.iter().any(|&k| {
             matches!(e[k].k, IDENT | QUOTED_IDENT) && self.column_arith(&e[k]) == Some(Arith::Money)
         });
-        if money && ops > 1 && !sqldiff_core::equiv::canon::MONEY_CHAINS {
+        if money && ops > 1 && !sqldiff_equiv::equiv::canon::MONEY_CHAINS {
             return None;
         }
         // Integer arithmetic raises its overflow error when SQL Server
@@ -8039,7 +8040,7 @@ impl<'a> Cx<'a> {
         let (ty, _, _) = self.ty(&ty)?;
         Ok(Some((
             ty,
-            sqldiff_core::equiv::canon::pg_template(sqldiff_core::equiv::canon::ISO126_PG, &x),
+            sqldiff_equiv::equiv::canon::pg_template(sqldiff_equiv::equiv::canon::ISO126_PG, &x),
             json,
         )))
     }
@@ -8769,7 +8770,7 @@ impl<'a> Cx<'a> {
             _ => ts[j].s.clone(),
         };
         let builtin = last == i && {
-            use sqldiff_core::catalog::builtins::{self, Availability};
+            use sqldiff_equiv::catalog::builtins::{self, Availability};
             builtins::of(Dialect::Tsql).function(&part(i), "9999") != Availability::Unknown
         };
         if builtin || last != i && part(i).eq_ignore_ascii_case("sys") {
@@ -8798,7 +8799,7 @@ impl<'a> Cx<'a> {
     /// PostgreSQL: `OPENJSON(@v) WITH (col type ['[lax|strict] $.key'], ...)
     /// [AS x]` in FROM becomes a derived table over the document's
     /// elements, the form the engine compares with OPENJSON
-    /// (`sqldiff_core::equiv::canon`, `pg_json_rows`): each column casts
+    /// (`sqldiff_equiv::equiv::canon`, `pg_json_rows`): each column casts
     /// `e ->> 'key'` (lax) or the strict path's value to the type T-SQL
     /// converts it to. Only a variable's document, keys spelled as plain
     /// names and the column types whose conversions agree (nvarchar, int,
@@ -9006,7 +9007,7 @@ impl<'a> Cx<'a> {
             return;
         }
         let value = string_value(lit);
-        match sqldiff_core::equiv::like::tsql_to_postgres(&value) {
+        match sqldiff_equiv::equiv::like::tsql_to_postgres(&value) {
             Ok(p) if p == value => o.push_str(lit),
             Ok(p) => {
                 self.step_ts_with("tsql.expr.like-pattern", at, p.clone());
@@ -9035,7 +9036,7 @@ impl<'a> Cx<'a> {
         let Some(body) = lit.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')) else {
             return;
         };
-        if sqldiff_core::equiv::literal::fraction_digits(body).is_some_and(|n| n > 6) {
+        if sqldiff_equiv::equiv::literal::fraction_digits(body).is_some_and(|n| n > 6) {
             self.step_ts("tsql.expr.literal-fraction", std::slice::from_ref(t));
             self.note(Status::Assumptions, "ASM-LITERAL-FRACTION", "A date and time literal with 7 fractional digits: where it meets a date and time value, T-SQL keeps the 100 ns digit and PostgreSQL rounds it to microseconds ('9999-12-31 23:59:59.9999999' becomes 10000-01-01 00:00:00). Equal only if no stored value lies within half a microsecond of the literal without being equal to it (data moved with the same rounding).");
         }
@@ -9049,7 +9050,7 @@ impl<'a> Cx<'a> {
     /// 14 to 26 digits), so `'20200101'` would fail there at run time. None
     /// when `ts` is not one such literal or T-SQL would round it.
     fn date_store(&mut self, dt: Dt, ts: &[T]) -> Option<String> {
-        use sqldiff_core::equiv::literal::{iso_tsql, Target};
+        use sqldiff_equiv::equiv::literal::{iso_tsql, Target};
         if !self.db2() {
             return self.end_of_time_store(dt, ts);
         }
@@ -9088,7 +9089,7 @@ impl<'a> Cx<'a> {
     /// 2026-10-29: 6 digits under an assumption). Any other 7-digit literal
     /// stays as written.
     fn end_of_time_store(&mut self, dt: Dt, ts: &[T]) -> Option<String> {
-        use sqldiff_core::equiv::literal::{iso_tsql, Target};
+        use sqldiff_equiv::equiv::literal::{iso_tsql, Target};
         if dt != Dt::DateTime2(7) {
             return None;
         }
@@ -9241,7 +9242,7 @@ impl<'a> Cx<'a> {
             ("ISJSON", 1) if self.in_table_check => {
                 self.note(Status::Assumptions, "ASM-JSON-PATH-VALUES", "ISJSON in a CHECK constraint becomes json_typeof of the value cast to json: 1 for an object or array, 0 for other JSON, NULL for NULL. Text that is not JSON makes ISJSON 0 and the cast fail, so both refuse the row, with another error. The rows are the same when the documents are valid JSON objects or arrays without duplicate keys, keys written with escapes, or \\u0000 and unpaired surrogate escapes (ASM-JSON-PATH-VALUES).");
                 let x = e(self, 0);
-                sqldiff_core::equiv::canon::pg_template(sqldiff_core::equiv::canon::ISJSON_PG, &x)
+                sqldiff_equiv::equiv::canon::pg_template(sqldiff_equiv::equiv::canon::ISJSON_PG, &x)
             }
             // LEFT and RIGHT: PostgreSQL's left and right read a negative
             // count as "all but", where T-SQL raises (Msg 536). A literal
@@ -9280,8 +9281,8 @@ impl<'a> Cx<'a> {
                     return None;
                 };
                 let x = e(self, 0);
-                sqldiff_core::equiv::canon::pg_template(
-                    &sqldiff_core::equiv::canon::parsename_pg(k),
+                sqldiff_equiv::equiv::canon::pg_template(
+                    &sqldiff_equiv::equiv::canon::parsename_pg(k),
                     &x,
                 )
             }
@@ -9627,10 +9628,10 @@ impl<'a> Cx<'a> {
     /// A call kept as written must exist in the target: a T-SQL built-in the
     /// target does not have refuses the unit instead of passing through.
     /// PostgreSQL: `EXISTS (…)` at `ts[open]` that checks whether a dbo
-    /// table or procedure exists (`sqldiff_core::equiv::objcheck`) becomes
+    /// table or procedure exists (`sqldiff_equiv::equiv::objcheck`) becomes
     /// the same check on pg_catalog. The text and the closing parenthesis.
     fn catalog_exists(&mut self, ts: &[T], open: Option<usize>) -> Option<(String, usize)> {
-        use sqldiff_core::equiv::objcheck;
+        use sqldiff_equiv::equiv::objcheck;
         let open = open.filter(|&p| ts[p].k == L_PAREN)?;
         let close = matching(ts, open)?;
         let inner = &ts[open + 1..close];
@@ -9679,12 +9680,13 @@ impl<'a> Cx<'a> {
         } else {
             format!("sys.{name}: {}", sys_catalog_refusal(&name))
         };
-        let text = crate::impossible::reason(crate::impossible::INSTANCE_METADATA, &text);
+        let text =
+            sqldiff_units::impossible::reason(sqldiff_units::impossible::INSTANCE_METADATA, &text);
         self.note(Status::NotConverted, METADATA, &text);
     }
 
     fn unmapped_builtin(&mut self, name: &str, args: &[T]) {
-        use sqldiff_core::catalog::builtins::{self, Availability};
+        use sqldiff_equiv::catalog::builtins::{self, Availability};
         let tsql = builtins::of(Dialect::Tsql).function(name, "9999") != Availability::Unknown;
         let target = builtins::of(self.to).function(name, "9999") != Availability::Unknown;
         if tsql && !target {
@@ -9718,9 +9720,12 @@ impl<'a> Cx<'a> {
             // SQL Server's own metadata and hashes have no target
             // counterpart; every other built-in only lacks a rule.
             let text = if server_metadata(&up) {
-                crate::impossible::reason(crate::impossible::INSTANCE_METADATA, &text)
+                sqldiff_units::impossible::reason(
+                    sqldiff_units::impossible::INSTANCE_METADATA,
+                    &text,
+                )
             } else if matches!(up.as_str(), "CHECKSUM" | "BINARY_CHECKSUM") {
-                crate::impossible::reason(crate::impossible::HASH_FUNCTIONS, &text)
+                sqldiff_units::impossible::reason(sqldiff_units::impossible::HASH_FUNCTIONS, &text)
             } else {
                 text
             };
@@ -9877,7 +9882,7 @@ impl<'a> Cx<'a> {
                 self.note(Status::Assumptions, "ASM-POSTGIS-GEOGRAPHY", "GEOGRAPHY becomes PostGIS geography (no type modifier, so each value keeps its own SRID, as in SQL Server): the database has the postgis extension and its types are on the search path. A value is carried as it is; SQL Server's geography methods (STDistance, Lat, …) and PostGIS's functions differ, so every spatial expression is converted and checked on its own, and clients read PostGIS's formats.");
                 ("geography".into(), false, false)
             }
-            "HIERARCHYID" => return impossible(crate::impossible::HIERARCHYID, "type HIERARCHYID: its values, ordering and methods (GetAncestor, IsDescendantOf, …) have no PostgreSQL counterpart (ltree is a different path type)"),
+            "HIERARCHYID" => return impossible(sqldiff_units::impossible::HIERARCHYID, "type HIERARCHYID: its values, ordering and methods (GetAncestor, IsDescendantOf, …) have no PostgreSQL counterpart (ltree is a different path type)"),
             "SQL_VARIANT" | "GEOMETRY" | "CURSOR" | "TABLE" => return no(format!("type {up} has no PostgreSQL equivalent rule yet")),
             _ => {
                 self.note(Status::Assumptions, "ASM-USER-TYPE", "A type without a rule was kept as written: it must exist in PostgreSQL under that name.");
@@ -9982,7 +9987,7 @@ impl<'a> Cx<'a> {
             }
             "XML" => other("XML".into()),
             "ROWVERSION" | "TIMESTAMP" => return no("ROWVERSION/TIMESTAMP: use a row change timestamp column (TIMESTAMP GENERATED ALWAYS FOR EACH ROW ON UPDATE AS ROW CHANGE TIMESTAMP)"),
-            "HIERARCHYID" => return impossible(crate::impossible::HIERARCHYID, "type HIERARCHYID: its values, ordering and methods (GetAncestor, IsDescendantOf, …) have no Db2 for i counterpart"),
+            "HIERARCHYID" => return impossible(sqldiff_units::impossible::HIERARCHYID, "type HIERARCHYID: its values, ordering and methods (GetAncestor, IsDescendantOf, …) have no Db2 for i counterpart"),
             "SQL_VARIANT" | "GEOGRAPHY" | "GEOMETRY" | "CURSOR" | "TABLE" => return no(format!("type {up} has no Db2 for i equivalent rule yet")),
             _ => {
                 self.note(Status::Assumptions, "ASM-USER-TYPE", "A type without a rule was kept as written: it must exist in Db2 for i under that name.");
@@ -10039,8 +10044,8 @@ const UNDECLARED: &str =
     "A variable is used without a declaration in this unit; it was renamed with the v_ prefix.";
 
 /// A trace of one step, for a unit one rule wrote alone.
-fn one_step(rule: &str, (start, end): (usize, usize)) -> Vec<crate::Step> {
-    vec![crate::Step {
+fn one_step(rule: &str, (start, end): (usize, usize)) -> Vec<sqldiff_units::Step> {
+    vec![sqldiff_units::Step {
         rule: rule.into(),
         start,
         end,
@@ -10334,7 +10339,7 @@ struct ResultCols {
     /// The select list's token range.
     list: (usize, usize),
     /// Per column: its expression's token range, its name token, its type.
-    cols: Vec<((usize, usize), usize, sqldiff_core::catalog::DataType)>,
+    cols: Vec<((usize, usize), usize, sqldiff_equiv::catalog::DataType)>,
 }
 
 /// An item of OUTPUT without INTO (`Cx::output_columns`).
@@ -10342,11 +10347,11 @@ struct OutputCol {
     image: &'static str,
     col: usize,
     name: usize,
-    ty: sqldiff_core::catalog::DataType,
+    ty: sqldiff_equiv::catalog::DataType,
 }
 
 /// T-SQL tokens for a catalog type, made up by `rule` at offset `at`.
-fn type_tokens(dt: &sqldiff_core::catalog::DataType, at: usize, rule: &'static str) -> Vec<T> {
+fn type_tokens(dt: &sqldiff_equiv::catalog::DataType, at: usize, rule: &'static str) -> Vec<T> {
     let made = |k, s: &str| T::made(k, s, at, rule);
     let mut ty = vec![made(IDENT, &dt.base)];
     if dt.max || !dt.args.is_empty() {
@@ -11127,7 +11132,7 @@ fn bare_columns(ts: &[T]) -> Vec<String> {
     for i in sig(ts) {
         let t = &ts[i];
         let quoted = t.k == QUOTED_IDENT;
-        if !(t.k == IDENT || quoted) || !quoted && sqldiff_core::normalize::is_keyword(&t.up()) {
+        if !(t.k == IDENT || quoted) || !quoted && sqldiff_equiv::normalize::is_keyword(&t.up()) {
             continue;
         }
         let prev = prev_sig(ts, i).map(|j| &ts[j]);
@@ -11922,7 +11927,7 @@ fn style_format(dt: Dt, style: u32) -> Option<(&'static str, u32)> {
         Dt::DateTime | Dt::DateTime2(_) => false,
         _ => return None,
     };
-    sqldiff_core::equiv::canon::style_format(date_only, style)
+    sqldiff_equiv::equiv::canon::style_format(date_only, style)
 }
 
 /// A T-SQL built-in whose result is always a string, so `+` next to a call
@@ -11958,7 +11963,7 @@ fn compared(ts: &[T], i: usize) -> bool {
 /// '9999-12-31 23:59:59.9999999', in any spelling it accepts (WideWorld-
 /// Importers writes '99991231 23:59:59.9999999').
 fn end_of_time(v: &str) -> bool {
-    use sqldiff_core::equiv::literal::{iso_tsql, Target};
+    use sqldiff_equiv::equiv::literal::{iso_tsql, Target};
     iso_tsql(v, Target::Timestamp { digits: 7 })
         .is_some_and(|(text, _)| text == "9999-12-31 23:59:59.9999999")
 }
@@ -11994,7 +11999,7 @@ fn quoted(s: &str) -> String {
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && !sqldiff_core::normalize::is_keyword(&inner.to_ascii_uppercase());
+        && !sqldiff_equiv::normalize::is_keyword(&inner.to_ascii_uppercase());
     if plain {
         inner
     } else {
@@ -12154,7 +12159,7 @@ fn memory_optimized(opts: &[&[T]]) -> R<bool> {
     }
     match value("DURABILITY").as_deref() {
         None | Some("SCHEMA_AND_DATA") => Ok(true),
-        Some(d) => impossible(crate::impossible::IN_MEMORY_OLTP, format!("table option DURABILITY = {d}: SQL Server keeps none of the table's rows across a restart; a plain table keeps them")),
+        Some(d) => impossible(sqldiff_units::impossible::IN_MEMORY_OLTP, format!("table option DURABILITY = {d}: SQL Server keeps none of the table's rows across a restart; a plain table keeps them")),
     }
 }
 
@@ -12748,7 +12753,7 @@ fn scope_of(ts: &[T]) -> Option<Scope> {
             let alias = s.get(k).and_then(|&j| {
                 let t = &ts[j];
                 (t.k == QUOTED_IDENT
-                    || t.k == IDENT && !sqldiff_core::normalize::is_keyword(&t.up()))
+                    || t.k == IDENT && !sqldiff_equiv::normalize::is_keyword(&t.up()))
                 .then(|| tsql_unquote(&t.s).to_ascii_lowercase())
             });
             if alias.is_some() {
@@ -12856,12 +12861,12 @@ impl Num {
 impl Cx<'_> {
     /// The catalog column types come from: the tree's, or else one read
     /// from this input's own CREATE TABLE statements.
-    fn type_catalog(&self) -> Option<&sqldiff_core::catalog::Catalog> {
+    fn type_catalog(&self) -> Option<&sqldiff_equiv::catalog::Catalog> {
         if let Some(c) = self.catalog {
             return Some(c);
         }
         self.local
-            .get_or_init(|| sqldiff_core::catalog::ddl::load(self.src, Dialect::Tsql, "input"))
+            .get_or_init(|| sqldiff_equiv::catalog::ddl::load(self.src, Dialect::Tsql, "input"))
             .into()
     }
 
@@ -12869,7 +12874,7 @@ impl Cx<'_> {
     /// `cols` (the tokens between its parentheses), replacing one of that name.
     fn own_table(&mut self, name: &str, cols: &[T]) {
         let text: String = cols.iter().map(|t| t.s.as_str()).collect();
-        let cat = sqldiff_core::catalog::ddl::load(
+        let cat = sqldiff_equiv::catalog::ddl::load(
             &format!("CREATE TABLE own_table ({text})"),
             Dialect::Tsql,
             "routine",
@@ -12884,8 +12889,8 @@ impl Cx<'_> {
     }
 
     /// The catalog table of a scope entry whose columns are known.
-    fn entry_table(&self, e: &ScopeEntry) -> Option<&sqldiff_core::catalog::Table> {
-        use sqldiff_core::catalog::{table_position, Ident};
+    fn entry_table(&self, e: &ScopeEntry) -> Option<&sqldiff_equiv::catalog::Table> {
+        use sqldiff_equiv::catalog::{table_position, Ident};
         if !e.named {
             return None;
         }
@@ -12911,7 +12916,7 @@ impl Cx<'_> {
     /// name needs every table of the statement known, and every table that
     /// has the column to agree on its type.
     fn column_dt(&self, ts: &[T]) -> Option<Dt> {
-        use sqldiff_core::catalog::Ident;
+        use sqldiff_equiv::catalog::Ident;
         let parts = name_parts(ts)?;
         let scope = self.scope.as_ref()?;
         let (q, col) = match parts.as_slice() {
@@ -12942,8 +12947,8 @@ impl Cx<'_> {
 
     /// The source catalog's type of a column reference, by the statement's
     /// tables, as `column_dt` finds it.
-    fn column_type(&self, ts: &[T]) -> Option<sqldiff_core::catalog::DataType> {
-        use sqldiff_core::catalog::Ident;
+    fn column_type(&self, ts: &[T]) -> Option<sqldiff_equiv::catalog::DataType> {
+        use sqldiff_equiv::catalog::Ident;
         let parts = name_parts(ts)?;
         let scope = self.scope.as_ref()?;
         let (q, col) = match parts.as_slice() {
@@ -12951,7 +12956,7 @@ impl Cx<'_> {
             [.., q, c] => (Some(q), c),
             [] => return None,
         };
-        let mut found: Option<sqldiff_core::catalog::DataType> = None;
+        let mut found: Option<sqldiff_equiv::catalog::DataType> = None;
         for e in &scope.entries {
             let here = q.map_or(true, |q| match &e.alias {
                 Some(a) => a == q,
@@ -13115,7 +13120,7 @@ impl Cx<'_> {
             let (lit, num) = (&trimmed(a[1])[*lit], &trimmed(a[2])[*num]);
             if lit.k == STRING
                 && num.k == NUMBER
-                && sqldiff_core::equiv::canon::compact_date_convert(
+                && sqldiff_equiv::equiv::canon::compact_date_convert(
                     name,
                     &string_value(&lit.s),
                     &num.s,

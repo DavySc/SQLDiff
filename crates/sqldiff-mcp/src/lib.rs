@@ -294,6 +294,7 @@ impl Server {
             "converted_file" => self.converted_file(args),
             "run_status" => self.run_status(args),
             "cancel_run" => self.cancel_run(args),
+            "compare_runs" => self.compare_runs(args),
             _ => return None,
         })
     }
@@ -1532,6 +1533,105 @@ impl Server {
             .ok_or_else(|| format!("no run `{id}` in this session (the last {RUN_LIMIT} are kept)"))
     }
 
+    /// What changed between two conversions (`sqldiff_convert::compare`):
+    /// units that improved, regressed, changed, appeared or went. Each side
+    /// is a tree id of this session or a `conversion-report.json` (or the
+    /// folder holding it), so a baseline survives a server restart.
+    fn compare_runs(&self, args: &Value) -> Result<(String, Value), String> {
+        use sqldiff_convert::compare;
+        let side = |key: &str| -> Result<(String, Option<tree::Report>), String> {
+            let v = str_arg(args, key).ok_or_else(|| {
+                format!("`{key}` is required (a tree id from `convert_tree`, or a conversion-report.json)")
+            })?;
+            if self.trees.iter().any(|(k, _)| *k == v) {
+                return Ok((v, None));
+            }
+            let p = std::path::Path::new(&v);
+            let file = if p.is_dir() {
+                p.join("conversion-report.json")
+            } else {
+                p.to_path_buf()
+            };
+            let text = std::fs::read_to_string(&file).map_err(|e| {
+                format!("`{v}` is no tree of this session and not a readable report: {e}")
+            })?;
+            let r: tree::Report = serde_json::from_str(&text)
+                .map_err(|e| format!("{}: not a conversion report: {e}", file.display()))?;
+            Ok((v, Some(r)))
+        };
+        let (na, ra) = side("a")?;
+        let (nb, rb) = side("b")?;
+        let held = |n: &str| {
+            self.trees
+                .iter()
+                .find(|(k, _)| k == n)
+                .map(|(_, t)| &t.report)
+        };
+        let a = ra.as_ref().or_else(|| held(&na)).expect("resolved above");
+        let b = rb.as_ref().or_else(|| held(&nb)).expect("resolved above");
+        let c = compare::compare(a, b)?;
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map_or(DEFAULT_TREE_LIMIT * 4, |n| n as usize);
+        let mut text = format!(
+            "{na} -> {nb}: {} regressed, {} improved, {} changed, {} new, {} gone, {} unchanged\n",
+            c.regressed, c.improved, c.changed, c.new, c.gone, c.unchanged
+        );
+        if c.src_differs {
+            text.push_str("Note: the two conversions read different source folders.\n");
+        }
+        if c.unchecked_a + c.unchecked_b > 0 {
+            text.push_str(&format!(
+                "Note: {} file(s) of `a` and {} of `b` were not checked (an increment); their units count as not converted, so they show as regressed.\n",
+                c.unchecked_a, c.unchecked_b
+            ));
+        }
+        let show = |s: &Option<compare::Side>| match s {
+            Some(s) => format!(
+                "{}{}",
+                s.status.label(),
+                if s.rules.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", s.rules.join(", "))
+                }
+            ),
+            None => "-".to_string(),
+        };
+        for r in c.rows.iter().take(limit) {
+            let line = r.b.as_ref().or(r.a.as_ref()).map_or(0, |s| s.src_line);
+            let why =
+                r.b.as_ref()
+                    .or(r.a.as_ref())
+                    .and_then(|s| s.reason.lines().next())
+                    .unwrap_or("");
+            text.push_str(&format!(
+                "{:?} {}:{line}: {} -> {}{}: {why}\n",
+                r.change,
+                r.path,
+                show(&r.a),
+                show(&r.b),
+                if r.differs.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", r.differs.join(", "))
+                }
+            ));
+        }
+        if c.rows.len() > limit {
+            text.push_str(&format!(
+                "{} more row(s); raise `limit`.\n",
+                c.rows.len() - limit
+            ));
+        }
+        let mut structured = serde_json::to_value(&c).expect("a comparison serializes");
+        structured["omitted_rows"] = json!(c.rows.len().saturating_sub(limit));
+        structured["rows"] =
+            serde_json::to_value(&c.rows[..c.rows.len().min(limit)]).expect("rows serialize");
+        Ok((text, structured))
+    }
+
     /// Where a run is; once it has finished, its report as `convert_tree`
     /// returns it, and the same on every later call.
     fn run_status(&mut self, args: &Value) -> Result<(String, Value), String> {
@@ -2307,6 +2407,21 @@ fn tools() -> Value {
                 "required": ["run"],
             },
             "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
+        },
+        {
+            "name": "compare_runs",
+            "title": "Compare two conversions",
+            "description": "What changed between two conversions of a tree, from their reports without converting again: units that regressed (a worse status), improved, changed (same status, but other rules, findings, reason or rewrites: a rule edit that changes a converted unit's output shows here), are new or are gone, in a fixed order (regressed worst first, improved, changed, new, gone; then path and source line). Units are joined by id, then by path and source line. Refused for conversions of different dialects; a different source folder is noted. Each side `a` (before) and `b` (after) is a tree id of this session or a conversion-report.json (or the folder holding it); copy the report before converting into the same `out` again to keep a baseline across a server restart. Returns the counts, the units per status in each run and the rows.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "a": { "type": "string", "description": "The earlier conversion: a tree id or a conversion-report.json path" },
+                    "b": { "type": "string", "description": "The later conversion: a tree id or a conversion-report.json path" },
+                    "limit": { "type": "integer", "minimum": 0, "description": "Cap on rows listed (default 100); the counts cover all" },
+                },
+                "required": ["a", "b"],
+            },
+            "annotations": ro,
         },
         {
             "name": "converted_file",

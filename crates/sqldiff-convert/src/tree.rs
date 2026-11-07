@@ -643,6 +643,30 @@ pub fn convert_for_review(
     convert_kept(a, inputs, unreadable, out, hooks, true, None, None)
 }
 
+/// [`convert_for_review`] keeping each file's checked result in the store of
+/// `out` and reusing the ones whose key matches, as [`convert_stored`] does.
+/// The result of a trimmed conversion is the same as a whole one (`trim` is
+/// part of the stored key), so a review of a tree that was converted before
+/// costs lookups, not a new check.
+pub fn convert_for_review_stored(
+    a: &Args,
+    inputs: &[Input],
+    unreadable: Vec<String>,
+    out: &Path,
+    hooks: &Hooks,
+) -> Result<Tree, String> {
+    convert_kept(
+        a,
+        inputs,
+        unreadable,
+        Some(out),
+        hooks,
+        true,
+        Some(false),
+        None,
+    )
+}
+
 /// What is kept of each file as it is checked: its notes, shared with the
 /// tree's (`shared::Pool`), and with `trim` only what a review reads of the
 /// engine's reports.
@@ -652,16 +676,27 @@ struct Finish {
 }
 
 impl Finish {
-    fn apply(&self, c: &mut Conversion) {
+    /// Shares the notes' text. What the result store holds is only shared,
+    /// never trimmed: a review and a run keep the same stored results.
+    fn share(&self, c: &mut Conversion) {
         for u in &mut c.units {
             for n in &mut u.notes {
                 self.pool.share(&mut n.rule);
                 self.pool.share(&mut n.text);
             }
         }
+    }
+
+    /// Lets go of the reports a review does not read, in memory only.
+    fn trim(&self, c: &mut Conversion) {
         if self.trim {
             crate::trim_reports(c);
         }
+    }
+
+    fn apply(&self, c: &mut Conversion) {
+        self.share(c);
+        self.trim(c);
     }
 }
 
@@ -732,7 +767,6 @@ fn convert_kept(
             store: crate::store::Store::of(o),
             build: crate::instances::build_hash()?,
             fresh,
-            trim,
         }),
         _ => None,
     };
@@ -809,6 +843,7 @@ fn convert_kept(
                 }
             },
         };
+        finish.trim(&mut c);
         core.restore(&mut c);
         finished.push((c, secs));
     }
@@ -1118,7 +1153,7 @@ pub(crate) fn verify_tree_state(
         return (!st.same_as(&fresh)).then(|| mismatch("the whole state"));
     }
     let source = st.source.as_ref();
-    let claims = crate::table_vars::Claims::of(
+    let claims = sqldiff_draft::table_vars::Claims::of(
         inputs.iter().map(|i| (i.rel.as_str(), i.text.as_str())),
         a.from,
     );
@@ -1176,7 +1211,7 @@ pub(crate) fn build_tree_state(
     });
     // The temporary table names the whole tree's table variables claim, so
     // no two routines that may be active in one session share one.
-    let claims = crate::table_vars::Claims::of(
+    let claims = sqldiff_draft::table_vars::Claims::of(
         inputs.iter().map(|i| (i.rel.as_str(), i.text.as_str())),
         a.from,
     );
@@ -1411,7 +1446,7 @@ fn convert_files(
                         build: &c.build,
                         from: a.from,
                         to: a.to,
-                        trim: c.trim,
+                        trim: false,
                         helpers: &a.helpers,
                         text: &i.text,
                         draft: d,
@@ -1490,7 +1525,7 @@ fn convert_files(
     // messages are sorted before they are reported, so the error does not
     // depend on which thread finished when.
     let mismatch: std::sync::Mutex<Vec<String>> = Default::default();
-    let claims: std::sync::OnceLock<crate::table_vars::Claims> = std::sync::OnceLock::new();
+    let claims: std::sync::OnceLock<sqldiff_draft::table_vars::Claims> = std::sync::OnceLock::new();
     let work = slots(inputs.iter().zip(drafts).zip(keys.iter()).enumerate());
     let progress = Progress::new(work.len(), hooks);
     let done = parallel(jobs, &work, |w| {
@@ -1572,7 +1607,7 @@ fn convert_files(
         let t = Instant::now();
         let rebuild = |plain_at: &[usize]| {
             let claims = claims.get_or_init(|| {
-                crate::table_vars::Claims::of(
+                sqldiff_draft::table_vars::Claims::of(
                     inputs.iter().map(|i| (i.rel.as_str(), i.text.as_str())),
                     a.from,
                 )
@@ -1590,11 +1625,12 @@ fn convert_files(
         // Hand-written output replaces the rules' draft: not built again.
         let rebuild: Option<crate::Rebuild> = ledger.is_none().then_some(&rebuild);
         let mut c = crate::check_with(&input.text, draft, &opts, rebuild);
-        finish.apply(&mut c);
+        // Shared but whole while it is compared and stored; trimmed after.
+        finish.share(&mut c);
         let secs = t.elapsed().as_secs_f64();
         if let Some((cc, k, old)) = &stored {
             let mut old = old.clone();
-            finish.apply(&mut old);
+            finish.share(&mut old);
             if !crate::store::compare(&old, &c) {
                 cc.store.bundle(k, &old, &c);
                 mismatch.lock().unwrap().push(format!(
@@ -1614,6 +1650,7 @@ fn convert_files(
                 Err(e) => eprintln!("sqldiff: result not stored: {e}"),
             }
         }
+        finish.trim(&mut c);
         progress.tick();
         Some((hold(c, key.as_ref(), in_store, false), secs, false, false))
     });
@@ -1658,7 +1695,6 @@ struct Cache {
     build: String,
     /// Reuse nothing; store every result again.
     fresh: bool,
-    trim: bool,
 }
 
 /// Reads the review ledger in `out`, if there is one.

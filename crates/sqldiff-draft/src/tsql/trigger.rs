@@ -130,7 +130,7 @@ impl Cx<'_> {
         let single = h.events.len() == 1;
         let mut text = String::new();
         let mut notes: Vec<Note> = Vec::new();
-        let mut trace: Vec<crate::Step> = Vec::new();
+        let mut trace: Vec<sqldiff_units::Step> = Vec::new();
         for &ev in &h.events {
             let suffix = if single { "" } else { ev.suffix() };
             let (fname, tname) = trigger_names(&h.schema, &h.name, suffix)?;
@@ -403,7 +403,7 @@ impl Cx<'_> {
             let x = &ts[n];
             x.is("AS")
                 || x.k == QUOTED_IDENT
-                || x.k == IDENT && !sqldiff_core::normalize::is_keyword(&x.up())
+                || x.k == IDENT && !sqldiff_equiv::normalize::is_keyword(&x.up())
         });
         let sub = format!("(SELECT * FROM {} WHERE false)", t.out);
         Some(if aliased {
@@ -472,7 +472,7 @@ impl Cx<'_> {
         let Some(def) = defs.first().copied().cloned() else {
             return no(format!("DROP TRIGGER: PostgreSQL drops a trigger ON its table, and no CREATE TRIGGER {shown} in the converted files says which table that is"));
         };
-        let same = |a: &sqldiff_core::catalog::Trigger| {
+        let same = |a: &sqldiff_equiv::catalog::Trigger| {
             let low = |v: &[String]| v.iter().map(|x| x.to_lowercase()).collect::<Vec<_>>();
             low(&a.table) == low(&def.table)
                 && a.events == def.events

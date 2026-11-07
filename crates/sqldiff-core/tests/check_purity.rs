@@ -64,10 +64,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
         "sqldiff-convert/src/tree.rs",
         &["Instant::now", "Mutex", "OnceLock", "fs::"],
     ),
-    (
-        "sqldiff-convert/src/tsql.rs",
-        &["OnceCell", "thread_local!"],
-    ),
+    ("sqldiff-draft/src/tsql.rs", &["OnceCell", "thread_local!"]),
     ("sqldiff-model/src/assumptions.rs", &["OnceLock"]),
     ("sqldiff-syntax/src/abstract_syntax.rs", &["thread_local!"]),
     ("sqldiff-catalog/src/builtins.rs", &["OnceLock"]),
@@ -136,6 +133,7 @@ fn the_check_reads_nothing_outside_its_arguments() {
         "sqldiff-catalog",
         "sqldiff-equiv",
         "sqldiff-units",
+        "sqldiff-draft",
     ] {
         scan(&root.join(krate).join("src"), &root, &mut found);
     }
