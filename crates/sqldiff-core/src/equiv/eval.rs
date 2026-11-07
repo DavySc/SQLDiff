@@ -792,6 +792,18 @@ impl<'s> Ctx<'s> {
         }
     }
 
+    /// The value of an input already made, or the need to choose it: what
+    /// [`Self::input`] answers for a known key. Asked before the candidates
+    /// are built, because building them costs as much as the literals of the
+    /// statement and an input is read again at every step of the search.
+    fn known_input(&self, key: &Key) -> Option<R<V>> {
+        let &i = self.index.get(key)?;
+        Some(match &self.values[i] {
+            Some(v) => Ok(v.clone()),
+            None => Err(Stop::Need(i)),
+        })
+    }
+
     fn input(&mut self, key: Key, origin: Origin, mut cands: Vec<V>) -> R<V> {
         if let Some(&i) = self.index.get(&key) {
             return match &self.values[i] {
@@ -849,8 +861,11 @@ impl<'s> Ctx<'s> {
     /// Candidate values for an input of a class.
     fn candidates(&self, class: Class, hint: &Hint, nullable: bool, non_negative: bool) -> Vec<V> {
         let mut out: Vec<V> = Vec::new();
+        // Seen values, by their debug text: a statement with thousands of
+        // literals must not cost the square of that to list them.
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut push = |v: V| {
-            if !out.contains(&v) {
+            if seen.insert(format!("{v:?}")) {
                 out.push(v);
             }
         };
@@ -1050,6 +1065,9 @@ impl<'s> Ctx<'s> {
             let id = format!("@{n}#random#{}", self.side);
             return Ok(self.opaque_value(id, format!("{name} (a random number)"), false));
         }
+        if let Some(r) = self.known_input(&Key::Var(n.clone())) {
+            return r;
+        }
         let hint = self.hint(&format!("@{n}"));
         // A declared type the evaluator does not model (interval, xml, ...)
         // takes no class from how the variable is compared.
@@ -1068,6 +1086,20 @@ impl<'s> Ctx<'s> {
 
     fn column(&mut self, table: &str, row: usize, col: &str) -> R<V> {
         let col = col.to_lowercase();
+        let key = Key::Col(table.to_string(), row, col.clone());
+        if let Some(r) = self.known_input(&key) {
+            // A table function's column is converted to its declared type.
+            return match (r, self.func_schema.get(table)) {
+                (Ok(v), Some(schema)) => match schema.iter().find(|(c, _)| *c == col) {
+                    Some((_, decl)) => {
+                        let decl = decl.clone();
+                        self.cast(v, &decl)
+                    }
+                    None => unsupported(format!("unknown column {col} of {table}")),
+                },
+                (r, _) => r,
+            };
+        }
         let hint = self.hint(&col);
         if let Some(schema) = self.func_schema.get(table) {
             // A table function's column: typed by its WITH schema, nullable.
@@ -1122,6 +1154,9 @@ impl<'s> Ctx<'s> {
 
     fn field(&mut self, rec: &str, col: &str) -> R<V> {
         let col = col.to_lowercase();
+        if let Some(r) = self.known_input(&Key::Field(rec.to_string(), col.clone())) {
+            return r;
+        }
         let hint = self.hint(&col);
         let class = hint.class.unwrap_or(Class::Gen);
         let cands = self.candidates(class, &hint, hint.null_tested, false);
