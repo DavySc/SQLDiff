@@ -75,3 +75,25 @@ Two visibility changes the move forced, with no change in what can be done:
 `Report.verdict` stays private (reads use `Report::verdict()`; reports are
 built with `Report::draft` and settled by `finish`, as before) and
 `proof::apply` is `pub`.
+
+## Step 3: `sqldiff-equiv`
+
+Measured module graph of `sqldiff-core` after step 2 (edges between its
+top-level modules): `classify`, `normalize`, `hooks`, `phrase`, `render` are
+leaves; `coverage` and `treediff` use each other and `normalize`; `equiv`
+(47k lines) uses only `classify`, `normalize`, `coverage`, `treediff`, the
+catalog and the model. Nothing among them uses `ir`, `facts`, `ledger` or
+`engine`. They move together into `sqldiff-equiv` (data: `pg18_*.txt`).
+
+`ledger` cannot be a lower layer: it calls `engine::diff`, `facts` and
+`ir::cfg`, so it sits on top. The one edge from below into it is
+`ir::behaviour` calling `ledger::declared_commit_level`, a pure text helper
+that can move to `sqldiff-model` later.
+
+What this buys: pass 1 of a conversion (`sqldiff-convert/src/tsql.rs`) uses
+`equiv::canon`, `literal`, `dynamic` and `cursor`. With this step it no
+longer needs `ir`, `engine` or `ledger` to be the same code to be the same
+engine, once `sqldiff-convert` is split to depend on `sqldiff-equiv` alone.
+
+Widened for the move: `equiv::script::routine_key` and `equiv::lower::is_do`
+are `pub` (the CFG code in `ir` calls them).

@@ -1964,7 +1964,7 @@ outcome = [
 
 # ---------------------------------------------------------------- V29 indexes and sequences
 # What a converted CREATE INDEX or CREATE SEQUENCE relies on. The engine
-# (crates/sqldiff-core/src/equiv/ddl.rs) leaves a Db2 for i UNIQUE index and a
+# (crates/sqldiff-equiv/src/equiv/ddl.rs) leaves a Db2 for i UNIQUE index and a
 # sequence that leaves values to Db2's defaults not proven until these are
 # answered. Each probe runs up to six statements in order; O_TEXT has one letter
 # per statement (Y it worked, N it failed, - not given), O_N1 the rows of
@@ -2370,7 +2370,7 @@ outcome = [
 
 # ---------------------------------------------------------------- V31 casts and literal types
 # The engine compares Db2 for i conversions only between integers, to wider
-# decimals and for strings that fit (crates/sqldiff-core/src/equiv/canon.rs,
+# decimals and for strings that fit (crates/sqldiff-equiv/src/equiv/canon.rs,
 # "casts and implicit conversions"); every other Db2 for i cast is unproven.
 # These answers would let it model more. SQL Server truncates a decimal or
 # float to an integer and PostgreSQL rounds; see eval/casts.
@@ -2608,7 +2608,7 @@ outcome = [
 # The converter writes a T-SQL date or datetime2 literal assigned to a variable
 # in the ISO form (crates/sqldiff-convert/src/tsql.rs date_store), and the
 # engine reads it as the CAST the IBM i "Timestamp strings" and "Date strings"
-# pages describe (crates/sqldiff-core/src/equiv/literal.rs). Each probe assigns
+# pages describe (crates/sqldiff-equiv/src/equiv/literal.rs). Each probe assigns
 # a string to a TIMESTAMP(7) or DATE variable: N1 is year * 10000 + month * 100
 # + day, N2 hour * 10000 + minute * 100 + second, TEXT the timestamp as VARCHAR.
 
