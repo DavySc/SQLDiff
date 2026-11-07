@@ -45,12 +45,25 @@ fn a_routine_within_budget_has_no_budget_finding() {
 fn a_routine_over_its_routine_budget_is_not_proven() {
     let r = run(Some((2, u64::MAX)));
     assert!(budget_findings(&r) > 0, "{:#?}", r.findings);
+    assert!(witnesses(&r)
+        .iter()
+        .all(|w| w.contains("routine work budget")));
 }
 
 #[test]
 fn a_routine_over_the_file_budget_is_not_proven() {
     let r = run(Some((u64::MAX, 2)));
     assert!(budget_findings(&r) > 0, "{:#?}", r.findings);
+    assert!(witnesses(&r).iter().all(|w| w.contains("file work budget")));
+}
+
+/// The witnesses of the budget findings: they name the cap that was hit.
+fn witnesses(r: &Report) -> Vec<&str> {
+    r.findings
+        .iter()
+        .filter(|f| f.rule == "equiv.budget")
+        .map(|f| f.witness.as_str())
+        .collect()
 }
 
 #[test]
