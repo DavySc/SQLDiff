@@ -46,3 +46,54 @@ next piece of work; each break is its own PR.
   full `cargo test --workspace`.
 - Conversion output of a fixed subset is identical before and after
   (`diff -r`, excluding `.sqldiff`), at `-j1` and `-j4`.
+
+## Step 2: `sqldiff-model` (breaking the model/ir/ledger/engine cycles)
+
+The cycles had one hub, `model` (the report types). `model` used six things
+that sat in modules which themselves use `model`:
+
+| `model` used | was in | now |
+|---|---|---|
+| `assumptions::lookup` (a debug check) | `assumptions` | moved into `sqldiff-model` |
+| `session::derive_verdict` | `session` | moved |
+| `proof::Proof` | `proof` (with `artifact`) | moved with `artifact` and `target` |
+| `ir::witness::Witness` | `ir/witness.rs` (with `ir/profile.rs`) | moved to `sqldiff-model::witness` and `::profile` |
+| `ledger::Discharge` | `ledger` | the struct moved into `model`; `ledger` re-exports it |
+
+`sqldiff-model` holds `model`, `assumptions`, `session`, `proof`, `artifact`,
+`target`, `profile` and `witness`, plus their data (`profiles/assumptions.toml`,
+`lifecycle.toml`, `semantics/*.toml`). It depends only on `sqldiff-syntax`.
+`sqldiff-core` re-exports the modules under their old paths
+(`sqldiff_core::model`, `ir::profile` and so on), so no caller changes.
+
+What stays in `sqldiff-core` and is still tangled: `ir` (cfg, interp,
+behaviour), `ledger`, `engine`, `facts`, `classify`, `equiv`. `ledger` uses
+`ir::cfg` and `ir::behaviour`, and `ir` uses `ledger`/`facts`/`equiv`: that
+is the remaining cycle. `ledger` is the smallest piece to break next.
+
+Two visibility changes the move forced, with no change in what can be done:
+`Report.verdict` stays private (reads use `Report::verdict()`; reports are
+built with `Report::draft` and settled by `finish`, as before) and
+`proof::apply` is `pub`.
+
+## Step 3: `sqldiff-equiv`
+
+Measured module graph of `sqldiff-core` after step 2 (edges between its
+top-level modules): `classify`, `normalize`, `hooks`, `phrase`, `render` are
+leaves; `coverage` and `treediff` use each other and `normalize`; `equiv`
+(47k lines) uses only `classify`, `normalize`, `coverage`, `treediff`, the
+catalog and the model. Nothing among them uses `ir`, `facts`, `ledger` or
+`engine`. They move together into `sqldiff-equiv` (data: `pg18_*.txt`).
+
+`ledger` cannot be a lower layer: it calls `engine::diff`, `facts` and
+`ir::cfg`, so it sits on top. The one edge from below into it is
+`ir::behaviour` calling `ledger::declared_commit_level`, a pure text helper
+that can move to `sqldiff-model` later.
+
+What this buys: pass 1 of a conversion (`sqldiff-convert/src/tsql.rs`) uses
+`equiv::canon`, `literal`, `dynamic` and `cursor`. With this step it no
+longer needs `ir`, `engine` or `ledger` to be the same code to be the same
+engine, once `sqldiff-convert` is split to depend on `sqldiff-equiv` alone.
+
+Widened for the move: `equiv::script::routine_key` and `equiv::lower::is_do`
+are `pub` (the CFG code in `ir` calls them).

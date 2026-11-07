@@ -2672,7 +2672,7 @@ fn unit_assumptions(u: &crate::Unit) -> Vec<&str> {
     for n in u.notes.iter().filter(|n| n.status == Status::Assumptions) {
         debug_assert!(
             !n.rule.starts_with("ASM-") || sqldiff_core::assumptions::lookup(&n.rule).is_some(),
-            "assumption id `{}` is not registered in crates/sqldiff-core/profiles/assumptions.toml",
+            "assumption id `{}` is not registered in crates/sqldiff-model/profiles/assumptions.toml",
             n.rule
         );
         if !out.contains(&n.rule.as_str()) {

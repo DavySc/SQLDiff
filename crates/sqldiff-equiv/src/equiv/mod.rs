@@ -4581,9 +4581,17 @@ fn align(a: &[Slot], b: &[Slot]) -> Alignment {
 /// The alignment search of `align`: only what every best alignment agrees
 /// on.
 fn align_certain(a: &[Slot], b: &[Slot]) -> Alignment {
+    align_certain_within(a, b, ALIGN_CELLS)
+}
+
+/// `align_certain` with the cell bound as a parameter.
+fn align_certain_within(a: &[Slot], b: &[Slot], cells: usize) -> Alignment {
     let (n, m) = (a.len(), b.len());
-    if n.saturating_mul(m) > ALIGN_CELLS {
-        return Alignment::default();
+    if n.saturating_mul(m) > cells {
+        return Alignment {
+            over_bound: true,
+            ..Alignment::default()
+        };
     }
     // A match of keys outweighs any number of gap matches, and a gap
     // against a gap any number of the others. With `ALIGN_CELLS` the
@@ -4599,23 +4607,30 @@ fn align_certain(a: &[Slot], b: &[Slot]) -> Alignment {
         _ => Some(1),
     };
     // f: best score of a[..i] against b[..j]; g: of a[i..] against b[j..].
-    let mut f = vec![vec![0u64; m + 1]; n + 1];
+    // Flat row-major buffers of (n + 1) * (m + 1) cells each.
+    let cols = m + 1;
+    let at = |i: usize, j: usize| i * cols + j;
+    let mut f = vec![0u64; (n + 1) * cols];
     for i in 1..=n {
         for j in 1..=m {
-            let d = w(&a[i - 1], &b[j - 1]).map_or(0, |x| f[i - 1][j - 1] + x);
-            f[i][j] = d.max(f[i - 1][j]).max(f[i][j - 1]);
+            let d = w(&a[i - 1], &b[j - 1]).map_or(0, |x| f[at(i - 1, j - 1)] + x);
+            f[at(i, j)] = d.max(f[at(i - 1, j)]).max(f[at(i, j - 1)]);
         }
     }
-    let mut g = vec![vec![0u64; m + 1]; n + 1];
+    let mut g = vec![0u64; (n + 1) * cols];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
-            let d = w(&a[i], &b[j]).map_or(0, |x| g[i + 1][j + 1] + x);
-            g[i][j] = d.max(g[i + 1][j]).max(g[i][j + 1]);
+            let d = w(&a[i], &b[j]).map_or(0, |x| g[at(i + 1, j + 1)] + x);
+            g[at(i, j)] = d.max(g[at(i + 1, j)]).max(g[at(i, j + 1)]);
         }
     }
-    let best = f[n][m];
+    let (f, g) = (
+        |i: usize, j: usize| f[at(i, j)],
+        |i: usize, j: usize| g[at(i, j)],
+    );
+    let best = f(n, m);
     let usable =
-        |i: usize, j: usize| w(&a[i], &b[j]).is_some_and(|x| f[i][j] + x + g[i + 1][j + 1] == best);
+        |i: usize, j: usize| w(&a[i], &b[j]).is_some_and(|x| f(i, j) + x + g(i + 1, j + 1) == best);
     let mut out = Alignment::default();
     // Every best alignment matches slot `i` of a side, and with one partner.
     for is_a in [true, false] {
@@ -4625,9 +4640,9 @@ fn align_certain(a: &[Slot], b: &[Slot]) -> Alignment {
             let skipped = (0..=other).any(|k| {
                 let (x, y) = at(k);
                 if is_a {
-                    f[x][y] + g[x + 1][y] == best
+                    f(x, y) + g(x + 1, y) == best
                 } else {
-                    f[x][y] + g[x][y + 1] == best
+                    f(x, y) + g(x, y + 1) == best
                 }
             });
             let partners: Vec<usize> = (0..other)
@@ -4663,13 +4678,16 @@ fn align_certain(a: &[Slot], b: &[Slot]) -> Alignment {
 }
 
 /// Above this many cells the alignment is not searched and nothing is
-/// paired.
+/// paired; the statements are reported as not paired for that reason
+/// (`Alignment::over_bound`), never as equal.
 const ALIGN_CELLS: usize = 16_000_000;
 
 /// How two sides' statements were paired (`align`).
 #[derive(Debug, Default)]
 struct Alignment {
     pairs: Vec<(usize, usize)>,
+    /// The search was skipped because it exceeds `ALIGN_CELLS`.
+    over_bound: bool,
     /// Statements every best alignment puts against a gap.
     beside: Vec<Beside>,
     /// Statements best alignments place differently: (side A, index).
@@ -4855,6 +4873,7 @@ fn pair_items(
     let kb: Vec<String> = ib.iter().map(|x| key(&x.term)).collect();
     let Alignment {
         pairs,
+        over_bound,
         beside,
         ambiguous,
         moved,
@@ -4937,6 +4956,10 @@ fn pair_items(
                 ),
                 None if ambiguous.contains(&(is_a, i)) => format!(
                     "{name} line {}: statement is not paired: the statements around it line up with the other side in more than one way",
+                    line(side, &it.nodes)
+                ),
+                None if over_bound => format!(
+                    "{name} line {}: statement is not paired: the statements are too many to line up exactly (align.bound)",
                     line(side, &it.nodes)
                 ),
                 None => format!(
@@ -5624,4 +5647,29 @@ pub fn refine_modified(
         }
     }
     *findings = keep;
+}
+
+#[cfg(test)]
+mod align_bound_tests {
+    use super::*;
+
+    fn items(keys: &'static [&'static str]) -> Vec<Slot<'static>> {
+        keys.iter()
+            .enumerate()
+            .map(|(i, k)| Slot::Item(i, k, false))
+            .collect()
+    }
+
+    #[test]
+    fn over_the_cell_bound_nothing_is_paired_and_it_says_so() {
+        let a = items(&["x", "y", "z"]);
+        let mut b = items(&["x", "z"]);
+        b.push(Slot::Gap(0));
+        let within = align_certain_within(&a, &b, 100);
+        assert!(!within.over_bound);
+        assert!(!within.pairs.is_empty());
+        let over = align_certain_within(&a, &b, 8);
+        assert!(over.over_bound);
+        assert!(over.pairs.is_empty() && over.beside.is_empty());
+    }
 }
