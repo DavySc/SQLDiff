@@ -489,7 +489,7 @@ impl StandIns {
 /// What flagging adds to one unit: the stand-in note and, when the unit may
 /// touch a refused column, that note (inserted before the first note below
 /// `Unproven`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnitFlag {
     unit: usize,
     stand_in: Note,

@@ -505,3 +505,31 @@ fn stand_in_flags_come_from_the_store_without_changing_the_output() {
     run(&f, &c, "a", 2, Select::default(), false);
     same(&base, &tree_of(&f.out("a")), "unreadable flags");
 }
+
+#[test]
+fn a_checked_again_file_must_give_the_stored_stand_in_flags() {
+    let f = Fixture::new("flagsmismatch");
+    let c = Case {
+        to: Dialect::Postgres,
+        catalogs: &[],
+    };
+    run(&f, &c, "a", 2, Select::default(), true);
+    let flags = f.out("a").join(".sqldiff/flags");
+    // A flag set that reads back but is not what the file gives now.
+    let mut changed = 0;
+    for e in std::fs::read_dir(&flags).unwrap().flatten() {
+        for g in std::fs::read_dir(e.path()).unwrap().flatten() {
+            std::fs::write(g.path(), b"[]").unwrap();
+            changed += 1;
+        }
+    }
+    assert!(changed > 0);
+    // Every file is checked again (`--fresh`): the flags are compared.
+    let mut job = f.job("a", 2, Select::default(), c.to, c.catalogs);
+    job.fresh = true;
+    let Err(err) = convert_into(&job, &Hooks::default()) else {
+        panic!("a flag set that differs from the fresh one must fail the run");
+    };
+    assert!(err.contains("stand-in flags"), "{err}");
+    assert!(err.contains("store is emptied"), "{err}");
+}

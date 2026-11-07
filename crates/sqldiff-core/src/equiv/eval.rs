@@ -1697,6 +1697,86 @@ impl Ctx<'_> {
         unsupported(format!("unresolved name {}", lower.join(".")))
     }
 
+    /// Whether `e` may be a fixed-length (`char(n)`) value: a cast to one, a
+    /// parameter or variable declared as one, or a column of the catalog that
+    /// is one. A name that resolves to a derived column, a record field or a
+    /// variable of unknown type counts as may-be, so the answer errs on
+    /// refusing. The whole expression is searched: COALESCE, NULLIF, CASE,
+    /// GREATEST, ISNULL, `+`, CONCAT and a scalar subquery all keep the
+    /// blanks of a `char(n)` value, and no function is known to strip them,
+    /// so any part that may be one makes the whole one.
+    fn may_be_char(&self, e: &Expr, scopes: &[Scope]) -> bool {
+        let mut found = false;
+        walk_expr(e, &mut |x| {
+            found = found || self.leaf_may_be_char(x, scopes);
+        });
+        found
+    }
+
+    /// One node of [`Self::may_be_char`].
+    fn leaf_may_be_char(&self, e: &Expr, scopes: &[Scope]) -> bool {
+        match e {
+            Expr::Cast(_, ty) => Ty::from_type(ty, self.d, true).fam == Fam::Char,
+            Expr::Var(v) => self.var_may_be_char(&var_key(v)),
+            Expr::Name(parts) => {
+                let lower: Vec<String> = parts.iter().map(|p| p.to_lowercase()).collect();
+                let col = lower.last().cloned().unwrap_or_default();
+                if lower.len() == 1 && self.d != Dialect::Tsql && self.vars.contains_key(&col) {
+                    return self.var_may_be_char(&col);
+                }
+                if lower.len() == 2 && self.d != Dialect::Tsql && self.records.contains(&lower[0]) {
+                    return true;
+                }
+                let qual = (lower.len() >= 2).then(|| lower[..lower.len() - 1].join("."));
+                scopes.iter().any(|scope| {
+                    scope.iter().any(|b| {
+                        let named = match &qual {
+                            Some(q) => b.names.iter().any(|n| n == q || n == last_part(q)),
+                            None => true,
+                        };
+                        named
+                            && match &b.src {
+                                Src::Base(t, _) => self.base_may_be_char(t, &col),
+                                Src::Derived(cols) => cols.iter().any(|(n, _)| *n == col),
+                                Src::Nulls => false,
+                            }
+                    })
+                })
+            }
+            // A scalar subquery returns whatever its select list is.
+            Expr::Subquery(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Whether column `col` of the table read `table` (a key as
+    /// [`Self::column`] takes it) may be `char(n)`. A table function's column
+    /// is typed by its WITH schema; a temporal read (`t FOR SYSTEM_TIME AS OF
+    /// x`) by the catalog of `t`. A view, or a table the catalog does not
+    /// know, counts as may-be; a table it knows that lacks the column does not.
+    fn base_may_be_char(&self, table: &str, col: &str) -> bool {
+        if let Some(schema) = self.func_schema.get(table) {
+            // Typed by its WITH schema: a column it lacks is not this one.
+            return schema
+                .iter()
+                .any(|(c, t)| c == col && Ty::from_type(t, self.d, false).fam == Fam::Char);
+        }
+        let base = table.split(' ').next().unwrap_or(table);
+        match self.schema.table(base) {
+            // Unknown to the catalog (a view, say): may be anything.
+            None => true,
+            // Known: only a column it has can be this one. A table without
+            // the column is another table of a join.
+            Some(t) => t.column(col).is_some_and(|c| c.ty.fam == Fam::Char),
+        }
+    }
+
+    fn var_may_be_char(&self, key: &str) -> bool {
+        self.vars
+            .get(key)
+            .map_or(true, |f| f.ty.as_ref().map_or(true, |t| t.fam == Fam::Char))
+    }
+
     fn has_column(&self, b: &Binding, col: &str) -> Option<bool> {
         match &b.src {
             Src::Derived(cols) => Some(cols.iter().any(|(n, _)| n == col)),
@@ -1799,6 +1879,16 @@ impl Ctx<'_> {
             Expr::Like(x, p, neg, ci) => {
                 let v = self.expr(x, scopes, g)?;
                 let pat = self.expr(p, scopes, g)?;
+                // Both dialects blank-pad a fixed-length value and the
+                // evaluator keeps values unpadded, whatever their source (a
+                // row, a parameter, a variable, a cast): LIKE would answer for
+                // the unpadded text. So a subject or pattern that may be
+                // declared `char(n)` is not evaluated.
+                if matches!((&v, &pat), (V::Str(_), V::Str(_)))
+                    && (self.may_be_char(x, scopes) || self.may_be_char(p, scopes))
+                {
+                    return rej();
+                }
                 match (&v, &pat) {
                     (V::Err(_), _) => Ok(v.clone()),
                     (_, V::Err(_)) => Ok(pat.clone()),
@@ -3130,9 +3220,20 @@ fn or3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
 }
 
 /// LIKE with `%` and `_` (no character classes); None when the answer could
-/// depend on the collation.
+/// depend on the collation or on the dialect:
+/// - a backslash in the pattern: PostgreSQL reads it as the default escape
+///   character (`'a%' LIKE 'a\%'` is true), SQL Server and Db2 for i as an
+///   ordinary character;
+/// - a trailing space in the text or the pattern: whether it counts depends
+///   on the type (a padded `char(n)` against a `varchar`) and the dialect, and
+///   the evaluator does not know the declared type of a string value.
+///
+/// Both are refused rather than guessed.
 fn like(s: &str, p: &str, ci: bool) -> Option<bool> {
-    if p.contains('[') || !s.is_ascii() || !p.is_ascii() {
+    if p.contains('[') || p.contains('\\') || !s.is_ascii() || !p.is_ascii() {
+        return None;
+    }
+    if s.ends_with(' ') || p.ends_with(' ') {
         return None;
     }
     let (s, p): (Vec<char>, Vec<char>) = if ci {
@@ -5156,6 +5257,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn like_refuses_what_depends_on_the_dialect_or_the_type() {
+        // PostgreSQL's default escape is the backslash; the others read it
+        // as a character.
+        assert_eq!(like("a%", "a\\%", true), None);
+        assert_eq!(like("a\\b", "a\\b", false), None);
+        // Trailing blanks of the text or the pattern.
+        assert_eq!(like("abc ", "abc", true), None);
+        assert_eq!(like("abc", "abc ", true), None);
+        assert_eq!(like("abc ", "abc%", true), None);
+        // Blanks inside or in front are ordinary characters.
+        assert_eq!(like(" abc", " a%", true), Some(true));
+        assert_eq!(like("a bc", "a_bc", true), Some(true));
     }
 
     #[test]

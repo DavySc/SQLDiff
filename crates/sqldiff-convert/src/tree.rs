@@ -1526,6 +1526,18 @@ fn convert_files(
                     let flags = stand_ins.flags_of(idx, &input.text, &c, a.from, a.to);
                     crate::refused::apply_flags(&mut c, &flags);
                     if let Some((cc, k, fk)) = &stored_flags {
+                        // A file checked again (the sample) must give the
+                        // flags the store holds for the same result.
+                        if let Some(old) = cc.store.get_flags(k, fk) {
+                            if old != flags {
+                                *mismatch.lock().unwrap() = Some(format!(
+                                    "{}: the stored stand-in flags {} differ from flags computed \
+                                     again for the same result. The store is emptied: run again.",
+                                    input.rel,
+                                    fk.as_str(),
+                                ));
+                            }
+                        }
                         cc.store.put_flags(k, fk, &flags);
                     }
                 }
@@ -3571,16 +3583,16 @@ mod tree_state_tests {
                 .map(|e| e.unwrap().path())
                 .find(|p| {
                     let v: serde_json::Value =
-                        serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
+                        serde_json::from_slice(&std::fs::read(p).unwrap()[65..]).unwrap();
                     v["rel"] == rel
                 })
                 .unwrap()
         };
         let (fa, fp) = (by_rel("a.sql"), by_rel("p.sql"));
         let mut v: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&fa).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(&fa).unwrap()[65..]).unwrap();
         v["rel"] = "p.sql".into();
-        std::fs::write(&fp, serde_json::to_vec(&v).unwrap()).unwrap();
+        std::fs::write(&fp, crate::store::framed(&serde_json::to_vec(&v).unwrap())).unwrap();
         let err = (0..8)
             .find_map(|seed| {
                 build_tree_state(&a, &out, &inputs, 1, None, None, Some(&cache(true, seed))).err()

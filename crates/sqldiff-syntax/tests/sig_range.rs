@@ -80,3 +80,50 @@ fn looking_from_both_ends_finds_what_walking_every_token_finds() {
         }
     }
 }
+
+/// Trees the parser does not produce today: trivia right after, before or
+/// between empty nodes. `sig_range` must not rely on the parser keeping
+/// them away.
+#[test]
+fn trivia_next_to_an_empty_node_is_handled() {
+    use rowan::GreenNodeBuilder;
+    use sqldiff_syntax::{SyntaxKind as K, SyntaxNode};
+    // Each shape is a list of children: 'w' trivia, 'i' significant token,
+    // 'e' empty BRANCH node.
+    let shapes = [
+        "wez",
+        "zew",
+        "wezw",
+        "wzew",
+        "wie",
+        "wew",
+        "weiw",
+        "wiewe",
+        "ewi",
+        "iew",
+        "wiweww",
+        "wwewiwwewiww",
+        "ewe",
+        "wiew",
+        "weiwe",
+        "iwewi",
+    ];
+    for shape in shapes {
+        let mut b = GreenNodeBuilder::new();
+        b.start_node(K::STATEMENT.into());
+        for c in shape.chars() {
+            match c {
+                'w' => b.token(K::WHITESPACE.into(), " "),
+                'i' => b.token(K::IDENT.into(), "x"),
+                'z' => b.token(K::IDENT.into(), ""),
+                _ => {
+                    b.start_node(K::BRANCH.into());
+                    b.finish_node();
+                }
+            }
+        }
+        b.finish_node();
+        let node = SyntaxNode::new_root(b.finish());
+        assert_eq!(sig_range(&node), walking(&node), "shape {shape}");
+    }
+}
