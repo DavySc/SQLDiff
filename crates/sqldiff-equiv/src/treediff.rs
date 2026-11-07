@@ -117,6 +117,7 @@ pub fn alignment_bound_finding(
 }
 
 pub fn diff(a: &Analyzed, b: &Analyzed, work: usize) -> TreeDiff {
+    sqldiff_model::work::spend(sqldiff_model::work::Site::DiffCalls, 1);
     let ua: Vec<Unit> = ast::structural_children(&a.root)
         .into_iter()
         .map(|n| build_unit(n, a))

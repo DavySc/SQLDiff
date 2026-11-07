@@ -93,6 +93,19 @@ pub(crate) fn check_with_mix(
     opts: &Options,
     rebuild: Option<Rebuild>,
 ) -> (Conversion, Option<Mix>) {
+    // The file's work count (`SQLDIFF_WORK=1` prints it); counting only.
+    sqldiff_model::work::scope("check", || {
+        check_with_mix_inner(input, draft, opts, rebuild)
+    })
+    .0
+}
+
+fn check_with_mix_inner(
+    input: &str,
+    draft: Draft,
+    opts: &Options,
+    rebuild: Option<Rebuild>,
+) -> (Conversion, Option<Mix>) {
     let mut draft = draft;
     let Some(plain) = draft.plain.take() else {
         return (check_one(input, draft, opts), None);

@@ -5065,6 +5065,7 @@ fn dfs(
         return Ok(None);
     }
     *budget -= 1;
+    sqldiff_model::work::spend(sqldiff_model::work::Site::WitnessTries, 1);
     c.guard_skipped = false;
     let ra = eval_side(c, a, 1);
     let rb = match &ra {

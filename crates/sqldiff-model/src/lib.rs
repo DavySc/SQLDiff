@@ -16,3 +16,4 @@ pub mod proof;
 pub mod session;
 pub mod target;
 pub mod witness;
+pub mod work;
