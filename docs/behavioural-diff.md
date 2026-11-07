@@ -84,8 +84,14 @@ and p01 (T-SQL goes on to `ROLLBACK; RETURN n`) diverge, as the oracle shows.
 
 Paths are matched by the conditions they take; condition text is compared with
 case, quoting, default schemas (`dbo.`, `public.`) and parameter prefixes
-(`@`, `p_`) folded. When paths cannot be matched, every combination is compared
-and a divergence that does not hold for all of them is "unknown".
+(`@`, `p_`) folded. A row-count test (`@@ROWCOUNT = 0`, `NOT FOUND`,
+`SQLCODE = 100`) is named by the statement whose count it reads and is recorded
+as "no rows from" that statement, so `IF @@ROWCOUNT = 0` on one side and
+`IF FOUND ... ELSE` on the other mean the same thing in a path. When the two
+sides' paths cannot be matched one to one, every combination is compared except
+those no input can produce (the same condition, decided once on each path, with
+two values; a condition decided more than once, as a loop test is, never rules
+a pair out), and a divergence that does not hold for all of them is "unknown".
 
 ## Structured witnesses
 

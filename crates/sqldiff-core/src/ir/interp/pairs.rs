@@ -201,6 +201,11 @@ impl Interp<'_> {
             faulted: _,
             fault_index: _,
             fault_route: _,
+            // Which statement a pending row-count test reads is a position,
+            // like the step counter: it would split every path and is left
+            // out of the measurement key.
+            rows_stmt: _,
+            rows_failed: _,
         } = st;
         let abs = v.abstract_log && v.agree && !live;
         let _ = write!(

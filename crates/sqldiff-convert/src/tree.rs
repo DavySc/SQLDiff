@@ -909,17 +909,23 @@ pub(crate) fn dest_under(out: &Path, rel: &str) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+/// How binding reasons name the two catalogs of a tree. Never a path: the
+/// folder a tree is read from or written to is no input of the check.
+const SOURCE_LABEL: &str = "the source tree";
+const TARGET_LABEL: &str = "the converted tree";
+
 /// The key of the tree state: every input of the catalogs, the drafts and
 /// the stand-ins, named. Anything that reaches them but is missing here
 /// would let a stale state through, so the list is the contract: the
 /// running build, the dialects and rule options, the source and output
-/// folder (they are quoted in the catalogs' origins), every file's path and
-/// text, the review ledger (hand-written output replaces drafts) and the base
+/// folder are not part of it: the catalogs carry logical labels
+/// (`SOURCE_LABEL`, `TARGET_LABEL`), so the same tree converted into another
+/// folder, or on another system, has the same key and the same reasons;
+/// every file's path and text, the review ledger (hand-written output replaces drafts) and the base
 /// catalogs.
 fn tree_key(
     c: &Cache,
     a: &Args,
-    out: &Path,
     inputs: &[Input],
     ledger: Option<&crate::review::Ledger>,
     base: Option<&crate::base::Base>,
@@ -930,8 +936,6 @@ fn tree_key(
     k.field("to", a.to.id().as_bytes());
     k.field("rules", format!("{:?}", a.rules).as_bytes());
     k.field("catalogs", &[!a.no_catalog as u8]);
-    k.field("src", a.src.display().to_string().as_bytes());
-    k.field("out", out.display().to_string().as_bytes());
     for i in inputs {
         k.field("path", i.rel.as_bytes());
         k.field("text", i.text.as_bytes());
@@ -1024,7 +1028,7 @@ pub(crate) struct DraftCache<'a> {
 /// stored draft differs from one built again.
 pub(crate) fn build_tree_state(
     a: &Args,
-    out: &Path,
+    _out: &Path,
     inputs: &[Input],
     jobs: usize,
     ledger: Option<&crate::review::Ledger>,
@@ -1041,11 +1045,11 @@ pub(crate) fn build_tree_state(
                 &b.source,
                 texts,
                 a.from,
-                crate::base::origin(&a.src.display().to_string(), &b.files),
+                crate::base::origin(SOURCE_LABEL, &b.files),
                 None,
                 jobs,
             ),
-            None => catalog(texts, a.from, &a.src, None, jobs),
+            None => catalog(texts, a.from, Path::new(SOURCE_LABEL), None, jobs),
         })
     });
     // The temporary table names the whole tree's table variables claim, so
@@ -1120,11 +1124,11 @@ pub(crate) fn build_tree_state(
                 &b.target,
                 texts,
                 a.to,
-                crate::base::origin(&out.display().to_string(), b.target_files()),
+                crate::base::origin(TARGET_LABEL, b.target_files()),
                 None,
                 jobs,
             ),
-            None => catalog(texts, a.to, out, None, jobs),
+            None => catalog(texts, a.to, Path::new(TARGET_LABEL), None, jobs),
         };
         // Tables whose CREATE TABLE was refused for a part of it stand in
         // for binding, without that part; what uses them is flagged below.
@@ -1175,7 +1179,7 @@ fn convert_files(
     // What the checks start from (catalogs, drafts, stand-ins) is a function
     // of the whole tree: taken from the store when its key matches exactly,
     // else built and stored for the next run.
-    let tree_key = cache.map(|c| tree_key(c, a, out, inputs, ledger, base));
+    let tree_key = cache.map(|c| tree_key(c, a, inputs, ledger, base));
     // Which stored things this run builds again to compare: a function of
     // the tree's key and the store's run count, never of the clock.
     let run_n = cache.map_or(0, |c| c.store.run_count());
@@ -1702,7 +1706,7 @@ fn declared_name(d: &str) -> Option<String> {
 #[allow(clippy::too_many_arguments)]
 fn convert_templates(
     a: &Args,
-    out: &Path,
+    _out: &Path,
     tm: &TemplateMode,
     inputs: &[Input],
     jobs: usize,
@@ -1742,11 +1746,11 @@ fn convert_templates(
                 &b.source,
                 texts,
                 a.from,
-                crate::base::origin(&a.src.display().to_string(), &b.files),
+                crate::base::origin(SOURCE_LABEL, &b.files),
                 stem,
                 jobs,
             ),
-            None => catalog(texts, a.from, &a.src, stem, jobs),
+            None => catalog(texts, a.from, Path::new(SOURCE_LABEL), stem, jobs),
         })
     });
 
@@ -1837,11 +1841,11 @@ fn convert_templates(
                 &b.target,
                 texts,
                 a.to,
-                crate::base::origin(&out.display().to_string(), b.target_files()),
+                crate::base::origin(TARGET_LABEL, b.target_files()),
                 stem,
                 jobs,
             ),
-            None => catalog(texts, a.to, out, stem, jobs),
+            None => catalog(texts, a.to, Path::new(TARGET_LABEL), stem, jobs),
         })];
     }
     hooks.stop_if_cancelled()?;
