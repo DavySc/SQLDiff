@@ -501,6 +501,34 @@ pub fn check_template(
     basis: PlaceholderBasis,
     delimiters: (&str, &str),
 ) -> Conversion {
+    check_template_as(t, d, stand, opts, basis, delimiters, true)
+}
+
+/// What a template that was not checked in this run comes out as (an
+/// increment that left it out, with no stored result that matches): the
+/// output is the rules' draft with the placeholders and special forms put
+/// back, every unit is not converted (`plan.not-checked`) and the reports are
+/// empty, as for a plain file ([`crate::not_checked`]). The engine never
+/// ran on it.
+pub fn not_checked_template(
+    t: &Template,
+    d: TemplateDraft,
+    stand: &StandIns,
+    basis: PlaceholderBasis,
+    delimiters: (&str, &str),
+) -> Conversion {
+    check_template_as(t, d, stand, &Options::default(), basis, delimiters, false)
+}
+
+fn check_template_as(
+    t: &Template,
+    d: TemplateDraft,
+    stand: &StandIns,
+    opts: &Options,
+    basis: PlaceholderBasis,
+    delimiters: (&str, &str),
+    checked: bool,
+) -> Conversion {
     let TemplateDraft {
         frag,
         draft,
@@ -538,7 +566,11 @@ pub fn check_template(
     } else {
         opts
     };
-    let mut c = check(&frag.text, draft, opts);
+    let mut c = if checked {
+        check(&frag.text, draft, opts)
+    } else {
+        crate::not_checked(&frag.text, draft)
+    };
     if let Some(h) = &harness {
         let mid = h.around.as_ref().and_then(|(pre, post)| {
             let o = &c.output;
