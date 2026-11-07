@@ -690,7 +690,7 @@ impl Schema {
                 .map(|t| t.name.to_lowercase()),
         );
         for t in view
-            .catalog
+            .catalog()
             .tables
             .iter()
             .filter(|t| t.kind == TableKind::View && t.types_from_source && !t.star_outputs)
@@ -701,7 +701,7 @@ impl Schema {
             // source column with that very type (an ALTER COLUMN, or a
             // table dropped and created again, leaves the copy stale).
             let sources: Vec<&crate::catalog::Table> = view
-                .catalog
+                .catalog()
                 .tables
                 .iter()
                 .filter(|b| {
