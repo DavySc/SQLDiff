@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Hang gate: adversarial and audit inputs under a time limit and a memory ceiling.
 
-Converts every file written by scripts/gen-adversarial.py (and every file under
-tests/hang/ if present) alone, -j 1, to PostgreSQL, and fails when one
+Converts every file written by scripts/gen-adversarial.py (the synthetic shapes
+and the audit repros, prefix n_) and every file under tests/hang/ if present, alone, -j 1, to PostgreSQL, and fails when one
 
   * is killed at the time limit,
   * peaks above the resident-memory ceiling,
@@ -22,7 +22,12 @@ ROOT = os.path.dirname(HERE)
 
 # Per-file limits where the default is wrong: name prefix -> (seconds, MB).
 # Every entry needs the measurement that justifies it.
-OVERRIDES = {}
+OVERRIDES = {
+    # 20,000 `SELECT 1` lines checked as Db2 for i: 20 s and 2.05 GB on main
+    # (audit h02). The ceiling is raised so the gate does not flap at it; the
+    # memory is a finding for the performance plan, not accepted behaviour.
+    "n_h02": (120, 3072),
+}
 
 # Shapes that still run too long or take too much memory, each with the row of
 # the performance plan (conversion-performance-plan.md, section 2.3)
@@ -37,13 +42,17 @@ KNOWN_OPEN = {
     "g_tables_5000": "catalog loading is quadratic, killed at 120 s",
     "j_branches_14": "R1: nested IF/ELSE depth 14, 109 s, 1 GB",
     "k_seq_ifs_200": "R1: sequential IF-guarded writes, killed at 120 s",
+    "n_h04_nested_while": "R2: 4000 nested WHILE, killed at 120 s, 2.3 GB (audit h04)",
 }
 
 
-def run(binary, path, out, timeout, kill_rss_mb):
+def run(binary, path, out, timeout, kill_rss_mb, dialect="tsql"):
     start = time.time()
+    # Db2 for i has no conversion rules yet: its repros are checked, not converted.
+    cmd = ([binary, "check", path, "-d", "db2i", "-f", "json", "--no-cache"] if dialect == "db2i"
+           else [binary, "convert", path, "-o", out, "--from", dialect, "--to", "postgres", "-j", "1"])
     p = subprocess.Popen(
-        [binary, "convert", path, "-o", out, "--to", "postgres", "-j", "1"],
+        cmd,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
@@ -108,7 +117,8 @@ def main():
                 if name.startswith(prefix):
                     secs, mb = s, m
             out = os.path.join(work, "out", name)
-            result, wall, peak = run(a.sqldiff, f, out, secs, mb)
+            dialect = "db2i" if "db2i" in name else "tsql"
+            result, wall, peak = run(a.sqldiff, f, out, secs, mb, dialect)
             if result == "ok" and peak > mb:
                 result = f"MEMORY ({peak} MB > {mb} MB)"
             if a.known_open:
