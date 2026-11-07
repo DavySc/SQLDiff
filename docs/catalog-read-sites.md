@@ -44,7 +44,7 @@ Inventory for the recorded-catalog-reads series (performance plan W4.3). It list
 | P11 | `sqldiff-draft/src/tsql/paging.rs` | `fn not_null_key(` | pass 1 `SourceReads` (sandbox only until Phase B) | key nullability for paging. |
 | P12 | `sqldiff-draft/src/tsql/trigger.rs` | `pub(super) fn drop_trigger(` | pass 1 `SourceReads` (sandbox only until Phase B) | trigger by name (`triggers_named`). |
 | P2 | `sqldiff-draft/src/tsql.rs` | `local: std::cell::OnceCell<sqldiff_equiv::catalog::Catalog>` | none (the file's own DDL) | Not an external input: built from the file's text. |
-| T1 | `sqldiff-convert/src/tree.rs` | `opts.facts_a.first().map(\|c\| c.as_ref())` | pass 1 handle | Pass 1 reads the catalog back out of `Options`; it should hold the tree state's own `Arc<Catalog>`. |
+| T1 | `sqldiff-convert/src/tree.rs` | `let source = source.map(Arc::new);` | pass 1 handle | Done in PR 2a: pass 1 holds the tree state's own `Arc<Catalog>` (`source`), not one read back out of `Options`, whose `Facts` handle only the engine opens. |
 
 ## Doors
 
@@ -119,7 +119,7 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 | `sqldiff-convert/src/check.rs` | driver | 6 |
 | `sqldiff-convert/src/instances.rs` | driver | 8 |
 | `sqldiff-convert/src/template.rs` | driver | 6 |
-| `sqldiff-convert/src/tree.rs` | driver | 7 |
+| `sqldiff-convert/src/tree.rs` | driver | 4 |
 | `sqldiff-core/src/engine.rs` | check | 22 |
 | `sqldiff-equiv/src/equiv/edit.rs` | check | 7 |
 

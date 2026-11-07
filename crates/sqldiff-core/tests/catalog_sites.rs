@@ -462,9 +462,9 @@ const SITES: &[Site] = &[
     Site {
         id: "T1",
         file: "sqldiff-convert/src/tree.rs",
-        anchor: "opts.facts_a.first().map(|c| c.as_ref())",
+        anchor: "let source = source.map(Arc::new);",
         query: "pass 1 handle",
-        note: "Pass 1 reads the catalog back out of `Options`; it should hold the tree state's own `Arc<Catalog>`.",
+        note: "Done in PR 2a: pass 1 holds the tree state's own `Arc<Catalog>` (`source`), not one read back out of `Options`, whose `Facts` handle only the engine opens.",
     },
 ];
 

@@ -23,7 +23,7 @@ use sqldiff_syntax::LineIndex;
 
 use crate::{check, recount, rewrite_in, span, Conversion, Draft, Note, Status, U16Index};
 use sqldiff_core::catalog::Catalog;
-use sqldiff_core::Options;
+use sqldiff_core::{Facts, Options};
 
 /// Excerpt lines in remapped findings.
 const EXCERPT: usize = 3;
@@ -479,10 +479,10 @@ pub fn check_template(
             std::sync::Arc::new(c)
         };
         if !opts.facts_a.is_empty() || !opts.catalog_a.is_empty() {
-            with_harness.facts_a.push(table(from));
+            with_harness.facts_a.push(Facts::new(table(from)));
         }
         if !opts.facts_b.is_empty() || !opts.catalog_b.is_empty() {
-            with_harness.facts_b.push(table(to));
+            with_harness.facts_b.push(Facts::new(table(to)));
         }
         &with_harness
     } else {

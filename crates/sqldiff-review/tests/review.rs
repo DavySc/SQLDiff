@@ -442,7 +442,7 @@ fn cache_misses_when_catalog_contents_change() {
     let cfg = config(&dir, PACK);
     let (a, b) = movestock();
     let facts = |ddl: &str| {
-        std::sync::Arc::new(sqldiff_core::catalog::ddl::load(
+        sqldiff_core::Facts::from(sqldiff_core::catalog::ddl::load(
             ddl,
             Dialect::Tsql,
             "base catalogs orders.sql",

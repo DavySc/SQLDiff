@@ -35,7 +35,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use sqldiff_core::catalog::builtins::Helper;
 use sqldiff_core::catalog::{ddl, default_schema, key, Catalog, Ident, RoutineKind, TableKind};
-use sqldiff_core::{Dialect, Options};
+use sqldiff_core::{Dialect, Facts, Options};
 use sqldiff_syntax::{SyntaxKind, SyntaxNode};
 
 use crate::{Conversion, Status};
@@ -501,8 +501,8 @@ pub fn prepare(
     hooks.stop_if_cancelled()?;
     let opts = Options {
         helpers: helpers.to_vec(),
-        facts_a: vec![Arc::clone(&source)],
-        facts_b: vec![Arc::new(target.clone())],
+        facts_a: vec![Facts::new(Arc::clone(&source))],
+        facts_b: vec![Facts::from(target.clone())],
         ..Options::default()
     };
     let work = std::sync::Mutex::new(drafts.into_iter().map(Some).collect::<Vec<_>>());

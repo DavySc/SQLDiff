@@ -39,8 +39,8 @@ fn pg_in(text: &str, tree: &[&str]) -> Conversion {
     );
     let d = rewrite_in(text, Dialect::Tsql, Dialect::Postgres, Some(&src));
     let opts = Options {
-        facts_a: vec![Arc::new(src)],
-        facts_b: vec![Arc::new(target)],
+        facts_a: vec![sqldiff_core::Facts::from(Arc::new(src))],
+        facts_b: vec![sqldiff_core::Facts::from(Arc::new(target))],
         ..Options::default()
     };
     sqldiff_convert::check(text, d, &opts)

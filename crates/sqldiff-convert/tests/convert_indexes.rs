@@ -18,8 +18,8 @@ fn catalog(text: &str, d: Dialect) -> Arc<Catalog> {
 fn convert(src: &str, to: Dialect) -> Conversion {
     let draft = rewrite(src, Dialect::Tsql, to);
     let opts = Options {
-        facts_a: vec![catalog(src, Dialect::Tsql)],
-        facts_b: vec![catalog(draft.output(), to)],
+        facts_a: vec![sqldiff_core::Facts::from(catalog(src, Dialect::Tsql))],
+        facts_b: vec![sqldiff_core::Facts::from(catalog(draft.output(), to))],
         ..Options::default()
     };
     check(src, draft, &opts)
