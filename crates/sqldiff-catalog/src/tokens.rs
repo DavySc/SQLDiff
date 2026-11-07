@@ -3,7 +3,7 @@
 
 use sqldiff_syntax::{ast, SyntaxKind, SyntaxNode, SyntaxToken};
 
-use crate::catalog::Ident;
+use crate::Ident;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tok {
