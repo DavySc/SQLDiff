@@ -1300,7 +1300,7 @@ struct Collector<'x, 'a> {
     cut_b: BTreeSet<NodeId>,
     /// The divergences of a scenario with a default flipped (`persists`),
     /// by scenario.
-    flipped: RefCell<HashMap<String, Rc<Divergences>>>,
+    flipped: RefCell<HashMap<String, (Rc<Divergences>, sqldiff_model::work::Work)>>,
     /// `diff` calls spent by this routine pair, and whether a budget ran out.
     spent: Cell<u64>,
     out_of_budget: Cell<bool>,
@@ -1467,14 +1467,21 @@ impl<'x, 'a> Collector<'x, 'a> {
         let key = format!("{sc:?}|{scen_a:?}|{scen_b:?}");
         let known = self.flipped.borrow().get(&key).cloned();
         let set = match known {
-            Some(set) => set,
+            Some((set, cost)) => {
+                // Made before (or dropped from the cache since): the work of
+                // making it counts every time, whatever the cache held.
+                sqldiff_model::work::charge(&cost);
+                set
+            }
             None => {
+                let started = sqldiff_model::work::now();
                 let set = Rc::new(self.divergences_of(sc, scen_a, scen_b));
+                let cost = sqldiff_model::work::now().since(&started);
                 let mut c = self.flipped.borrow_mut();
                 if c.len() >= FLIPPED_MAX {
                     c.clear();
                 }
-                c.insert(key, set.clone());
+                c.insert(key, (set.clone(), cost));
                 set
             }
         };

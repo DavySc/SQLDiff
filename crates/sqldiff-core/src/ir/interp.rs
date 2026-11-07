@@ -958,8 +958,7 @@ impl Explorer {
                 outs_end: 0,
                 small,
                 dropped: false,
-                spent: sqldiff_model::work::now()
-                    .get(sqldiff_model::work::Site::ExplorerSteps),
+                spent: sqldiff_model::work::now().get(sqldiff_model::work::Site::ExplorerSteps),
             });
             it.tick(&mut m);
             // A path dropped by joining ran nothing: a replay must not merge
