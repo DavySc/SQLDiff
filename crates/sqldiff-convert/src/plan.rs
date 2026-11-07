@@ -338,18 +338,25 @@ impl Plan {
     /// Plans `inputs` (source files in `from`). Deterministic: the same tree
     /// gives the same plan.
     pub fn build(inputs: &[Input], from: Dialect) -> Plan {
+        let jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
+        Plan::build_with(inputs, from, jobs)
+    }
+
+    /// [`Plan::build`] with the files scanned on `jobs` threads. A scan reads
+    /// one file's text only and the results are taken in path order, so the
+    /// plan is the same for any `jobs`.
+    pub fn build_with(inputs: &[Input], from: Dialect, jobs: usize) -> Plan {
         let mut order: Vec<usize> = (0..inputs.len()).collect();
         order.sort_by(|&a, &b| inputs[a].rel.cmp(&inputs[b].rel));
         let mut hasher = Sha256::new();
-        let mut scans = Vec::new();
         for &i in &order {
             let inp = &inputs[i];
             hasher.update((inp.rel.len() as u64).to_le_bytes());
             hasher.update(inp.rel.as_bytes());
             hasher.update((inp.text.len() as u64).to_le_bytes());
             hasher.update(inp.text.as_bytes());
-            scans.push(scan(&inp.text, from));
         }
+        let scans = crate::tree::parallel(jobs.max(1), &order, |&i| scan(&inputs[i].text, from));
         let tree_hash = hasher
             .finalize()
             .iter()
@@ -777,6 +784,13 @@ mod tests {
         rev.reverse();
         let b = Plan::build(&rev, Dialect::Tsql);
         assert_eq!(a.to_json(), b.to_json());
+        // Any thread count gives the same plan.
+        for jobs in [1, 2, 7] {
+            assert_eq!(
+                a.to_json(),
+                Plan::build_with(&tree(), Dialect::Tsql, jobs).to_json()
+            );
+        }
         let mut changed = tree();
         changed[0].text.push(' ');
         assert!(a.matches(&tree(), Dialect::Tsql));

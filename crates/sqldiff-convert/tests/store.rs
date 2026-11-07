@@ -462,6 +462,25 @@ fn fresh_does_not_read_the_tree_state() {
     assert_eq!(want, tree_of(&f.out("o")));
 }
 
+#[test]
+fn a_damaged_stored_draft_fails_the_run_cleanly_whichever_file_it_is() {
+    // Whatever file the sample would pick, a draft whose ranges lie outside
+    // its text is refused with a message, never indexed.
+    let f = Fixture::standard("damageddraft");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    for idx in 0..4 {
+        let p = states(&f.out("o")).remove(0);
+        let mut st = read_state(&p);
+        st["drafts"][idx]["raw"]["text"] = "".into();
+        write_state(&p, &st);
+        let err = convert_into(&f.job("o", true, false), &Hooks::default())
+            .err()
+            .expect("a damaged draft fails the run");
+        assert!(err.contains("stored tree state"), "{err}");
+        convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
+    }
+}
+
 fn with_recheck(mut j: Job, r: tree::Recheck) -> Job {
     j.tree.recheck = r;
     j
@@ -630,4 +649,23 @@ fn an_edited_result_that_is_still_valid_json_is_a_miss_and_converted_again() {
     }
     convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
     assert_eq!(base, sql(&f.out("o")));
+}
+
+#[test]
+fn a_damaged_stored_draft_fails_cleanly_even_when_nothing_is_rechecked() {
+    // `--recheck none` trusts the store's content, never its ranges: a
+    // damaged draft still fails the run instead of being indexed.
+    let f = Fixture::standard("damagednone");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    let p = states(&f.out("o")).remove(0);
+    let mut st = read_state(&p);
+    st["drafts"][3]["raw"]["text"] = "".into();
+    write_state(&p, &st);
+    let err = convert_into(
+        &with_recheck(f.job("o", true, false), tree::Recheck::None),
+        &Hooks::default(),
+    )
+    .err()
+    .expect("a damaged draft fails the run");
+    assert!(err.contains("stored tree state"), "{err}");
 }
