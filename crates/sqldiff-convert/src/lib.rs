@@ -23,6 +23,7 @@ include!(concat!(env!("OUT_DIR"), "/fingerprint.rs"));
 pub mod base;
 pub mod callees;
 pub mod cert;
+pub mod compare;
 pub mod drift;
 pub mod gate;
 pub mod impossible;
