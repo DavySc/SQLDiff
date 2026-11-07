@@ -1,0 +1,12 @@
+[package]
+name = "sqldiff-units"
+description = "The data a conversion's first pass hands to the second: draft, units, notes, steps and statuses"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sqldiff-syntax.workspace = true
+serde.workspace = true
+sha2.workspace = true
