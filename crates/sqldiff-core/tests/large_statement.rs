@@ -115,6 +115,30 @@ fn past_the_alignment_bound_the_script_is_unknown_not_guessed() {
     assert_eq!(r.verdict(), Verdict::Unknown);
 }
 
+/// The "could not align" finding marks the whole stretch it skipped, not its
+/// first statement: a change elsewhere is judged against what the edit checker
+/// takes as changed, and a skipped statement outside the mark would count as
+/// unchanged.
+#[test]
+fn the_alignment_bound_finding_covers_the_whole_skipped_stretch() {
+    let r = script_report_with(Some(1_000_000));
+    let f = r
+        .findings
+        .iter()
+        .find(|f| f.rule == "align.bound")
+        .expect("one align.bound finding");
+    for loc in [f.a.as_ref(), f.b.as_ref()] {
+        let loc = loc.expect("a location on each side");
+        assert!(
+            loc.end_line > loc.start_line + 1000,
+            "the mark is {}..{}",
+            loc.start_line,
+            loc.end_line
+        );
+        assert!(loc.byte_end > loc.byte_start + 10_000);
+    }
+}
+
 /// A statement that moves into a stretch too large to align is not said to
 /// have no counterpart: it may be there. The gap is 2 100 x 2 101
 /// statements, past the bound of the similarity pairing, with no test hook.
