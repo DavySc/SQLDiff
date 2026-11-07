@@ -222,6 +222,12 @@ pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Compare two artifacts. Same dialect: version review (UC2). Different
 /// dialects: drift and conversion review (UC1, UC3).
 pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
+    // Counts the work of this comparison (see `sqldiff_model::work`); inside
+    // a file's check it shares the file's meter.
+    sqldiff_model::work::scope("diff", || diff_inner(a, b, opts)).0
+}
+
+fn diff_inner(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
     let ab = Analyzed::new(b, Side::B, opts.excerpt_lines);
     let same = a.dialect == b.dialect;

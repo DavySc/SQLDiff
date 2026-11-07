@@ -1397,6 +1397,7 @@ impl<'x, 'a> Collector<'x, 'a> {
         }
         self.spent.set(self.spent.get() + 1);
         self.file_spent.set(file + 1);
+        sqldiff_model::work::spend(sqldiff_model::work::Site::BehaviourDiffs, 1);
         true
     }
 

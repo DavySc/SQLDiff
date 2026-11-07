@@ -22,6 +22,9 @@
 //!   result store and seeds the sampled re-check, none of which the check sees; timings are kept out of the
 //!   bytes a stored result is compared by; `tree.rs` also memoises the tree
 //!   claims (derived from the inputs) in a `OnceLock` for the per-routine rebuild.
+//! - `work.rs` (`sqldiff-model`): the per-file work meter, a thread-local
+//!   counter of deterministic events; `SQLDIFF_WORK` only prints it. It
+//!   counts and never changes a result.
 //! - `abstract_syntax.rs` (`sqldiff-syntax`) keeps a bounded per-thread cache of the
 //!   tokens of a node (`tokens_shared`), a pure function of the node.
 
@@ -93,6 +96,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("sqldiff-core/src/rule_proofs.rs", &["OnceLock"]),
     ("sqldiff-equiv/src/rules/rule.rs", &["OnceLock"]),
     ("sqldiff-model/src/target.rs", &["Mutex", "OnceLock"]),
+    ("sqldiff-model/src/work.rs", &["env::var", "thread_local!"]),
 ];
 
 fn scan(dir: &Path, root: &Path, out: &mut BTreeMap<String, BTreeSet<&'static str>>) {
