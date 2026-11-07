@@ -734,6 +734,22 @@ pub fn explore(cfg: &Cfg, sc: &Scenario) -> Vec<Outcome> {
     it.run()
 }
 
+/// Marks the text of a condition that is not proven to be the same fact on
+/// both sides (perf plan W6c, E2): the marker names the side, so no text of
+/// one side equals a text of the other and `pairs()`/`feasible()` match
+/// nothing by it. Shown conditions go through [`plain_cond`].
+pub(crate) fn opaque_cond(text: &str, side_a: bool) -> String {
+    format!("\u{1}{}:{text}", if side_a { 'a' } else { 'b' })
+}
+
+/// A condition's text without the marker `opaque_cond` puts in front.
+pub(crate) fn plain_cond(text: &str) -> &str {
+    match text.strip_prefix('\u{1}') {
+        Some(rest) => rest.get(2..).unwrap_or(rest),
+        None => text,
+    }
+}
+
 /// Runs fault scenarios without repeating the work before or after the fault.
 ///
 /// A scenario that injects one fault runs exactly like the same scenario
@@ -1911,8 +1927,10 @@ impl Interp<'_> {
                     let n = seen.len();
                     if n > 2 {
                         if seen[n - 1] != seen[n - 2] {
-                            st.imprecise
-                                .push(format!("loop `{text}` summarized after two iterations"));
+                            st.imprecise.push(format!(
+                                "loop `{}` summarized after two iterations",
+                                plain_cond(&text)
+                            ));
                         }
                         st.loop_seen.remove(&id);
                         return Step::Go(f, st);
