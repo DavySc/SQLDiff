@@ -942,6 +942,32 @@ fn view_table(
             "GROUPING",
         ])
     });
+    // The column types are those of the one table or view read: no join,
+    // comma list, set operation, CTE or derived table, which could put
+    // another source's column under a name the one table also has.
+    tb.types_from_source = from_tables.len() == 1
+        && !query.iter().any(|x| {
+            x.is_any_kw(&[
+                "JOIN",
+                "APPLY",
+                "UNION",
+                "EXCEPT",
+                "INTERSECT",
+                "MINUS",
+                "WITH",
+                "PIVOT",
+                "UNPIVOT",
+            ])
+        })
+        && find_kw(query, 0, "FROM").is_some_and(|f| {
+            let end = ["WHERE", "GROUP", "HAVING", "ORDER"]
+                .iter()
+                .filter_map(|k| find_kw(query, f, k))
+                .min()
+                .unwrap_or(query.len());
+            split_commas(&query[f + 1..end]).len() == 1
+                && !query[f + 1..end].iter().any(|x| x.is(SyntaxKind::L_PAREN))
+        });
     match (outputs, cols) {
         (Some(outs), explicit) => {
             for (k, o) in outs.iter().enumerate() {
