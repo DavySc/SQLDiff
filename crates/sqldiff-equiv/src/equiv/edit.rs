@@ -65,6 +65,17 @@ fn note_budget(f: &mut Finding, allowance: &Allowance) {
     f.witness = format!("{} ({})", f.witness, not_examined(allowance));
 }
 
+/// A candidate whose witness search ran out of allowance: it was examined,
+/// but not to the end, so "no witness" is not the answer.
+fn note_search_stopped(f: &mut Finding, allowance: &Allowance) {
+    f.witness = format!(
+        "{} (witness search stopped at the statement-level work budget ({} of {} units of work))",
+        f.witness,
+        allowance.spent(),
+        allowance.cap().unwrap_or(0)
+    );
+}
+
 /// Re-examines "modified" statements and headers that are still unknown.
 ///
 /// Under a statement-level allowance (`Options::statement_work_cap`) the
@@ -162,7 +173,7 @@ pub fn decide(
         );
         allowance.take(sqldiff_model::work::now().total().saturating_sub(before));
         if matches!(&r, Err(e) if e == BUDGET_ERR) {
-            note_budget(f, allowance);
+            note_search_stopped(f, allowance);
         }
         if std::env::var_os("SQLDIFF_DEBUG_EDIT").is_some() {
             match &r {
@@ -2674,6 +2685,8 @@ impl<'r, 'x, 'a> TaintSweep<'r, 'x, 'a> {
     }
 
     fn offer(&mut self, u: usize) {
+        // Counting only: one unit visited.
+        sqldiff_model::work::spend(sqldiff_model::work::Site::EditClosure, 1);
         self.offered[u] = true;
         self.offered_list.push(u as u32);
         let unit = &self.units[u];
@@ -2716,6 +2729,7 @@ impl<'r, 'x, 'a> TaintSweep<'r, 'x, 'a> {
             if was_empty {
                 wake.extend(self.any_readers.iter().copied());
             }
+            sqldiff_model::work::spend(sqldiff_model::work::Site::EditClosure, wake.len() as u64);
             for u in wake {
                 let u = u as usize;
                 if self.offered[u]
@@ -2745,6 +2759,11 @@ impl<'r, 'x, 'a> TaintSweep<'r, 'x, 'a> {
                     needed.extend(self.units[u].reads.iter().copied());
                 }
             }
+            // Counting only: the span lookups and the names they read.
+            sqldiff_model::work::spend(
+                sqldiff_model::work::Site::EditClosure,
+                (spans.len() + needed.len()) as u64,
+            );
             needed.sort_unstable();
             needed.dedup();
             if self.taint.meets(&needed) {

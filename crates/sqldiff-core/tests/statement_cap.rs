@@ -40,7 +40,16 @@ fn run(cap: Option<u64>) -> (Report, u64) {
             },
         )
     });
-    (r, w.get(Site::AlignCells) + w.get(Site::GapScores))
+    // Everything the allowance is charged with: the tree diff and the edit
+    // checker's metered work.
+    (
+        r,
+        w.get(Site::AlignCells)
+            + w.get(Site::GapScores)
+            + w.get(Site::EditReach)
+            + w.get(Site::EditClosure)
+            + w.get(Site::WitnessTries),
+    )
 }
 
 fn json(r: &Report) -> String {
@@ -48,9 +57,13 @@ fn json(r: &Report) -> String {
 }
 
 fn cut(r: &Report) -> bool {
-    r.findings
-        .iter()
-        .any(|f| f.rule == "align.bound" && f.witness.contains("statement-level work budget"))
+    r.findings.iter().any(|f| {
+        (f.rule == "align.bound" && f.witness.contains("statement-level work budget"))
+            || f.witness
+                .contains("not examined: past the statement-level work budget")
+            || f.witness
+                .contains("witness search stopped at the statement-level work budget")
+    })
 }
 
 #[test]
@@ -181,7 +194,6 @@ fn the_edit_checker_stops_at_the_allowance_and_says_so() {
     );
     assert_eq!(json(&run_routine(Some(total + 1)).0), json(&full));
     let mut cut_seen = false;
-    let mut stopped = false;
     let step = ((total / 80).max(1)) as usize;
     for cap in (0..=total + 1).step_by(step) {
         let (r, _) = run_routine(Some(cap));
@@ -198,11 +210,70 @@ fn the_edit_checker_stops_at_the_allowance_and_says_so() {
         assert!(edits(&r) <= edits(&full), "cap {cap}");
         assert_ne!(r.verdict(), Verdict::Equal, "cap {cap}");
         cut_seen |= edit_cut(&r);
-        stopped |= r
-            .findings
-            .iter()
-            .any(|f| f.witness.contains("witness search stopped"));
     }
-    let _ = stopped;
     assert!(cut_seen, "no allowance cut the edit checker");
+}
+
+/// Two versions of one select that no input tells apart, but whose
+/// equivalence the engine does not prove: the witness search runs through
+/// its candidates and finds none.
+fn lookalike(b: bool) -> String {
+    let cond = if b {
+        "price * 1 + 0 < @max"
+    } else {
+        "price < @max"
+    };
+    format!(
+        "CREATE PROCEDURE dbo.cheap @max decimal(12,2) AS\nBEGIN\nSELECT item_id FROM dbo.item WHERE {cond} ORDER BY item_id;\nEND\n"
+    )
+}
+
+fn run_lookalike(cap: Option<u64>) -> (Report, u64) {
+    let (r, w) = scope("t", || {
+        diff(
+            &Artifact::new("a.sql", Dialect::Tsql, lookalike(false)),
+            &Artifact::new("b.sql", Dialect::Tsql, lookalike(true)),
+            &Options {
+                statement_work_cap: cap,
+                catalog_a: vec![Artifact::new("catalog.sql", Dialect::Tsql, DDL)],
+                catalog_b: vec![Artifact::new("catalog.sql", Dialect::Tsql, DDL)],
+                ..Options::default()
+            },
+        )
+    });
+    (r, w.get(Site::WitnessTries))
+}
+
+fn names_budget(r: &Report) -> bool {
+    r.findings
+        .iter()
+        .any(|f| f.witness.contains("statement-level work budget"))
+}
+
+#[test]
+fn a_witness_search_cut_by_the_allowance_does_not_read_as_no_witness() {
+    let (full, tries) = run_lookalike(None);
+    assert!(tries > 1_000, "the fixture needs a long search: {tries}");
+    assert!(!names_budget(&full));
+    let mut stopped = 0;
+    for cap in (0..tries + 200).step_by(41) {
+        let (r, _) = run_lookalike(Some(cap));
+        let witnesses: Vec<&str> = r.findings.iter().map(|f| f.witness.as_str()).collect();
+        // Cut inside the search: the witness says so, and says "stopped".
+        if witnesses
+            .iter()
+            .any(|w| w.contains("witness search stopped at the statement-level work budget"))
+        {
+            stopped += 1;
+        }
+        // Cut anywhere: a changed report names the budget, and a cut
+        // candidate is still Unknown, never Equal.
+        if json(&r) != json(&full) {
+            assert!(names_budget(&r), "cap {cap}: {witnesses:?}");
+        }
+        assert_ne!(r.verdict(), Verdict::Equal, "cap {cap}");
+    }
+    assert!(stopped > 5, "only {stopped} caps stopped the search");
+    let (r, _) = run_lookalike(Some(tries * 4));
+    assert_eq!(json(&r), json(&full), "a large allowance");
 }
