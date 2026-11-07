@@ -387,6 +387,22 @@ impl Draft {
         &self.raw.text
     }
 
+    /// Whether every unit's source range lies in `input` and every output
+    /// range in the draft's text, on character boundaries, in the draft and
+    /// in its variant without exception blocks. A draft read back from a
+    /// store that fails this was damaged: using it would index outside its
+    /// text.
+    pub(crate) fn well_formed(&self, input: &str) -> bool {
+        let ok = |t: &str, (s, e): (usize, usize)| {
+            s <= e && e <= t.len() && t.is_char_boundary(s) && t.is_char_boundary(e)
+        };
+        self.raw
+            .units
+            .iter()
+            .all(|u| ok(input, u.src) && ok(&self.raw.text, u.out))
+            && self.plain.as_ref().is_none_or(|p| p.well_formed(input))
+    }
+
     /// The options the rules ran with.
     pub fn options(&self) -> RuleOptions {
         self.options

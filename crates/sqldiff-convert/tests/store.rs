@@ -444,3 +444,22 @@ fn fresh_does_not_read_the_tree_state() {
     convert_into(&f.job("o", true, true), &Hooks::default()).unwrap();
     assert_eq!(want, tree_of(&f.out("o")));
 }
+
+#[test]
+fn a_damaged_stored_draft_fails_the_run_cleanly_whichever_file_it_is() {
+    // Whatever file the sample would pick, a draft whose ranges lie outside
+    // its text is refused with a message, never indexed.
+    let f = Fixture::standard("damageddraft");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    for idx in 0..4 {
+        let p = states(&f.out("o")).remove(0);
+        let mut st = read_state(&p);
+        st["drafts"][idx]["raw"]["text"] = "".into();
+        write_state(&p, &st);
+        let err = convert_into(&f.job("o", true, false), &Hooks::default())
+            .err()
+            .expect("a damaged draft fails the run");
+        assert!(err.contains("stored tree state"), "{err}");
+        convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
+    }
+}
