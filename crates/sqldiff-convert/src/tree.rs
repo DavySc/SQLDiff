@@ -27,8 +27,9 @@ use std::time::Instant;
 use crate::{Conversion, FragmentKind, StandIns, Status, ValueKind};
 use serde::{Deserialize, Serialize};
 use sqldiff_core::catalog::builtins::Helper;
+use sqldiff_core::catalog::record::Reads;
 use sqldiff_core::catalog::{ddl, Catalog};
-use sqldiff_core::{Dialect, Facts, Options};
+use sqldiff_core::{Dialect, Facts, Options, Replay};
 use sqldiff_source::compose;
 use sqldiff_syntax::template::Template;
 
@@ -831,18 +832,24 @@ fn convert_kept(
     let mut refs: Vec<&mut crate::Core> = cores.iter_mut().collect();
     crate::callees::resolve(inputs, &mut refs, a.from);
     let mut finished: Vec<(Conversion, f64)> = Vec::with_capacity(results.len());
+    // The entries this run took or wrote: the ones eviction keeps.
+    let mut used: std::collections::BTreeSet<crate::store::EntryRef> = Default::default();
     for ((held, secs), core) in results.into_iter().zip(cores) {
         let mut c = match held {
             Held::Whole(c) => *c,
-            Held::Stored { key, .. } => match cache.as_ref().and_then(|c| c.store.get(&key)) {
-                Some((c, ..)) => c,
-                None => {
-                    return Err(format!(
-                        "the stored result {} is gone or unreadable; run again",
-                        key.as_str()
-                    ))
+            Held::Stored { entry, .. } => {
+                let got = cache.as_ref().and_then(|c| c.store.get(&entry));
+                let at = format!("{}/{}", entry.key.as_str(), entry.id);
+                used.insert(entry);
+                match got {
+                    Some((c, ..)) => c,
+                    None => {
+                        return Err(format!(
+                            "the stored result {at} is gone or unreadable; run again"
+                        ))
+                    }
                 }
-            },
+            }
         };
         finish.trim(&mut c);
         core.restore(&mut c);
@@ -853,7 +860,7 @@ fn convert_kept(
     // under keys of files as they were before an edit (or of another build)
     // are of no use to any later run of this tree.
     if let (Some(live), Some(c)) = (&live, cache.as_ref()) {
-        c.store.gc(live);
+        c.store.gc(live, &used);
     }
     let mut files = Vec::new();
     let mut run_files = Vec::new();
@@ -1431,14 +1438,8 @@ fn convert_files(
     // Pass 2: check every draft, or take its stored result when the key of
     // everything the check reads matches.
     hooks.stop_if_cancelled()?;
-    let digests = cache.map(|_| {
-        (
-            source.as_deref().map(crate::store::catalog_digest),
-            target.as_deref().map(crate::store::catalog_digest),
-        )
-    });
-    let keys: Vec<Option<crate::store::Key>> = match (cache, &digests) {
-        (Some(c), Some((src, tgt))) => parallel(
+    let keys: Vec<Option<crate::store::Key>> = match cache {
+        Some(c) => parallel(
             jobs,
             &inputs.iter().zip(&drafts).collect::<Vec<_>>(),
             |(i, d)| {
@@ -1451,8 +1452,8 @@ fn convert_files(
                         helpers: &a.helpers,
                         text: &i.text,
                         draft: d,
-                        source: src.as_deref(),
-                        target: tgt.as_deref(),
+                        source: source.is_some(),
+                        target: target.is_some(),
                     }
                     .key(),
                 )
@@ -1470,10 +1471,31 @@ fn convert_files(
                 .collect(),
         );
     }
+    // The stored results each file could take: the entries of its key whose
+    // recorded catalog reads all have, against the catalogs of this run, the
+    // answer they had when the entry was made (replayed by the code the
+    // check ran; the answers are remembered across files). Planning below
+    // and the work after it both read this, never the bare key.
+    let replay = Replay::new(a.from, a.to, &opts);
+    let candidates: Vec<Vec<(String, Reads)>> = match cache {
+        Some(c) if !c.fresh => parallel(jobs, &keys, |k| {
+            k.as_ref()
+                .map(|k| {
+                    c.store
+                        .entries(k)
+                        .into_iter()
+                        .filter(|(_, reads)| replay.holds(reads))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }),
+        _ => keys.iter().map(|_| Vec::new()).collect(),
+    };
     // The increment: which files this run checks. The others are taken from
-    // the store when their key matches, else they are not checked.
+    // the store when an entry of their key still holds, else they are not
+    // checked.
     let in_increment: Option<Vec<bool>> = match (select, cache) {
-        (Some(sel), Some(c)) => {
+        (Some(sel), Some(_)) => {
             let plan = crate::plan::Plan::build_with(inputs, a.from, jobs);
             let at: std::collections::BTreeMap<&str, usize> = plan
                 .files
@@ -1481,10 +1503,7 @@ fn convert_files(
                 .enumerate()
                 .map(|(i, f)| (f.path.as_str(), i))
                 .collect();
-            let stored_here: Vec<bool> = keys
-                .iter()
-                .map(|k| !c.fresh && k.as_ref().is_some_and(|k| c.store.has(k)))
-                .collect();
+            let stored_here: Vec<bool> = candidates.iter().map(|c| !c.is_empty()).collect();
             let mut by_plan = vec![false; plan.files.len()];
             for (i, inp) in inputs.iter().enumerate() {
                 by_plan[at[inp.rel.as_str()]] = stored_here[i];
@@ -1511,10 +1530,10 @@ fn convert_files(
     // (`store::pick`).
     let sample = match cache {
         Some(c) if !c.fresh => {
-            let present: Vec<(usize, usize)> = keys
+            let present: Vec<(usize, usize)> = candidates
                 .iter()
                 .enumerate()
-                .filter(|(_, k)| k.as_ref().is_some_and(|k| c.store.has(k)))
+                .filter(|(_, c)| !c.is_empty())
                 .map(|(i, _)| (i, inputs[i].text.len()))
                 .collect();
             a.recheck.pick(&present, seed)
@@ -1527,10 +1546,17 @@ fn convert_files(
     // depend on which thread finished when.
     let mismatch: std::sync::Mutex<Vec<String>> = Default::default();
     let claims: std::sync::OnceLock<sqldiff_draft::table_vars::Claims> = std::sync::OnceLock::new();
-    let work = slots(inputs.iter().zip(drafts).zip(keys.iter()).enumerate());
+    let work = slots(
+        inputs
+            .iter()
+            .zip(drafts)
+            .zip(keys.iter())
+            .zip(candidates)
+            .enumerate(),
+    );
     let progress = Progress::new(work.len(), hooks);
     let done = parallel(jobs, &work, |w| {
-        let (idx, ((input, draft), key)) = w.lock().unwrap().take().unwrap();
+        let (idx, (((input, draft), key), entries)) = w.lock().unwrap().take().unwrap();
         if hooks.cancelled() {
             return None;
         }
@@ -1559,20 +1585,74 @@ fn convert_files(
         // that lost before can win now, or the other way. A mix is built
         // again from the stored routines (pass-1 cost, no check) and
         // compared; anything else is a miss and the file is checked again.
+        //
+        // Every entry whose reads hold is read and compared with the first
+        // (by id): a check is a function of its reads, so two entries that
+        // both hold must be the same result, and a difference is a store
+        // mismatch like a sampled one.
         let stored = match (cache, key) {
-            (Some(c), Some(k)) if !c.fresh => c.store.get(k).and_then(|(r, mix, tried)| {
-                let same = match (&mix, rebuild) {
-                    // No mix was built. That says something only if one
-                    // could have been tried; a result stored under a
-                    // review ledger could not, so a run without one
-                    // checks the file again.
-                    (None, Some(_)) => tried,
-                    (None, None) => true,
-                    (Some(m), Some(rb)) => rb(&m.plain_at).canonical() == m.draft,
-                    (Some(_), None) => false,
-                };
-                same.then_some((c, k, r, mix))
-            }),
+            (Some(c), Some(k)) if !c.fresh => {
+                let mut taken: Vec<Taken> = Vec::new();
+                for (id, reads) in &entries {
+                    let entry = crate::store::EntryRef {
+                        key: k.clone(),
+                        id: id.clone(),
+                    };
+                    let Some((r, mix, tried)) = c.store.get(&entry) else {
+                        continue;
+                    };
+                    let same = match (&mix, rebuild) {
+                        // No mix was built. That says something only if one
+                        // could have been tried; a result stored under a
+                        // review ledger could not, so a run without one
+                        // checks the file again.
+                        (None, Some(_)) => tried,
+                        (None, None) => true,
+                        (Some(m), Some(rb)) => {
+                            let built = rb(&m.plain_at).canonical() == m.draft;
+                            if !built {
+                                // The draft code builds this mix differently
+                                // now: the entry is of no use to any run, and
+                                // the check below stores its replacement
+                                // under the same reads.
+                                c.store.remove(&entry);
+                            }
+                            built
+                        }
+                        (Some(_), None) => false,
+                    };
+                    if same {
+                        taken.push(Taken {
+                            entry,
+                            conversion: r,
+                            mix,
+                            reads: reads.clone(),
+                        });
+                    }
+                }
+                let mut rest = taken.drain(1.min(taken.len())..).collect::<Vec<_>>();
+                let first = taken.pop();
+                if let Some(f) = &first {
+                    for o in rest.drain(..) {
+                        if !crate::store::compare(&f.conversion, &o.conversion) || f.mix != o.mix {
+                            c.store.bundle(k, &f.conversion, &o.conversion);
+                            mismatch.lock().unwrap().push(format!(
+                                "{}: the stored results {}/{} and {}/{} both hold against the \
+                                 catalogs of this run but differ; both are in {}/{}.json. \
+                                 The store is emptied: run again.",
+                                input.rel,
+                                f.entry.key.as_str(),
+                                f.entry.id,
+                                o.entry.key.as_str(),
+                                o.entry.id,
+                                crate::store::MISMATCH_DIR,
+                                k.as_str()
+                            ));
+                        }
+                    }
+                }
+                first.map(|t| (c, t))
+            }
             _ => None,
         };
         if stored.is_none() && in_increment.as_ref().is_some_and(|m| !m[idx]) {
@@ -1584,97 +1664,141 @@ fn convert_files(
         }
         // A file is flagged for the stand-in tables it names, and then its
         // output and reports are let go when the store holds them.
-        let hold =
-            |mut c: Conversion, key: Option<&crate::store::Key>, in_store: bool, reuse: bool| {
-                // The flags are stored beside the result they were made for; a
-                // result checked again in this run (a sample, a miss) computes
-                // them again and stores them.
-                let stored_flags = match (cache, key) {
-                    (Some(cc), Some(k)) if in_store && !stand_ins.is_empty() => {
-                        let fk =
-                            crate::store::Store::flags_key(k, &stand_ins_digest, idx, a.from, a.to);
-                        Some((cc, k, fk))
-                    }
-                    _ => None,
-                };
-                let reused = match &stored_flags {
-                    Some((cc, k, fk)) if reuse => cc
-                        .store
-                        .get_flags(k, fk)
-                        .is_some_and(|f| crate::refused::apply_flags(&mut c, &f)),
-                    _ => false,
-                };
-                if !reused {
-                    let flags = stand_ins.flags_of(idx, &input.text, &c, a.from, a.to);
-                    crate::refused::apply_flags(&mut c, &flags);
-                    if let Some((cc, k, fk)) = &stored_flags {
-                        // A file checked again (the sample) must give the
-                        // flags the store holds for the same result.
-                        if let Some(old) = cc.store.get_flags(k, fk) {
-                            if old != flags {
-                                cc.store.bundle_flags(k, fk, &old, &flags);
-                                mismatch.lock().unwrap().push(format!(
-                                    "{}: the stored stand-in flags {} differ from flags computed \
+        let hold = |mut c: Conversion,
+                    key: Option<&crate::store::EntryRef>,
+                    in_store: bool,
+                    reuse: bool| {
+            // The flags are stored beside the result they were made for; a
+            // result checked again in this run (a sample, a miss) computes
+            // them again and stores them.
+            let stored_flags = match (cache, key) {
+                (Some(cc), Some(k)) if in_store && !stand_ins.is_empty() => {
+                    let fk =
+                        crate::store::Store::flags_key(k, &stand_ins_digest, idx, a.from, a.to);
+                    Some((cc, k, fk))
+                }
+                _ => None,
+            };
+            let reused = match &stored_flags {
+                Some((cc, k, fk)) if reuse => cc
+                    .store
+                    .get_flags(k, fk)
+                    .is_some_and(|f| crate::refused::apply_flags(&mut c, &f)),
+                _ => false,
+            };
+            if !reused {
+                let flags = stand_ins.flags_of(idx, &input.text, &c, a.from, a.to);
+                crate::refused::apply_flags(&mut c, &flags);
+                if let Some((cc, k, fk)) = &stored_flags {
+                    // A file checked again (the sample) must give the
+                    // flags the store holds for the same result.
+                    if let Some(old) = cc.store.get_flags(k, fk) {
+                        if old != flags {
+                            cc.store.bundle_flags(k, fk, &old, &flags);
+                            mismatch.lock().unwrap().push(format!(
+                                "{}: the stored stand-in flags {} differ from flags computed \
                                      again for the same result; both are in {}/flags-{}.json. \
                                      The store is emptied: run again.",
-                                    input.rel,
-                                    fk.as_str(),
-                                    crate::store::MISMATCH_DIR,
-                                    fk.as_str(),
-                                ));
-                            }
+                                input.rel,
+                                fk.as_str(),
+                                crate::store::MISMATCH_DIR,
+                                fk.as_str(),
+                            ));
                         }
-                        cc.store.put_flags(k, fk, &flags);
                     }
+                    cc.store.put_flags(k, fk, &flags);
                 }
-                match key {
-                    Some(k) if in_store => Held::Stored {
-                        key: k.clone(),
-                        core: crate::Core::take(&mut c),
-                    },
-                    _ => Held::Whole(Box::new(c)),
-                }
-            };
-        if let Some((_, k, conv, _)) = &stored {
+            }
+            match key {
+                Some(k) if in_store => Held::Stored {
+                    entry: k.clone(),
+                    core: crate::Core::take(&mut c),
+                },
+                _ => Held::Whole(Box::new(c)),
+            }
+        };
+        if let Some((_, t)) = &stored {
             if !sample.contains(&idx) {
-                let mut conv = conv.clone();
+                let mut conv = t.conversion.clone();
                 finish.apply(&mut conv);
                 hooks.file_done(&input.rel, crate::callees::file_status(&conv).label());
                 progress.tick();
-                return Some((hold(conv, Some(k), true, true), 0.0, true, false));
+                return Some((hold(conv, Some(&t.entry), true, true), 0.0, true, false));
             }
         }
         let t = Instant::now();
-        let (mut c, mix) = crate::check_with_mix(&input.text, draft, &opts, rebuild);
+        let crate::Checked {
+            conversion: mut c,
+            mix,
+            reads,
+            conflicts,
+        } = crate::check_with_reads(&input.text, draft, &opts, rebuild);
         // Shared but whole while it is compared and stored; trimmed after.
         finish.share(&mut c);
         let secs = t.elapsed().as_secs_f64();
-        if let Some((cc, k, old, old_mix)) = &stored {
-            let mut old = old.clone();
+        if let Some((cc, t)) = &stored {
+            let mut old = t.conversion.clone();
             finish.share(&mut old);
-            if !crate::store::compare(&old, &c) || *old_mix != mix {
-                cc.store.bundle(k, &old, &c);
+            // With the same answers the check takes the same path, so it
+            // asks the same questions: a read set that differs is a bug in
+            // the recording or in the replay, whatever the output says.
+            if !crate::store::compare(&old, &c) || t.mix != mix || t.reads != reads {
+                cc.store.bundle(&t.entry.key, &old, &c);
                 mismatch.lock().unwrap().push(format!(
-                    "{}: the stored result {} differs from a fresh check of the same input; \
-                     both are in {}/{}.json. The store is emptied: run again.",
+                    "{}: the stored result {}/{} differs from a fresh check of the same input \
+                     (its output{}); both are in {}/{}.json. The store is emptied: run again.",
                     input.rel,
-                    k.as_str(),
+                    t.entry.key.as_str(),
+                    t.entry.id,
+                    if t.reads != reads {
+                        " or the catalog reads it made"
+                    } else {
+                        ""
+                    },
                     crate::store::MISMATCH_DIR,
-                    k.as_str()
+                    t.entry.key.as_str()
                 ));
             }
         }
-        let mut in_store = false;
+        let mut entry = None;
         if let (Some(cc), Some(k)) = (cache, key) {
-            match cc.store.put(k, &c, mix.as_ref(), rebuild.is_some()) {
-                Ok(()) => in_store = true,
-                Err(e) => eprintln!("sqldiff: result not stored: {e}"),
+            if let Some((q, _)) = conflicts.first() {
+                // A question answered two ways within one check: the result
+                // is right for this run but names no read set, so it is not
+                // stored.
+                eprintln!("sqldiff: result not stored: the catalog answered {q:?} two ways");
+            } else {
+                match cc.store.put(k, &c, mix.as_ref(), rebuild.is_some(), &reads) {
+                    Ok((e, crate::store::Put::Differs)) => {
+                        // Same reads, other bytes: not an entry to keep.
+                        if let Some((old, ..)) = cc.store.get(&e) {
+                            cc.store.bundle(&e.key, &old, &c);
+                        }
+                        mismatch.lock().unwrap().push(format!(
+                            "{}: a result is stored under {}/{} with the same catalog reads but \
+                             other output than a fresh check; both are in {}/{}.json. \
+                             The store is emptied: run again.",
+                            input.rel,
+                            e.key.as_str(),
+                            e.id,
+                            crate::store::MISMATCH_DIR,
+                            e.key.as_str()
+                        ));
+                    }
+                    Ok((e, _)) => entry = Some(e),
+                    Err(e) => eprintln!("sqldiff: result not stored: {e}"),
+                }
             }
         }
         finish.trim(&mut c);
         hooks.file_done(&input.rel, crate::callees::file_status(&c).label());
         progress.tick();
-        Some((hold(c, key.as_ref(), in_store, false), secs, false, false))
+        Some((
+            hold(c, entry.as_ref(), entry.is_some(), false),
+            secs,
+            false,
+            false,
+        ))
     });
     crate::mem::release();
     let mut found = mismatch.into_inner().unwrap();
@@ -1698,6 +1822,15 @@ fn convert_files(
     Ok(done.into_iter().map(|(h, s, _, _)| (h, s)).collect())
 }
 
+/// A stored result a file takes in this run: the entry, what it holds, and
+/// the catalog reads it was made under.
+struct Taken {
+    entry: crate::store::EntryRef,
+    conversion: Conversion,
+    mix: Option<crate::check::Mix>,
+    reads: Reads,
+}
+
 /// A checked file while the cross-file passes run. With a result store its
 /// output and engine reports are not kept: only the core (units, counts)
 /// stays, and the rest is read back from the store under `key` when the
@@ -1706,7 +1839,7 @@ fn convert_files(
 enum Held {
     Whole(Box<Conversion>),
     Stored {
-        key: crate::store::Key,
+        entry: crate::store::EntryRef,
         core: crate::Core,
     },
 }
@@ -3796,9 +3929,12 @@ END;
         /// The stored result files, parsed.
         fn results(&self) -> Vec<(PathBuf, serde_json::Value)> {
             let dir = self.out().join(".sqldiff/results");
+            // `<key>/<id>.json` (the entries) beside `<key>/<id>.reads`.
             let mut v: Vec<_> = std::fs::read_dir(dir)
                 .unwrap()
                 .flatten()
+                .flat_map(|k| std::fs::read_dir(k.path()).unwrap().flatten())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
                 .map(|e| {
                     let raw = std::fs::read(e.path()).unwrap();
                     (e.path(), serde_json::from_slice(&raw[65..]).unwrap())
@@ -3895,22 +4031,20 @@ END;
         std::fs::write(&ledger, "").unwrap();
         f.run(false);
         assert!(!f.reused("procs.sql"), "a mix was taken under a ledger");
-        assert!(f.with_mix().is_none());
-        // Only the checked file was stored again, without a try; the other
-        // result had no mix to doubt and stayed.
-        assert_eq!(
-            f.results()
-                .iter()
-                .filter(|(_, e)| e["mix_tried"] == false)
-                .count(),
-            1
-        );
-        // Without the ledger the result stored under it says nothing about
-        // a mix: the file is checked again and the mix is found.
-        std::fs::remove_file(&ledger).unwrap();
-        f.run(false);
-        assert!(!f.reused("procs.sql"), "a result without a try was taken");
+        // Only the checked file was stored again, without a try, as an entry
+        // of its own: the entry with the mix is still there, because a run
+        // without a ledger can use it.
+        let tried_not: Vec<_> = f
+            .results()
+            .into_iter()
+            .filter(|(_, e)| e["mix_tried"] == false)
+            .collect();
+        assert_eq!(tried_not.len(), 1);
+        assert!(tried_not[0].1["mix"].is_null());
         assert!(f.with_mix().is_some());
+        // Without the ledger the result stored under it says nothing about
+        // a mix and is not taken; the entry stored before it is.
+        std::fs::remove_file(&ledger).unwrap();
         f.run(false);
         assert!(f.reused("procs.sql"));
     }
@@ -3982,10 +4116,15 @@ END;
             !review(),
             "a review under a ledger took a result with a mix"
         );
-        assert!(f.with_mix().is_none());
+        // The result stored under the ledger is an entry of its own and
+        // holds no mix.
+        assert!(f
+            .results()
+            .iter()
+            .any(|(_, e)| e["mix_tried"] == false && e["mix"].is_null()));
         std::fs::remove_file(&ledger).unwrap();
-        assert!(!review(), "a review took a result stored without a try");
-        assert!(f.with_mix().is_some());
+        // The entry with the mix, stored before, is still the one to take.
         assert!(review());
+        assert!(f.with_mix().is_some());
     }
 }

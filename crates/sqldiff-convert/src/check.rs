@@ -7,6 +7,8 @@
 //! check runs through names the draft crate.
 
 use super::*;
+use sqldiff_core::catalog::record::{NoSink, Query, ReadSink, Reads, Recorder, Side as ReadSide};
+use std::sync::Arc;
 
 /// Engine findings on the output alone that gate a unit: it does not bind
 /// (unknown built-in, column, variable, type, ...), still holds source-dialect
@@ -95,9 +97,47 @@ pub(crate) fn check_with_mix(
 ) -> (Conversion, Option<Mix>) {
     // The file's work count (`SQLDIFF_WORK=1` prints it); counting only.
     sqldiff_model::work::scope("check", || {
-        check_with_mix_inner(input, draft, opts, rebuild)
+        check_with_mix_inner(input, draft, opts, rebuild, &unrecorded())
     })
     .0
+}
+
+/// What [`check_with_reads`] hands back: the conversion, the mix that was
+/// built (if any), every catalog read the check made, and the questions the
+/// catalog answered two ways (a result with a conflict is never stored).
+pub(crate) struct Checked {
+    pub conversion: Conversion,
+    pub mix: Option<Mix>,
+    pub reads: Reads,
+    pub conflicts: Vec<(ReadSide, Query)>,
+}
+
+/// [`check_with_mix`] with every catalog read recorded. The reads are the
+/// union over the variants the check ran (blocks, plain, and the mix), since
+/// the chosen conversion depends on all of them.
+pub(crate) fn check_with_reads(
+    input: &str,
+    draft: Draft,
+    opts: &Options,
+    rebuild: Option<Rebuild>,
+) -> Checked {
+    let recorder = Arc::new(Recorder::default());
+    let sink: Arc<dyn ReadSink + Send> = recorder.clone();
+    let (conversion, mix) = sqldiff_model::work::scope("check", || {
+        check_with_mix_inner(input, draft, opts, rebuild, &sink)
+    })
+    .0;
+    let (reads, conflicts) = recorder.snapshot();
+    Checked {
+        conversion,
+        mix,
+        reads,
+        conflicts,
+    }
+}
+
+fn unrecorded() -> Arc<dyn ReadSink + Send> {
+    Arc::new(NoSink)
 }
 
 fn check_with_mix_inner(
@@ -105,14 +145,15 @@ fn check_with_mix_inner(
     draft: Draft,
     opts: &Options,
     rebuild: Option<Rebuild>,
+    sink: &Arc<dyn ReadSink + Send>,
 ) -> (Conversion, Option<Mix>) {
     let mut draft = draft;
     let Some(plain) = draft.plain.take() else {
-        return (check_one(input, draft, opts), None);
+        return (check_one(input, draft, opts, sink), None);
     };
     let from = draft.from;
-    let blocks = check_one(input, draft, opts);
-    let without = check_one(input, *plain, opts);
+    let blocks = check_one(input, draft, opts, sink);
+    let without = check_one(input, *plain, opts, sink);
     // Never the version the engine has shown wrong over the one it cannot
     // yet prove: fewer units with a difference found first, then fewer units
     // open. (Both versions are the same code to run; only what the engine
@@ -161,7 +202,7 @@ fn check_with_mix_inner(
                 plain_at: plain_at.clone(),
                 draft: mixed.canonical(),
             });
-            check_one(input, mixed, opts)
+            check_one(input, mixed, opts, sink)
         })
     });
     let best = if sb < sw { blocks } else { without };
@@ -172,7 +213,12 @@ fn check_with_mix_inner(
     (chosen, built)
 }
 
-fn check_one(input: &str, draft: Draft, opts: &Options) -> Conversion {
+fn check_one(
+    input: &str,
+    draft: Draft,
+    opts: &Options,
+    sink: &Arc<dyn ReadSink + Send>,
+) -> Conversion {
     let Draft {
         from,
         to,
@@ -200,7 +246,7 @@ fn check_one(input: &str, draft: Draft, opts: &Options) -> Conversion {
     // is flagged with ASM-CI-COLLATION for the reviewer.
     let report = {
         let _ci = sqldiff_core::equiv::compare::ci_collation_scope(true);
-        sqldiff_core::diff(&a, &b, &traced)
+        sqldiff_core::diff_recorded(&a, &b, &traced, sink.clone())
     };
     // The output on its own, bound against the target catalog.
     let own = Options {
@@ -210,7 +256,7 @@ fn check_one(input: &str, draft: Draft, opts: &Options) -> Conversion {
         facts_b: Vec::new(),
         ..opts.clone()
     };
-    let output_check = sqldiff_core::check(&b, &own);
+    let output_check = sqldiff_core::check_recorded(&b, &own, ReadSide::OwnTarget, sink.clone());
     let (li, lo) = (LineIndex::new(input), LineIndex::new(&raw.text));
     let (ui, uo) = (U16Index::new(input), U16Index::new(&raw.text));
     let mut units: Vec<Unit> = raw

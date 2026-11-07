@@ -24,7 +24,9 @@ use sha2::{Digest, Sha256};
 
 /// Which catalog a read went to. The same catalog can be read through
 /// different views; replay must ask the same side again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum Side {
     /// The catalog the input (source dialect) binds against.
     Source,
@@ -39,7 +41,7 @@ pub type Part = (String, bool);
 
 /// A question to a catalog. Closed on purpose: a read that is not one of
 /// these is not a recorded read. `Ord` is the order of a read set.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum Query {
     /// Whether any catalog was supplied for the side (`CatalogView::supplied`).
     Supplied,
@@ -105,6 +107,18 @@ impl Outcome {
     pub fn hex(&self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
     }
+
+    /// The digest [`hex`](Self::hex) wrote; `None` for any other text.
+    pub fn from_hex(text: &str) -> Option<Outcome> {
+        if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok()?;
+        }
+        Some(Outcome(out))
+    }
 }
 
 /// Where reads go. A check holds a sink; the default drops them.
@@ -151,6 +165,16 @@ pub struct Recorder {
 }
 
 impl Recorder {
+    /// The reads so far and the questions that got two answers, leaving the
+    /// recorder as it is (a recorder shared through an `Arc` cannot be
+    /// consumed).
+    pub fn snapshot(&self) -> (Reads, Vec<(Side, Query)>) {
+        (
+            self.reads.lock().unwrap().clone(),
+            self.conflicts.lock().unwrap().clone(),
+        )
+    }
+
     pub fn finish(self) -> (Reads, Vec<(Side, Query)>) {
         (
             self.reads.into_inner().unwrap(),
