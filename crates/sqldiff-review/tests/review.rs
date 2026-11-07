@@ -599,6 +599,14 @@ fn placeholder_glued_to_a_word_is_not_a_leak_of_a_hex_term() {
     let s = red.redact_str("ownership chain (routine and objects with one owner)");
     assert!(!s.contains("objects"), "{s}");
     red.verify(&s).unwrap();
+    // Glued on the left, on the right, or both.
+    let mut red = Redactor::new(&cfg, b"salt-00009466-padpadpad");
+    for text in ["objects", "subobjects", "subobj", "myobj", "the obj here"] {
+        let s = red.redact_str(text);
+        assert!(!s.contains("obj"), "{s}");
+        red.verify(&s)
+            .unwrap_or_else(|e| panic!("{text} -> {s}: {e:?}"));
+    }
 }
 
 #[test]
