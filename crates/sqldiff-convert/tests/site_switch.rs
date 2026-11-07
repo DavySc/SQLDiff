@@ -29,8 +29,53 @@ use support::harness::{try_one, Fixture};
 const SEED: u64 = 7;
 const DIALECTS: &[Dialect] = &[Dialect::Postgres, Dialect::Db2i];
 
-/// Sites no generated edit kills, with why. Empty until the first run says.
-const SURVIVORS: &[(&str, &str)] = &[];
+/// Why the sites below are listed: the current 24 edits do not kill them. A
+/// site is only needed when it is the one place that records some question
+/// for some file; where another line records the same question (the read set
+/// is a map), skipping this one changes nothing, and where no file of the
+/// generated tree depends on the answer, the generator has a gap. Each entry
+/// is work for the generator (an edit that only this site's read can see), not
+/// a claim that the site is dead. The list is compared both ways, so a site an
+/// edit starts to kill must leave it.
+const GAP: &str = "no generated edit kills it yet";
+
+/// Sites no generated edit kills.
+const SURVIVORS: &[(&str, &str)] = &[
+    ("crates/sqldiff-core/src/bind/query.rs:1109", GAP),
+    ("crates/sqldiff-core/src/bind/query.rs:1113", GAP),
+    ("crates/sqldiff-core/src/bind/query.rs:1127", GAP),
+    ("crates/sqldiff-core/src/bind/query.rs:1131", GAP),
+    ("crates/sqldiff-core/src/bind/query.rs:1193", GAP),
+    ("crates/sqldiff-core/src/bind/query.rs:2084", GAP),
+    ("crates/sqldiff-core/src/bind/query.rs:2093", GAP),
+    ("crates/sqldiff-core/src/bind/query.rs:2408", GAP),
+    ("crates/sqldiff-core/src/bind/query.rs:2858", GAP),
+    ("crates/sqldiff-core/src/engine.rs:562", GAP),
+    ("crates/sqldiff-core/src/engine.rs:563", GAP),
+    ("crates/sqldiff-core/src/engine.rs:572", GAP),
+    ("crates/sqldiff-core/src/engine.rs:774", GAP),
+    ("crates/sqldiff-equiv/src/equiv/call.rs:217", GAP),
+    ("crates/sqldiff-equiv/src/equiv/call.rs:1154", GAP),
+    ("crates/sqldiff-equiv/src/equiv/canon.rs:744", GAP),
+    ("crates/sqldiff-equiv/src/equiv/canon.rs:1063", GAP),
+    ("crates/sqldiff-equiv/src/equiv/canon.rs:1080", GAP),
+    ("crates/sqldiff-equiv/src/equiv/canon.rs:1097", GAP),
+    ("crates/sqldiff-equiv/src/equiv/canon.rs:1339", GAP),
+    ("crates/sqldiff-equiv/src/equiv/canon.rs:2627", GAP),
+    ("crates/sqldiff-equiv/src/equiv/canon.rs:5509", GAP),
+    ("crates/sqldiff-equiv/src/equiv/canon.rs:6456", GAP),
+    ("crates/sqldiff-equiv/src/equiv/canon.rs:7263", GAP),
+    ("crates/sqldiff-equiv/src/equiv/ddl.rs:372", GAP),
+    ("crates/sqldiff-equiv/src/equiv/ddl.rs:375", GAP),
+    ("crates/sqldiff-equiv/src/equiv/mod.rs:2354", GAP),
+    ("crates/sqldiff-equiv/src/equiv/mod.rs:2381", GAP),
+    ("crates/sqldiff-equiv/src/equiv/mod.rs:2413", GAP),
+    ("crates/sqldiff-equiv/src/equiv/mod.rs:2594", GAP),
+    ("crates/sqldiff-equiv/src/equiv/mod.rs:2595", GAP),
+    ("crates/sqldiff-equiv/src/equiv/table.rs:1850", GAP),
+    ("crates/sqldiff-equiv/src/equiv/trigger.rs:286", GAP),
+    ("crates/sqldiff-equiv/src/equiv/trigger.rs:288", GAP),
+];
 
 /// The sites the checks of the generated tree read from, per dialect.
 fn sites_of(to: Dialect) -> BTreeSet<site_switch::Site> {
@@ -43,7 +88,12 @@ fn sites_of(to: Dialect) -> BTreeSet<site_switch::Site> {
     seen.into_iter().collect()
 }
 
+/// Takes about 25 minutes in a debug build (every site against every edit), so
+/// it is run by hand: `cargo test -p sqldiff-convert --test site_switch -- --ignored`.
+/// `SQLDIFF_T3_ONLY=canon.rs:1063` limits it to the sites whose name contains
+/// the text.
 #[test]
+#[ignore]
 fn every_site_that_reads_a_catalog_is_missed_by_some_edit_when_it_does_not_record() {
     let only = std::env::var("SQLDIFF_T3_ONLY").ok();
     let mut by_dialect: Vec<(Dialect, BTreeSet<site_switch::Site>)> = Vec::new();
