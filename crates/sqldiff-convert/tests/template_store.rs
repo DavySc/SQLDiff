@@ -159,7 +159,7 @@ fn results(out: &Path) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-fn recheck_all(mut j: Job) -> Job {
+fn no_recheck(mut j: Job) -> Job {
     j.tree.recheck = Recheck::None;
     j
 }
@@ -188,9 +188,9 @@ fn a_second_run_reuses_the_jobs_and_gives_the_same_tree() {
 #[test]
 fn recheck_none_reuses_every_job() {
     let f = Fixture::new("none");
-    convert_into(&recheck_all(f.job("o", false, false)), &Hooks::default()).unwrap();
+    convert_into(&no_recheck(f.job("o", false, false)), &Hooks::default()).unwrap();
     let first = tree_of(&f.out("o"));
-    convert_into(&recheck_all(f.job("o", true, false)), &Hooks::default()).unwrap();
+    convert_into(&no_recheck(f.job("o", true, false)), &Hooks::default()).unwrap();
     assert_eq!(first, tree_of(&f.out("o")));
     assert!(reused(&f.out("o")).iter().all(|(_, r)| *r));
 }
@@ -198,9 +198,9 @@ fn recheck_none_reuses_every_job() {
 #[test]
 fn an_edited_template_is_checked_again_and_the_tree_equals_a_fresh_one() {
     let f = Fixture::new("edit");
-    convert_into(&recheck_all(f.job("o", false, false)), &Hooks::default()).unwrap();
+    convert_into(&no_recheck(f.job("o", false, false)), &Hooks::default()).unwrap();
     f.write("dml/u.sql", "UPDATE <%S%>.<%T%> SET a = 3 WHERE b = 'y';\n");
-    convert_into(&recheck_all(f.job("o", true, false)), &Hooks::default()).unwrap();
+    convert_into(&no_recheck(f.job("o", true, false)), &Hooks::default()).unwrap();
     let resumed = tree_of(&f.out("o"));
     let r = reused(&f.out("o"));
     let by: std::collections::BTreeMap<_, _> = r.iter().cloned().collect();
@@ -235,12 +235,12 @@ fn an_edited_template_is_checked_again_and_the_tree_equals_a_fresh_one() {
 #[test]
 fn a_changed_table_changes_every_key_which_is_conservative_and_correct() {
     let f = Fixture::new("catalog");
-    convert_into(&recheck_all(f.job("o", false, false)), &Hooks::default()).unwrap();
+    convert_into(&no_recheck(f.job("o", false, false)), &Hooks::default()).unwrap();
     f.write(
         "tables/t.sql",
         "CREATE TABLE <%S%>.<%T%> (a int NOT NULL, b varchar(10) NULL, c int NULL);\n",
     );
-    convert_into(&recheck_all(f.job("o", true, false)), &Hooks::default()).unwrap();
+    convert_into(&no_recheck(f.job("o", true, false)), &Hooks::default()).unwrap();
     let r = reused(&f.out("o"));
     assert!(r.iter().all(|(_, x)| !x), "{r:?}");
 }
@@ -270,4 +270,144 @@ fn a_stored_result_that_a_fresh_check_contradicts_fails_the_run_and_empties_the_
     assert!(results(&f.out("o")).is_empty(), "the store is emptied");
     convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
     assert_eq!(results(&f.out("o")).len(), 4);
+}
+
+fn select_next(n: usize) -> sqldiff_convert::plan::Select {
+    sqldiff_convert::plan::Select {
+        next: Some(n),
+        ..Default::default()
+    }
+}
+
+/// The conversion report without where and when it was made.
+fn report_of(out: &Path) -> serde_json::Value {
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("conversion-report.json")).unwrap())
+            .unwrap();
+    for k in ["out", "run", "progress"] {
+        v.as_object_mut().unwrap().remove(k);
+    }
+    if let Some(t) = v["totals"].as_object_mut() {
+        t.remove("progress");
+    }
+    v
+}
+
+fn outputs_of(dir: &Path) -> Vec<(String, String)> {
+    tree_of(dir)
+        .into_iter()
+        .filter(|(p, _)| !p.starts_with("conversion-report") && !p.starts_with("review-queue"))
+        .collect()
+}
+
+#[test]
+fn chunked_increments_end_with_the_tree_of_a_full_run() {
+    let f = Fixture::new("chunks");
+    convert_into(&f.job("full", false, true), &Hooks::default()).unwrap();
+    let mut j = f.job("inc", false, false);
+    j.select = select_next(1);
+    convert_into(&j, &Hooks::default()).unwrap();
+    // After the first chunk something is not checked, and nothing reads as
+    // better converted than in the full run.
+    let first = report_of(&f.out("inc"));
+    assert!(first["totals"]["files_not_checked"].as_u64().unwrap() > 0);
+    let mut last = None;
+    for _ in 0..8 {
+        let mut j = f.job("inc", true, false);
+        j.select = select_next(1);
+        convert_into(&j, &Hooks::default()).unwrap();
+        last = Some(report_of(&f.out("inc")));
+    }
+    let last = last.unwrap();
+    assert_eq!(last["totals"]["files_not_checked"].as_u64().unwrap_or(0), 0);
+    assert_eq!(outputs_of(&f.out("full")), outputs_of(&f.out("inc")));
+    assert_eq!(report_of(&f.out("full")), last);
+}
+
+#[test]
+fn a_pair_is_one_job_in_an_increment() {
+    let f = Fixture::new("pairinc");
+    let mut j = f.job("o", false, false);
+    j.select = sqldiff_convert::plan::Select {
+        paths: vec!["procs/head.sql".into()],
+        ..Default::default()
+    };
+    convert_into(&j, &Hooks::default()).unwrap();
+    let r = report_of(&f.out("o"));
+    let checked = |p: &str| {
+        r["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["path"] == p)
+            .map(|x| x["checked"].as_bool().unwrap_or(true))
+            .unwrap()
+    };
+    // Selecting one half checks both; the others are not checked.
+    assert!(checked("procs/head.sql") && checked("procs/foot.sql"));
+    assert!(!checked("dml/u.sql") && !checked("views/v.sql"));
+}
+
+#[test]
+fn a_plan_of_a_template_tree_sees_names_with_placeholders() {
+    let f = Fixture::new("plan");
+    let j = f.job("o", false, false);
+    let (plan, _) = sqldiff_convert::job::plan_into(&j.tree, &f.out("o")).unwrap();
+    // The view uses the table through placeholders: it comes after it.
+    let at = |p: &str| {
+        plan.groups
+            .iter()
+            .position(|g| g.files.iter().any(|x| plan.files[*x].path == p))
+            .unwrap()
+    };
+    assert!(at("tables/t.sql") < at("views/v.sql"), "{plan:?}");
+}
+
+#[test]
+fn hand_written_output_in_the_ledger_is_never_stored_and_wins_on_a_resume() {
+    use sqldiff_convert::review::{append, By};
+    let f = Fixture::new("ledger");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    // Record a hand-written text for the unit of dml/u.sql.
+    let j = f.job("o", true, false);
+    let (inputs, unread) = tree::read(&j.tree).unwrap();
+    let t = tree::convert(&j.tree, &inputs, unread, None).unwrap();
+    let k = t
+        .report
+        .files
+        .iter()
+        .position(|x| x.path == "dml/u.sql")
+        .unwrap();
+    let id = t.report.files[k].units[0].id.clone();
+    let r = tree::written_record(
+        &t,
+        &inputs,
+        "dml/u.sql",
+        &id,
+        "UPDATE <%S%>.<%T%> SET a = 99;",
+        By::Human,
+        "dana",
+        "by hand",
+        "2026-11-07T12:00:00Z",
+    )
+    .unwrap();
+    append(&f.out("o"), &r).unwrap();
+    let before = results(&f.out("o")).len();
+    convert_into(&no_recheck(f.job("o", true, false)), &Hooks::default()).unwrap();
+    let resumed = outputs_of(&f.out("o"));
+    let text = &resumed
+        .iter()
+        .find(|(p, _)| p.ends_with("u.sql"))
+        .unwrap()
+        .1;
+    assert!(text.contains("99"), "{text}");
+    // Its job was not stored; the others were reused.
+    let by: std::collections::BTreeMap<_, _> = reused(&f.out("o")).into_iter().collect();
+    assert!(!by["dml/u.sql"], "{by:?}");
+    assert!(by["tables/t.sql"], "{by:?}");
+    // Its old result is swept as no key of this tree; nothing new is stored.
+    assert_eq!(results(&f.out("o")).len(), before - 1);
+    // A fresh run gives the same files.
+    convert_into(&f.job("o", true, true), &Hooks::default()).unwrap();
+    assert_eq!(resumed, outputs_of(&f.out("o")));
 }

@@ -198,6 +198,7 @@ pub fn extensions(given: Vec<String>) -> Vec<String> {
 const DIRECTIVE: &str = "ASM-TEMPLATE-DIRECTIVE";
 
 /// One input file.
+#[derive(Clone)]
 pub struct Input {
     /// Path relative to the source tree, with `/` separators.
     pub rel: String,
@@ -712,10 +713,10 @@ fn convert_kept(
     select: Option<&crate::plan::Select>,
 ) -> Result<Tree, String> {
     let started = Instant::now();
-    if select.is_some() && (a.template.is_some() || a.no_catalog) {
+    if select.is_some() && a.no_catalog {
         return Err(
-            "an increment needs the whole tree's catalogs and plain files: it cannot be \
-                    combined with --template or --no-catalog"
+            "an increment needs the whole tree's catalogs: it cannot be combined with \
+                    --no-catalog"
                 .to_string(),
         );
     }
@@ -804,6 +805,9 @@ fn convert_kept(
             cache.as_ref(),
             &mut reused,
             &mut live,
+            select,
+            &mut unchecked,
+            &mut progress,
         )?,
     };
     // The cross-file passes work on the units alone (`Core`): what they read
@@ -1948,6 +1952,9 @@ fn convert_templates(
     cache: Option<&Cache>,
     reused: &mut Vec<bool>,
     live: &mut Option<std::collections::BTreeSet<String>>,
+    select: Option<&crate::plan::Select>,
+    unchecked: &mut Vec<bool>,
+    progress_out: &mut Option<crate::plan::Progress>,
 ) -> Result<Vec<(Held, f64)>, String> {
     let mut parsed: Vec<(Template, sqldiff_core::composition::PlaceholderBasis)> = Vec::new();
     for i in inputs {
@@ -2172,6 +2179,61 @@ fn convert_templates(
         }
         _ => Default::default(),
     };
+    // The increment: which jobs this run checks. The others are taken from
+    // the store when their key matches, else they are not checked. The plan
+    // is made on the fragments (stand-ins for placeholders), so a name with a
+    // placeholder is seen as the name it stands for.
+    let in_increment: Option<Vec<bool>> = match (select, cache) {
+        (Some(sel), Some(c)) => {
+            let frags = plan_inputs(a, inputs);
+            let plan = crate::plan::Plan::build_with(&frags, a.from, jobs);
+            let at: std::collections::BTreeMap<&str, usize> = plan
+                .files
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (f.path.as_str(), i))
+                .collect();
+            // A file is stored when its job is.
+            let mut stored_file = vec![false; inputs.len()];
+            for (j, k) in jobs_list.iter().zip(&keys) {
+                let here = !c.fresh && k.as_ref().is_some_and(|k| c.store.has(k));
+                match j.target {
+                    Target::File(f) => stored_file[f] = here,
+                    Target::Pair(h, f) => {
+                        stored_file[h] = here;
+                        stored_file[f] = here;
+                    }
+                }
+            }
+            let mut by_plan = vec![false; plan.files.len()];
+            for (i, inp) in inputs.iter().enumerate() {
+                by_plan[at[inp.rel.as_str()]] = stored_file[i];
+            }
+            let on = plan.select(sel, &by_plan)?;
+            let file_on = |i: usize| on[at[inputs[i].rel.as_str()]];
+            let mut done = by_plan.clone();
+            for (i, inp) in inputs.iter().enumerate() {
+                done[at[inp.rel.as_str()]] |= file_on(i);
+            }
+            *progress_out = Some(plan.progress(&done));
+            // A pair is checked as one job: when either half is selected.
+            Some(
+                jobs_list
+                    .iter()
+                    .map(|j| match j.target {
+                        Target::File(f) => file_on(f),
+                        Target::Pair(h, f) => file_on(h) || file_on(f),
+                    })
+                    .collect(),
+            )
+        }
+        (Some(_), None) => {
+            return Err(
+                "an increment needs an output folder: its results are kept there".to_string(),
+            )
+        }
+        _ => None,
+    };
     let mismatch: std::sync::Mutex<Vec<String>> = Default::default();
     let work = slots(jobs_list.iter().zip(drafts).zip(keys.iter()).enumerate());
     let progress = Progress::new(work.len(), hooks);
@@ -2193,8 +2255,15 @@ fn convert_templates(
                 let mut conv = conv.clone();
                 finish.apply(&mut conv);
                 progress.tick();
-                return Some((Some((*k).clone()), conv, 0.0, true));
+                return Some((Some((*k).clone()), conv, 0.0, true, false));
             }
+        }
+        if stored.is_none() && in_increment.as_ref().is_some_and(|m| !m[idx]) {
+            let mut c =
+                crate::not_checked_template(&j.template, draft, &stand, j.basis, delimiters);
+            finish.apply(&mut c);
+            progress.tick();
+            return Some((None, c, 0.0, false, true));
         }
         let t0 = Instant::now();
         let mut c = crate::check_template(&j.template, draft, &stand, &opts, j.basis, delimiters);
@@ -2224,7 +2293,7 @@ fn convert_templates(
         }
         finish.trim(&mut c);
         progress.tick();
-        Some((in_store, c, secs, false))
+        Some((in_store, c, secs, false, false))
     });
     let mut found = mismatch.into_inner().unwrap();
     if !found.is_empty() {
@@ -2234,7 +2303,7 @@ fn convert_templates(
         found.sort();
         return Err(found.join("\n"));
     }
-    let done: Vec<(Option<crate::store::Key>, Conversion, f64, bool)> = done
+    let done: Vec<(Option<crate::store::Key>, Conversion, f64, bool, bool)> = done
         .into_iter()
         .map(|d| d.ok_or_else(|| CANCELLED.to_string()))
         .collect::<Result<_, _>>()?;
@@ -2244,10 +2313,12 @@ fn convert_templates(
     }
     let mut out: Vec<Option<(Held, f64)>> = (0..inputs.len()).map(|_| None).collect();
     *reused = vec![false; inputs.len()];
-    for (j, (key, mut c, secs, hit)) in jobs_list.iter().zip(done) {
+    *unchecked = vec![false; inputs.len()];
+    for (j, (key, mut c, secs, hit, skipped)) in jobs_list.iter().zip(done) {
         match j.target {
             Target::File(k) => {
                 reused[k] = hit;
+                unchecked[k] = skipped;
                 // A stored file lets go of its output and reports; they are
                 // read back from the store when the file is finished.
                 out[k] = Some((
@@ -2264,6 +2335,8 @@ fn convert_templates(
             Target::Pair(h, f) => {
                 reused[h] = hit;
                 reused[f] = hit;
+                unchecked[h] = skipped;
+                unchecked[f] = skipped;
                 let (ch, cf) = crate::split_pair(c, &inputs[h].text, &inputs[f].text, &marker);
                 out[h] = Some((Held::Whole(Box::new(ch)), secs / 2.0));
                 out[f] = Some((Held::Whole(Box::new(cf)), secs / 2.0));
@@ -2283,6 +2356,33 @@ fn convert_templates(
         }
     }
     Ok(out)
+}
+
+/// The inputs a plan of the tree is made from: the files, or for a template
+/// tree their fragments, so `--plan` and an increment see the same tree.
+pub fn plan_inputs<'a>(a: &Args, inputs: &'a [Input]) -> std::borrow::Cow<'a, [Input]> {
+    let Some(tm) = &a.template else {
+        return std::borrow::Cow::Borrowed(inputs);
+    };
+    let parsed: Vec<Template> = inputs
+        .iter()
+        .map(|i| {
+            tm.placeholders
+                .parse(&i.text, a.from, tm.parameters.as_ref())
+                .0
+        })
+        .collect();
+    let stand = StandIns::new(parsed.iter()).with_kinds(tm.kinds.clone());
+    std::borrow::Cow::Owned(
+        inputs
+            .iter()
+            .zip(&parsed)
+            .map(|(i, t)| Input {
+                rel: i.rel.clone(),
+                text: crate::template_fragment(t, &stand),
+            })
+            .collect(),
+    )
 }
 
 /// One conversion: a file, or a routine's opening and closing templates.
