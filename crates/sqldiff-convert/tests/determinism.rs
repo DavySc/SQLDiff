@@ -506,6 +506,16 @@ fn stand_in_flags_come_from_the_store_without_changing_the_output() {
     same(&base, &tree_of(&f.out("a")), "unreadable flags");
 }
 
+/// A stored file is the SHA-256 of its body in hex, a newline, the body.
+fn framed(body: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let hex: String = Sha256::digest(body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    [hex.as_bytes(), b"\n", body].concat()
+}
+
 #[test]
 fn a_checked_again_file_must_give_the_stored_stand_in_flags() {
     let f = Fixture::new("flagsmismatch");
@@ -519,7 +529,7 @@ fn a_checked_again_file_must_give_the_stored_stand_in_flags() {
     let mut changed = 0;
     for e in std::fs::read_dir(&flags).unwrap().flatten() {
         for g in std::fs::read_dir(e.path()).unwrap().flatten() {
-            std::fs::write(g.path(), b"[]").unwrap();
+            std::fs::write(g.path(), framed(b"[]")).unwrap();
             changed += 1;
         }
     }
@@ -532,4 +542,69 @@ fn a_checked_again_file_must_give_the_stored_stand_in_flags() {
     };
     assert!(err.contains("stand-in flags"), "{err}");
     assert!(err.contains("store is emptied"), "{err}");
+    // The evidence is kept, as for a result: the stored flags and the fresh
+    // ones, in a file the message names.
+    let bundles: Vec<_> = std::fs::read_dir(f.out("a").join(".sqldiff/mismatch"))
+        .unwrap()
+        .flatten()
+        .collect();
+    assert!(!bundles.is_empty());
+    for b in &bundles {
+        let name = b.file_name().to_string_lossy().to_string();
+        assert!(name.starts_with("flags-"), "{name}");
+        assert!(err.contains(&name), "{err} does not name {name}");
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(b.path()).unwrap()).unwrap();
+        assert_eq!(v["stored"], serde_json::json!([]));
+        assert!(!v["fresh"].as_array().unwrap().is_empty());
+    }
+}
+
+/// The error of a run lists every mismatch, in an order that does not
+/// depend on which thread found which: the same text at any `-j`.
+#[test]
+fn mismatches_are_all_reported_in_a_fixed_order() {
+    let f = Fixture::new("flagsmany");
+    let c = Case {
+        to: Dialect::Postgres,
+        catalogs: &[],
+    };
+    run(&f, &c, "a", 2, Select::default(), true);
+    let snapshot = |tag: &str| {
+        std::fs::remove_dir_all(f.out(tag)).ok();
+        copy_dir(&f.out("a"), &f.out(tag));
+    };
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap().flatten() {
+            let (p, q) = (e.path(), to.join(e.file_name()));
+            if p.is_dir() {
+                copy_dir(&p, &q);
+            } else {
+                std::fs::copy(&p, &q).unwrap();
+            }
+        }
+    }
+    let mut texts = Vec::new();
+    for (tag, jobs) in [("m1", 1), ("m4", 4), ("m7", 7)] {
+        snapshot(tag);
+        for e in std::fs::read_dir(f.out(tag).join(".sqldiff/flags"))
+            .unwrap()
+            .flatten()
+        {
+            for g in std::fs::read_dir(e.path()).unwrap().flatten() {
+                std::fs::write(g.path(), framed(b"[]")).unwrap();
+            }
+        }
+        let mut job = f.job(tag, jobs, Select::default(), c.to, c.catalogs);
+        job.fresh = true;
+        let Err(err) = convert_into(&job, &Hooks::default()) else {
+            panic!("a differing flag set must fail the run");
+        };
+        assert!(err.lines().count() >= 2, "{err}");
+        // The messages name the output-independent parts only: the folder
+        // is the same in the text, so drop its name before comparing.
+        texts.push(err.replace(tag, "<out>"));
+    }
+    assert!(texts.windows(2).all(|w| w[0] == w[1]), "{texts:#?}");
 }
