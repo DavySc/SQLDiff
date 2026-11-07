@@ -282,3 +282,58 @@ fn sweep_wake_ups_agree_with_the_exact_scan() {
     }
     assert!(answered > 0);
 }
+
+/// The shapes the design review asked for that the generator reaches only by
+/// chance: statements that write nothing but the status names, a finding
+/// that exists on one side only (an added statement), and findings that are
+/// no candidate edit (a changed declaration, a changed parameter default)
+/// sitting in the span list beside edits. Every subset of the constants is
+/// edited, in both directions, for both dialects.
+#[test]
+fn status_only_one_sided_and_non_candidate_findings_agree_with_the_exact_scan() {
+    std::env::set_var("SQLDIFF_EDIT_ORACLE", "1");
+    // (declared default, [k1, k2, k3], extra statement in the routine)
+    let tsql = |d: u32, k: [u32; 3], extra: bool| {
+        let add = if extra { "SET @v3 = @p;\n" } else { "" };
+        format!(
+            "CREATE PROCEDURE dbo.r @p int AS\nBEGIN\nDECLARE @v2 int = {d}, @v3 int = 0;\nSELECT @p + {};\nSET @v2 = @p + {};\n{add}SELECT @v2 + {};\nSELECT @v3 + 1;\nEND\n",
+            k[0], k[1], k[2]
+        )
+    };
+    let pg = |d: u32, k: [u32; 3], extra: bool| {
+        let add = if extra { "v3 := p;\n" } else { "" };
+        format!(
+            "CREATE FUNCTION r(p int) RETURNS void LANGUAGE plpgsql AS $$\nDECLARE v2 int := {d}; v3 int := 0;\nBEGIN\nPERFORM p + {};\nv2 := p + {};\n{add}PERFORM v2 + {};\nPERFORM v3 + 1;\nEND $$;\n",
+            k[0], k[1], k[2]
+        )
+    };
+    let mut answered = 0;
+    for d in [Dialect::Tsql, Dialect::Postgres] {
+        let make = |dflt: u32, k: [u32; 3], extra: bool| {
+            if d == Dialect::Tsql {
+                tsql(dflt, k, extra)
+            } else {
+                pg(dflt, k, extra)
+            }
+        };
+        for mask in 0..8u32 {
+            for (dflt, extra) in [(0u32, false), (1, false), (0, true), (1, true)] {
+                if mask == 0 && dflt == 0 && !extra {
+                    continue;
+                }
+                let bit = |n: u32| 1 + ((mask >> n) & 1);
+                let x = make(0, [1, 1, 1], false);
+                let y = make(dflt, [bit(0), bit(1), bit(2)], extra);
+                for (p, q) in [(&x, &y), (&y, &x)] {
+                    let r = diff(
+                        &Artifact::new("a.sql", d, p.as_str()),
+                        &Artifact::new("b.sql", d, q.as_str()),
+                        &Options::default(),
+                    );
+                    answered += r.findings.len();
+                }
+            }
+        }
+    }
+    assert!(answered > 0);
+}
