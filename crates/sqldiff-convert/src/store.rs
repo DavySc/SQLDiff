@@ -112,7 +112,7 @@ pub struct CheckInput<'a> {
 impl CheckInput<'_> {
     pub fn key(&self) -> Key {
         let mut k = KeyBuilder::new();
-        k.field("format", b"2");
+        k.field("format", b"3");
         k.field("build", self.build.as_bytes());
         k.field("from", self.from.id().as_bytes());
         k.field("to", self.to.id().as_bytes());
@@ -200,6 +200,18 @@ struct Entry {
     key: String,
     pool: Vec<String>,
     conversion: serde_json::Value,
+}
+
+/// The body of a result file: the file is the SHA-256 of its body in hex, a
+/// newline, then the body. A file edited after it was written (even into
+/// other valid JSON) does not match its digest and is a miss, so it is
+/// converted again instead of trusted.
+fn verified_body(raw: &[u8]) -> Option<&[u8]> {
+    let (digest, body) = (raw.get(..64)?, raw.get(65..)?);
+    if raw[64] != b'\n' || digest != hex(&Sha256::digest(body)).as_bytes() {
+        return None;
+    }
+    Some(body)
 }
 
 /// A result file is named by its key: 64 hex digits.
@@ -376,7 +388,9 @@ impl Store {
     /// not name its own key, is a miss.
     pub fn get(&self, key: &Key) -> Option<Conversion> {
         let path = crate::tree::dest_under(&self.out, &Self::rel(key)).ok()?;
-        let mut e: Entry = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        let raw = std::fs::read(path).ok()?;
+        let body = verified_body(&raw)?;
+        let mut e: Entry = serde_json::from_slice(body).ok()?;
         if e.key != key.0 {
             return None;
         }
@@ -392,12 +406,16 @@ impl Store {
         let mut value = serde_json::to_value(c).map_err(|e| e.to_string())?;
         share_notes(&mut value);
         let (pool, conversion) = intern(value);
-        let bytes = serde_json::to_vec(&Entry {
+        let body = serde_json::to_vec(&Entry {
             key: key.0.clone(),
             pool,
             conversion,
         })
         .map_err(|e| e.to_string())?;
+        let mut bytes = Vec::with_capacity(body.len() + 65);
+        bytes.extend_from_slice(hex(&Sha256::digest(&body)).as_bytes());
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&body);
         let dest = crate::tree::dest_under(&self.out, &Self::rel(key))?;
         if let Some(p) = dest.parent() {
             std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
