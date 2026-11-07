@@ -27,6 +27,7 @@ pub(crate) use check::{check_with_mix, not_checked, recount, span, Rebuild, U16I
 pub mod base;
 pub mod callees;
 pub mod cert;
+pub mod compare;
 pub mod drift;
 pub mod gate;
 use sqldiff_draft::rewrite_in_tree;

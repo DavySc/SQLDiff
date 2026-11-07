@@ -88,6 +88,7 @@ fn handshake_list_and_conversion_review() {
             "write_unit",
             "run_status",
             "cancel_run",
+            "compare_runs",
             "converted_file"
         ]
     );

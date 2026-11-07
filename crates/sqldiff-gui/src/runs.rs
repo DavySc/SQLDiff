@@ -2301,9 +2301,12 @@ fn reopen(
     };
     // Stored after the review is shown: compressing takes a moment.
     let keep = match (&opened, &stored) {
-        (Ok(review), Some((st, extra))) if fresh => {
-            Some((Arc::clone(st), review.stored_key(extra), review.tree_json()))
-        }
+        (Ok(review), Some((st, extra))) if fresh => Some((
+            st.pending(),
+            Arc::clone(st),
+            review.stored_key(extra),
+            review.tree_json(),
+        )),
         _ => None,
     };
     {
@@ -2318,7 +2321,7 @@ fn reopen(
             Err(e) => *opening = Some(Opening::Failed(e)),
         }
     }
-    if let Some((st, key, json)) = keep {
+    if let Some((_pending, st, key, json)) = keep {
         st.put(&key, &json);
     }
 }
@@ -2453,6 +2456,7 @@ fn execute(run: &Arc<Run>, work: Work, stored: Option<&Arc<Stored>>) -> State {
         Ok(review) => {
             let keep = extra.map(|(st, extra)| {
                 (
+                    st.pending(),
                     Arc::clone(st),
                     review.stored_key(&extra),
                     review.tree_json(),
@@ -2461,10 +2465,13 @@ fn execute(run: &Arc<Run>, work: Work, stored: Option<&Arc<Stored>>) -> State {
             *run.review.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(Arc::new(Mutex::new(review)));
             // Compressing a large tree takes a moment: not on the run's time.
-            if let Some((st, key, json)) = keep {
+            if let Some((pending, st, key, json)) = keep {
                 let _ = std::thread::Builder::new()
                     .name(format!("sqldiff-store-{}", run.id))
-                    .spawn(move || st.put(&key, &json));
+                    .spawn(move || {
+                        st.put(&key, &json);
+                        drop(pending);
+                    });
             }
         }
         // Written all the same: the review can be opened from the command line.
