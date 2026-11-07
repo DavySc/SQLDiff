@@ -106,6 +106,13 @@ impl Outcome {
 /// Where reads go. A check holds a sink; the default drops them.
 pub trait ReadSink: Sync {
     fn record(&self, side: Side, query: &Query, outcome: Outcome);
+
+    /// Whether anything is kept. A view digests an answer only when it is:
+    /// the digest of a table is the `Debug` text of it, which no unrecorded
+    /// run pays for.
+    fn active(&self) -> bool {
+        true
+    }
 }
 
 /// Records nothing (every run until the series' PR 3).
@@ -113,6 +120,10 @@ pub struct NoSink;
 
 impl ReadSink for NoSink {
     fn record(&self, _: Side, _: &Query, _: Outcome) {}
+
+    fn active(&self) -> bool {
+        false
+    }
 }
 
 /// The reads of one check: sorted by side and query, each once.
@@ -152,5 +163,153 @@ impl ReadSink for Recorder {
                 self.conflicts.lock().unwrap().push((side, query.clone()));
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The doors a check is allowed to use (PR 2a).
+// ---------------------------------------------------------------------------
+
+use crate::{Catalog, CatalogView, Dialect, Ident, Lookup, Routine, RoutineKind, Table};
+
+/// A sink that drops everything, for a view not under a recorded check.
+pub static NO_SINK: NoSink = NoSink;
+
+fn parts_of(parts: &[Ident]) -> Vec<Part> {
+    parts.iter().map(|p| (p.text.clone(), p.quoted)).collect()
+}
+
+/// The external catalog of one side as a check sees it: every question goes
+/// through the sink with the digest of its answer. It holds the
+/// [`CatalogView`] by reference and has no accessor for it, so the only reads
+/// a check can make are the methods below (and [`whole`](Self::whole), which
+/// records the sound fallback `WholeCatalog`).
+#[derive(Clone, Copy)]
+pub struct RecordingView<'a> {
+    view: &'a CatalogView,
+    side: Side,
+    sink: &'a dyn ReadSink,
+}
+
+impl<'a> RecordingView<'a> {
+    /// Only the engine, where a side is built, opens a view (see the scan in
+    /// `sqldiff-core/tests/catalog_sites.rs`).
+    pub fn new(view: &'a CatalogView, side: Side, sink: &'a dyn ReadSink) -> Self {
+        RecordingView { view, side, sink }
+    }
+
+    fn rec<T: std::fmt::Debug + ?Sized>(&self, q: impl FnOnce() -> Query, answer: &T) {
+        if self.sink.active() {
+            self.sink.record(self.side, &q(), Outcome::of(answer));
+        }
+    }
+
+    pub fn dialect(&self) -> Dialect {
+        self.view.dialect
+    }
+
+    pub fn supplied(&self) -> bool {
+        let a = self.view.supplied();
+        self.rec(|| Query::Supplied, &a);
+        a
+    }
+
+    pub fn origin(&self) -> String {
+        let a = self.view.origin();
+        self.rec(|| Query::Origin, &a);
+        a
+    }
+
+    pub fn tables_authoritative(&self) -> bool {
+        let a = self.view.tables_authoritative();
+        self.rec(|| Query::TablesAuthoritative, &a);
+        a
+    }
+
+    pub fn routines_authoritative(&self, kind: RoutineKind) -> bool {
+        let a = self.view.routines_authoritative(kind);
+        self.rec(|| Query::RoutinesAuthoritative(format!("{kind:?}")), &a);
+        a
+    }
+
+    pub fn table(&self, parts: &[Ident]) -> Lookup<&'a Table> {
+        let a = self.view.table(parts);
+        self.rec(|| Query::Table(parts_of(parts)), &a);
+        a
+    }
+
+    pub fn routines(&self, parts: &[Ident]) -> Lookup<Vec<&'a Routine>> {
+        let a = self.view.routines(parts);
+        self.rec(|| Query::Routines(parts_of(parts)), &a);
+        a
+    }
+
+    /// The whole catalog, for a read that has no narrow query yet. Recorded
+    /// as `WholeCatalog` with the digest of everything, so a file that calls
+    /// it is re-checked on any edit of this side's catalog: sound, and the
+    /// price of not having a narrow form. Each call site is in the inventory.
+    pub fn whole(&self) -> &'a Catalog {
+        let c = self.view.unrecorded_catalog();
+        self.rec(|| Query::WholeCatalog, c);
+        c
+    }
+}
+
+/// The source catalog as pass 1 (`sqldiff-draft`) reads it. Pass 1 holds this
+/// and never a `Catalog`, so every read of the tree's catalog goes through
+/// one of these methods (the compiler enforces it; the door scan in
+/// `tests/catalog_sites.rs` counts the calls). The sandbox of Phase A: reads
+/// go to a sink that keeps nothing today, and become `SourceReads` of a
+/// stored draft only if Phase B is built.
+#[derive(Clone, Copy)]
+pub struct SourceReads<'a> {
+    cat: &'a Catalog,
+    dialect: Dialect,
+    sink: &'a dyn ReadSink,
+}
+
+impl<'a> SourceReads<'a> {
+    /// Wraps the catalog a draft is made against (the driver's one call).
+    pub fn new(cat: &'a Catalog, dialect: Dialect) -> Self {
+        SourceReads {
+            cat,
+            dialect,
+            sink: &NO_SINK,
+        }
+    }
+
+    fn rec<T: std::fmt::Debug + ?Sized>(&self, q: impl FnOnce() -> Query, answer: &T) {
+        if self.sink.active() {
+            self.sink.record(Side::Source, &q(), Outcome::of(answer));
+        }
+    }
+
+    /// A table by name.
+    pub fn table(&self, parts: &[Ident]) -> Option<&'a Table> {
+        let a = crate::table_position(self.dialect, self.cat, parts).map(|i| &self.cat.tables[i]);
+        self.rec(|| Query::Table(parts_of(parts)), &a);
+        a
+    }
+
+    /// The triggers a name matches, as [`Catalog::triggers_named`].
+    pub fn triggers_named(&self, schema: Option<&str>, name: &str) -> Vec<&'a crate::Trigger> {
+        let a = self.cat.triggers_named(self.dialect, schema, name);
+        self.rec(
+            || Query::TriggersNamed(schema.map(str::to_string), name.to_string()),
+            &a,
+        );
+        a
+    }
+
+    /// Every table: records `WholeCatalog`.
+    pub fn tables(&self) -> &'a [Table] {
+        self.rec(|| Query::WholeCatalog, self.cat);
+        &self.cat.tables
+    }
+
+    /// Every routine: records `WholeCatalog`.
+    pub fn routines(&self) -> &'a [Routine] {
+        self.rec(|| Query::WholeCatalog, self.cat);
+        &self.cat.routines
     }
 }

@@ -819,7 +819,7 @@ impl Cx<'_> {
                     .any(|c| self.dt_cat(&c.data_type.base, &c.data_type.args) == Dt::Bit)
             })
             || self.type_catalog().is_some_and(|c| {
-                c.tables.iter().any(|t| {
+                c.tables().iter().any(|t| {
                     t.columns
                         .iter()
                         .any(|c| self.dt_cat(&c.data_type.base, &c.data_type.args) == Dt::Bit)

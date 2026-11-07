@@ -19,7 +19,8 @@ use sqldiff_syntax::{ast, Dialect, SyntaxKind, SyntaxNode};
 use crate::artifact::Analyzed;
 use crate::catalog::builtins::{self, Helper};
 use crate::catalog::ddl::{self, OutputCol};
-use crate::catalog::{CatalogView, DataType, Ident, RoutineKind, TableKind};
+use crate::catalog::record::RecordingView;
+use crate::catalog::{DataType, Ident, LocalView, RoutineKind, TableKind};
 use crate::model::{Assumption, ChangeClass, Severity};
 use crate::tokens::{self, close_paren, split_commas, Tok};
 
@@ -27,7 +28,7 @@ pub use compare::{binding_findings, Bindings};
 
 /// What a binder needs besides the artifact.
 pub struct BindInput<'a> {
-    pub view: &'a CatalogView,
+    pub view: RecordingView<'a>,
     pub helpers: &'a [Helper],
 }
 
@@ -201,7 +202,7 @@ pub(crate) struct Binder<'a> {
     scopes: Vec<Scope>,
     next_scope: usize,
     /// Objects the artifact creates: temp tables, table variables, routines.
-    local: CatalogView,
+    local: LocalView,
     ordinals: HashMap<String, usize>,
     trigger: Option<TriggerCtx>,
     /// `#variable_conflict use_column` in a PL/pgSQL body: a name that is
@@ -213,7 +214,7 @@ pub(crate) struct Binder<'a> {
     /// Every routine the artifact creates, wherever it is: a call inside a
     /// routine body is resolved when the body runs, possibly after a routine
     /// defined further down was created.
-    later: CatalogView,
+    later: LocalView,
 }
 
 /// Binds one parsed artifact.
@@ -227,7 +228,7 @@ pub fn bind(a: &Analyzed, input: &BindInput) -> Bound {
         out: Bound::default(),
         scopes: Vec::new(),
         next_scope: 0,
-        local: CatalogView::scratch(a.dialect()),
+        local: LocalView::new(a.dialect()),
         ordinals: HashMap::new(),
         trigger: None,
         pg_conflict_directive: a
@@ -238,7 +239,7 @@ pub fn bind(a: &Analyzed, input: &BindInput) -> Bound {
             .skip(1)
             .any(|r| r.trim_start().starts_with("use_column")),
         goto_labels: Vec::new(),
-        later: CatalogView::scratch(a.dialect()),
+        later: LocalView::new(a.dialect()),
     };
     for r in a
         .root
@@ -1597,7 +1598,11 @@ impl<'a> Binder<'a> {
         (Some(dt), None)
     }
 
-    fn lookup_table_quiet(&self, parts: &[Ident], view: &CatalogView) -> Option<Vec<OutputCol>> {
+    fn lookup_table_quiet(
+        &self,
+        parts: &[Ident],
+        view: RecordingView<'_>,
+    ) -> Option<Vec<OutputCol>> {
         let local = &self.local;
         let found = match local.table(parts) {
             crate::catalog::Lookup::Found(t) => Some(t.clone()),

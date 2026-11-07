@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::artifact::{exact_hash, Analyzed, Artifact};
 use crate::bind::{self, BindInput, Bindings};
 use crate::catalog::builtins::Helper;
+use crate::catalog::record::{RecordingView, Side as ReadSide};
 use crate::catalog::{ddl, Catalog, CatalogView};
 use crate::classify::pairing_key;
 use crate::equiv;
@@ -181,6 +182,13 @@ fn ddl_catalog(dialect: sqldiff_syntax::Dialect, ddl: &[Artifact]) -> Arc<Catalo
 /// The catalog one side binds against, and the equivalence schema read from
 /// it, built once and shared by every file compared against the same
 /// catalogs (a tree run compares hundreds of files against two).
+/// A side's view as a check reads it. Nothing is recorded until the series'
+/// PR 3 passes each check's sink here; this is where a side's `CatalogView`
+/// is turned into the only thing the check crates can hold.
+fn reading(view: &CatalogView, side: ReadSide) -> RecordingView<'_> {
+    RecordingView::new(view, side, &sqldiff_catalog::record::NO_SINK)
+}
+
 struct BoundSide {
     view: Arc<CatalogView>,
     schema: equiv::schema::Schema,
@@ -433,14 +441,14 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     let bound_a = bind::bind(
         &aa,
         &BindInput {
-            view: view_a,
+            view: reading(view_a, ReadSide::Source),
             helpers: &opts.helpers,
         },
     );
     let bound_b = bind::bind(
         &ab,
         &BindInput {
-            view: view_b,
+            view: reading(view_b, ReadSide::Target),
             helpers: &opts.helpers,
         },
     );
@@ -638,7 +646,7 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
     let bound = bind::bind(
         &aa,
         &BindInput {
-            view,
+            view: reading(view, ReadSide::Source),
             helpers: &opts.helpers,
         },
     );

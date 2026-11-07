@@ -23,7 +23,7 @@ Inventory for the recorded-catalog-reads series (performance plan W4.3). It list
 | A3 | `sqldiff-equiv/src/equiv/schema.rs` | `pub fn table_exact(` | `SchemaTables(lower name)` | `Schema::table`, `table_exact`, `with_ddl`, `with_images`: base and temporary tables by `to_lowercase` unqualified name, last one wins, `ambiguous` across schemas. Not `Ident::key`. |
 | A4 | `sqldiff-equiv/src/equiv/schema.rs` | `types_from_source && !t.star_outputs` | `ViewFamily(name)` | Views typed from a source: every non-view table of the source's name under `eq_ignore_ascii_case`, and their columns; two views of a name give an empty map. A flag digest would be too coarse. |
 | A5 | `sqldiff-equiv/src/equiv/schema.rs` | `if d == Dialect::Postgres {` | `Spellings(lower name)` | PostgreSQL spellings over schemas, routine schemas and names, table schemas and names, columns, keys and indexes: seven sources. |
-| A6 | `sqldiff-equiv/src/equiv/call.rs` | `fn exists(target: &Target, view: &CatalogView` | `SchemaKnown(part)`, `Table(parts)`, `Routines(parts)`, and the scan at the end | Comment targets. The `tables.iter().any(..)` scan is a named `Scan` or `WholeCatalog`. |
+| A6 | `sqldiff-equiv/src/equiv/call.rs` | `fn exists(target: &Target, view: RecordingView` | `SchemaKnown(part)`, `Table(parts)`, `Routines(parts)`, and the scan at the end | Comment targets. The `tables.iter().any(..)` scan is `RecordingView::whole` (`WholeCatalog`) in PR 2a. |
 | C1 | `sqldiff-equiv/src/equiv/call.rs` | `fn switches(` | `Table(parts)` on both sides | Versioning declared on the table and its history table on the other side. |
 | C2 | `sqldiff-equiv/src/equiv/call.rs` | `fn comments(` | `Table(parts)`, `Routines(parts)` | COMMENT ON targets. |
 | C3 | `sqldiff-equiv/src/equiv/call.rs` | `fn callee<'v>(` | `Routines(parts)` | The routine a CALL names. |
@@ -32,7 +32,7 @@ Inventory for the recorded-catalog-reads series (performance plan W4.3). It list
 | A7 | `sqldiff-equiv/src/equiv/mod.rs` | `fn trigger_drop(` | `TriggersNamed`, `TriggersOn`, `TriggersRunning` | Triggers by name; PostgreSQL triggers with a name on a table; any other trigger that runs the function. |
 | A8 | `sqldiff-equiv/src/equiv/schema.rs` | `sources: view.origins().to_vec()` | `Origin`, `Supplied` | `Schema::catalog()` is `None` when nothing was supplied; origins reach witnesses. |
 | A9 | `sqldiff-convert/src/check.rs` | `fn check_with_mix(` | the union of the reads of every `check_one` inside, the losing variants included | The result is the best of two or three checks. A catalog edit that flips which variant wins must not replay clean. The pass-1 reads inside `rebuild` are covered by rebuilding the mix against the current catalog on reuse. |
-| P1 | `sqldiff-draft/src/tsql.rs` | `catalog: Option<&'a sqldiff_equiv::catalog::Catalog>` | pass 1 `SourceReads` (sandbox only until Phase B) | `Cx` holds the whole-tree source catalog directly. |
+| P1 | `sqldiff-draft/src/tsql.rs` | `catalog: Option<SourceReads<'a>>,` | pass 1 `SourceReads` (sandbox only until Phase B) | `Cx` holds the whole-tree source catalog as `SourceReads`, the only way in (PR 2a, compiler-enforced). |
 | P3 | `sqldiff-draft/src/tsql.rs` | `fn catalog_table(` | pass 1 `SourceReads` (sandbox only until Phase B) | a table of the source catalog by name (dynamic SQL, column owners). |
 | P4 | `sqldiff-draft/src/tsql.rs` | `fn column_owners(` | pass 1 `SourceReads` (sandbox only until Phase B) | the owners of a column name among catalog tables. |
 | P5 | `sqldiff-draft/src/tsql.rs` | `fn routine_in<'c>(` | pass 1 `SourceReads` (sandbox only until Phase B) | callee routine lookup (`callee`, `callee_returns_status`). |
@@ -52,14 +52,30 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 
 ### catalog accessor
 
-`\.catalog\(\)`: `CatalogView::catalog` / `Schema::catalog`: the whole-catalog door. Gone after PR 2a (a `RecordingView` has no accessor).
+`\.catalog\(\)`: `Schema::catalog`: the side's `RecordingView`. `CatalogView::catalog` is gone (PR 2a): a `RecordingView` has no accessor for the catalog behind it.
 
 | file | stage | count |
 |---|---|---|
-| `sqldiff-equiv/src/equiv/call.rs` | check | 8 |
+| `sqldiff-equiv/src/equiv/call.rs` | check | 4 |
 | `sqldiff-equiv/src/equiv/canon.rs` | check | 2 |
-| `sqldiff-equiv/src/equiv/mod.rs` | check | 5 |
+| `sqldiff-equiv/src/equiv/mod.rs` | check | 2 |
+
+### unrecorded catalog
+
+`\.unrecorded_catalog\(\)`: `CatalogView::unrecorded_catalog`: engine-side only. `Schema::build` reads whole tables through it until PR 2b makes the overlay lazy; the scan below fails on any other file.
+
+| file | stage | count |
+|---|---|---|
 | `sqldiff-equiv/src/equiv/schema.rs` | check | 5 |
+
+### whole catalog
+
+`\.whole\(\)`: `RecordingView::whole`: records `WholeCatalog`. Sound (any edit of the side re-checks the file) and the price of a read with no narrow query yet: call.rs comments (A6), the trigger scans (A7).
+
+| file | stage | count |
+|---|---|---|
+| `sqldiff-equiv/src/equiv/call.rs` | check | 4 |
+| `sqldiff-equiv/src/equiv/mod.rs` | check | 3 |
 
 ### authoritative
 
@@ -87,6 +103,8 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 |---|---|---|
 | `sqldiff-core/src/bind/mod.rs` | check | 2 |
 | `sqldiff-core/src/bind/query.rs` | check | 9 |
+| `sqldiff-draft/src/tsql.rs` | pass 1 | 4 |
+| `sqldiff-draft/src/tsql/temporal.rs` | pass 1 | 3 |
 | `sqldiff-equiv/src/equiv/call.rs` | check | 5 |
 | `sqldiff-equiv/src/equiv/canon.rs` | check | 24 |
 | `sqldiff-equiv/src/equiv/edit.rs` | check | 2 |
@@ -103,6 +121,8 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 
 | file | stage | count |
 |---|---|---|
+| `sqldiff-draft/src/tsql/bits.rs` | pass 1 | 1 |
+| `sqldiff-draft/src/tsql/temporal.rs` | pass 1 | 1 |
 | `sqldiff-equiv/src/equiv/canon.rs` | check | 3 |
 | `sqldiff-equiv/src/equiv/edit.rs` | check | 1 |
 | `sqldiff-equiv/src/equiv/mod.rs` | check | 9 |
@@ -148,10 +168,10 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 
 | file | stage | count |
 |---|---|---|
-| `sqldiff-draft/src/tsql.rs` | pass 1 | 15 |
+| `sqldiff-draft/src/tsql.rs` | pass 1 | 9 |
 | `sqldiff-draft/src/tsql/bits.rs` | pass 1 | 2 |
 | `sqldiff-draft/src/tsql/paging.rs` | pass 1 | 1 |
-| `sqldiff-draft/src/tsql/temporal.rs` | pass 1 | 10 |
+| `sqldiff-draft/src/tsql/temporal.rs` | pass 1 | 4 |
 | `sqldiff-draft/src/tsql/trigger.rs` | pass 1 | 1 |
 
 ### view type
@@ -160,17 +180,15 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 
 | file | stage | count |
 |---|---|---|
-| `sqldiff-core/src/bind/mod.rs` | check | 7 |
-| `sqldiff-core/src/engine.rs` | check | 3 |
-| `sqldiff-equiv/src/equiv/call.rs` | check | 2 |
-| `sqldiff-equiv/src/equiv/schema.rs` | check | 12 |
+| `sqldiff-core/src/engine.rs` | check | 4 |
+| `sqldiff-equiv/src/equiv/schema.rs` | check | 11 |
 
 ## `CatalogView` public methods
 
 | method | becomes |
 |---|---|
 | `new` | builder |
-| `catalog` | removed in PR 2a (was the whole-catalog door) |
+| `unrecorded_catalog` | engine only: `Schema::build` until PR 2b, and `RecordingView::whole` |
 | `scratch` | builder (a `LocalView`) |
 | `put_table` | builder |
 | `put_routine` | builder |
@@ -202,3 +220,38 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 | `list_stars_with` | HiddenTables / SchemaTables |
 | `from_view` | builder (Spellings, ViewFamily, StarView) |
 | `from_shared_view` | builder (Spellings, ViewFamily, StarView) |
+
+## `RecordingView` public methods
+
+| method | becomes |
+|---|---|
+| `new` | builder (engine only) |
+| `dialect` | none (a fact of the side, not of the catalog) |
+| `supplied` | Supplied |
+| `origin` | Origin |
+| `tables_authoritative` | TablesAuthoritative |
+| `routines_authoritative` | RoutinesAuthoritative |
+| `table` | Table |
+| `routines` | Routines |
+| `whole` | WholeCatalog |
+
+## `SourceReads` public methods
+
+| method | becomes |
+|---|---|
+| `new` | builder (the driver's one call; `sqldiff-draft/src/lib.rs`) |
+| `table` | pass 1 `Table(parts)` |
+| `triggers_named` | pass 1 `TriggersNamed` |
+| `tables` | pass 1 `WholeCatalog` |
+| `routines` | pass 1 `WholeCatalog` |
+
+## `LocalView` public methods
+
+| method | becomes |
+|---|---|
+| `new` | builder |
+| `put_table` | builder |
+| `put_routine` | builder |
+| `apply_statement` | builder |
+| `table` | none (the file's own DDL) |
+| `routines` | none (the file's own DDL) |

@@ -653,6 +653,40 @@ pub fn table_position(d: Dialect, cat: &Catalog, parts: &[Ident]) -> Option<usiz
         .position(|t| key(d, &t.name) == k && schema_matches(d, t.schema.as_deref(), schema))
 }
 
+/// A file's own objects as a binder builds them (temporary tables, routines
+/// created so far). Not an input: it is built from the file's text, so reading
+/// it is not a catalog read. A distinct type from [`CatalogView`] so that a
+/// scan can keep `CatalogView` out of the check crates, where only a
+/// [`record::RecordingView`] reaches an external catalog.
+#[derive(Debug, Clone)]
+pub struct LocalView(CatalogView);
+
+impl LocalView {
+    pub fn new(dialect: Dialect) -> LocalView {
+        LocalView(CatalogView::scratch(dialect))
+    }
+
+    pub fn put_table(&mut self, t: Table) {
+        self.0.put_table(t);
+    }
+
+    pub fn put_routine(&mut self, r: Routine) {
+        self.0.put_routine(r);
+    }
+
+    pub fn apply_statement(&mut self, t: &[crate::tokens::Tok]) {
+        self.0.apply_statement(t);
+    }
+
+    pub fn table(&self, parts: &[Ident]) -> Lookup<&Table> {
+        self.0.table(parts)
+    }
+
+    pub fn routines(&self, parts: &[Ident]) -> Lookup<Vec<&Routine>> {
+        self.0.routines(parts)
+    }
+}
+
 /// The merged catalog one side binds against.
 #[derive(Debug, Clone)]
 pub struct CatalogView {
@@ -691,10 +725,13 @@ impl CatalogView {
         }
     }
 
-    /// The merged catalog. Read-only on purpose: the name index is built for
-    /// it, so every change goes through `put_table`, `put_routine` or
-    /// `apply_statement`, which keep the index current.
-    pub fn catalog(&self) -> &Catalog {
+    /// The merged catalog, unrecorded. Read-only on purpose: the name index
+    /// is built for it, so every change goes through `put_table`,
+    /// `put_routine` or `apply_statement`, which keep the index current.
+    /// A check reads through a [`record::RecordingView`] instead; this is
+    /// for the engine's own side construction (`Schema::build`, until PR 2b
+    /// makes that lazy) and for [`record::RecordingView::whole`].
+    pub fn unrecorded_catalog(&self) -> &Catalog {
         &self.catalog
     }
 
