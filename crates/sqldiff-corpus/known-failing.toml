@@ -69,6 +69,10 @@ id = "p06-paged-orders:tsql~db2i"
 reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
 
 [[failing]]
+id = "p10-temp-state-rollback:tsql~pg"
+reason = "no transactional finding with verdict different [W6c E3: IF EXISTS on table state is not identified across the sides]"
+
+[[failing]]
 id = "p10-temp-state-rollback:tsql~db2i"
 reason = "verdict unknown != different [WP3 temp-state model + WP9]"
 
