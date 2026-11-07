@@ -976,14 +976,18 @@ fn exists(target: &Target, view: &CatalogView, side: &str) -> R<()> {
     match target {
         Target::Schema(s) => {
             let k = ident(s).key(d);
-            let known = view.catalog.schemas.iter().any(|x| catalog::key(d, x) == k)
+            let known = view
+                .catalog()
+                .schemas
+                .iter()
+                .any(|x| catalog::key(d, x) == k)
                 || view
-                    .catalog
+                    .catalog()
                     .tables
                     .iter()
                     .filter_map(|t| t.schema.as_deref())
                     .chain(
-                        view.catalog
+                        view.catalog()
                             .routines
                             .iter()
                             .filter_map(|r| r.schema.as_deref()),
@@ -1033,7 +1037,7 @@ fn exists(target: &Target, view: &CatalogView, side: &str) -> R<()> {
         Target::Index(s, t, x) => {
             let k = ident(x).key(d);
             let sk = ident(s).key(d);
-            let hit = view.catalog.tables.iter().any(|tb| {
+            let hit = view.catalog().tables.iter().any(|tb| {
                 let in_schema = match &tb.schema {
                     Some(ts) => catalog::key(d, ts) == sk,
                     None => catalog::default_schema(d)

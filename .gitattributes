@@ -11,3 +11,6 @@ tests/fixtures/* text eol=lf
 docs/assumptions.md text eol=lf
 formal/lean/Sqldiff/Syntax.lean text eol=lf
 formal/lean/Sqldiff/Ast.lean text eol=lf
+
+# Vendored real-code gate sources are hashed byte for byte (corpus/real-code/sources.json).
+corpus/real-code/vendor/** -text

@@ -9,6 +9,7 @@ pub mod classify;
 pub mod coverage;
 pub mod equiv;
 pub mod normalize;
+pub mod rules;
 pub mod treediff;
 
 // The moved code names these through `crate::`, as it did inside `sqldiff-core`.

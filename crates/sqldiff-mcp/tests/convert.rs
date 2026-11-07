@@ -556,3 +556,56 @@ fn convert_tree_binds_against_base_catalogs_as_the_cli_does() {
     assert!(!mcp_out.join("orders.sql").exists());
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn convert_tree_keeps_and_reuses_the_result_store() {
+    let d = scratch("store");
+    let src = d.join("src");
+    write(&src.join("a.sql"), "CREATE TABLE t (id int NOT NULL);\n");
+    write(&src.join("b.sql"), "SELECT id FROM t;\n");
+    let out = d.join("out");
+    let r = session(&[
+        call(
+            1,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": out }),
+        ),
+        // The same tree again: reused from the store, then verified in full.
+        call(
+            2,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": out, "overwrite": true, "recheck": "all" }),
+        ),
+        call(
+            3,
+            "conversion_queue",
+            json!({ "src": src, "to": "postgres", "out": out, "recheck": "none" }),
+        ),
+        call(
+            4,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "recheck": "sometimes" }),
+        ),
+        call(
+            5,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "select": { "paths": ["a.sql"] } }),
+        ),
+        call(
+            6,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": d.join("out2"), "select": { "paths": ["a.sql"] } }),
+        ),
+    ]);
+    let first = result(&r[0]);
+    let second = result(&r[1]);
+    assert!(out.join(".sqldiff").exists());
+    assert_eq!(first["files"], second["files"]);
+    result(&r[2]);
+    assert_eq!(r[3]["result"]["isError"], true, "{}", r[3]);
+    assert_eq!(r[4]["result"]["isError"], true, "{}", r[4]);
+    // An increment is planned: the plan is written beside the store.
+    result(&r[5]);
+    assert!(d.join("out2").join(".sqldiff/plan.json").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
