@@ -554,6 +554,7 @@ version = "0.1.0"
 dependencies = [
  "rowan",
  "serde",
+ "sha2",
  "sqldiff-syntax",
  "toml",
 ]

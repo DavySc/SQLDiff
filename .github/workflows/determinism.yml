@@ -1,0 +1,28 @@
+name: determinism
+
+# The same real-code tree converted with different thread counts, fresh and
+# resumed from a store another run made, into different folders must give
+# identical files and reports (scripts/determinism-corpus.py). This is the
+# only test that exercises the explorer's budgets at corpus scale; it runs
+# weekly and when the script or the workflow changes, not on every PR.
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths: ["scripts/determinism-corpus.py", ".github/workflows/determinism.yml"]
+
+jobs:
+  corpus:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: target/determinism/src
+          key: determinism-${{ hashFiles('corpus/real-code/sources.json') }}
+      - run: cargo build --release -p sqldiff-cli
+      - run: python3 scripts/determinism-corpus.py

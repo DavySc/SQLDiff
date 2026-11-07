@@ -25,6 +25,8 @@
 //! - `work.rs` (`sqldiff-model`): the per-file work meter, a thread-local
 //!   counter of deterministic events; `SQLDIFF_WORK` only prints it. It
 //!   counts and never changes a result.
+//! - `record.rs` (`sqldiff-catalog`): the recorder collects the check's own reads
+//!   (a write-only sink; nothing the check computes depends on it).
 //! - `abstract_syntax.rs` (`sqldiff-syntax`) keeps a bounded per-thread cache of the
 //!   tokens of a node (`tokens_shared`), a pure function of the node.
 
@@ -72,6 +74,8 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("sqldiff-syntax/src/abstract_syntax.rs", &["thread_local!"]),
     ("sqldiff-catalog/src/builtins.rs", &["OnceLock"]),
     ("sqldiff-catalog/src/ddl.rs", &["fs::"]),
+    // The read recorder (W4.3): a sink the check writes to, not a source it reads from.
+    ("sqldiff-catalog/src/record.rs", &["Mutex"]),
     ("sqldiff-core/src/engine.rs", &["Mutex", "OnceLock"]),
     (
         "sqldiff-equiv/src/equiv/canon.rs",
