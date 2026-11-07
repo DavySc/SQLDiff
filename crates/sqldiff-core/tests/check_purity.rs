@@ -20,7 +20,8 @@
 //!   the tree run (reading sources, writing the output, timing the report)
 //!   and the build hash of `instances.rs`; `store.rs` reads and writes the
 //!   result store and seeds the sampled re-check, none of which the check sees; timings are kept out of the
-//!   bytes a stored result is compared by.
+//!   bytes a stored result is compared by; `tree.rs` also memoises the tree
+//!   claims (derived from the inputs) in a `OnceLock` for the per-routine rebuild.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -54,7 +55,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("sqldiff-convert/src/store.rs", &["SystemTime", "fs::"]),
     (
         "sqldiff-convert/src/tree.rs",
-        &["Instant::now", "Mutex", "fs::"],
+        &["Instant::now", "Mutex", "OnceLock", "fs::"],
     ),
     (
         "sqldiff-convert/src/tsql.rs",
