@@ -668,6 +668,52 @@ impl CatalogView {
         }
     }
 
+    /// An empty view that objects are added to as they are created (a
+    /// binder's temporary tables and routines): looked up through the same
+    /// index, which each addition keeps current.
+    pub fn scratch(dialect: Dialect) -> CatalogView {
+        CatalogView::new(dialect, &[&Catalog::default()])
+    }
+
+    fn reindexed(&mut self) {
+        self.indexed = (self.catalog.tables.len(), self.catalog.routines.len());
+    }
+
+    /// Adds or replaces a table, as [`Catalog::put_table`].
+    pub fn put_table(&mut self, t: Table) {
+        if self.is_indexed() {
+            self.index.put_table(self.dialect, &mut self.catalog, t);
+        } else {
+            self.catalog.put_table(self.dialect, t);
+            self.index = NameIndex::new(self.dialect, &self.catalog);
+        }
+        self.reindexed();
+    }
+
+    /// Adds or replaces a routine, as [`Catalog::put_routine`].
+    pub fn put_routine(&mut self, r: Routine) {
+        if self.is_indexed() {
+            self.index.put_routine(self.dialect, &mut self.catalog, r);
+        } else {
+            self.catalog.put_routine(self.dialect, r);
+            self.index = NameIndex::new(self.dialect, &self.catalog);
+        }
+        self.reindexed();
+    }
+
+    /// Applies one DDL statement ([`ddl::apply_statement`]) to the view.
+    pub fn apply_statement(&mut self, t: &[crate::tokens::Tok]) {
+        if !self.is_indexed() {
+            self.index = NameIndex::new(self.dialect, &self.catalog);
+        }
+        ddl::apply_indexed(&mut self.catalog, &mut self.index, t, self.dialect);
+        self.reindexed();
+    }
+
+    fn is_indexed(&self) -> bool {
+        self.indexed == (self.catalog.tables.len(), self.catalog.routines.len())
+    }
+
     /// Supplied tables are authoritative: a table that is not there does not exist.
     pub fn tables_authoritative(&self) -> bool {
         self.supplied && !self.catalog.tables.is_empty()
