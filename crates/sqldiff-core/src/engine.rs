@@ -405,8 +405,8 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         },
     );
     let (bindf, binda) = bind::binding_findings(&Bindings {
-        a: (&aa, &bound_a, view_a.supplied),
-        b: Some((&ab, &bound_b, view_b.supplied)),
+        a: (&aa, &bound_a, view_a.supplied()),
+        b: Some((&ab, &bound_b, view_b.supplied())),
     });
     absorb_residue(&mut findings, &bindf);
     findings.extend(bindf);
@@ -415,7 +415,7 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
             assumptions.push(x);
         }
     }
-    if view_a.supplied || view_b.supplied {
+    if view_a.supplied() || view_b.supplied() {
         normalizations.push("names bound against the catalog".to_string());
     }
 
@@ -603,7 +603,7 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
         },
     );
     let (bindf, assumptions) = bind::binding_findings(&Bindings {
-        a: (&aa, &bound, view.supplied),
+        a: (&aa, &bound, view.supplied()),
         b: None,
     });
     absorb_residue(&mut findings, &bindf);

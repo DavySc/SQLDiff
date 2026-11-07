@@ -660,9 +660,9 @@ pub struct CatalogView {
     catalog: Catalog,
     /// Whether any catalog was supplied for this side. Without one, persistent
     /// objects stay unresolved and become assumptions.
-    pub supplied: bool,
+    supplied: bool,
     /// Origins of the supplied catalogs, for witnesses.
-    pub origins: Vec<String>,
+    origins: Vec<String>,
     /// Name positions in `catalog` as built, and the sizes they were built
     /// for: a catalog edited afterwards is searched by scanning instead.
     index: NameIndex,
@@ -753,6 +753,16 @@ impl CatalogView {
     /// some of that kind (DDL catalogs often list procedures but not functions).
     pub fn routines_authoritative(&self, kind: RoutineKind) -> bool {
         self.supplied && self.catalog.routines.iter().any(|r| r.kind == kind)
+    }
+
+    /// Whether any catalog was supplied for this side.
+    pub fn supplied(&self) -> bool {
+        self.supplied
+    }
+
+    /// The origins of the supplied catalogs, in the order they were merged.
+    pub fn origins(&self) -> &[String] {
+        &self.origins
     }
 
     pub fn origin(&self) -> String {

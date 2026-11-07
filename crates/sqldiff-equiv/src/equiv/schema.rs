@@ -639,19 +639,19 @@ impl Schema {
     pub fn from_view(view: &CatalogView) -> Schema {
         Self::build(
             view,
-            view.supplied.then(|| std::sync::Arc::new(view.clone())),
+            view.supplied().then(|| std::sync::Arc::new(view.clone())),
         )
     }
 
     /// As `from_view`, keeping the shared view instead of copying it.
     pub fn from_shared_view(view: &std::sync::Arc<CatalogView>) -> Schema {
-        Self::build(view, view.supplied.then(|| std::sync::Arc::clone(view)))
+        Self::build(view, view.supplied().then(|| std::sync::Arc::clone(view)))
     }
 
     fn build(view: &CatalogView, shared: Option<std::sync::Arc<CatalogView>>) -> Schema {
         let d = view.dialect;
         let mut s = Schema {
-            sources: view.origins.clone(),
+            sources: view.origins().to_vec(),
             pg_system: d == Dialect::Postgres,
             tsql_system: d == Dialect::Tsql,
             view: shared,

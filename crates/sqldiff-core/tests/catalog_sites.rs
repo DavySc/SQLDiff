@@ -158,8 +158,8 @@ const DOORS: &[(&str, &str, &str)] = &[
     ),
     (
         "supplied / origins",
-        r"\.supplied\b|\.origins\b|\.origin\(\)",
-        "`Supplied`, `Origin`. The fields become private in PR 2a.",
+        r"\.supplied\(\)|\.origins\(\)|\.origin\(\)",
+        "`Supplied`, `Origin`. The fields are private since PR 2a; these are the accessors.",
     ),
     (
         "view lookups",
@@ -273,7 +273,7 @@ const SITES: &[Site] = &[
     Site {
         id: "E1",
         file: "sqldiff-core/src/engine.rs",
-        anchor: "view_a.supplied",
+        anchor: "view_a.supplied()",
         query: "`Supplied` per side",
         note: "A8: field reads. Today the key tells `none` from a catalog; once digests leave the key, `supplied` stays in it.",
     },
@@ -364,7 +364,7 @@ const SITES: &[Site] = &[
     Site {
         id: "A8",
         file: "sqldiff-equiv/src/equiv/schema.rs",
-        anchor: "sources: view.origins.clone()",
+        anchor: "sources: view.origins().to_vec()",
         query: "`Origin`, `Supplied`",
         note: "`Schema::catalog()` is `None` when nothing was supplied; origins reach witnesses.",
     },
@@ -478,6 +478,8 @@ const VIEW_METHODS: &[(&str, &str)] = &[
     ("apply_statement", "builder"),
     ("tables_authoritative", "TablesAuthoritative"),
     ("routines_authoritative", "RoutinesAuthoritative"),
+    ("supplied", "Supplied"),
+    ("origins", "Origin"),
     ("origin", "Origin"),
     ("table", "Table"),
     ("routines", "Routines"),

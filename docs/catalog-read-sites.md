@@ -17,7 +17,7 @@ Inventory for the recorded-catalog-reads series (performance plan W4.3). It list
 | B6 | `sqldiff-core/src/bind/query.rs` | `fn lookup_table_silent(` | `Table(parts)` | `self.input.view.table`: the same lookup as `table_ref`, without the reason text. |
 | B7 | `sqldiff-core/src/bind/mod.rs` | `fn lookup_table_quiet(` | `Table(parts)` | `view.table(parts)` for a caller outside the query binder. |
 | S1 | `sqldiff-equiv/src/equiv/canon.rs` | `fn visible_star(` | `StarView(lower name)`, `HiddenTables` (the `list_stars` flag) | Reads the public fields `Schema::star_views` and `Schema::list_stars`. |
-| E1 | `sqldiff-core/src/engine.rs` | `view_a.supplied` | `Supplied` per side | A8: field reads. Today the key tells `none` from a catalog; once digests leave the key, `supplied` stays in it. |
+| E1 | `sqldiff-core/src/engine.rs` | `view_a.supplied()` | `Supplied` per side | A8: field reads. Today the key tells `none` from a catalog; once digests leave the key, `supplied` stays in it. |
 | A1 | `sqldiff-equiv/src/equiv/schema.rs` | `pub fn hides_columns(` | `HiddenTables` per side, plus `SchemaTables` for each counterpart | Runs for every file (`list_stars_with`, `mirrored`). If this falls back to `WholeCatalog`, the series buys nothing. |
 | A2 | `sqldiff-equiv/src/equiv/edit.rs` | `fn typed_class(` | `ColumnNamed(name)` | Scans `schema.tables()` (deduplicated set) for a column of that name. |
 | A3 | `sqldiff-equiv/src/equiv/schema.rs` | `pub fn table_exact(` | `SchemaTables(lower name)` | `Schema::table`, `table_exact`, `with_ddl`, `with_images`: base and temporary tables by `to_lowercase` unqualified name, last one wins, `ambiguous` across schemas. Not `Ident::key`. |
@@ -30,7 +30,7 @@ Inventory for the recorded-catalog-reads series (performance plan W4.3). It list
 | K1 | `sqldiff-equiv/src/equiv/canon.rs` | `fn user_fn(` | `Routines(parts)` | A user function in an expression. |
 | K2 | `sqldiff-equiv/src/equiv/canon.rs` | `fn schema_unindexed(` | `Table(parts)` | Whether a column set is covered by an index. |
 | A7 | `sqldiff-equiv/src/equiv/mod.rs` | `fn trigger_drop(` | `TriggersNamed`, `TriggersOn`, `TriggersRunning` | Triggers by name; PostgreSQL triggers with a name on a table; any other trigger that runs the function. |
-| A8 | `sqldiff-equiv/src/equiv/schema.rs` | `sources: view.origins.clone()` | `Origin`, `Supplied` | `Schema::catalog()` is `None` when nothing was supplied; origins reach witnesses. |
+| A8 | `sqldiff-equiv/src/equiv/schema.rs` | `sources: view.origins().to_vec()` | `Origin`, `Supplied` | `Schema::catalog()` is `None` when nothing was supplied; origins reach witnesses. |
 | A9 | `sqldiff-convert/src/check.rs` | `fn check_with_mix(` | the union of the reads of every `check_one` inside, the losing variants included | The result is the best of two or three checks. A catalog edit that flips which variant wins must not replay clean. The pass-1 reads inside `rebuild` are covered by rebuilding the mix against the current catalog on reuse. |
 | P1 | `sqldiff-draft/src/tsql.rs` | `catalog: Option<&'a sqldiff_equiv::catalog::Catalog>` | pass 1 `SourceReads` (sandbox only until Phase B) | `Cx` holds the whole-tree source catalog directly. |
 | P3 | `sqldiff-draft/src/tsql.rs` | `fn catalog_table(` | pass 1 `SourceReads` (sandbox only until Phase B) | a table of the source catalog by name (dynamic SQL, column owners). |
@@ -71,7 +71,7 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 
 ### supplied / origins
 
-`\.supplied\b|\.origins\b|\.origin\(\)`: `Supplied`, `Origin`. The fields become private in PR 2a.
+`\.supplied\(\)|\.origins\(\)|\.origin\(\)`: `Supplied`, `Origin`. The fields are private since PR 2a; these are the accessors.
 
 | file | stage | count |
 |---|---|---|
@@ -177,6 +177,8 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 | `apply_statement` | builder |
 | `tables_authoritative` | TablesAuthoritative |
 | `routines_authoritative` | RoutinesAuthoritative |
+| `supplied` | Supplied |
+| `origins` | Origin |
 | `origin` | Origin |
 | `table` | Table |
 | `routines` | Routines |
