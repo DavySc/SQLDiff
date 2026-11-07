@@ -1526,6 +1526,18 @@ fn convert_files(
                     let flags = stand_ins.flags_of(idx, &input.text, &c, a.from, a.to);
                     crate::refused::apply_flags(&mut c, &flags);
                     if let Some((cc, k, fk)) = &stored_flags {
+                        // A file checked again (the sample) must give the
+                        // flags the store holds for the same result.
+                        if let Some(old) = cc.store.get_flags(k, fk) {
+                            if old != flags {
+                                *mismatch.lock().unwrap() = Some(format!(
+                                    "{}: the stored stand-in flags {} differ from flags computed \
+                                     again for the same result. The store is emptied: run again.",
+                                    input.rel,
+                                    fk.as_str(),
+                                ));
+                            }
+                        }
                         cc.store.put_flags(k, fk, &flags);
                     }
                 }
