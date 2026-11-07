@@ -199,7 +199,20 @@ impl Ctx<'_, '_> {
                 && !gb.is_empty()
                 && (!exact || ga.len().saturating_mul(gb.len()) > GAP_BOUND)
             {
-                let loc = |x: &Analyzed, us: &[Unit]| us.first().map(|u| x.node_location(&u.node));
+                // The whole stretch, from its first statement's start to its
+                // last statement's end: a finding that marked only the first
+                // statement would let the edit checker treat the others as
+                // unchanged.
+                let loc = |x: &Analyzed, us: &[Unit]| {
+                    let first = x.node_location(&us.first()?.node);
+                    let last = x.node_location(&us.last()?.node);
+                    Some(crate::model::Location {
+                        end_line: last.end_line,
+                        end_col: last.end_col,
+                        byte_end: last.byte_end,
+                        ..first
+                    })
+                };
                 let f = alignment_bound_finding(
                     self.object(),
                     "statements",
