@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 197 | 35 (18%) | 6 (3%) | 156 (79%) |
+| `converter` | 198 | 35 (18%) | 6 (3%) | 157 (79%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 226 | 38 (17%) | 8 (4%) | 180 (80%) |
+| **All** | 227 | 38 (17%) | 8 (4%) | 181 (80%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -125,7 +125,8 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.expr.undeclared-variable` | `converter` | engine |  | `sqldiff-draft/src/tsql.rs` |
 | `tsql.expr.unicode-literal` | `converter` | lemma: `Sqldiff.Mirror/C2b strings/Literals` | `N'...'` of printable ASCII without a backslash reads as the same literal as `'...'` | `sqldiff-draft/src/tsql.rs` |
 | `tsql.expr.variable` | `converter` | lemma: `Sqldiff.Mirror/Expressions` | a variable read; the rename (`p_`/`v_` prefix) is the certificate's renaming, checked injective | `sqldiff-draft/src/tsql.rs` |
-| `tsql.from.apply` | `converter` | engine | CROSS APPLY (q) to CROSS JOIN LATERAL (q); OUTER APPLY (q) to LEFT JOIN LATERAL (q) ON TRUE (PostgreSQL). The engine does not model LATERAL yet, so the unit stays not proven (equiv.unsupported) | `sqldiff-draft/src/tsql.rs` |
+| `tsql.from.apply` | `converter` | engine | CROSS APPLY (q or f(x)) to CROSS JOIN LATERAL; OUTER APPLY to LEFT JOIN LATERAL … ON TRUE (PostgreSQL). The engine does not model LATERAL yet, so the unit stays not proven (equiv.unsupported) | `sqldiff-draft/src/tsql.rs` |
+| `tsql.from.apply-refused` | `converter` | engine | an APPLY with no LATERAL rewrite (any on Db2 for i, which has no APPLY; a shape other than a subquery or function call on PostgreSQL) is refused, the original kept as a comment | `sqldiff-draft/src/tsql.rs` |
 | `tsql.from.openjson` | `converter` | engine | OPENJSON ... WITH in FROM → a jsonb_array_elements derived table; the engine compares the column list (key, strict or lax, type) under ASM-OPENJSON-VALUES | `sqldiff-draft/src/tsql.rs` |
 | `tsql.from.table-function` | `converter` | engine |  | `sqldiff-draft/src/tsql.rs` |
 | `tsql.from.table-hint` | `converter` | engine |  | `sqldiff-draft/src/tsql.rs` |
