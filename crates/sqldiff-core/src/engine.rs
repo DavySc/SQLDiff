@@ -509,6 +509,32 @@ pub fn pair_states(
     crate::ir::behaviour::pair_states(&aa, &ab, &env, max_states)
 }
 
+/// Report only (perf plan W6c, aligned merging step 1): which conditions of
+/// the routines of `a` and `b` are the same fact about the input
+/// (`equiv::identity`). Nothing calls this on the diff path.
+pub fn identity(a: &Artifact, b: &Artifact, opts: &Options) -> Vec<equiv::identity::UnitReport> {
+    let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
+    let ab = Analyzed::new(b, Side::B, opts.excerpt_lines);
+    let side_a = side(a.dialect, &opts.catalog_a, &opts.facts_a);
+    let side_b = side(b.dialect, &opts.catalog_b, &opts.facts_b);
+    let mut schema_a = side_a.schema.clone();
+    let mut schema_b = side_b.schema.clone();
+    schema_a.list_stars_with(&mut schema_b);
+    equiv::compare(&aa, &ab, &schema_a, &schema_b, &[]).identity
+}
+
+/// Report only (E2): the conditions the explorer treats as one decision
+/// because their folded text is equal (`ir::behaviour::SharedText`).
+pub fn shared_conditions(
+    a: &Artifact,
+    b: &Artifact,
+    opts: &Options,
+) -> Vec<crate::ir::behaviour::SharedText> {
+    let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
+    let ab = Analyzed::new(b, Side::B, opts.excerpt_lines);
+    crate::ir::behaviour::shared_conditions(&aa, &ab)
+}
+
 /// Transaction overlay brackets of both sides (design §6.2).
 pub fn overlay(a: &Artifact, b: &Artifact) -> crate::ir::overlay::Overlay {
     let aa = Analyzed::new(a, Side::A, 1);

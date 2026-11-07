@@ -242,3 +242,32 @@ expectations met: mutations m06, m07, m08, m09 and m12 (T-SQL → Db2), and
 p01, p02, p07, p09 (both pairs), p04, p05, p11 (pg~db2i) and p12 (tsql~db2i).
 The rest are listed in `crates/sqldiff-corpus/known-failing.toml` (cardinality
 and binding work, WP1/WP10).
+
+## Identified conditions (report only)
+
+Aligned merging would treat an `IF` of one routine and an `IF` of the other
+as one decision. Today `pairs()` (exact matching of path signatures) and
+`feasible()` (pruning of a pair by a condition decided both ways) already do
+that when the folded text of two conditions is equal (`norm_cond`). Equal
+text is not the same fact: `@x` and `p_x` hold equal values only if every
+assignment that reaches them agrees.
+
+`equiv/identity.rs` decides it and **only reports**; nothing on the diff
+path reads the result (`sqldiff_core::identity`, the `identity` example).
+A pair of conditions is identified when the `ctl-if` / `ctl-while` items are
+paired and proven equal, the term is a function of the inputs (no clock,
+random value, sequence or row count), and every parameter and local it reads
+has exactly one reaching definition on each side, the two being paired
+parameters with types that store values alike and equal defaults, both
+"declared without a value", or plain assignments (`SET @v = e`, `v := e`)
+whose items are paired and equal, whose own inputs are equal in turn. A
+condition that reads the database is at best state-identified and must not be
+used. Loops, handlers, `SELECT ... INTO`, `EXEC ... OUTPUT`, `FETCH INTO`,
+variables a call or dynamic SQL names, and anything not read by the parser
+end the fact. The scope is fault-free runs only.
+
+`identity SRC OUT FROM TO` prints one line per routine pair, one per paired
+condition (class `value`, `state`, `rows` or `no` with the reason and the
+assumptions) and one per folded text the explorer treats as one decision
+(`e2`, identified or not). The next step makes the explorer use it: a text
+match that is not identified falls back to all combinations.

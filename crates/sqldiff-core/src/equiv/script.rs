@@ -250,7 +250,7 @@ pub(super) fn locals(
 
 /// The variables the statement terms identify with each other: by
 /// declaration order, or by name (`name_locals`).
-fn local_pairs<'u>(ua: &'u Unit, ub: &'u Unit) -> Vec<(&'u Local, &'u Local)> {
+pub(super) fn local_pairs<'u>(ua: &'u Unit, ub: &'u Unit) -> Vec<(&'u Local, &'u Local)> {
     match (&ua.local_ids, &ub.local_ids) {
         (Some(ia), Some(ib)) => ua
             .locals
@@ -348,7 +348,7 @@ fn tsql_type(t: &Type) -> Result<table::Ty, String> {
     table::tsql_type(t)
 }
 
-fn local_pair(ua: &Unit, ub: &Unit, x: &Local, y: &Local) -> Result<Asms, String> {
+pub(super) fn local_pair(ua: &Unit, ub: &Unit, x: &Local, y: &Local) -> Result<Asms, String> {
     let (Some(tx), Some(ty)) = (&x.decl, &y.decl) else {
         return Err("its declared type was not read".into());
     };

@@ -18,6 +18,7 @@ pub mod edit;
 pub mod eval;
 pub mod geography;
 mod geography_area;
+pub mod identity;
 mod known_bytes;
 pub mod like;
 pub mod literal;
@@ -64,6 +65,9 @@ pub struct Outcome {
     /// the unknown reason). The engine keeps the reason unless the
     /// behaviour model compared the routine that holds the statement.
     pub txn_unknown: Vec<(bool, usize, String)>,
+    /// Which conditions of the routine pairs are the same fact about the
+    /// input (`identity.rs`). A report: nothing reads it on the diff path.
+    pub identity: Vec<identity::UnitReport>,
 }
 
 impl Outcome {
@@ -619,6 +623,8 @@ fn compare_units(
     });
     let gaps = [gaps(a, ua, &ia), gaps(b, ub, &ib)];
     let pairs = pair_items(a, b, &ia, &ib, &gaps, anchors, wit.as_ref(), out);
+    out.identity
+        .push(identity::analyze(a, b, ua, ub, &ia, &ib, &pairs));
     calls(a, b, ua, ub, sa, sb, anchors, ((&ia, &ib), &pairs), out);
     for p in places {
         if !same_place_paired((&ia, &ib), &pairs, &p.x, &p.y, anchors) {
