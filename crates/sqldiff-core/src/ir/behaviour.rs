@@ -1586,6 +1586,10 @@ impl<'x, 'a> Collector<'x, 'a> {
     /// muted or recomputing a flipped scenario: that work was counted when it
     /// was first done, and a cut there would depend on a cache.
     fn work_cap_used(&self) -> bool {
+        // Defensive: no current replay path reaches this (a replay returns
+        // from `spend` first, and a cut run does not replay), so the guard
+        // is pinned by `cap_tests` and keeps a future path from letting a
+        // cache decide a cut.
         if self.replay.get().is_some() || sqldiff_model::work::is_muted() {
             return false;
         }
@@ -2702,6 +2706,48 @@ pub fn what_if(
         findings: std::mem::take(&mut c.out.findings),
         witnesses: std::mem::take(&mut c.out.witnesses),
         notes,
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+    use crate::model::Side;
+
+    const SRC: &str =
+        "CREATE PROCEDURE dbo.p @p int AS\nBEGIN\nSET @p = @p + 1;\nSELECT @p;\nEND;\n";
+
+    /// The cap guard of `work_cap_used`: a collector whose unit cap is used
+    /// up reports it, except while recomputing a flipped scenario or muted.
+    #[test]
+    fn the_cap_guard_holds_off_in_a_replay_and_when_muted() {
+        let art = crate::Artifact::new("a.sql", Dialect::Tsql, SRC);
+        let (a, b) = (
+            Analyzed::new(&art, Side::A, 3),
+            Analyzed::new(&art, Side::B, 3),
+        );
+        let env = Env {
+            work_caps: Some((0, 0)),
+            ..Env::from_flips(&BTreeMap::new())
+        };
+        let file_work = FileWork {
+            start: sqldiff_model::work::now().total(),
+            cap: 0,
+        };
+        let (ra, rb) = (
+            routines_of(&a).first().cloned(),
+            routines_of(&b).first().cloned(),
+        );
+        let c = Collector::new(&a, &b, env, ra, rb, Rc::new(Cell::new(0)), file_work);
+        assert!(c.work_cap_used(), "a zero cap is used up");
+        c.replay.set(Some(5));
+        assert!(!c.work_cap_used(), "not while recomputing a scenario");
+        c.replay.set(None);
+        assert!(c.work_cap_used());
+        sqldiff_model::work::muted(|| {
+            assert!(!c.work_cap_used(), "not while muted");
+        });
+        assert!(c.work_cap_used());
     }
 }
 

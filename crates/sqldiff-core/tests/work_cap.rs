@@ -260,23 +260,3 @@ fn a_comparison_inside_a_busy_scope_gives_the_report_of_a_direct_one() {
         }
     }
 }
-
-/// A flipped-scenario recompute that starts with the cap already used up
-/// (cap 0, so every replay begins over it) is muted: it neither tests the
-/// cap nor changes the report, whether the scenario came from the cache or
-/// was recomputed.
-#[test]
-fn a_replay_that_starts_over_the_cap_gives_the_same_report_cached_or_not() {
-    for f in fixtures() {
-        let (on, _) = run(&f, Some((0, 0)));
-        set_caches_off_for_tests(true);
-        let (off, _) = run(&f, Some((0, 0)));
-        set_caches_off_for_tests(false);
-        assert_eq!(json(&on), json(&off), "{}", f.name);
-        assert!(
-            on.findings.iter().any(is_cut) || on.verdict() != Verdict::Equal,
-            "{}: a zero cap moved nothing toward equal",
-            f.name
-        );
-    }
-}
