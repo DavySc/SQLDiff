@@ -28,7 +28,7 @@ use crate::{Conversion, FragmentKind, StandIns, Status, ValueKind};
 use serde::{Deserialize, Serialize};
 use sqldiff_core::catalog::builtins::Helper;
 use sqldiff_core::catalog::{ddl, Catalog};
-use sqldiff_core::{Dialect, Options};
+use sqldiff_core::{Dialect, Facts, Options};
 use sqldiff_source::compose;
 use sqldiff_syntax::template::Template;
 
@@ -1420,21 +1420,21 @@ fn convert_files(
         helpers: a.helpers.clone(),
         ..Options::default()
     };
-    if let (Some(source), Some(target)) = (source, target) {
-        opts.facts_a = vec![Arc::new(source)];
-        opts.facts_b = vec![Arc::new(target)];
+    // The tree state's own catalogs: pass 1 and the keys read these, never
+    // the opaque handles in `opts`.
+    let source = source.map(Arc::new);
+    let target = target.map(Arc::new);
+    if let (Some(source), Some(target)) = (&source, &target) {
+        opts.facts_a = vec![Facts::new(Arc::clone(source))];
+        opts.facts_b = vec![Facts::new(Arc::clone(target))];
     }
     // Pass 2: check every draft, or take its stored result when the key of
     // everything the check reads matches.
     hooks.stop_if_cancelled()?;
     let digests = cache.map(|_| {
         (
-            opts.facts_a
-                .first()
-                .map(|c| crate::store::catalog_digest(c)),
-            opts.facts_b
-                .first()
-                .map(|c| crate::store::catalog_digest(c)),
+            source.as_deref().map(crate::store::catalog_digest),
+            target.as_deref().map(crate::store::catalog_digest),
         )
     });
     let keys: Vec<Option<crate::store::Key>> = match (cache, &digests) {
@@ -1545,7 +1545,7 @@ fn convert_files(
                 &input.text,
                 a.from,
                 a.to,
-                opts.facts_a.first().map(|c| c.as_ref()),
+                source.as_deref(),
                 Some(claims),
                 a.rules,
                 plain_at,
@@ -2063,9 +2063,9 @@ fn convert_templates(
         ..Options::default()
     };
     if let Some(source) = source {
-        opts.facts_a = vec![source];
+        opts.facts_a = vec![Facts::new(source)];
         let texts = drafts.iter().map(|d| d.output());
-        opts.facts_b = vec![Arc::new(match base {
+        opts.facts_b = vec![Facts::from(match base {
             Some(b) => crate::base::over(
                 &b.target,
                 texts,

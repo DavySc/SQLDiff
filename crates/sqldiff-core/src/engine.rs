@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::artifact::{exact_hash, Analyzed, Artifact};
 use crate::bind::{self, BindInput, Bindings};
 use crate::catalog::builtins::Helper;
+use crate::catalog::record::{RecordingView, Side as ReadSide};
 use crate::catalog::{ddl, Catalog, CatalogView};
 use crate::classify::pairing_key;
 use crate::equiv;
@@ -17,6 +18,42 @@ use crate::model::{
 };
 use crate::rules;
 use crate::treediff;
+
+/// Structured catalog facts handed to the engine. Opaque on purpose: only the
+/// engine opens it (to build a side's view), so a read of the catalog in the
+/// check cannot go around the recorded queries (performance plan W4.3, R2.2).
+/// A caller that needs the catalog itself keeps its own `Arc<Catalog>`.
+#[derive(Debug, Clone)]
+pub struct Facts(Arc<Catalog>);
+
+impl Facts {
+    pub fn new(catalog: Arc<Catalog>) -> Facts {
+        Facts(catalog)
+    }
+
+    /// The facts as JSON, for the key of a cache outside the check (the review
+    /// cache). Not a read the check can record: nothing in a check calls it.
+    pub fn serialized(&self) -> Vec<u8> {
+        serde_json::to_vec(self.0.as_ref()).unwrap_or_default()
+    }
+
+    /// The catalog, for the engine's own side construction.
+    fn open(&self) -> &Arc<Catalog> {
+        &self.0
+    }
+}
+
+impl From<Arc<Catalog>> for Facts {
+    fn from(c: Arc<Catalog>) -> Facts {
+        Facts(c)
+    }
+}
+
+impl From<Catalog> for Facts {
+    fn from(c: Catalog) -> Facts {
+        Facts(Arc::new(c))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -30,9 +67,9 @@ pub struct Options {
     /// Catalog DDL for side B.
     pub catalog_b: Vec<Artifact>,
     /// Structured catalog facts for side A (adapter `get_catalog`, snapshot bundles).
-    pub facts_a: Vec<Arc<Catalog>>,
+    pub facts_a: Vec<Facts>,
     /// Structured catalog facts for side B.
-    pub facts_b: Vec<Arc<Catalog>>,
+    pub facts_b: Vec<Facts>,
     /// Pack-supplied helper functions, added to the built-in catalog.
     pub helpers: Vec<Helper>,
     /// Session assumption flips (id → holds). Flips of scenario assumptions
@@ -145,6 +182,13 @@ fn ddl_catalog(dialect: sqldiff_syntax::Dialect, ddl: &[Artifact]) -> Arc<Catalo
 /// The catalog one side binds against, and the equivalence schema read from
 /// it, built once and shared by every file compared against the same
 /// catalogs (a tree run compares hundreds of files against two).
+/// A side's view as a check reads it. Nothing is recorded until the series'
+/// PR 3 passes each check's sink here; this is where a side's `CatalogView`
+/// is turned into the only thing the check crates can hold.
+fn reading(view: &CatalogView, side: ReadSide) -> RecordingView<'_> {
+    RecordingView::new(view, side, &sqldiff_catalog::record::NO_SINK)
+}
+
 struct BoundSide {
     view: Arc<CatalogView>,
     schema: equiv::schema::Schema,
@@ -156,23 +200,23 @@ struct BoundSide {
 struct SideKey {
     dialect: sqldiff_syntax::Dialect,
     ddl: String,
-    held: Vec<Arc<Catalog>>,
+    held: Vec<Facts>,
 }
 
 impl SideKey {
-    fn is(&self, dialect: sqldiff_syntax::Dialect, ddl: &str, facts: &[Arc<Catalog>]) -> bool {
+    fn is(&self, dialect: sqldiff_syntax::Dialect, ddl: &str, facts: &[Facts]) -> bool {
         self.dialect == dialect
             && self.ddl == ddl
             && self.held.len() == facts.len()
-            && self.held.iter().zip(facts).all(|(a, b)| Arc::ptr_eq(a, b))
+            && self
+                .held
+                .iter()
+                .zip(facts)
+                .all(|(a, b)| Arc::ptr_eq(a.open(), b.open()))
     }
 }
 
-fn side(
-    dialect: sqldiff_syntax::Dialect,
-    ddl: &[Artifact],
-    facts: &[Arc<Catalog>],
-) -> Arc<BoundSide> {
+fn side(dialect: sqldiff_syntax::Dialect, ddl: &[Artifact], facts: &[Facts]) -> Arc<BoundSide> {
     type Cache = Mutex<Vec<(SideKey, Arc<BoundSide>)>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
     const MAX_ENTRIES: usize = 4;
@@ -194,7 +238,11 @@ fn side(
         return s;
     }
     let loaded = (!ddl.is_empty()).then(|| ddl_catalog(dialect, ddl));
-    let sources: Vec<&Catalog> = loaded.iter().chain(facts).map(|c| c.as_ref()).collect();
+    let sources: Vec<&Catalog> = loaded
+        .iter()
+        .chain(facts.iter().map(Facts::open))
+        .map(|c| c.as_ref())
+        .collect();
     let view = Arc::new(CatalogView::new(dialect, &sources));
     let schema = equiv::schema::Schema::from_shared_view(&view);
     let built = Arc::new(BoundSide { view, schema });
@@ -393,20 +441,20 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     let bound_a = bind::bind(
         &aa,
         &BindInput {
-            view: view_a,
+            view: reading(view_a, ReadSide::Source),
             helpers: &opts.helpers,
         },
     );
     let bound_b = bind::bind(
         &ab,
         &BindInput {
-            view: view_b,
+            view: reading(view_b, ReadSide::Target),
             helpers: &opts.helpers,
         },
     );
     let (bindf, binda) = bind::binding_findings(&Bindings {
-        a: (&aa, &bound_a, view_a.supplied),
-        b: Some((&ab, &bound_b, view_b.supplied)),
+        a: (&aa, &bound_a, view_a.supplied()),
+        b: Some((&ab, &bound_b, view_b.supplied())),
     });
     absorb_residue(&mut findings, &bindf);
     findings.extend(bindf);
@@ -415,7 +463,7 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
             assumptions.push(x);
         }
     }
-    if view_a.supplied || view_b.supplied {
+    if view_a.supplied() || view_b.supplied() {
         normalizations.push("names bound against the catalog".to_string());
     }
 
@@ -598,12 +646,12 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
     let bound = bind::bind(
         &aa,
         &BindInput {
-            view,
+            view: reading(view, ReadSide::Source),
             helpers: &opts.helpers,
         },
     );
     let (bindf, assumptions) = bind::binding_findings(&Bindings {
-        a: (&aa, &bound, view.supplied),
+        a: (&aa, &bound, view.supplied()),
         b: None,
     });
     absorb_residue(&mut findings, &bindf);

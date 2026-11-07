@@ -149,7 +149,17 @@ const DOORS: &[(&str, &str, &str)] = &[
     (
         "catalog accessor",
         r"\.catalog\(\)",
-        "`CatalogView::catalog` / `Schema::catalog`: the whole-catalog door. Gone after PR 2a (a `RecordingView` has no accessor).",
+        "`Schema::catalog`: the side's `RecordingView`. `CatalogView::catalog` is gone (PR 2a): a `RecordingView` has no accessor for the catalog behind it.",
+    ),
+    (
+        "unrecorded catalog",
+        r"\.unrecorded_catalog\(\)",
+        "`CatalogView::unrecorded_catalog`: engine-side only. `Schema::build` reads whole tables through it until PR 2b makes the overlay lazy; the scan below fails on any other file.",
+    ),
+    (
+        "whole catalog",
+        r"\.whole\(\)",
+        "`RecordingView::whole`: records `WholeCatalog`. Sound (any edit of the side re-checks the file) and the price of a read with no narrow query yet: call.rs comments (A6), the trigger scans (A7).",
     ),
     (
         "authoritative",
@@ -158,8 +168,8 @@ const DOORS: &[(&str, &str, &str)] = &[
     ),
     (
         "supplied / origins",
-        r"\.supplied\b|\.origins\b|\.origin\(\)",
-        "`Supplied`, `Origin`. The fields become private in PR 2a.",
+        r"\.supplied\(\)|\.origins\(\)|\.origin\(\)",
+        "`Supplied`, `Origin`. The fields are private since PR 2a; these are the accessors.",
     ),
     (
         "view lookups",
@@ -273,7 +283,7 @@ const SITES: &[Site] = &[
     Site {
         id: "E1",
         file: "sqldiff-core/src/engine.rs",
-        anchor: "view_a.supplied",
+        anchor: "view_a.supplied()",
         query: "`Supplied` per side",
         note: "A8: field reads. Today the key tells `none` from a catalog; once digests leave the key, `supplied` stays in it.",
     },
@@ -315,9 +325,9 @@ const SITES: &[Site] = &[
     Site {
         id: "A6",
         file: "sqldiff-equiv/src/equiv/call.rs",
-        anchor: "fn exists(target: &Target, view: &CatalogView",
+        anchor: "fn exists(target: &Target, view: RecordingView",
         query: "`SchemaKnown(part)`, `Table(parts)`, `Routines(parts)`, and the scan at the end",
-        note: "Comment targets. The `tables.iter().any(..)` scan is a named `Scan` or `WholeCatalog`.",
+        note: "Comment targets. The `tables.iter().any(..)` scan is `RecordingView::whole` (`WholeCatalog`) in PR 2a.",
     },
     Site {
         id: "C1",
@@ -364,7 +374,7 @@ const SITES: &[Site] = &[
     Site {
         id: "A8",
         file: "sqldiff-equiv/src/equiv/schema.rs",
-        anchor: "sources: view.origins.clone()",
+        anchor: "sources: view.origins().to_vec()",
         query: "`Origin`, `Supplied`",
         note: "`Schema::catalog()` is `None` when nothing was supplied; origins reach witnesses.",
     },
@@ -378,9 +388,9 @@ const SITES: &[Site] = &[
     Site {
         id: "P1",
         file: "sqldiff-draft/src/tsql.rs",
-        anchor: "catalog: Option<&'a sqldiff_equiv::catalog::Catalog>",
+        anchor: "catalog: Option<SourceReads<'a>>,",
         query: "pass 1 `SourceReads` (sandbox only until Phase B)",
-        note: "`Cx` holds the whole-tree source catalog directly.",
+        note: "`Cx` holds the whole-tree source catalog as `SourceReads`, the only way in (PR 2a, compiler-enforced).",
     },
     Site {
         id: "P3",
@@ -462,22 +472,27 @@ const SITES: &[Site] = &[
     Site {
         id: "T1",
         file: "sqldiff-convert/src/tree.rs",
-        anchor: "opts.facts_a.first().map(|c| c.as_ref())",
+        anchor: "let source = source.map(Arc::new);",
         query: "pass 1 handle",
-        note: "Pass 1 reads the catalog back out of `Options`; it should hold the tree state's own `Arc<Catalog>`.",
+        note: "Done in PR 2a: pass 1 holds the tree state's own `Arc<Catalog>` (`source`), not one read back out of `Options`, whose `Facts` handle only the engine opens.",
     },
 ];
 
 /// `CatalogView` public methods: each is a builder or becomes a query.
 const VIEW_METHODS: &[(&str, &str)] = &[
     ("new", "builder"),
-    ("catalog", "removed in PR 2a (was the whole-catalog door)"),
+    (
+        "unrecorded_catalog",
+        "engine only: `Schema::build` until PR 2b, and `RecordingView::whole`",
+    ),
     ("scratch", "builder (a `LocalView`)"),
     ("put_table", "builder"),
     ("put_routine", "builder"),
     ("apply_statement", "builder"),
     ("tables_authoritative", "TablesAuthoritative"),
     ("routines_authoritative", "RoutinesAuthoritative"),
+    ("supplied", "Supplied"),
+    ("origins", "Origin"),
     ("origin", "Origin"),
     ("table", "Table"),
     ("routines", "Routines"),
@@ -530,6 +545,41 @@ fn impl_blocks_of(ty: &str, dir: &str) -> Vec<(String, String)> {
     out
 }
 
+/// `RecordingView` public methods: each one records a query.
+const RECORDING_METHODS: &[(&str, &str)] = &[
+    ("new", "builder (engine only)"),
+    ("dialect", "none (a fact of the side, not of the catalog)"),
+    ("supplied", "Supplied"),
+    ("origin", "Origin"),
+    ("tables_authoritative", "TablesAuthoritative"),
+    ("routines_authoritative", "RoutinesAuthoritative"),
+    ("table", "Table"),
+    ("routines", "Routines"),
+    ("whole", "WholeCatalog"),
+];
+
+/// `SourceReads` public methods: pass 1's only door to the tree's catalog.
+const SOURCE_METHODS: &[(&str, &str)] = &[
+    (
+        "new",
+        "builder (the driver's one call; `sqldiff-draft/src/lib.rs`)",
+    ),
+    ("table", "pass 1 `Table(parts)`"),
+    ("triggers_named", "pass 1 `TriggersNamed`"),
+    ("tables", "pass 1 `WholeCatalog`"),
+    ("routines", "pass 1 `WholeCatalog`"),
+];
+
+/// `LocalView` public methods: the file's own objects, no external read.
+const LOCAL_METHODS: &[(&str, &str)] = &[
+    ("new", "builder"),
+    ("put_table", "builder"),
+    ("put_routine", "builder"),
+    ("apply_statement", "builder"),
+    ("table", "none (the file's own DDL)"),
+    ("routines", "none (the file's own DDL)"),
+];
+
 fn pub_fns_of_impl(file: &str, header: &str) -> Vec<String> {
     let text = std::fs::read_to_string(crates_dir().join(file)).unwrap();
     let start = text
@@ -557,6 +607,24 @@ fn the_catalog_readers_have_no_other_impl_blocks() {
         (
             "CatalogView",
             vec![("sqldiff-catalog/src/lib.rs", "impl CatalogView {")],
+        ),
+        (
+            "RecordingView",
+            vec![(
+                "sqldiff-catalog/src/record.rs",
+                "impl<'a> RecordingView<'a> {",
+            )],
+        ),
+        (
+            "SourceReads",
+            vec![(
+                "sqldiff-catalog/src/record.rs",
+                "impl<'a> SourceReads<'a> {",
+            )],
+        ),
+        (
+            "LocalView",
+            vec![("sqldiff-catalog/src/lib.rs", "impl LocalView {")],
         ),
         (
             "Schema",
@@ -598,6 +666,21 @@ fn the_public_methods_of_the_catalog_readers_are_all_classified() {
             "impl Schema {",
             SCHEMA_METHODS,
         ),
+        (
+            "sqldiff-catalog/src/record.rs",
+            "impl<'a> RecordingView<'a> {",
+            RECORDING_METHODS,
+        ),
+        (
+            "sqldiff-catalog/src/lib.rs",
+            "impl LocalView {",
+            LOCAL_METHODS,
+        ),
+        (
+            "sqldiff-catalog/src/record.rs",
+            "impl<'a> SourceReads<'a> {",
+            SOURCE_METHODS,
+        ),
     ] {
         let got = pub_fns_of_impl(file, header);
         let want: Vec<String> = table.iter().map(|(n, _)| n.to_string()).collect();
@@ -607,6 +690,69 @@ fn the_public_methods_of_the_catalog_readers_are_all_classified() {
              give it a query in the table in tests/catalog_sites.rs (and a `Query` variant if it reads)"
         );
     }
+}
+
+/// The check crates hold no `CatalogView` and read no unrecorded catalog:
+/// only the engine, where a side is built, and the equivalence schema's
+/// construction (until PR 2b) may.
+#[test]
+fn the_check_crates_hold_no_catalog_view_outside_the_engine() {
+    let allowed = [
+        "sqldiff-core/src/engine.rs",
+        "sqldiff-equiv/src/equiv/schema.rs",
+    ];
+    let root = crates_dir();
+    for dir in ["sqldiff-core/src", "sqldiff-equiv/src", "sqldiff-model/src"] {
+        let mut files = Vec::new();
+        rs_files(&root.join(dir), &mut files);
+        for p in files {
+            let rel = p
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text =
+                without_comments(&without_test_modules(&std::fs::read_to_string(&p).unwrap()));
+            for needle in ["CatalogView", "unrecorded_catalog"] {
+                let re = Regex::new(&format!(r"\b{needle}\b")).unwrap();
+                assert!(
+                    allowed.contains(&rel.as_str()) || !re.is_match(&text),
+                    "{rel} names `{needle}`: a check reads an external catalog through a \
+                     `RecordingView` (`Schema::catalog`, `BindInput::view`); only {allowed:?} may open one"
+                );
+            }
+        }
+    }
+}
+
+/// Pass 1 reads the tree's catalog only through `SourceReads`: its
+/// `Cx::catalog` field has that type, and none of the `Catalog` accessors a
+/// read used before is named in the crate any more.
+#[test]
+fn pass_1_reads_the_tree_catalog_only_through_source_reads() {
+    let root = crates_dir();
+    let mut files = Vec::new();
+    rs_files(&root.join("sqldiff-draft/src"), &mut files);
+    let mut fields = 0;
+    for p in files {
+        let text = without_comments(&without_test_modules(&std::fs::read_to_string(&p).unwrap()));
+        for needle in [
+            "table_position(",
+            ".triggers_named(Dialect",
+            "catalog: Option<&",
+        ] {
+            assert!(
+                !text.contains(needle),
+                "{} reads the tree's catalog without `SourceReads` (`{needle}`)",
+                p.display()
+            );
+        }
+        fields += text.matches("catalog: Option<SourceReads<").count();
+    }
+    assert!(
+        fields >= 2,
+        "the convert entry and `Cx` hold a `SourceReads`"
+    );
 }
 
 #[test]
@@ -698,6 +844,18 @@ fn markdown() -> String {
     }
     out.push_str("\n## `Schema` public methods\n\n| method | becomes |\n|---|---|\n");
     for (m, q) in SCHEMA_METHODS {
+        out.push_str(&format!("| `{m}` | {q} |\n"));
+    }
+    out.push_str("\n## `RecordingView` public methods\n\n| method | becomes |\n|---|---|\n");
+    for (m, q) in RECORDING_METHODS {
+        out.push_str(&format!("| `{m}` | {q} |\n"));
+    }
+    out.push_str("\n## `SourceReads` public methods\n\n| method | becomes |\n|---|---|\n");
+    for (m, q) in SOURCE_METHODS {
+        out.push_str(&format!("| `{m}` | {q} |\n"));
+    }
+    out.push_str("\n## `LocalView` public methods\n\n| method | becomes |\n|---|---|\n");
+    for (m, q) in LOCAL_METHODS {
         out.push_str(&format!("| `{m}` | {q} |\n"));
     }
     out
