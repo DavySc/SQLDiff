@@ -50,12 +50,7 @@ fn an_in_list_of_thousands_of_numbers_is_compared() {
     assert_eq!(run(a, b), Verdict::Different);
 }
 
-/// A script of thousands of statements with edits at both ends and
-/// transactions in between is aligned exactly: only the real edits are
-/// reported, and no COMMIT is said to have moved. (The alignment table of
-/// such a script is past the size it is built in whole.)
-#[test]
-fn a_long_script_with_few_edits_reports_only_those() {
+fn long_script() -> (String, String) {
     let n = 4_300;
     let base = |i: usize| format!("UPDATE dbo.t{} SET c = {} WHERE id = {};\n", i % 50, i, i);
     let stmt = |i: usize, b: bool| -> String {
@@ -71,15 +66,44 @@ fn a_long_script_with_few_edits_reports_only_those() {
             base(i)
         }
     };
-    let a: String = (0..n).map(|i| stmt(i, false)).collect();
-    let b: String = (0..n).map(|i| stmt(i, true)).collect();
-    let r = diff(
+    (
+        (0..n).map(|i| stmt(i, false)).collect(),
+        (0..n).map(|i| stmt(i, true)).collect(),
+    )
+}
+
+fn script_report() -> sqldiff_core::Report {
+    let (a, b) = long_script();
+    diff(
         &Artifact::new("a.sql", Dialect::Tsql, a),
         &Artifact::new("b.sql", Dialect::Tsql, b),
         &Options::default(),
-    );
+    )
+}
+
+/// A script of thousands of statements with edits at both ends and
+/// transactions in between is aligned exactly: only the real edits are
+/// reported, and no COMMIT is said to have moved. (The alignment table of
+/// such a script is past the size it is built in whole.)
+#[test]
+fn a_long_script_with_few_edits_reports_only_those() {
+    let r = script_report();
     let count = |rule: &str| r.findings.iter().filter(|f| f.rule == rule).count();
     assert_eq!(count("stmt.moved"), 0, "nothing moved");
     assert_eq!(count("stmt.added"), 2);
     assert_eq!(count("stmt.removed"), 2);
+}
+
+/// Past the alignment bound the middle is not aligned, and nothing is
+/// claimed about it: one Unknown finding, no moved, added or removed
+/// statement made up from a partial alignment.
+#[test]
+fn past_the_alignment_bound_the_script_is_unknown_not_guessed() {
+    let r = sqldiff_core::normalize::with_alignment_bound(1_000_000, script_report);
+    let count = |rule: &str| r.findings.iter().filter(|f| f.rule == rule).count();
+    assert_eq!(count("stmt.moved"), 0, "{:?}", r.findings);
+    assert_eq!(count("stmt.added"), 0);
+    assert_eq!(count("stmt.removed"), 0);
+    assert_eq!(count("align.bound"), 1);
+    assert_eq!(r.verdict(), Verdict::Unknown);
 }

@@ -75,6 +75,47 @@ pub struct TreeDiff {
     pub receipts: Vec<Receipt>,
 }
 
+/// The most statements of the two sides that `diff_gap` pairs by similarity
+/// (`x.len() * y.len()` scores, each a comparison of up to 400 tokens): past
+/// it the gap is not looked into.
+const GAP_BOUND: usize = 4_000_000;
+
+/// One Unknown finding for two lists that were not aligned: they are past
+/// the bound of the alignment, so what lies between the parts that did match
+/// is neither paired nor called added, removed or moved. Equivalence is not
+/// established for it.
+pub(crate) fn alignment_bound_finding(
+    object: &str,
+    what: &str,
+    na: usize,
+    nb: usize,
+    a: Option<crate::model::Location>,
+    b: Option<crate::model::Location>,
+) -> Finding {
+    let class = ChangeClass::Semantic;
+    let rule = "align.bound";
+    let anchor = format!("{what}:{na}x{nb}");
+    Finding {
+        fingerprint: fingerprint(&FingerprintInput {
+            object,
+            class,
+            rule,
+            anchor_a: &anchor,
+            anchor_b: "",
+        }),
+        rule: rule.to_string(),
+        class,
+        severity: class.default_severity(),
+        verdict: Verdict::Unknown,
+        witness: format!(
+            "{na} {what} on side A and {nb} on side B could not be aligned: the two lists are past the alignment bound. What lies between the parts that matched is not paired and not reported as added, removed or moved. Equivalence is not established."
+        ),
+        a,
+        b,
+        assumptions: Vec::new(),
+    }
+}
+
 pub fn diff(a: &Analyzed, b: &Analyzed) -> TreeDiff {
     let ua: Vec<Unit> = ast::structural_children(&a.root)
         .into_iter()
@@ -134,13 +175,32 @@ impl Ctx<'_, '_> {
     fn diff_lists(&mut self, a: &[Unit], b: &[Unit]) {
         let ka: Vec<&str> = a.iter().map(|u| u.full.as_str()).collect();
         let kb: Vec<&str> = b.iter().map(|u| u.full.as_str()).collect();
-        let anchors = crate::normalize::lcs_pairs(&ka, &kb);
+        let (anchors, exact) = crate::normalize::lcs_pairs_checked(&ka, &kb);
         let (mut ai, mut bj) = (0, 0);
         for (i, j) in anchors
             .into_iter()
             .chain(std::iter::once((a.len(), b.len())))
         {
-            self.diff_gap(&a[ai..i], &b[bj..j]);
+            let (ga, gb) = (&a[ai..i], &b[bj..j]);
+            // A gap with units on both sides is not paired when the
+            // alignment is partial or the gap is too large to score.
+            if !ga.is_empty()
+                && !gb.is_empty()
+                && (!exact || ga.len().saturating_mul(gb.len()) > GAP_BOUND)
+            {
+                let loc = |x: &Analyzed, us: &[Unit]| us.first().map(|u| x.node_location(&u.node));
+                let f = alignment_bound_finding(
+                    self.object(),
+                    "statements",
+                    ga.len(),
+                    gb.len(),
+                    loc(self.a, ga),
+                    loc(self.b, gb),
+                );
+                self.out.findings.push(f);
+            } else {
+                self.diff_gap(ga, gb);
+            }
             if i < a.len() {
                 self.matched(&a[i], &b[j]);
             }

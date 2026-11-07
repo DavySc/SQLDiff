@@ -269,24 +269,37 @@ pub fn lcs_len<T: PartialEq>(a: &[T], b: &[T]) -> usize {
 const LCS_CELLS: usize = 16_000_000;
 
 /// The most cells (the product of the lengths, once the common start and end
-/// are matched) `lcs_pairs` works through exactly: about a minute of work in
-/// a release build. Past it the middle stays unmatched.
+/// are matched) the alignment works through exactly: about a minute of work
+/// in a release build. Past it the middle stays unmatched.
 const LCS_WORK: usize = 4_000_000_000;
 
-/// Index pairs of a longest common subsequence.
+thread_local! {
+    static LCS_WORK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(LCS_WORK) };
+}
+
+/// Runs `f` with the exact alignment bound ([`LCS_WORK`]) set to `limit` on
+/// this thread, so a test can reach the inexact path with small inputs.
+#[doc(hidden)]
+pub fn with_alignment_bound<R>(limit: usize, f: impl FnOnce() -> R) -> R {
+    let old = LCS_WORK_LIMIT.with(|c| c.replace(limit));
+    let r = f();
+    LCS_WORK_LIMIT.with(|c| c.set(old));
+    r
+}
+
+/// Index pairs of a longest common subsequence, and whether they are one.
 ///
 /// Exact at every size up to [`LCS_WORK`]. While the table fits
 /// [`LCS_CELLS`] it is the table walk (so the pairs there are the same as
 /// they always were); past that the common start and end are matched and the
 /// middle is aligned by Hirschberg's method, which needs memory in the order
-/// of the shorter length. Beyond [`LCS_WORK`] the middle stays unmatched: the
-/// pairs are then a common subsequence but not a longest one, so a caller
-/// shows more of the two as changed, never less. The answer depends only on
-/// the inputs.
-pub fn lcs_pairs<T: PartialEq>(a: &[T], b: &[T]) -> Vec<(usize, usize)> {
+/// of the shorter length. Beyond the bound the middle stays unmatched and
+/// the flag is false: the pairs are then a common subsequence but not a
+/// longest one. The answer depends only on the inputs.
+pub fn lcs_pairs_checked<T: PartialEq>(a: &[T], b: &[T]) -> (Vec<(usize, usize)>, bool) {
     let (n, m) = (a.len(), b.len());
     if n.saturating_mul(m) <= LCS_CELLS {
-        return lcs_table(a, b, 0, 0);
+        return (lcs_table(a, b, 0, 0), true);
     }
     let pre = a.iter().zip(b).take_while(|(x, y)| x == y).count();
     let suf = a[pre..]
@@ -297,13 +310,31 @@ pub fn lcs_pairs<T: PartialEq>(a: &[T], b: &[T]) -> Vec<(usize, usize)> {
         .count();
     let (ma, mb) = (&a[pre..n - suf], &b[pre..m - suf]);
     let mut out: Vec<(usize, usize)> = (0..pre).map(|i| (i, i)).collect();
-    if ma.len().saturating_mul(mb.len()) <= LCS_CELLS {
+    let cells = ma.len().saturating_mul(mb.len());
+    let mut exact = true;
+    if cells <= LCS_CELLS {
         out.extend(lcs_table(ma, mb, pre, pre));
-    } else if ma.len().saturating_mul(mb.len()) <= LCS_WORK {
+    } else if cells <= LCS_WORK_LIMIT.with(|c| c.get()) {
         hirschberg(ma, mb, pre, pre, &mut out);
+    } else {
+        exact = false;
     }
     out.extend((0..suf).map(|k| (n - suf + k, m - suf + k)));
-    out
+    (out, exact)
+}
+
+/// [`lcs_pairs_checked`] for callers that only show the pairs: past the
+/// bound they get the partial alignment.
+pub fn lcs_pairs<T: PartialEq>(a: &[T], b: &[T]) -> Vec<(usize, usize)> {
+    lcs_pairs_checked(a, b).0
+}
+
+/// The pairs of a longest common subsequence, or `None` when the lists are
+/// past the bound and only part of them could be aligned. For callers that
+/// report what is left over as added, removed or moved.
+pub fn lcs_pairs_exact<T: PartialEq>(a: &[T], b: &[T]) -> Option<Vec<(usize, usize)>> {
+    let (p, exact) = lcs_pairs_checked(a, b);
+    exact.then_some(p)
 }
 
 /// LCS length of `a` against every prefix of `b` (`b.len() + 1` values), read

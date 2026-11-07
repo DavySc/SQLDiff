@@ -31,7 +31,6 @@ use crate::model::{
     fingerprint, Assumption, AssumptionSource, ChangeClass, Finding, FingerprintInput, Location,
     Report, Severity, Side, Verdict,
 };
-use crate::normalize::lcs_pairs;
 use crate::Options;
 
 /// One part of a composed output.
@@ -532,7 +531,36 @@ fn compare_parts(
 ) {
     let na: Vec<&str> = ca.parts.iter().map(|p| p.name.as_str()).collect();
     let nb: Vec<&str> = cb.parts.iter().map(|p| p.name.as_str()).collect();
-    let pairs = lcs_pairs(&na, &nb);
+    let Some(pairs) = crate::normalize::lcs_pairs_exact(&na, &nb) else {
+        // Too many parts to align: none is called added or removed.
+        if let Some(p) = cb.parts.first() {
+            let mut f = part_finding(
+                ab,
+                object,
+                "align.bound",
+                ChangeClass::Semantic,
+                Severity::Medium,
+                Verdict::Unknown,
+                format!(
+                    "{} parts on side A and {} on side B could not be aligned: the two lists are past the alignment bound. Equivalence is not established.",
+                    na.len(),
+                    nb.len()
+                ),
+                p,
+            );
+            f.fingerprint = crate::treediff::alignment_bound_finding(
+                object,
+                "parts",
+                na.len(),
+                nb.len(),
+                None,
+                None,
+            )
+            .fingerprint;
+            report.findings.push(f);
+        }
+        return;
+    };
     let matched_a: BTreeSet<usize> = pairs.iter().map(|x| x.0).collect();
     let matched_b: BTreeSet<usize> = pairs.iter().map(|x| x.1).collect();
     for &(i, j) in &pairs {

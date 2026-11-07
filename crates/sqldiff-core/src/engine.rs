@@ -15,7 +15,6 @@ use crate::model::{
     fingerprint, Assumption, ChangeClass, Finding, FingerprintInput, Location, NoiseCounts, Report,
     Severity, Side, Verdict,
 };
-use crate::normalize::lcs_pairs;
 use crate::rules;
 use crate::treediff;
 
@@ -747,7 +746,17 @@ fn pair_writes_in(
     };
     const SAME_TABLE: &str = "the same table is written by a different kind of statement";
 
-    let pairs = lcs_pairs(&ka, &kb);
+    let Some(pairs) = crate::normalize::lcs_pairs_exact(&ka, &kb) else {
+        // Too many writes to align: none is called unpaired.
+        return vec![crate::treediff::alignment_bound_finding(
+            &a.object,
+            "writes",
+            ka.len(),
+            kb.len(),
+            None,
+            None,
+        )];
+    };
     let matched_a: HashSet<usize> = pairs.iter().map(|p| p.0).collect();
     let matched_b: HashSet<usize> = pairs.iter().map(|p| p.1).collect();
     // Lookups built once: keys, targets and the normal-path writes left over
