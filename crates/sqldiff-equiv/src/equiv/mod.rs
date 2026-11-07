@@ -4731,6 +4731,72 @@ fn innermost(anchors: &[Anchor], side_a: bool, at: usize) -> Vec<usize> {
         .collect()
 }
 
+/// [`innermost`] for many positions of one side: the answers for every
+/// stretch between two span boundaries, made once by a sweep over the
+/// boundaries, so a lookup is a binary search instead of a scan of all anchors
+/// (`traced` asked once per statement). The answers are the ones `innermost`
+/// gives, in the same order.
+struct InnermostIndex {
+    /// Boundaries (span starts and ends), ascending and distinct.
+    points: Vec<usize>,
+    /// For the stretch from `points[i]` to the next boundary: the anchors
+    /// holding it with the shortest span, by anchor number.
+    holding: Vec<Vec<usize>>,
+}
+
+impl InnermostIndex {
+    fn new(anchors: &[Anchor], side_a: bool) -> InnermostIndex {
+        let span = |x: &Anchor| if side_a { x.a } else { x.b };
+        // (position, adds first? no: removals and additions at one point are
+        // both applied before the stretch that starts there is recorded).
+        let mut events: Vec<(usize, bool, usize)> = Vec::new();
+        for (k, x) in anchors.iter().enumerate() {
+            let (s, e) = span(x);
+            if s < e {
+                events.push((s, true, k));
+                events.push((e, false, k));
+            }
+        }
+        events.sort_unstable();
+        let mut points = Vec::new();
+        let mut holding = Vec::new();
+        let mut active: std::collections::BTreeSet<(usize, usize)> =
+            std::collections::BTreeSet::new();
+        let mut i = 0;
+        while i < events.len() {
+            let at = events[i].0;
+            while i < events.len() && events[i].0 == at {
+                let (_, add, k) = events[i];
+                let (s, e) = span(&anchors[k]);
+                if add {
+                    active.insert((e - s, k));
+                } else {
+                    active.remove(&(e - s, k));
+                }
+                i += 1;
+            }
+            points.push(at);
+            holding.push(match active.iter().next() {
+                None => Vec::new(),
+                Some(&(len, _)) => active
+                    .iter()
+                    .take_while(|&&(l, _)| l == len)
+                    .map(|&(_, k)| k)
+                    .collect(),
+            });
+        }
+        InnermostIndex { points, holding }
+    }
+
+    /// The same answer as `innermost(anchors, side_a, at)`.
+    fn at(&self, at: usize) -> Vec<usize> {
+        match self.points.partition_point(|&p| p <= at) {
+            0 => Vec::new(),
+            n => self.holding[n - 1].clone(),
+        }
+    }
+}
+
 /// Pairs statements through a conversion's trace: two statements can pair
 /// only when they sit in the same anchor (the input statement and the
 /// output written from it). Statements linked through shared anchors form a
@@ -4749,14 +4815,12 @@ fn traced(
     anchors: &[Anchor],
 ) -> Alignment {
     let (n, m) = (ia.len(), ib.len());
-    let at_a: Vec<Vec<usize>> = ia
-        .iter()
-        .map(|x| innermost(anchors, true, start(x)))
-        .collect();
-    let at_b: Vec<Vec<usize>> = ib
-        .iter()
-        .map(|x| innermost(anchors, false, start(x)))
-        .collect();
+    let (index_a, index_b) = (
+        InnermostIndex::new(anchors, true),
+        InnermostIndex::new(anchors, false),
+    );
+    let at_a: Vec<Vec<usize>> = ia.iter().map(|x| index_a.at(start(x))).collect();
+    let at_b: Vec<Vec<usize>> = ib.iter().map(|x| index_b.at(start(x))).collect();
     // Union-find over A items, B items and anchors.
     let mut up: Vec<usize> = (0..n + m + anchors.len()).collect();
     fn root(up: &mut [usize], mut x: usize) -> usize {
@@ -4821,6 +4885,11 @@ fn traced(
     // its counterpart is in that gap.
     for (is_a, at) in [(true, &at_a), (false, &at_b)] {
         let other = if is_a { &gaps[1] } else { &gaps[0] };
+        // The anchors each gap of the other side sits in, once.
+        let in_gap: Vec<Vec<usize>> = other
+            .iter()
+            .map(|g| if is_a { &index_b } else { &index_a }.at(g.start))
+            .collect();
         let mut paired = vec![false; at.len()];
         for p in &out.pairs {
             if let Some(x) = paired.get_mut(if is_a { p.0 } else { p.1 }) {
@@ -4838,11 +4907,7 @@ fn traced(
                 continue;
             }
             let near: Vec<usize> = (0..other.len())
-                .filter(|&g| {
-                    innermost(anchors, !is_a, other[g].start)
-                        .iter()
-                        .any(|k| ks.contains(k))
-                })
+                .filter(|&g| in_gap[g].iter().any(|k| ks.contains(k)))
                 .collect();
             if let [g] = near.as_slice() {
                 out.ambiguous.retain(|x| *x != (is_a, i));
@@ -5744,6 +5809,47 @@ mod crossing_tests {
             let n = next(12);
             let pairs: Vec<(usize, usize)> = (0..n).map(|_| (next(6), next(6))).collect();
             assert_eq!(crossing_pairs(&pairs), brute(&pairs), "{pairs:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod innermost_tests {
+    use super::{innermost, Anchor, InnermostIndex};
+
+    /// The index gives what the scan gave, at every position, for spans that
+    /// nest, tie, touch, repeat and are empty.
+    #[test]
+    fn the_index_agrees_with_the_scan() {
+        let mut seed = 987654321u64;
+        let mut next = |m: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) % m) as usize
+        };
+        for round in 0..400 {
+            let n = next(14);
+            let span = |next: &mut dyn FnMut(u64) -> usize| {
+                let s = next(20);
+                (s, s + next(8))
+            };
+            let anchors: Vec<Anchor> = (0..n)
+                .map(|_| Anchor {
+                    a: span(&mut next),
+                    b: span(&mut next),
+                })
+                .collect();
+            for side_a in [true, false] {
+                let index = InnermostIndex::new(&anchors, side_a);
+                for at in 0..32 {
+                    assert_eq!(
+                        index.at(at),
+                        innermost(&anchors, side_a, at),
+                        "round {round} side_a {side_a} at {at}: {anchors:?}"
+                    );
+                }
+            }
         }
     }
 }

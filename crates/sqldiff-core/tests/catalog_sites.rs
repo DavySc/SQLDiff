@@ -154,7 +154,7 @@ const DOORS: &[(&str, &str, &str)] = &[
     (
         "unrecorded catalog",
         r"\.unrecorded_catalog\(\)",
-        "`CatalogView::unrecorded_catalog`: engine-side only. `Schema::build` reads whole tables through it until PR 2b makes the overlay lazy; the scan below fails on any other file.",
+        "`CatalogView::unrecorded_catalog`: engine-side only. `Schema::build` and the static `include_str!` schemas use it (no sink); the scan below fails on any other file.",
     ),
     (
         "whole catalog",
@@ -194,7 +194,7 @@ const DOORS: &[(&str, &str, &str)] = &[
     (
         "schema fields",
         r"\.(star_views|list_stars|is_star_view)\b",
-        "`StarView(lower name)`. `Schema::star_views` and `list_stars` are public fields: a read of either is a read of the catalog.",
+        "`StarView(lower name)`. `Schema::star_views` and `list_stars` are private; a read is a read of the catalog.",
     ),
     (
         "pass 1 catalog",
@@ -278,12 +278,12 @@ const SITES: &[Site] = &[
         file: "sqldiff-equiv/src/equiv/canon.rs",
         anchor: "fn visible_star(",
         query: "`StarView(lower name)`, `HiddenTables` (the `list_stars` flag)",
-        note: "Reads the public fields `Schema::star_views` and `Schema::list_stars`.",
+        note: "Reads through `Schema::is_star_view` and `Schema::lists_stars`; the fields are private.",
     },
     Site {
         id: "E1",
         file: "sqldiff-core/src/engine.rs",
-        anchor: "view_a.supplied()",
+        anchor: "read_a.supplied()",
         query: "`Supplied` per side",
         note: "A8: field reads. Today the key tells `none` from a catalog; once digests leave the key, `supplied` stays in it.",
     },
@@ -500,17 +500,19 @@ const VIEW_METHODS: &[(&str, &str)] = &[
 
 /// `Schema` public methods: each is a builder or reads the catalog.
 const SCHEMA_METHODS: &[(&str, &str)] = &[
+    ("for_check", "per-check handle (side + sink)"),
     ("catalog", "the view door (Supplied)"),
-    ("is_empty", "SchemaTables (any)"),
+    ("sources", "Supplied / Origin (the recorded source list)"),
+    ("lists_stars", "HiddenTables (the `list_stars` flag)"),
     ("is_star_view", "StarView"),
-    ("tables", "SchemaTables / ColumnNamed"),
+    ("column_types", "ColumnNamed / SchemaTables"),
     ("table", "SchemaTables"),
     ("view_column_is_not_char", "ViewFamily"),
     ("table_exact", "SchemaTables"),
     ("with_images", "builder over SchemaTables"),
     ("with_ddl", "builder over SchemaTables"),
     ("with_local", "builder (the file's own DDL)"),
-    ("case_check", "SchemaTables"),
+    ("case_check", "Spellings"),
     ("load", "builder"),
     ("hides_columns", "HiddenTables"),
     ("list_stars_with", "HiddenTables / SchemaTables"),
@@ -722,6 +724,42 @@ fn the_check_crates_hold_no_catalog_view_outside_the_engine() {
                      `RecordingView` (`Schema::catalog`, `BindInput::view`); only {allowed:?} may open one"
                 );
             }
+        }
+    }
+}
+
+/// The unrecorded sink is named only where an unrecorded read is meant: the
+/// recorder itself, the engine's `unrecorded()` helper and `Schema`'s
+/// fallback for a schema with no per-check handle.
+#[test]
+fn the_unrecorded_sink_is_named_only_by_its_allowed_files() {
+    let allowed = [
+        "sqldiff-core/src/engine.rs",
+        "sqldiff-equiv/src/equiv/schema.rs",
+        "sqldiff-catalog/src/record.rs",
+    ];
+    let root = crates_dir();
+    let re = Regex::new(r"\bNO_SINK\b|\bNoSink\b").unwrap();
+    for dir in [
+        "sqldiff-core/src",
+        "sqldiff-equiv/src",
+        "sqldiff-model/src",
+        "sqldiff-catalog/src",
+    ] {
+        let mut files = Vec::new();
+        rs_files(&root.join(dir), &mut files);
+        for p in files {
+            let rel = p
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text =
+                without_comments(&without_test_modules(&std::fs::read_to_string(&p).unwrap()));
+            assert!(
+                allowed.contains(&rel.as_str()) || !re.is_match(&text),
+                "{rel} names the unrecorded sink; only {allowed:?} may"
+            );
         }
     }
 }

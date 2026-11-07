@@ -151,6 +151,18 @@ pub fn now() -> Work {
     METER.with(|m| m.borrow().unwrap_or_default())
 }
 
+/// Whether counting is switched off here (inside [`muted`]). A work cap must
+/// not test while muted: that work was counted when it was first done.
+pub fn is_muted() -> bool {
+    MUTED.with(Cell::get) > 0
+}
+
+/// Whether a scope is open on this thread: a cap reads [`now`], which is zero
+/// outside one, so it would never fire.
+pub fn in_scope() -> bool {
+    METER.with(|m| m.borrow().is_some())
+}
+
 /// What the statement-level checker (alignment, tree diff) may still spend,
 /// passed down as a parameter so the functions that use it stay pure: a
 /// deterministic count, decremented in program order, never a time. Off (the

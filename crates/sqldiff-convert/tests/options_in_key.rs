@@ -36,6 +36,7 @@ const FIELDS: &[(&str, &str)] = &[
     ("historyless", "in the key: the draft's options"),
     ("skip_witnesses", "in the key: fixed by the converter (true in every conversion check, by the check fingerprint's code)"),
     ("work_budgets", "constant: the built-in budgets"),
+    ("work_caps", "constant: the built-in caps"),
     ("alignment_bound", "constant: the built-in bound"),
     ("statement_work_cap", "constant: no statement-level allowance"),
 ];
@@ -57,10 +58,11 @@ fn every_option_is_classified() {
         historyless: _,
         skip_witnesses: _,
         work_budgets: _,
+        work_caps: _,
         alignment_bound: _,
         statement_work_cap: _,
     } = Options::default();
-    assert_eq!(FIELDS.len(), 16);
+    assert_eq!(FIELDS.len(), 17);
 }
 
 /// The field names assigned at the top level of the `Options { .. }` literals
@@ -186,7 +188,7 @@ fn the_constant_fields_are_never_assigned_later() {
     // `proof` is also a field of reports and units, so it counts only on a
     // receiver named like options.
     let re = regex::Regex::new(
-        r"\.(excerpt_lines|flips|declared|observer|work_budgets|alignment_bound|statement_work_cap)\s*(=[^=]|\.insert|\.push|\.extend)|\b\w*opt\w*\.proof\s*(=[^=]|\.insert|\.push|\.extend)",
+        r"\.(excerpt_lines|flips|declared|observer|work_budgets|work_caps|alignment_bound|statement_work_cap)\s*(=[^=]|\.insert|\.push|\.extend)|\b\w*opt\w*\.proof\s*(=[^=]|\.insert|\.push|\.extend)",
     )
     .unwrap();
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
