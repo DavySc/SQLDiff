@@ -181,6 +181,8 @@ struct Routine<'x, 'a> {
     sql_set_result: bool,
     /// Statements and conditions with what they read and write, built on first use.
     units: std::cell::OnceCell<Vec<Unit>>,
+    /// The names of `units`, set with them.
+    names: std::cell::OnceCell<Names>,
     /// The first unit or statement (in tree order) that starts at each byte
     /// offset, built on first use: a file of thousands of routines is asked
     /// once per edit, and a scan of the whole tree each time was quadratic.
@@ -258,6 +260,7 @@ impl<'x, 'a> Routine<'x, 'a> {
                     && matches!(u.kind, lower::UnitKind::Proc | lower::UnitKind::Script),
             sql_set_result,
             units: std::cell::OnceCell::new(),
+            names: std::cell::OnceCell::new(),
             starts: std::cell::OnceCell::new(),
             spelling: std::cell::OnceCell::new(),
             parens: std::cell::OnceCell::new(),
@@ -1458,9 +1461,22 @@ const ANY: &str = "*";
 struct Unit {
     start: usize,
     end: usize,
+    /// Ids (see `Names`) of the names it reads, sorted.
+    reads: Vec<u32>,
+    /// Ids of the names it writes, sorted.
+    writes: Vec<u32>,
+    /// Ids of the names it reads or writes, sorted.
+    touches: Vec<u32>,
+    /// It may leave the sequence it is in (RETURN, BREAK, THROW, ...).
+    jumps: bool,
+}
+
+/// A unit as scanned, before its names are numbered.
+struct RawUnit {
+    start: usize,
+    end: usize,
     reads: HashSet<String>,
     writes: HashSet<String>,
-    /// It may leave the sequence it is in (RETURN, BREAK, THROW, ...).
     jumps: bool,
 }
 
@@ -1507,8 +1523,88 @@ impl SpanSet {
     }
 }
 
-fn meets(a: &HashSet<String>, b: &HashSet<String>) -> bool {
-    !a.is_empty() && !b.is_empty() && (a.contains(ANY) || b.contains(ANY) || !a.is_disjoint(b))
+/// The names of a routine's units as small numbers, so that the closure
+/// over many units compares integers, not strings. Numbered in name order;
+/// `ANY` is always 0.
+struct Names {
+    ids: std::collections::BTreeMap<String, u32>,
+    names: Vec<String>,
+    /// Whether the name is one of `STATUS`.
+    status: Vec<bool>,
+}
+
+const ANY_ID: u32 = 0;
+
+impl Names {
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: the names are sorted before they are numbered
+    fn of(all: &HashSet<String>) -> Names {
+        let mut sorted: Vec<&String> = all.iter().filter(|x| x.as_str() != ANY).collect();
+        sorted.sort();
+        let mut names = vec![ANY.to_string()];
+        names.extend(sorted.into_iter().cloned());
+        let ids = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i as u32))
+            .collect();
+        let status = names.iter().map(|n| STATUS.contains(&n.as_str())).collect();
+        Names { ids, names, status }
+    }
+
+    /// The sorted ids of `set`; a name no unit mentions has none.
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: the ids are sorted
+    fn ids_of(&self, set: &HashSet<String>) -> Vec<u32> {
+        let mut v: Vec<u32> = set
+            .iter()
+            .filter_map(|x| self.ids.get(x).copied())
+            .collect();
+        v.sort_unstable();
+        v
+    }
+}
+
+/// A growing set of names, answering the closure's "does this unit read
+/// something in it" (the old `meets` over string sets).
+struct Taint {
+    on: Vec<bool>,
+    count: usize,
+}
+
+impl Taint {
+    fn new(size: usize) -> Taint {
+        Taint {
+            on: vec![false; size],
+            count: 0,
+        }
+    }
+
+    /// Adds a name; whether it was new.
+    fn add(&mut self, id: u32) -> bool {
+        let at = &mut self.on[id as usize];
+        let new = !*at;
+        *at = true;
+        self.count += usize::from(new);
+        new
+    }
+
+    fn add_all(&mut self, ids: &[u32]) -> bool {
+        let mut grew = false;
+        for &i in ids {
+            grew |= self.add(i);
+        }
+        grew
+    }
+
+    fn has(&self, id: u32) -> bool {
+        self.on[id as usize]
+    }
+
+    /// Both sets are non-empty and either holds `ANY` or they share a name.
+    fn meets(&self, ids: &[u32]) -> bool {
+        !ids.is_empty()
+            && self.count > 0
+            && (self.has(ANY_ID) || ids.iter().any(|&i| i == ANY_ID || self.has(i)))
+    }
 }
 
 impl<'x, 'a> Routine<'x, 'a> {
@@ -1566,8 +1662,9 @@ impl<'x, 'a> Routine<'x, 'a> {
         self.units.get_or_init(|| self.build_units())
     }
 
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: the names are collected into a set and numbered in sorted order
     fn build_units(&self) -> Vec<Unit> {
-        let mut out = Vec::new();
+        let mut out: Vec<RawUnit> = Vec::new();
         for n in self.side.root.descendants() {
             match n.kind() {
                 SyntaxKind::STATEMENT => {
@@ -1580,7 +1677,7 @@ impl<'x, 'a> Routine<'x, 'a> {
                         | "BREAK" | "CONTINUE" | "EXIT" | "LEAVE" | "ITERATE" => true,
                         _ => false,
                     };
-                    out.push(Unit {
+                    out.push(RawUnit {
                         start,
                         end,
                         reads: tokens(&n).iter().filter_map(unit_name).collect(),
@@ -1606,7 +1703,7 @@ impl<'x, 'a> Routine<'x, 'a> {
                             }
                         }
                     }
-                    out.push(Unit {
+                    out.push(RawUnit {
                         start,
                         end,
                         reads: tokens(&n).iter().filter_map(unit_name).collect(),
@@ -1617,7 +1714,37 @@ impl<'x, 'a> Routine<'x, 'a> {
                 _ => {}
             }
         }
-        out
+        let all: HashSet<String> = out
+            .iter()
+            .flat_map(|u| u.reads.iter().chain(&u.writes))
+            .cloned()
+            .collect();
+        let names = Names::of(&all);
+        let units = out
+            .into_iter()
+            .map(|u| {
+                let (reads, writes) = (names.ids_of(&u.reads), names.ids_of(&u.writes));
+                let mut touches: Vec<u32> = reads.iter().chain(&writes).copied().collect();
+                touches.sort_unstable();
+                touches.dedup();
+                Unit {
+                    start: u.start,
+                    end: u.end,
+                    reads,
+                    writes,
+                    touches,
+                    jumps: u.jumps,
+                }
+            })
+            .collect();
+        let _ = self.names.set(names);
+        units
+    }
+
+    /// The names of [`Self::units`].
+    fn unit_names(&self) -> &Names {
+        self.units();
+        self.names.get().expect("set with the units")
     }
 
     /// Conditions that decide whether `n` runs: those of the IF and WHILE
@@ -1674,10 +1801,11 @@ impl<'x, 'a> Routine<'x, 'a> {
         let line = |off: usize| self.side.lines.line_col(off).0;
 
         // Values at `n` that changed code may have set.
-        let mut tainted: HashSet<String> = HashSet::new();
+        let names = self.unit_names();
+        let mut tainted = Taint::new(names.names.len());
         let mut first_change: Option<usize> = None;
         for u in others.iter().filter(|u| before(u) && changed_unit(u)) {
-            tainted.extend(u.writes.iter().cloned());
+            tainted.add_all(&u.writes);
             first_change = Some(first_change.map_or(u.start, |f| f.min(u.start)));
             // A changed jump on the way that is not evaluated as a guard.
             if u.jumps && !reach.untraced.is_empty() {
@@ -1688,12 +1816,18 @@ impl<'x, 'a> Routine<'x, 'a> {
             }
         }
         if let Some(first) = first_change {
+            // The closure does not depend on the order the units are met,
+            // only on which of them are unchanged and before `n`.
+            let prior: Vec<&Unit> = others
+                .iter()
+                .copied()
+                .filter(|u| before(u) && !changed_unit(u))
+                .collect();
             loop {
                 let mut grew = false;
-                for u in others.iter().filter(|u| before(u) && !changed_unit(u)) {
-                    if meets(&u.reads, &tainted) && !u.writes.is_subset(&tainted) {
-                        tainted.extend(u.writes.iter().cloned());
-                        grew = true;
+                for u in &prior {
+                    if tainted.meets(&u.reads) {
+                        grew |= tainted.add_all(&u.writes);
                     }
                 }
                 if !grew {
@@ -1701,21 +1835,24 @@ impl<'x, 'a> Routine<'x, 'a> {
                 }
             }
             let deciding = self.deciding_conditions(n);
-            let needed: HashSet<String> = units
+            let mut needed: Vec<u32> = units
                 .iter()
                 .filter(|u| {
                     overlaps((u.start, u.end), here)
                         || deciding.iter().any(|c| overlaps(*c, (u.start, u.end)))
                 })
-                .flat_map(|u| u.reads.iter().cloned())
+                .flat_map(|u| u.reads.iter().copied())
                 .collect();
-            if meets(&needed, &tainted) {
-                let mut names: Vec<&String> = needed
-                    .intersection(&tainted)
-                    .filter(|x| x.as_str() != ANY)
+            needed.sort_unstable();
+            needed.dedup();
+            if tainted.meets(&needed) {
+                let mut shared: Vec<&String> = needed
+                    .iter()
+                    .filter(|&&i| i != ANY_ID && tainted.has(i))
+                    .map(|&i| &names.names[i as usize])
                     .collect();
-                names.sort();
-                return Some(match names.first() {
+                shared.sort();
+                return Some(match shared.first() {
                     Some(x) => format!(
                         "{} may hold a value set by the changed code at line {}",
                         spell(x),
@@ -1733,7 +1870,7 @@ impl<'x, 'a> Routine<'x, 'a> {
         let seed: HashSet<String> = units
             .iter()
             .filter(|u| overlaps((u.start, u.end), here))
-            .flat_map(|u| u.writes.iter().cloned())
+            .flat_map(|u| u.writes.iter().map(|&i| names.names[i as usize].clone()))
             .collect();
         self.reaches_change(seed, here, units, changed)
             .map(|l| format!("its result reaches the changed code at line {l}"))
@@ -1742,6 +1879,7 @@ impl<'x, 'a> Routine<'x, 'a> {
     /// The line of the first changed unit after `here` (or in a loop with
     /// it) that reads or overwrites one of `seed`, directly or through
     /// unchanged units in between.
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: the seed only decides which names are reached; order never matters
     fn reaches_change(
         &self,
         seed: HashSet<String>,
@@ -1758,20 +1896,40 @@ impl<'x, 'a> Routine<'x, 'a> {
                         *ls <= u.start && u.end <= *le && *ls <= here.0 && here.1 <= *le
                     }))
         };
-        let mut reached: HashSet<String> = seed
-            .into_iter()
+        let names = self.unit_names();
+        // A name no unit mentions can never be met again, but it still
+        // makes the set non-empty.
+        let seed: Vec<&String> = seed
+            .iter()
             .filter(|x| !STATUS.contains(&x.as_str()))
             .collect();
-        if reached.is_empty() {
+        if seed.is_empty() {
             return None;
         }
+        let mut reached = Taint::new(names.names.len() + seed.len());
+        let mut unknown = names.names.len();
+        for x in seed {
+            match names.ids.get(x.as_str()) {
+                Some(&i) => {
+                    reached.add(i);
+                }
+                None => {
+                    reached.add(unknown as u32);
+                    unknown += 1;
+                }
+            }
+        }
+        let later: Vec<&Unit> = units
+            .iter()
+            .filter(|u| after(u) && !changed_unit(u))
+            .collect();
         loop {
             let mut grew = false;
-            for u in units.iter().filter(|u| after(u) && !changed_unit(u)) {
-                if meets(&u.reads, &reached) {
-                    for w in &u.writes {
-                        if !STATUS.contains(&w.as_str()) && reached.insert(w.clone()) {
-                            grew = true;
+            for u in &later {
+                if reached.meets(&u.reads) {
+                    for &w in &u.writes {
+                        if !names.status[w as usize] {
+                            grew |= reached.add(w);
                         }
                     }
                 }
@@ -1783,10 +1941,7 @@ impl<'x, 'a> Routine<'x, 'a> {
         units
             .iter()
             .filter(|u| after(u) && changed_unit(u))
-            .find(|u| {
-                let touched: HashSet<String> = u.reads.union(&u.writes).cloned().collect();
-                u.jumps || meets(&touched, &reached)
-            })
+            .find(|u| u.jumps || reached.meets(&u.touches))
             .map(|u| self.side.lines.line_col(u.start).0)
     }
 }
@@ -4603,6 +4758,27 @@ mod tests {
         );
         assert_eq!(eval::date_neighbour("99991231", 1), None);
         assert_eq!(eval::date_neighbour("hello", 1), None);
+    }
+
+    /// The integer name sets meet as the string sets did: both non-empty,
+    /// and either holds the any-name or they share one.
+    #[test]
+    fn taint_meets_like_the_string_sets() {
+        let all: HashSet<String> = ["a", "b", "c"].iter().map(|x| x.to_string()).collect();
+        let names = Names::of(&all);
+        let id = |x: &str| names.ids[x];
+        let mut t = Taint::new(names.names.len());
+        assert!(!t.meets(&[id("a")]), "empty taint meets nothing");
+        t.add(id("a"));
+        assert!(t.meets(&[id("a"), id("b")]));
+        assert!(!t.meets(&[id("b"), id("c")]));
+        assert!(!t.meets(&[]), "an empty read set meets nothing");
+        assert!(
+            t.meets(&[ANY_ID]),
+            "a read of any name meets a non-empty taint"
+        );
+        t.add(ANY_ID);
+        assert!(t.meets(&[id("c")]), "a taint of any name meets every read");
     }
 
     /// The span set answers as a scan with `overlaps` does, for spans that
