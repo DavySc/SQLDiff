@@ -217,3 +217,26 @@ What the move forced, none of it changes what is computed:
   hand-written `Debug` (and it prints the string it holds), and a draft that
   differs in any one field prints differently, so `Draft::canonical()` (the
   `Debug` text) separates every pair of drafts.
+
+## Step 6: `sqldiff-draft` (PR 2 of the stage-fingerprint plan)
+
+The code that writes a draft moves into `sqldiff-draft`: `tsql` (the rules
+for T-SQL), `tok`, `table_vars` and the `rewrite*` entry points with their
+panic guard. It depends on `sqldiff-syntax`, `-catalog`, `-model`, `-equiv`
+and `-units` and on nothing above them: not on `sqldiff-core`, so an edit to
+`ir`, `engine`, `ledger` or the check can never change a draft, and the
+Cargo closure of this crate is the draft code's fingerprint set.
+
+`impossible` (recognising the SQL Server-only features a note names) and
+`trace_text` moved into `sqldiff-units`, because the check side reads them
+too. `sqldiff-convert` keeps the check (`check`, `check_with`, `check_one`),
+the store, the review ledger and the tree driver (`tree.rs`), which is
+also where pass 1 of a tree is orchestrated (`build_tree_state`,
+`refused.rs`, the catalog fold). It re-exports the moved items under their
+old paths. No behaviour changes.
+
+What the move forced: `tsql::{convert-adjacent entry points, CONTINUE_RULE,
+without_continuation, with_plain_routines}` and `rewrite_in_tree*` are
+`pub`, and the places in `sqldiff-convert` that call into the draft crate are
+now visible as `sqldiff_draft::` paths (PR 3 turns that into a test: only
+the listed call sites may name the draft crate).

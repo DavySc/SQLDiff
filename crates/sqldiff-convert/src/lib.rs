@@ -16,7 +16,7 @@ pub use shared::Shared;
 use sqldiff_core::{Artifact, Dialect, Options, Report};
 use sqldiff_syntax::{parse, LineIndex};
 use sqldiff_units::kept_notes;
-pub use sqldiff_units::{Draft, Note, RuleOptions, Status, Step, Written};
+pub use sqldiff_units::{trace_text, Draft, Note, RuleOptions, Status, Step, Written};
 
 include!(concat!(env!("OUT_DIR"), "/fingerprint.rs"));
 
@@ -25,23 +25,24 @@ pub mod callees;
 pub mod cert;
 pub mod drift;
 pub mod gate;
-pub mod impossible;
+use sqldiff_draft::rewrite_in_tree;
+use sqldiff_draft::rewrite_in_tree_plain;
+pub use sqldiff_draft::{rewrite, rewrite_in, rewrite_with};
+pub use sqldiff_units::impossible;
 pub mod instances;
 pub mod job;
 pub mod mem;
 pub mod names;
-use sqldiff_units::out;
 pub mod plan;
 pub mod queue;
 mod refused;
 pub mod review;
 pub use sqldiff_units::shared;
 pub mod store;
-mod table_vars;
+
 mod template;
-mod tok;
+
 pub mod tree;
-mod tsql;
 
 pub use template::{
     check_template, convert_template, rewrite_template, rewrite_template_as, rewrite_template_with,
@@ -63,17 +64,6 @@ pub fn trim_reports(c: &mut Conversion) {
         r.refinements = Vec::new();
         r.proof = None;
     }
-}
-
-/// A unit's text as the trace's completeness rule compares it: without
-/// whitespace and statement terminators, in lower case. A unit whose input
-/// and output differ by more than that was rewritten, and its trace names at
-/// least one rule (checked in debug builds and by the corpus test).
-pub fn trace_text(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_whitespace() && *c != ';')
-        .flat_map(char::to_lowercase)
-        .collect()
 }
 
 /// A span in the input or the output.
@@ -266,145 +256,6 @@ pub fn convert_with(
     opts: &Options,
 ) -> Result<Conversion, String> {
     Ok(check(text, rewrite(text, from, to), opts))
-}
-
-/// Apply the rules only. Nothing in a draft has been checked yet.
-pub fn rewrite(text: &str, from: Dialect, to: Dialect) -> Draft {
-    rewrite_in(text, from, to, None)
-}
-
-/// Apply the rules with the source catalog of the whole tree being
-/// converted (`sqldiff_core::catalog::ddl` over every input file), so a
-/// rule can rely on what other files define: a call with OUTPUT arguments
-/// converts only when the called procedure's parameters are known.
-pub fn rewrite_in(
-    text: &str,
-    from: Dialect,
-    to: Dialect,
-    source: Option<&sqldiff_core::catalog::Catalog>,
-) -> Draft {
-    rewrite_in_tree(text, from, to, source, None, RuleOptions::default())
-}
-
-/// [`rewrite_in`] with `options` for the rules.
-pub fn rewrite_with(
-    text: &str,
-    from: Dialect,
-    to: Dialect,
-    source: Option<&sqldiff_core::catalog::Catalog>,
-    options: RuleOptions,
-) -> Draft {
-    rewrite_in_tree(text, from, to, source, None, options)
-}
-
-/// [`rewrite_in`] with the temporary table names the whole tree's table
-/// variables claim (`table_vars::Claims`), so a table variable of this
-/// text that would take another routine's name is refused. Without
-/// `claims`, the text's own routines are checked against each other.
-pub(crate) fn rewrite_in_tree(
-    text: &str,
-    from: Dialect,
-    to: Dialect,
-    source: Option<&sqldiff_core::catalog::Catalog>,
-    claims: Option<&table_vars::Claims>,
-    options: RuleOptions,
-) -> Draft {
-    rewrite_in_tree_plain(text, from, to, source, claims, options, &[])
-}
-
-/// [`rewrite_in_tree`] with the routines starting at the source offsets
-/// `plain_at` (sorted) converted without exception blocks and the rest as
-/// the rules write them: one variant, no second draft kept.
-pub(crate) fn rewrite_in_tree_plain(
-    text: &str,
-    from: Dialect,
-    to: Dialect,
-    source: Option<&sqldiff_core::catalog::Catalog>,
-    claims: Option<&table_vars::Claims>,
-    options: RuleOptions,
-    plain_at: &[usize],
-) -> Draft {
-    let root = parse(text, from).syntax();
-    let own;
-    let claims = match claims {
-        Some(c) => c,
-        None => {
-            let mut c = table_vars::Claims::default();
-            if from == Dialect::Tsql {
-                c.add_root(&root, "");
-            }
-            own = c;
-            &own
-        }
-    };
-    let run = || {
-        guarded(&root, text, || match (from, to) {
-            (Dialect::Tsql, Dialect::Postgres | Dialect::Db2i) => {
-                tsql::convert(&root, text, to, source, claims, options)
-            }
-            _ => no_rules(&root, text, from, to),
-        })
-    };
-    if !plain_at.is_empty() {
-        let raw = tsql::with_plain_routines(plain_at, run);
-        return Draft {
-            from,
-            to,
-            options,
-            raw,
-            plain: None,
-        };
-    }
-    let raw = run();
-    let plain = raw
-        .units
-        .iter()
-        .any(|u| u.trace.iter().any(|s| s.rule == tsql::CONTINUE_RULE))
-        .then(|| {
-            let raw = tsql::without_continuation(run);
-            Box::new(Draft {
-                from,
-                to,
-                options,
-                raw,
-                plain: None,
-            })
-        });
-    Draft {
-        from,
-        to,
-        options,
-        raw,
-        plain,
-    }
-}
-
-/// Runs the rules over one file. A panic in them must not take the other files
-/// of a tree with it: the file becomes "not converted", every unit with the
-/// reason, and the run goes on.
-fn guarded(
-    root: &sqldiff_syntax::SyntaxNode,
-    text: &str,
-    rules: impl FnOnce() -> out::Out,
-) -> out::Out {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(rules)) {
-        Ok(o) => o,
-        Err(e) => {
-            let what = e
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| e.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "unknown".into());
-            refuse_all(
-                root,
-                text,
-                &format!(
-                    "the conversion rules stopped on this file with an internal error ({what}); nothing in it was converted. This is a bug: report it with a reduced example"
-                ),
-                "internal-error",
-            )
-        }
-    }
 }
 
 /// Engine findings on the output alone that gate a unit: it does not bind
@@ -948,60 +799,6 @@ pub(crate) fn recount<C: Cored>(c: &mut C) {
     c.set_counts(counts);
 }
 
-/// Every top-level unit kept as a comment, for a pair without rules.
-fn no_rules(root: &sqldiff_syntax::SyntaxNode, text: &str, from: Dialect, to: Dialect) -> out::Out {
-    let reason = if from == to {
-        format!("source and target are both {}", from.display_name())
-    } else {
-        format!(
-            "no conversion rules from {} to {} yet",
-            from.display_name(),
-            to.display_name()
-        )
-    };
-    refuse_all(root, text, &reason, "no-rules")
-}
-
-/// Every unit of the file kept as a comment, "not converted" for `reason`.
-fn refuse_all(root: &sqldiff_syntax::SyntaxNode, text: &str, reason: &str, rule: &str) -> out::Out {
-    let mut o = out::Out::default();
-    let units = root.children().flat_map(|c| {
-        if c.kind() == sqldiff_syntax::SyntaxKind::BATCH {
-            c.children().filter(|u| u.kind().is_unit()).collect()
-        } else if c.kind().is_unit() {
-            vec![c]
-        } else {
-            Vec::new()
-        }
-    });
-    for u in units {
-        let (s, e) = sqldiff_syntax::ast::sig_range(&u);
-        let mut t = format!("-- [not converted] {reason}\n");
-        for line in text[s..e].lines() {
-            t.push_str("-- ");
-            t.push_str(line);
-            t.push('\n');
-        }
-        o.unit(
-            (s, e),
-            0,
-            &t,
-            vec![Note {
-                status: Status::NotConverted,
-                rule: rule.into(),
-                text: reason.to_string().into(),
-            }],
-            vec![Step {
-                rule: rule.into(),
-                start: s,
-                end: e,
-                inst: None,
-            }],
-        );
-    }
-    o
-}
-
 /// A one-sided check's witness without its `Side A line N: ` prefix (the
 /// unit already says where).
 fn without_side(w: &str) -> &str {
@@ -1066,20 +863,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_panic_in_the_rules_makes_the_file_not_converted_not_a_crash() {
-        let text = "CREATE PROCEDURE a AS SELECT 1\nGO\nCREATE PROCEDURE b AS SELECT 2\nGO\n";
-        let root = parse(text, Dialect::Tsql).syntax();
-        let o = guarded(&root, text, || panic!("the rules lost their place"));
-        assert!(o.text.contains("[not converted]"), "{}", o.text);
-        assert!(o.text.contains("the rules lost their place"), "{}", o.text);
-        assert_eq!(o.units.len(), 2, "every unit is accounted for");
-        assert!(o.units.iter().all(|u| u
-            .notes
-            .iter()
-            .any(|n| n.rule == "internal-error" && n.status == Status::NotConverted)));
-    }
-
-    #[test]
     fn a_core_carries_the_units_out_and_back_and_recounts_like_the_conversion() {
         let text = "CREATE TABLE t (a int NOT NULL)\nGO\nSELECT TOP 1 a FROM t\nGO\n";
         let mut c = convert(text, Dialect::Tsql, Dialect::Postgres).unwrap();
@@ -1103,14 +886,6 @@ mod tests {
             serde_json::to_string(&direct).unwrap()
         );
         assert_ne!(serde_json::to_string(&c).unwrap(), before);
-    }
-
-    #[test]
-    fn rules_that_do_not_panic_are_untouched() {
-        let text = "CREATE PROCEDURE a AS SELECT 1\nGO\n";
-        let root = parse(text, Dialect::Tsql).syntax();
-        let o = guarded(&root, text, out::Out::default);
-        assert!(o.text.is_empty());
     }
 }
 

@@ -21,6 +21,7 @@ const CRATES: &[&str] = &[
     "sqldiff-core",
     "sqldiff-source",
     "sqldiff-units",
+    "sqldiff-draft",
     "sqldiff-convert",
 ];
 

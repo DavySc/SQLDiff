@@ -344,7 +344,7 @@ impl Cx<'_> {
     /// column the source catalog declares NOT NULL, of a table that no
     /// outer join can leave out. `false` whenever that is not certain.
     fn not_null_key(&self, ts: &[T], ds: &[i32], order: usize, key: &[T]) -> bool {
-        use sqldiff_core::catalog::Ident;
+        use sqldiff_equiv::catalog::Ident;
         // Only with the tree's catalog, which the engine checks against too
         // (without it, it cannot tell either). And not in a statement with
         // CTEs: a FROM name may be a CTE, not a table.
