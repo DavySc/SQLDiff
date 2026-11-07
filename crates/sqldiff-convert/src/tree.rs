@@ -1481,7 +1481,10 @@ fn convert_files(
         _ => Default::default(),
     };
     let stand_ins_digest = stand_ins.digest();
-    let mismatch: std::sync::Mutex<Option<String>> = Default::default();
+    // Every mismatch found, not the last one a thread happened to store: the
+    // messages are sorted before they are reported, so the error does not
+    // depend on which thread finished when.
+    let mismatch: std::sync::Mutex<Vec<String>> = Default::default();
     let claims: std::sync::OnceLock<crate::table_vars::Claims> = std::sync::OnceLock::new();
     let work = slots(inputs.iter().zip(drafts).zip(keys.iter()).enumerate());
     let progress = Progress::new(work.len(), hooks);
@@ -1530,10 +1533,14 @@ fn convert_files(
                         // flags the store holds for the same result.
                         if let Some(old) = cc.store.get_flags(k, fk) {
                             if old != flags {
-                                *mismatch.lock().unwrap() = Some(format!(
+                                cc.store.bundle_flags(k, fk, &old, &flags);
+                                mismatch.lock().unwrap().push(format!(
                                     "{}: the stored stand-in flags {} differ from flags computed \
-                                     again for the same result. The store is emptied: run again.",
+                                     again for the same result; both are in {}/flags-{}.json. \
+                                     The store is emptied: run again.",
                                     input.rel,
+                                    fk.as_str(),
+                                    crate::store::MISMATCH_DIR,
                                     fk.as_str(),
                                 ));
                             }
@@ -1585,7 +1592,7 @@ fn convert_files(
             finish.apply(&mut old);
             if !crate::store::compare(&old, &c) {
                 cc.store.bundle(k, &old, &c);
-                *mismatch.lock().unwrap() = Some(format!(
+                mismatch.lock().unwrap().push(format!(
                     "{}: the stored result {} differs from a fresh check of the same input; \
                      both are in {}/{}.json. The store is emptied: run again.",
                     input.rel,
@@ -1606,11 +1613,13 @@ fn convert_files(
         Some((hold(c, key.as_ref(), in_store, false), secs, false, false))
     });
     crate::mem::release();
-    if let Some(msg) = mismatch.into_inner().unwrap() {
+    let mut found = mismatch.into_inner().unwrap();
+    if !found.is_empty() {
         if let Some(c) = cache {
             c.store.clear();
         }
-        return Err(msg);
+        found.sort();
+        return Err(found.join("\n"));
     }
     let done: Vec<(Held, f64, bool, bool)> = done
         .into_iter()
