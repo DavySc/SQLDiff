@@ -108,8 +108,8 @@ fn query_verdict(d: Dialect, ty: &str, a: &str, b: &str) -> Verdict {
     };
     let q = |w: &str| format!("SELECT id FROM t WHERE c = 'abc' AND {w};");
     diff(
-        &Artifact::new("a.sql", d, &q(a)),
-        &Artifact::new("b.sql", d, &q(b)),
+        &Artifact::new("a.sql", d, q(a)),
+        &Artifact::new("b.sql", d, q(b)),
         &opts,
     )
     .verdict()
