@@ -22,11 +22,7 @@ ROOT = os.path.dirname(HERE)
 
 # Per-file limits where the default is wrong: name prefix -> (seconds, MB).
 # Every entry needs the measurement that justifies it.
-OVERRIDES = {
-    # R1 shape that finishes but slowly: 94 s and 1 GB on main (4 cores), so the
-    # default 120 s would flap on a slower runner. Fixed by R1, then drop this.
-    "j_branches_14": (240, 2048),
-}
+OVERRIDES = {}
 
 # Shapes that still run too long or take too much memory, each with the row of
 # the performance plan (conversion-performance-plan.md, section 2.3)
@@ -36,6 +32,12 @@ OVERRIDES = {
 # An entry that finishes (slowly) rather than being killed is a tuple
 # (reason, seconds, MB): the limits it is known to break, used in that mode.
 KNOWN_OPEN = {
+    "a_procs_50x20": ("R1: IF-guarded writes per routine, 49 to 75 s", 30, 2048),
+    "j_branches_14": (
+        "R1: nested IF/ELSE depth 14, 94 to 99 s, 1 GB; time ~2.4x per doubling",
+        30,
+        2048,
+    ),
     "a_procs_50x200": "R1: killed at 120 s, 937 MB",
     "a_procs_200x20": "R1: killed at 120 s",
     "a_procs_500x20": "R1: killed at 120 s",
