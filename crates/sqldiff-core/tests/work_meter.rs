@@ -40,15 +40,18 @@ fn the_same_input_gives_the_same_work() {
     assert_eq!(first, other);
 }
 
-// Logical charging (R4): what a cache, a memo or a replay saves is charged
-// again, so the total is what the algorithm does and not what its shortcuts
-// happened to skip.
-mod logical {
+// What is counted does not depend on what answered. The caches (explorer,
+// flipped scenarios) are speed-ups: their work is counted at the first request
+// and not again, hit or recomputed. A path dropped by joining is one event;
+// the exponential work it avoids is not counted. A replay restored from a
+// checkpoint counts what it runs from the fault on, not the restore.
+mod fixed {
     use sqldiff_core::artifact::Analyzed;
+    use sqldiff_core::ir::behaviour::set_caches_off_for_tests;
     use sqldiff_core::ir::{self, ErrorKind, Explorer, Fault, KeyUniverse, Scenario};
     use sqldiff_core::model::Side;
-    use sqldiff_core::{Artifact, Dialect};
-    use sqldiff_model::work::{scope, Site};
+    use sqldiff_core::{diff, Artifact, Dialect, Options};
+    use sqldiff_model::work::{scope, Site, Work};
 
     fn cfg_of(body: &str) -> ir::Cfg {
         let sql = format!("CREATE PROCEDURE dbo.p @p int AS\nBEGIN\n{body}END\nGO\n");
@@ -56,14 +59,56 @@ mod logical {
         ir::lower(&Analyzed::new(&art, Side::A, 3))
     }
 
-    fn steps(w: &sqldiff_model::work::Work) -> u64 {
+    fn steps(w: &Work) -> u64 {
         w.get(Site::ExplorerSteps)
     }
 
-    /// Joining drops paths, but each dropped path is charged the subtree it
-    /// would have run: joined and plain runs count the same steps.
+    /// Two procedures with branches, loops and writes, so that the behaviour
+    /// model builds explorers, replays faults and flips scenarios.
+    fn pair() -> (String, String) {
+        let mk = |c: u32| {
+            let body: String = (0..6)
+                .map(|k| {
+                    format!(
+                        "  IF @p > {k} UPDATE dbo.t SET a = a + {k} WHERE a = {};\n  IF @@ROWCOUNT = 0 INSERT INTO dbo.t (a) VALUES ({k});\n",
+                        if k == 5 { c } else { 1 }
+                    )
+                })
+                .collect();
+            format!("CREATE PROCEDURE dbo.p @p int AS\nBEGIN\n  SET XACT_ABORT ON;\n  BEGIN TRY\n{body}  END TRY\n  BEGIN CATCH\n    THROW;\n  END CATCH\nEND\n")
+        };
+        (mk(1), mk(2))
+    }
+
+    fn run() -> Work {
+        let (a, b) = pair();
+        scope("t", || {
+            let _ = diff(
+                &Artifact::new("a.sql", Dialect::Tsql, a.as_str()),
+                &Artifact::new("b.sql", Dialect::Tsql, b.as_str()),
+                &Options::default(),
+            );
+        })
+        .1
+    }
+
+    /// With the explorer and flipped caches off the total is the same.
     #[test]
-    fn a_joined_run_counts_what_the_plain_run_does() {
+    fn the_total_is_the_same_with_the_caches_off() {
+        let on = run();
+        assert!(steps(&on) > 1000, "{on}");
+        set_caches_off_for_tests(true);
+        let off = run();
+        set_caches_off_for_tests(false);
+        assert_eq!(on, off);
+        // Other thread: same again (nothing carries over between files).
+        assert_eq!(on, std::thread::spawn(run).join().unwrap());
+    }
+
+    /// A joined run drops paths at one event each: it counts far fewer steps
+    /// than the plain run, which does the exponential work.
+    #[test]
+    fn a_joined_run_does_not_count_the_work_it_avoided() {
         let body: String = (0..6)
             .map(|i| format!("  IF @p > {i}\n    PRINT 'x{i}';\n"))
             .collect::<String>()
@@ -80,54 +125,10 @@ mod logical {
         assert_eq!(plain.joined(), 0);
         assert!(joined.joined() > 0);
         assert!(steps(&wp) > 100, "{wp}");
-        assert_eq!(steps(&wp), steps(&wj), "plain {wp}\njoined {wj}");
-        assert_eq!(plain.built(), wp);
-        assert_eq!(joined.built(), wj);
+        assert!(steps(&wj) < steps(&wp) / 4, "plain {wp}\njoined {wj}");
     }
 
-    /// A fault scenario restored from a checkpoint is charged the prefix it
-    /// skips (the ticks before the fault), not the ticks the restore re-ran:
-    /// a fault reached at tick 600 is charged about 600 steps.
-    #[test]
-    fn a_replay_is_charged_its_prefix_not_the_restore() {
-        // Far more ticks than checkpoints, so restores re-run many ticks.
-        let body: String = (0..700)
-            .map(|i| format!("  UPDATE dbo.t SET a = {i};\n"))
-            .collect();
-        let cfg = cfg_of(&body);
-        let keys = KeyUniverse::of(&[&cfg]);
-        let base = Scenario::default();
-        let (x, built) = scope("build", || Explorer::in_universe(&cfg, &base, &keys));
-        // Nodes are numbered from the end of the routine: the 100th statement
-        // node is reached at tick 600, so 600 ticks of prefix, then a short rest.
-        let node = (0..cfg.nodes.len())
-            .filter(|&n| cfg.node(n).stmt().is_some())
-            .nth(100)
-            .expect("a statement");
-        let sc = Scenario {
-            faults: vec![Fault {
-                node,
-                kind: ErrorKind::ALL[0],
-            }],
-            ..base.clone()
-        };
-        let (_, w) = scope("replay", || x.explore(&cfg, &sc));
-        let (w_steps, built_steps) = (steps(&w), steps(&built));
-        // Charged the prefix (about 600 ticks, whatever the checkpoint
-        // spacing), not the few ticks the restore re-ran, and not the whole run.
-        assert!(
-            (590..=640).contains(&w_steps) && w_steps < built_steps,
-            "replay {w} vs build {built}"
-        );
-        // And it is the same every time.
-        let (_, again) = scope("replay", || x.explore(&cfg, &sc));
-        assert_eq!(w, again);
-    }
-
-    /// The charge for a replay does not depend on what the file did before
-    /// the explorer was made (a resumed or stored earlier routine).
-    #[test]
-    fn a_replay_charge_ignores_earlier_work_in_the_file() {
+    fn replay_cost(earlier: u64, nth: usize) -> u64 {
         let body: String = (0..700)
             .map(|i| format!("  UPDATE dbo.t SET a = {i};\n"))
             .collect();
@@ -136,7 +137,7 @@ mod logical {
         let base = Scenario::default();
         let node = (0..cfg.nodes.len())
             .filter(|&n| cfg.node(n).stmt().is_some())
-            .nth(100)
+            .nth(nth)
             .expect("a statement");
         let sc = Scenario {
             faults: vec![Fault {
@@ -145,21 +146,28 @@ mod logical {
             }],
             ..base.clone()
         };
-        let run = |earlier: u64| {
-            scope("file", || {
-                sqldiff_model::work::spend(Site::ExplorerSteps, earlier);
-                let x = Explorer::in_universe(&cfg, &base, &keys);
-                scope("replay", || x.explore(&cfg, &sc)).1
-            })
-            .0
-        };
-        assert_eq!(run(0), run(1_000_000));
+        scope("file", || {
+            sqldiff_model::work::spend(Site::ExplorerSteps, earlier);
+            let x = Explorer::in_universe(&cfg, &base, &keys);
+            steps(&scope("replay", || x.explore(&cfg, &sc)).1)
+        })
+        .0
     }
 
-    /// A fault the explorer cannot resume (its node is not the one the
-    /// checkpoint reaches) falls back to a full run: charged once.
+    /// A fault reached at tick 600 (nodes are numbered from the end of the
+    /// routine, so the 100th statement node) counts what its replay runs, a
+    /// few steps, whatever the checkpoint spacing and whatever the file did
+    /// before. Its prefix was counted when the fault-free run was made.
     #[test]
-    fn two_faults_are_charged_as_one_full_run() {
+    fn a_replay_counts_only_what_it_runs() {
+        let late = replay_cost(0, 100);
+        assert!(late < 20, "{late}");
+        assert_eq!(late, replay_cost(1_000_000, 100));
+    }
+
+    /// Two faults make no resumable replay: a full run, counted once.
+    #[test]
+    fn two_faults_are_counted_as_one_full_run() {
         let body: String = (0..50)
             .map(|i| format!("  UPDATE dbo.t SET a = {i};\n"))
             .collect();
@@ -182,5 +190,47 @@ mod logical {
         };
         let (_, w) = scope("two", || x.explore(&cfg, &sc));
         assert!(steps(&w) > 0 && steps(&w) < 200, "{w}");
+    }
+
+    /// The recompute of a flipped scenario (caches off, or a cache that was
+    /// cleared) spends no routine or file diff budget, so a budget set to
+    /// exactly what the cached run spends gives the same report and the same
+    /// work with the caches on or off. p01-move-stock reaches the flipped
+    /// scenarios (`persists`) with first requests and repeats.
+    #[test]
+    fn a_flipped_scenario_recomputed_spends_no_budget() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../corpus/pairs/p01-move-stock");
+        let read = |f: &str| {
+            std::fs::read_to_string(dir.join(f))
+                .unwrap()
+                .replace("\r\n", "\n")
+        };
+        let (a, b) = (read("tsql.sql"), read("db2i.sql"));
+        let run = |budget: Option<(u64, u64)>| {
+            let opts = Options {
+                work_budgets: budget,
+                ..Options::default()
+            };
+            let (rep, w) = scope("t", || {
+                diff(
+                    &Artifact::new("a.sql", Dialect::Tsql, a.as_str()),
+                    &Artifact::new("b.sql", Dialect::Db2i, b.as_str()),
+                    &opts,
+                )
+            });
+            (serde_json::to_string(&rep).unwrap(), w)
+        };
+        let (base_report, base) = run(None);
+        let spent = base.get(Site::BehaviourDiffs);
+        assert!(spent > 4, "{base}");
+        // Exactly the cached run's spend: nothing is cut with the caches on.
+        let (on_report, on) = run(Some((spent, u64::MAX)));
+        assert_eq!(on_report, base_report);
+        set_caches_off_for_tests(true);
+        let (off_report, off) = run(Some((spent, u64::MAX)));
+        set_caches_off_for_tests(false);
+        assert_eq!(off_report, on_report);
+        assert_eq!(off, on);
     }
 }

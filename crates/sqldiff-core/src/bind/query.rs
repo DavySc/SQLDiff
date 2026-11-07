@@ -73,6 +73,8 @@ struct Shape {
     clause: Vec<bool>,
     /// Kind of the innermost paren around each token.
     inner: Vec<Option<Paren>>,
+    /// Length of `chain(g)` for each group, made once.
+    depth: Vec<usize>,
 }
 
 const SET_OPS: &[&str] = &["UNION", "EXCEPT", "INTERSECT", "MINUS"];
@@ -203,11 +205,19 @@ fn shape(t: &[Tok]) -> Shape {
         clause.push(at_query);
         inner.push(stack.last().map(|s| s.0));
     }
+    // A parent is always made before its children.
+    let mut depth = vec![1usize; parent.len()];
+    for g in 0..parent.len() {
+        if let Some(p) = parent[g] {
+            depth[g] = depth[p] + 1;
+        }
+    }
     Shape {
         group,
         parent,
         clause,
         inner,
+        depth,
     }
 }
 
@@ -1473,7 +1483,7 @@ impl<'a> Binder<'a> {
                             "FOR",
                             "WINDOW",
                         ]))
-                        || (sh.group[k] != g && sh.chain(sh.group[k]).len() < sh.chain(g).len())
+                        || (sh.group[k] != g && sh.depth[sh.group[k]] < sh.depth[g])
                         || t[k].is(SyntaxKind::SEMICOLON)
                 })
                 .unwrap_or(t.len());

@@ -56,6 +56,17 @@ pub(crate) fn tokens(n: &SyntaxNode) -> Vec<T> {
         .collect()
 }
 
+/// Whether the first significant token of `n` is the unquoted word `w`,
+/// without reading the tokens after it (`tokens(n)` copies the whole
+/// subtree, which for a loop nested in a loop nested in a loop … is the
+/// whole rest of the input at every level).
+pub(crate) fn starts_with_word(n: &SyntaxNode, w: &str) -> bool {
+    n.descendants_with_tokens()
+        .filter_map(SyntaxElement::into_token)
+        .find(|t| !t.kind().is_trivia() && t.kind() != INFERRED_TERMINATOR)
+        .is_some_and(|t| t.kind() == IDENT && t.text().eq_ignore_ascii_case(w))
+}
+
 /// The input bytes a token slice covers, from its first to its last
 /// significant token (made-up tokens count by the place they stand for).
 /// `None` for a slice with no significant token.
@@ -167,4 +178,20 @@ pub(crate) fn snake(name: &str) -> String {
         out.extend(c.to_lowercase());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::starts_with_word;
+
+    #[test]
+    fn first_significant_word_ignores_trivia_and_case() {
+        let root = sqldiff_syntax::parse(
+            "  /* c */ while 1=1 select 1;",
+            sqldiff_syntax::Dialect::Tsql,
+        )
+        .syntax();
+        assert!(starts_with_word(&root, "WHILE"));
+        assert!(!starts_with_word(&root, "SELECT"));
+    }
 }
