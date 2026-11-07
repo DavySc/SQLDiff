@@ -1209,7 +1209,6 @@ impl Server {
                     .get("temporal_historyless")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
-                ..Default::default()
             },
             recheck: match str_arg(args, "recheck") {
                 Some(r) => r.parse()?,
