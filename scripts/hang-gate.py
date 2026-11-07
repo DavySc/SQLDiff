@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Hang gate: adversarial and audit inputs under a time limit and a memory ceiling.
 
-Converts every file written by scripts/gen-adversarial.py (and every file under
-tests/hang/ if present) alone, -j 1, to PostgreSQL, and fails when one
+Converts every file written by scripts/gen-adversarial.py (the synthetic shapes
+and the audit repros, prefix n_) and every file under tests/hang/ if present, alone, -j 1, to PostgreSQL, and fails when one
 
   * is killed at the time limit,
   * peaks above the resident-memory ceiling,
@@ -29,21 +29,36 @@ OVERRIDES = {}
 # that fixes it, measured on main at 4 cores. The normal run skips them (it
 # would only spend CI minutes being killed); `--known-open` runs only them and
 # fails when one now passes, so the entry is removed in the PR that fixes it.
+# An entry that finishes (slowly) rather than being killed is a tuple
+# (reason, seconds, MB): the limits it is known to break, used in that mode.
 KNOWN_OPEN = {
-    "a_procs_50x20": "R1: IF-guarded writes per routine, 53 s",
+    "a_procs_50x20": ("R1: IF-guarded writes per routine, 49 to 75 s", 30, 2048),
+    "j_branches_14": (
+        "R1: nested IF/ELSE depth 14, 94 to 99 s, 1 GB; time ~2.4x per doubling",
+        30,
+        2048,
+    ),
     "a_procs_50x200": "R1: killed at 120 s, 937 MB",
     "a_procs_200x20": "R1: killed at 120 s",
     "a_procs_500x20": "R1: killed at 120 s",
     "g_tables_5000": "catalog loading is quadratic, killed at 120 s",
-    "j_branches_14": "R1: nested IF/ELSE depth 14, 109 s, 1 GB",
     "k_seq_ifs_200": "R1: sequential IF-guarded writes, killed at 120 s",
+    "n_h02_select_no_from_db2i": (
+        "findings of unterminated SELECTs span to the end of the file, so excerpts "
+        "grow as n^2/2 lines: 10k lines 4 s / 542 MB, 20k lines 17 s / 2 GB (audit h02)",
+        10, 512,
+    ),
+    "n_h04_nested_while": "R2: 4000 nested WHILE, killed at 120 s, 2.3 GB (audit h04)",
 }
 
 
-def run(binary, path, out, timeout, kill_rss_mb):
+def run(binary, path, out, timeout, kill_rss_mb, dialect="tsql"):
     start = time.time()
+    # Db2 for i has no conversion rules yet: its repros are checked, not converted.
+    cmd = ([binary, "check", path, "-d", "db2i", "-f", "json", "--no-cache"] if dialect == "db2i"
+           else [binary, "convert", path, "-o", out, "--from", dialect, "--to", "postgres", "-j", "1"])
     p = subprocess.Popen(
-        [binary, "convert", path, "-o", out, "--to", "postgres", "-j", "1"],
+        cmd,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
@@ -98,6 +113,9 @@ def main():
             if a.only not in name:
                 continue
             known = next((r for k, r in KNOWN_OPEN.items() if name.startswith(k + ".")), None)
+            known_limits = None
+            if isinstance(known, tuple):
+                known, *known_limits = known
             if known and not a.known_open:
                 print(f"{name:32} skipped (known open: {known})")
                 continue
@@ -105,10 +123,13 @@ def main():
                 continue
             secs, mb = a.timeout, a.rss_mb
             for prefix, (s, m) in OVERRIDES.items():
-                if name.startswith(prefix):
+                if name.startswith(prefix + "."):
                     secs, mb = s, m
+            if a.known_open and known_limits:
+                secs, mb = known_limits
             out = os.path.join(work, "out", name)
-            result, wall, peak = run(a.sqldiff, f, out, secs, mb)
+            dialect = "db2i" if "db2i" in name else "tsql"
+            result, wall, peak = run(a.sqldiff, f, out, secs, mb, dialect)
             if result == "ok" and peak > mb:
                 result = f"MEMORY ({peak} MB > {mb} MB)"
             if a.known_open:
