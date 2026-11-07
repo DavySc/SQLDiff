@@ -68,7 +68,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
         "sqldiff-convert/src/tsql.rs",
         &["OnceCell", "thread_local!"],
     ),
-    ("sqldiff-core/src/assumptions.rs", &["OnceLock"]),
+    ("sqldiff-model/src/assumptions.rs", &["OnceLock"]),
     ("sqldiff-syntax/src/abstract_syntax.rs", &["thread_local!"]),
     ("sqldiff-core/src/catalog/builtins.rs", &["OnceLock"]),
     ("sqldiff-core/src/catalog/ddl.rs", &["fs::"]),
@@ -88,11 +88,11 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("sqldiff-core/src/equiv/schema.rs", &["OnceLock", "fs::"]),
     ("sqldiff-core/src/format/tests.rs", &["fs::"]),
     ("sqldiff-core/src/ir/behaviour.rs", &["OnceCell"]),
-    ("sqldiff-core/src/ir/profile.rs", &["OnceLock"]),
+    ("sqldiff-model/src/profile.rs", &["OnceLock"]),
     ("sqldiff-core/src/lint.rs", &["OnceLock"]),
     ("sqldiff-core/src/rule_proofs.rs", &["OnceLock"]),
     ("sqldiff-core/src/rules/rule.rs", &["OnceLock"]),
-    ("sqldiff-core/src/target.rs", &["Mutex", "OnceLock"]),
+    ("sqldiff-model/src/target.rs", &["Mutex", "OnceLock"]),
 ];
 
 fn scan(dir: &Path, root: &Path, out: &mut BTreeMap<String, BTreeSet<&'static str>>) {
@@ -125,7 +125,12 @@ fn scan(dir: &Path, root: &Path, out: &mut BTreeMap<String, BTreeSet<&'static st
 fn the_check_reads_nothing_outside_its_arguments() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut found = BTreeMap::new();
-    for krate in ["sqldiff-core", "sqldiff-convert", "sqldiff-syntax"] {
+    for krate in [
+        "sqldiff-core",
+        "sqldiff-convert",
+        "sqldiff-syntax",
+        "sqldiff-model",
+    ] {
         scan(&root.join(krate).join("src"), &root, &mut found);
     }
     let allowed: BTreeMap<&str, BTreeSet<&str>> = ALLOWED

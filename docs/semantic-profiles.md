@@ -1,7 +1,7 @@
 # Semantic profiles
 
 The error and transaction behaviour of each dialect (design §4, §7) lives as
-data in `crates/sqldiff-core/profiles/semantics/<dialect>.toml`. The code in
+data in `crates/sqldiff-model/profiles/semantics/<dialect>.toml`. The code in
 `crates/sqldiff-core/src/ir/` (CFG lowering, the transaction interpreter and
 the behavioural comparison) reads these tables. It does not hard-code
 vendor rules.

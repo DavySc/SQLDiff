@@ -551,6 +551,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqldiff-model",
  "sqldiff-syntax",
  "toml",
 ]
@@ -595,6 +596,18 @@ dependencies = [
  "sqldiff-core",
  "sqldiff-review",
  "sqldiff-source",
+]
+
+[[package]]
+name = "sqldiff-model"
+version = "0.1.0"
+dependencies = [
+ "rowan",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqldiff-syntax",
+ "toml",
 ]
 
 [[package]]

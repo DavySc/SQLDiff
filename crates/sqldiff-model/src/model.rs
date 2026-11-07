@@ -179,7 +179,7 @@ impl Assumption {
     pub fn default(id: &str, text: &str) -> Self {
         debug_assert!(
             crate::assumptions::lookup(id).is_some(),
-            "assumption id `{id}` is not registered in crates/sqldiff-core/profiles/assumptions.toml"
+            "assumption id `{id}` is not registered in crates/sqldiff-model/profiles/assumptions.toml"
         );
         Assumption {
             id: id.to_string(),
@@ -285,10 +285,10 @@ pub struct Report {
     /// Structured witnesses of behavioural findings, by fingerprint: the
     /// scenario and both sides' outcomes (design §2 "must carry").
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub witnesses: Vec<crate::ir::witness::Witness>,
+    pub witnesses: Vec<crate::witness::Witness>,
     /// Defaults the objects' own source states (ledger status "discharged").
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub discharged: Vec<crate::ledger::Discharge>,
+    pub discharged: Vec<Discharge>,
     /// Findings hidden by review decisions or in-source markers; they do
     /// not count towards [`Report::open_verdict`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -332,6 +332,34 @@ pub struct Suppressed {
 }
 
 impl Report {
+    /// A report with nothing in it yet. Its verdict is "equal" only because
+    /// a verdict has to start somewhere: the caller fills in the rest and
+    /// hands the report to [`Report::settle`], which derives the real one.
+    /// This is the only way to build a report outside this crate, so a
+    /// verdict can never be set directly.
+    pub fn draft(tool_version: String, a: ArtifactInfo, b: Option<ArtifactInfo>) -> Report {
+        Report {
+            tool_version,
+            verdict: Verdict::Equal,
+            a,
+            b,
+            findings: Vec::new(),
+            noise: NoiseCounts::default(),
+            normalizations: Vec::new(),
+            assumptions: Vec::new(),
+            unknown_reasons: Vec::new(),
+            diagnostics: Vec::new(),
+            witnesses: Vec::new(),
+            discharged: Vec::new(),
+            suppressed: Vec::new(),
+            verdict_before_suppression: None,
+            refinements: Vec::new(),
+            equivalent: None,
+            proof: None,
+            verdict_before_proof: None,
+        }
+    }
+
     /// The verdict over the findings that are still open. It equals
     /// `verdict` when nothing is suppressed. When something is, it is never
     /// better than "equal under assumptions": an accepted difference is
@@ -388,4 +416,21 @@ impl Report {
             .max_by_key(|f| (f.severity, f.class))
             .map(|f| f.class)
     }
+}
+
+/// A fact the object's own source states, so the matching default is not
+/// an assumption for that side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Discharge {
+    pub id: String,
+    pub side: Side,
+    pub line: usize,
+    /// The statement that states it, e.g. `SET XACT_ABORT ON`.
+    pub cite: String,
+    /// The stated value, where the fact has one (a commit level).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// Byte range of the statement.
+    #[serde(skip)]
+    pub range: (usize, usize),
 }

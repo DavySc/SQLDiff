@@ -453,26 +453,17 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         ));
     }
 
-    let mut report = finish(Report {
-        tool_version: TOOL_VERSION.to_string(),
-        verdict: Verdict::Equal,
-        a: aa.info(),
-        b: Some(ab.info()),
-        findings,
-        noise,
-        normalizations,
-        assumptions,
-        unknown_reasons,
-        suppressed: Vec::new(),
-        verdict_before_suppression: None,
-        refinements,
-        equivalent: None,
-        proof: None,
-        verdict_before_proof: None,
-        diagnostics,
-        witnesses,
-        discharged,
-    });
+    let mut report = Report::draft(TOOL_VERSION.to_string(), aa.info(), Some(ab.info()));
+    report.findings = findings;
+    report.noise = noise;
+    report.normalizations = normalizations;
+    report.assumptions = assumptions;
+    report.unknown_reasons = unknown_reasons;
+    report.refinements = refinements;
+    report.diagnostics = diagnostics;
+    report.witnesses = witnesses;
+    report.discharged = discharged;
+    let mut report = finish(report);
     crate::proof::apply(&mut report, &aa, &ab, &opts.proof);
     report
 }
@@ -572,26 +563,12 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
     if !diagnostics.is_empty() {
         unknown_reasons.push(format!("{} parse problem(s)", diagnostics.len()));
     }
-    finish(Report {
-        tool_version: TOOL_VERSION.to_string(),
-        verdict: Verdict::Equal,
-        a: aa.info(),
-        b: None,
-        findings,
-        noise: NoiseCounts::default(),
-        normalizations: Vec::new(),
-        assumptions,
-        unknown_reasons,
-        suppressed: Vec::new(),
-        verdict_before_suppression: None,
-        refinements: Vec::new(),
-        equivalent: None,
-        proof: None,
-        verdict_before_proof: None,
-        diagnostics,
-        witnesses: Vec::new(),
-        discharged: Vec::new(),
-    })
+    let mut report = Report::draft(TOOL_VERSION.to_string(), aa.info(), None);
+    report.findings = findings;
+    report.assumptions = assumptions;
+    report.unknown_reasons = unknown_reasons;
+    report.diagnostics = diagnostics;
+    finish(report)
 }
 
 /// A proven binding error (`GETDATE()` in PostgreSQL fails to bind) says more

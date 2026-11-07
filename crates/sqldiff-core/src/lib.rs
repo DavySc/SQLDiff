@@ -4,8 +4,8 @@
 //! The engine never reports a false "equal": anything it cannot show to be
 //! equivalent is reported as "unknown" or "equal under assumptions".
 
-pub mod artifact;
-pub mod assumptions;
+pub use sqldiff_model::artifact;
+pub use sqldiff_model::assumptions;
 pub mod bind;
 pub mod catalog;
 pub mod classify;
@@ -19,16 +19,16 @@ pub mod hooks;
 pub mod ir;
 pub mod ledger;
 pub mod lint;
-pub mod model;
+pub use sqldiff_model::model;
 pub mod normalize;
 pub mod observer;
 pub mod phrase;
-pub mod proof;
+pub use sqldiff_model::proof;
 pub mod render;
 pub mod rule_proofs;
 pub mod rules;
-pub mod session;
-pub mod target;
+pub use sqldiff_model::session;
+pub use sqldiff_model::target;
 pub mod tokens;
 pub mod treediff;
 
