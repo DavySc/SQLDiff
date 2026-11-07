@@ -111,31 +111,88 @@ data, so the code that writes a draft depends on `sqldiff-syntax`,
 Today one fingerprint (`ENGINE_FINGERPRINT`) keys everything, so any edit,
 also one in `ir` or `engine` that cannot change a draft, discards the stored
 drafts and tree state, and any edit to the draft code discards results
-whose draft did not change. The result key already contains the draft text
-and the rule options (`store::CheckInput::key`), so a result stays valid when
-the draft is byte-identical and the check code is the same. The aim:
+whose draft did not change. The aim is that an edit invalidates only the
+stored work it can change. A stale reuse is the worst outcome (a resumed run
+would differ from a fresh one), so the cut is only allowed where it can be
+proved, and two facts of the current code limit it (found in the review of
+the first version of this section):
 
-| stage | stored under | fingerprint covers |
-|---|---|---|
-| draft (pass 1: drafts, tree state) | tree key | the draft crates only |
-| result (pass 2: check of a draft) | result key (draft text inside) | everything pass 2 runs, **not** the code that wrote the draft |
+**1. Pass 2 runs draft code.** `check_with` takes a `rebuild` callback; in a
+tree run (`tree.rs`, the `rebuild` closure) it calls
+`rewrite_in_tree_plain` and so `tsql::with_plain_routines`, and checks a
+*mixed* draft: routines that do best without exception blocks written plain,
+the others with blocks. The result key holds `draft.canonical()`, which
+covers the whole-file blocks draft and the whole-file plain draft, **not**
+the mix. A check fingerprint that left out the draft code would therefore
+reuse a stale mixed result after an edit that changes only the mix. "Pass 2
+runs nothing of pass 1" is false today.
 
-A stale reuse is the worst outcome, so the cut must be enforced by Cargo
-dependencies, not by a list: the draft stage becomes a crate whose
-dependency closure is the draft fingerprint, and a test asserts that closure
-equals the fingerprinted set (as `engine_fingerprint.rs` does today). The
-check stage's set is the closure of `sqldiff-convert` minus the draft crate,
-asserted the same way, and the draft crate's public API stays limited to
-producing drafts; anything the check stage reads from a draft (its types and
-accessors) lives in a crate both fingerprints cover.
+**2. The tree state is built by more than the draft producers.**
+`build_tree_state` builds the source catalog fold (`tree.rs`), base catalogs
+(`base::over`), the claims, the ledger's hand-written output (`review.rs`),
+the target catalog with its stand-in tables and `refused::StandIns::build`,
+which itself calls `rewrite_in` and `relax`. A tree-state fingerprint that
+covered only `tsql`, `tok`, `table_vars`, `impossible` and `rewrite_*`
+would reuse a stale tree state after an edit to `refused.rs` or the catalog
+fold, and nothing would flag it (the per-file result keys stay consistent
+through the target and stand-in digests, and the sampled re-check compares
+drafts only).
 
-Next PRs, each with no change in behaviour until the last:
+### Decisions
+
+- **The draft stage is all of pass 1**: `build_tree_state` and everything it
+  calls. Until pass 1 is a crate of its own, split out of `tree.rs`, the tree
+  state and the stored drafts stay under the full fingerprint. No gain is
+  claimed for them before that.
+- **Results get the first gain.** The result key keeps the full-engine
+  closure *except* the draft producers, and the mix is made part of the
+  result: the result stores the mixed routines (`plain_at`) and the mixed
+  draft's text; on reuse the mix is built again (pass-1 cost only, no check)
+  and compared, and a mismatch is a miss. That keeps the expensive part (the
+  check) reusable after a rule tweak that leaves the output alone, and stays
+  sound for an edit that changes only the mix. (Rejected: putting the draft
+  fingerprint in the key whenever a rebuild can run, which loses the reuse
+  exactly for the files with exception blocks; moving the mix choice out of
+  pass 2.)
+- **Cargo must enforce it.** The producers are called by pass 2 only through
+  the `rebuild` closure that the orchestrator hands in, so the check code
+  can live in a crate that does not depend on the producers, and the closure
+  test (as in `engine_fingerprint.rs`) asserts the stage's set equals the
+  Cargo closure. That needs the check code (`check_one`, `check_with`,
+  reports, store) separated from `tree.rs`, which is the real work of PR 2.
+
+### The cross-file claims
+
+The mix rebuild reads `Claims::of(all inputs)`: the temporary table names
+that table variables claim across the tree. It is not in the per-file result
+key. It cannot change the mix alone: a clash makes the declaration of a
+routine refuse (`tsql.rs`, `claims.clash`), the refusal depends on the table
+name and the routine, not on whether that routine is written with or without
+exception blocks, so the same refusal is in both whole-file drafts and in
+`draft.canonical()`, and the key changes. This argument is a claim, not a
+proof: PR 3 adds a test (a second file whose table variable takes the same
+name, with and without exception blocks) and any case where the whole-file
+drafts stay equal but the mix differs is a hole in the existing keys to fix
+before anything else.
+
+### `Debug` of `Draft` is the key
+
+`canonical()` is built from `Debug`. Every type reachable from `Draft`
+derives `Debug` today and `Shared` forwards to its `str`, so it is faithful.
+When the draft types move, they move together, and a guard test asserts that
+no type reachable from `Draft` has a hand-written lossy `Debug` (or
+`canonical()` switches to the serde bytes).
+
+### Next PRs
 
 1. Move the draft types (`Draft`, `Out`, `Note`, `Status`, `Step`,
-   `Written`, `RuleOptions`) to a small crate both stages cover.
-2. Move the producing code (`tsql`, `tok`, `table_vars`, `impossible`,
-   `rewrite_*`) into `sqldiff-draft`.
-3. Two fingerprints and their closure tests; key the tree state with the
-   draft fingerprint and the results with the check fingerprint. This is the
-   behaviour change (what stored work survives an edit), covered by tests
-   that an edit in each crate invalidates exactly the stages it should.
+   `Written`, `RuleOptions`, `Shared`) to a small crate both stages cover, with
+   the `Debug` guard. No change in behaviour.
+2. Separate the check code from `tree.rs` (a `sqldiff-check` crate) and the
+   producers (`tsql`, `tok`, `table_vars`) into `sqldiff-draft`. No change in
+   behaviour.
+3. Store the mix with the result, two fingerprints, closure tests, and the
+   tests that an edit in each place invalidates exactly what it should: an
+   edit to `tsql` that changes only the mix, an edit to a pass-1-only file
+   outside `tsql` (`refused.rs`), an edit to `ir` (drafts kept, results not),
+   and the claims case above. This is the behaviour change.
