@@ -1354,6 +1354,7 @@ fn convert_files(
         }
         _ => Default::default(),
     };
+    let stand_ins_digest = stand_ins.digest();
     let mismatch: std::sync::Mutex<Option<String>> = Default::default();
     let work = slots(inputs.iter().zip(drafts).zip(keys.iter()).enumerate());
     let progress = Progress::new(work.len(), hooks);
@@ -1374,22 +1375,47 @@ fn convert_files(
         }
         // A file is flagged for the stand-in tables it names, and then its
         // output and reports are let go when the store holds them.
-        let hold = |mut c: Conversion, key: Option<&crate::store::Key>, in_store: bool| {
-            stand_ins.flag_file(idx, &input.text, &mut c, a.from, a.to);
-            match key {
-                Some(k) if in_store => Held::Stored {
-                    key: k.clone(),
-                    core: crate::Core::take(&mut c),
-                },
-                _ => Held::Whole(Box::new(c)),
-            }
-        };
+        let hold =
+            |mut c: Conversion, key: Option<&crate::store::Key>, in_store: bool, reuse: bool| {
+                // The flags are stored beside the result they were made for; a
+                // result checked again in this run (a sample, a miss) computes
+                // them again and stores them.
+                let stored_flags = match (cache, key) {
+                    (Some(cc), Some(k)) if in_store && !stand_ins.is_empty() => {
+                        let fk =
+                            crate::store::Store::flags_key(k, &stand_ins_digest, idx, a.from, a.to);
+                        Some((cc, k, fk))
+                    }
+                    _ => None,
+                };
+                let reused = match &stored_flags {
+                    Some((cc, k, fk)) if reuse => cc
+                        .store
+                        .get_flags(k, fk)
+                        .is_some_and(|f| crate::refused::apply_flags(&mut c, &f)),
+                    _ => false,
+                };
+                if !reused {
+                    let flags = stand_ins.flags_of(idx, &input.text, &c, a.from, a.to);
+                    crate::refused::apply_flags(&mut c, &flags);
+                    if let Some((cc, k, fk)) = &stored_flags {
+                        cc.store.put_flags(k, fk, &flags);
+                    }
+                }
+                match key {
+                    Some(k) if in_store => Held::Stored {
+                        key: k.clone(),
+                        core: crate::Core::take(&mut c),
+                    },
+                    _ => Held::Whole(Box::new(c)),
+                }
+            };
         if let Some((_, k, conv)) = &stored {
             if !sample.contains(&idx) {
                 let mut conv = conv.clone();
                 finish.apply(&mut conv);
                 progress.tick();
-                return Some((hold(conv, Some(k), true), 0.0, true, false));
+                return Some((hold(conv, Some(k), true, true), 0.0, true, false));
             }
         }
         let t = Instant::now();
@@ -1419,7 +1445,7 @@ fn convert_files(
             }
         }
         progress.tick();
-        Some((hold(c, key.as_ref(), in_store), secs, false, false))
+        Some((hold(c, key.as_ref(), in_store, false), secs, false, false))
     });
     crate::mem::release();
     if let Some(msg) = mismatch.into_inner().unwrap() {

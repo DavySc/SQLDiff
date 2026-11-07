@@ -33,6 +33,16 @@ const FILES: &[(&str, &str)] = &[
         "CREATE PROCEDURE dbo.cur AS\nBEGIN\n  DECLARE @v int;\n  DECLARE c CURSOR FOR SELECT a FROM dbo.t;\n  OPEN c;\n  FETCH NEXT FROM c INTO @v;\n  WHILE @@FETCH_STATUS = 0\n  BEGIN\n    UPDATE dbo.t SET b = 'x' WHERE a = @v;\n    FETCH NEXT FROM c INTO @v;\n  END\n  CLOSE c;\n  DEALLOCATE c;\nEND\n",
     ),
     ("load.sql", "INSERT INTO dbo.t (a) VALUES (1);\n"),
+    // A table refused for its computed column stands in for binding; what
+    // uses it is flagged, and the flags are stored with the result.
+    (
+        "tables/c.sql",
+        "CREATE TABLE dbo.c (a int NOT NULL, custom nvarchar(max) NULL, other AS (json_query(custom, N'strict $.Other')));\n",
+    ),
+    (
+        "procs/usec.sql",
+        "CREATE PROCEDURE dbo.usec AS\nBEGIN\n  UPDATE dbo.c SET a = 1;\nEND\n",
+    ),
 ];
 
 struct Fixture {
@@ -256,4 +266,38 @@ fn a_run_cancelled_before_it_starts_leaves_the_folder_as_it_was() {
         !o.join(".sqldiff").join("run-counter").exists(),
         "a cancelled run recorded itself"
     );
+}
+
+#[test]
+fn stand_in_flags_come_from_the_store_without_changing_the_output() {
+    let f = Fixture::new("flags");
+    run(&f, "a", 2, Select::default(), true);
+    let base = tree_of(&f.out("a"), &f.dir);
+    let flags = f.out("a").join(".sqldiff/flags");
+    let stored = std::fs::read_dir(&flags).map(|d| d.count()).unwrap_or(0);
+    assert!(
+        stored > 0,
+        "the flags of the file using the stand-in are stored"
+    );
+    assert!(
+        base.iter().any(|(_, t)| t.contains("ASM-TABLE-STAND-IN")),
+        "the fixture does flag a unit"
+    );
+    // Resumed: the flags are read, not computed; same files.
+    for jobs in [1, 3] {
+        run(&f, "a", jobs, Select::default(), false);
+        same(
+            &base,
+            &tree_of(&f.out("a"), &f.dir),
+            "resumed with stored flags",
+        );
+    }
+    // A stored flag set that does not read back is computed again.
+    for e in std::fs::read_dir(&flags).unwrap().flatten() {
+        for g in std::fs::read_dir(e.path()).unwrap().flatten() {
+            std::fs::write(g.path(), b"not json").unwrap();
+        }
+    }
+    run(&f, "a", 2, Select::default(), false);
+    same(&base, &tree_of(&f.out("a"), &f.dir), "unreadable flags");
 }
