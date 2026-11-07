@@ -506,6 +506,16 @@ fn stand_in_flags_come_from_the_store_without_changing_the_output() {
     same(&base, &tree_of(&f.out("a")), "unreadable flags");
 }
 
+/// A stored file is the SHA-256 of its body in hex, a newline, the body.
+fn framed(body: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let hex: String = Sha256::digest(body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    [hex.as_bytes(), b"\n", body].concat()
+}
+
 #[test]
 fn a_checked_again_file_must_give_the_stored_stand_in_flags() {
     let f = Fixture::new("flagsmismatch");
@@ -519,7 +529,7 @@ fn a_checked_again_file_must_give_the_stored_stand_in_flags() {
     let mut changed = 0;
     for e in std::fs::read_dir(&flags).unwrap().flatten() {
         for g in std::fs::read_dir(e.path()).unwrap().flatten() {
-            std::fs::write(g.path(), b"[]").unwrap();
+            std::fs::write(g.path(), framed(b"[]")).unwrap();
             changed += 1;
         }
     }
@@ -583,7 +593,7 @@ fn mismatches_are_all_reported_in_a_fixed_order() {
             .flatten()
         {
             for g in std::fs::read_dir(e.path()).unwrap().flatten() {
-                std::fs::write(g.path(), b"[]").unwrap();
+                std::fs::write(g.path(), framed(b"[]")).unwrap();
             }
         }
         let mut job = f.job(tag, jobs, Select::default(), c.to, c.catalogs);
