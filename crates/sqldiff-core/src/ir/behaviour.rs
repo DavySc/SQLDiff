@@ -1300,7 +1300,12 @@ struct Collector<'x, 'a> {
     cut_b: BTreeSet<NodeId>,
     /// The divergences of a scenario with a default flipped (`persists`),
     /// by scenario.
-    flipped: RefCell<HashMap<String, (Rc<Divergences>, sqldiff_model::work::Work)>>,
+    flipped: RefCell<HashMap<String, Rc<Divergences>>>,
+    /// What the work count has been charged for already (see
+    /// `Collector::explorer`): the first request for an explorer or a flipped
+    /// scenario is counted, repeats are not, so the count does not depend on
+    /// whether a cache answered.
+    charged: RefCell<BTreeSet<String>>,
     /// `diff` calls spent by this routine pair, and whether a budget ran out.
     spent: Cell<u64>,
     out_of_budget: Cell<bool>,
@@ -1318,6 +1323,24 @@ type Divergences = BTreeSet<(&'static str, String)>;
 
 /// Flipped scenarios kept before the cache starts over (time only).
 const FLIPPED_MAX: usize = 4096;
+
+thread_local! {
+    /// Test hook: answer every request without the explorer and flipped
+    /// caches. It changes no result and no work count (see
+    /// `Collector::explorer`); the work-meter tests use it to show that.
+    static CACHES_OFF: Cell<bool> = const { Cell::new(false) };
+}
+
+fn caches_off() -> bool {
+    CACHES_OFF.with(Cell::get)
+}
+
+/// Turns the behaviour model's caches off (or on) on this thread. A test
+/// hook: results and work counts must be the same either way.
+#[doc(hidden)]
+pub fn set_caches_off_for_tests(off: bool) {
+    CACHES_OFF.with(|c| c.set(off));
+}
 
 /// How many outcome-pair comparisons (`diff` calls) one routine pair may
 /// spend, and one file's check in all. A count, never a time: the same
@@ -1361,6 +1384,7 @@ impl<'x, 'a> Collector<'x, 'a> {
             cut_a: BTreeSet::new(),
             cut_b: BTreeSet::new(),
             flipped: RefCell::new(HashMap::new()),
+            charged: RefCell::new(BTreeSet::new()),
             spent: Cell::new(0),
             out_of_budget: Cell::new(false),
             cap_hit: Cell::new(None),
@@ -1414,8 +1438,17 @@ impl<'x, 'a> Collector<'x, 'a> {
 
     /// The fault-free run of `cfg` under the environment of `sc` (the
     /// scenario without its faults), made once per environment.
+    ///
+    /// The cache is a speed-up and is not part of the work count: the first
+    /// request for an environment is counted (the run is made and its steps
+    /// are spent), a later one counts nothing, whether it hits the cache or,
+    /// with the caches off, makes the run again (not counted). So the total
+    /// is the same with the cache on or off. `charged` is the ledger of
+    /// what was counted.
     fn explorer(
         cache: &RefCell<Vec<Rc<Explorer>>>,
+        charged: &RefCell<BTreeSet<String>>,
+        side: &str,
         cfg: &Cfg,
         other: &Cfg,
         sc: &Scenario,
@@ -1425,17 +1458,26 @@ impl<'x, 'a> Collector<'x, 'a> {
             faults: Vec::new(),
             ..sc.clone()
         };
+        let first = charged.borrow_mut().insert(format!("{side}|{env:?}"));
+        let on = !caches_off();
         let mut c = cache.borrow_mut();
-        if let Some(x) = c.iter().find(|x| *x.base_scenario() == env) {
-            // The run is already made; the work of making it counts again.
-            sqldiff_model::work::charge(&x.built());
-            return x.clone();
+        if on {
+            if let Some(x) = c.iter().find(|x| *x.base_scenario() == env) {
+                return x.clone();
+            }
         }
         // Paths of this side that reach the same state are joined when the
         // other side makes no decision (see `interp::decision_free`).
         let join = crate::ir::interp::decision_free(other);
-        let x = Rc::new(Explorer::in_universe_joined(cfg, &env, keys, join));
-        c.push(x.clone());
+        let build = || Rc::new(Explorer::in_universe_joined(cfg, &env, keys, join));
+        let x = if first {
+            build()
+        } else {
+            sqldiff_model::work::muted(build)
+        };
+        if on {
+            c.push(x.clone());
+        }
         x
     }
 
@@ -1446,8 +1488,10 @@ impl<'x, 'a> Collector<'x, 'a> {
         scen_b: &Scenario,
     ) -> (Vec<Outcome>, Vec<Outcome>) {
         let (ca, cb) = (&self.sa.cfg, &self.sb.cfg);
-        let mut pa = Self::explorer(&self.xa, ca, cb, scen_a, &self.keys).explore(ca, scen_a);
-        let mut pb = Self::explorer(&self.xb, cb, ca, scen_b, &self.keys).explore(cb, scen_b);
+        let mut pa = Self::explorer(&self.xa, &self.charged, "a", ca, cb, scen_a, &self.keys)
+            .explore(ca, scen_a);
+        let mut pb = Self::explorer(&self.xb, &self.charged, "b", cb, ca, scen_b, &self.keys)
+            .explore(cb, scen_b);
         if let Kind::Fault { key, .. } = sc {
             // Only paths that reach the failing statement belong to the scenario.
             let reached = |o: &Outcome| o.fault_hit || o.effects.contains_key(key.as_str());
@@ -1465,23 +1509,31 @@ impl<'x, 'a> Collector<'x, 'a> {
     /// to explore and compare every outcome pair again for each of them.
     fn persists(&self, sc: &Kind, scen_a: &Scenario, scen_b: &Scenario, d: &Div) -> bool {
         let key = format!("{sc:?}|{scen_a:?}|{scen_b:?}");
-        let known = self.flipped.borrow().get(&key).cloned();
+        // The cache of flipped scenarios is a speed-up like the explorers':
+        // a scenario's work is counted the first time it is asked for and not
+        // again, hit or recomputed (see `explorer`).
+        let first = self.charged.borrow_mut().insert(format!("flip|{key}"));
+        let known = if caches_off() {
+            None
+        } else {
+            self.flipped.borrow().get(&key).cloned()
+        };
         let set = match known {
-            Some((set, cost)) => {
-                // Made before (or dropped from the cache since): the work of
-                // making it counts every time, whatever the cache held.
-                sqldiff_model::work::charge(&cost);
-                set
-            }
+            Some(set) => set,
             None => {
-                let started = sqldiff_model::work::now();
-                let set = Rc::new(self.divergences_of(sc, scen_a, scen_b));
-                let cost = sqldiff_model::work::now().since(&started);
-                let mut c = self.flipped.borrow_mut();
-                if c.len() >= FLIPPED_MAX {
-                    c.clear();
+                let make = || Rc::new(self.divergences_of(sc, scen_a, scen_b));
+                let set = if first {
+                    make()
+                } else {
+                    sqldiff_model::work::muted(make)
+                };
+                if !caches_off() {
+                    let mut c = self.flipped.borrow_mut();
+                    if c.len() >= FLIPPED_MAX {
+                        c.clear();
+                    }
+                    c.insert(key, set.clone());
                 }
-                c.insert(key, (set.clone(), cost));
                 set
             }
         };
