@@ -27,9 +27,9 @@ pub use sqldiff_model::proof;
 pub mod render;
 pub mod rule_proofs;
 pub mod rules;
+pub use sqldiff_catalog::tokens;
 pub use sqldiff_model::session;
 pub use sqldiff_model::target;
-pub use sqldiff_catalog::tokens;
 pub mod treediff;
 
 pub use artifact::Artifact;
