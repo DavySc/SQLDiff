@@ -1566,7 +1566,7 @@ impl Server {
         };
         let a = ra.as_ref().or_else(|| held(&na)).expect("resolved above");
         let b = rb.as_ref().or_else(|| held(&nb)).expect("resolved above");
-        let c = compare::compare(a, b);
+        let c = compare::compare(a, b)?;
         let limit = args
             .get("limit")
             .and_then(Value::as_u64)
@@ -1575,6 +1575,15 @@ impl Server {
             "{na} -> {nb}: {} regressed, {} improved, {} changed, {} new, {} gone, {} unchanged\n",
             c.regressed, c.improved, c.changed, c.new, c.gone, c.unchanged
         );
+        if c.src_differs {
+            text.push_str("Note: the two conversions read different source folders.\n");
+        }
+        if c.unchecked_a + c.unchecked_b > 0 {
+            text.push_str(&format!(
+                "Note: {} file(s) of `a` and {} of `b` were not checked (an increment); their units count as not converted, so they show as regressed.\n",
+                c.unchecked_a, c.unchecked_b
+            ));
+        }
         let show = |s: &Option<compare::Side>| match s {
             Some(s) => format!(
                 "{}{}",
@@ -1595,11 +1604,16 @@ impl Server {
                     .and_then(|s| s.reason.lines().next())
                     .unwrap_or("");
             text.push_str(&format!(
-                "{:?} {}:{line}: {} -> {}: {why}\n",
+                "{:?} {}:{line}: {} -> {}{}: {why}\n",
                 r.change,
                 r.path,
                 show(&r.a),
-                show(&r.b)
+                show(&r.b),
+                if r.differs.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", r.differs.join(", "))
+                }
             ));
         }
         if c.rows.len() > limit {
@@ -2394,7 +2408,7 @@ fn tools() -> Value {
         {
             "name": "compare_runs",
             "title": "Compare two conversions",
-            "description": "What changed between two conversions of a tree, from their reports without converting again: units that regressed (a worse status), improved, changed (same status, other rules, findings or reason), are new or are gone, in a fixed order (regressed worst first, improved, changed, new, gone; then path and source line). Units are joined by id, then by path and source line. Each side `a` (before) and `b` (after) is a tree id of this session or a conversion-report.json (or the folder holding it); copy the report before converting into the same `out` again to keep a baseline across a server restart. Returns the counts, the units per status in each run and the rows.",
+            "description": "What changed between two conversions of a tree, from their reports without converting again: units that regressed (a worse status), improved, changed (same status, but other rules, findings, reason or rewrites: a rule edit that changes a converted unit's output shows here), are new or are gone, in a fixed order (regressed worst first, improved, changed, new, gone; then path and source line). Units are joined by id, then by path and source line. Refused for conversions of different dialects; a different source folder is noted. Each side `a` (before) and `b` (after) is a tree id of this session or a conversion-report.json (or the folder holding it); copy the report before converting into the same `out` again to keep a baseline across a server restart. Returns the counts, the units per status in each run and the rows.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
