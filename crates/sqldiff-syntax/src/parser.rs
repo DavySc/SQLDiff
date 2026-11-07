@@ -134,9 +134,9 @@ struct Parser<'a> {
 /// inside WHILE ...). The passes after it recurse once per level, with large
 /// frames: on the engine's stack a nest of `IF` overflows near 3 000 levels in
 /// a debug build. Real code nests a few dozen at most. Past this the rest of
-/// the file is one error node and the parse reports it, so the unit is
+/// the batch is one error node and the parse reports it, so the unit is
 /// refused instead of the process crashing.
-pub const MAX_STATEMENT_NESTING: usize = 256;
+pub const MAX_STATEMENT_NESTING: usize = 1000;
 
 impl<'a> Parser<'a> {
     // ---- token access ----------------------------------------------------
@@ -345,7 +345,9 @@ impl<'a> Parser<'a> {
                 "statements nested deeper than {MAX_STATEMENT_NESTING}: nesting too deep"
             ));
             self.start(ERROR);
-            while self.sig_index(0).is_some() {
+            // Stop at the next batch separator: the objects after a deep
+            // routine are separate batches and still parse.
+            while self.nth_kind(0).is_some_and(|k| k != BATCH_SEP) {
                 self.bump();
             }
             self.finish();

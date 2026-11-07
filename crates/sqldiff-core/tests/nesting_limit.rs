@@ -90,3 +90,51 @@ fn statements_nested_past_the_limit_are_not_proven_and_do_not_crash() {
         r.diagnostics
     );
 }
+
+/// One routine nested past the limit costs only its own batch: the objects
+/// after a `GO` are still read and their differences still reported.
+#[test]
+fn a_deep_routine_does_not_swallow_the_batches_after_it() {
+    let file = |v: &str, t: &str| {
+        let n = 1100;
+        format!(
+            "CREATE PROCEDURE dbo.deep AS\n{}SELECT 1;\n{}\nGO\nCREATE TABLE dbo.z (a {t});\nGO\nCREATE PROCEDURE dbo.q AS SELECT {v};\n",
+            "BEGIN\n".repeat(n),
+            "END\n".repeat(n)
+        )
+    };
+    let r = run(file("1", "int"), file("2", "bigint"));
+    assert!(not_proven(&r), "{:?}", r.verdict());
+    let text = format!("{:?}", r.findings);
+    assert!(
+        text.contains("dbo.q") || text.contains("dbo.Q") || text.contains("q"),
+        "{text}"
+    );
+    assert!(
+        r.findings.len() >= 2,
+        "the later batches differ twice: {} finding(s): {text}",
+        r.findings.len()
+    );
+}
+
+/// A dispatcher with hundreds of `ELSE IF` branches nests one statement per
+/// branch and is still read.
+#[test]
+fn a_long_else_if_chain_is_still_compared() {
+    let chain = |last: i32| {
+        let mut s = String::from("CREATE PROCEDURE dbo.p @x int AS\nIF @x = 0 SELECT 0;\n");
+        for i in 1..400 {
+            s += &format!("ELSE IF @x = {i} SELECT {i};\n");
+        }
+        s + &format!("ELSE SELECT {last};\n")
+    };
+    let r = run(chain(1), chain(2));
+    assert!(
+        !r.diagnostics
+            .iter()
+            .any(|d| d.message.contains("nesting too deep")),
+        "{:?}",
+        r.diagnostics
+    );
+    assert_eq!(r.verdict(), Verdict::Different, "{:?}", r.unknown_reasons);
+}
