@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[build-dependencies]
+sha2.workspace = true
+
 [dependencies]
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 sqldiff-syntax.workspace = true

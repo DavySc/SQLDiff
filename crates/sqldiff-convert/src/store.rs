@@ -88,7 +88,7 @@ pub fn catalog_digest(c: &Catalog) -> String {
 /// Everything [`crate::check`] reads for one file of a tree: the only
 /// argument a stored result's key is made from.
 pub struct CheckInput<'a> {
-    /// The running executable's hash: another build may check differently.
+    /// The engine fingerprint (`ENGINE_FINGERPRINT`): another engine may check differently.
     pub build: &'a str,
     pub from: Dialect,
     pub to: Dialect,
