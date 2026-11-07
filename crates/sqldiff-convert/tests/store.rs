@@ -154,13 +154,7 @@ fn read_result(p: &Path) -> serde_json::Value {
 /// Writes `v` as a result with a digest that matches it: a stored result that
 /// is wrong but whole, as an engine bug would leave one.
 fn write_result(p: &Path, v: &serde_json::Value) {
-    use sha2::{Digest, Sha256};
-    let body = serde_json::to_vec(v).unwrap();
-    let hex: String = Sha256::digest(&body)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    std::fs::write(p, [hex.as_bytes(), b"\n", &body].concat()).unwrap();
+    std::fs::write(p, framed(&serde_json::to_vec(v).unwrap())).unwrap();
 }
 
 fn results(out: &Path) -> Vec<PathBuf> {
@@ -412,19 +406,26 @@ fn a_damaged_tree_state_is_a_miss() {
 
 /// A stored tree state is gzip-compressed JSON.
 fn read_state(p: &Path) -> serde_json::Value {
+    let raw = std::fs::read(p).unwrap();
     let mut json = Vec::new();
-    std::io::Read::read_to_end(
-        &mut flate2::read::GzDecoder::new(std::fs::File::open(p).unwrap()),
-        &mut json,
-    )
-    .unwrap();
+    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&raw[65..]), &mut json).unwrap();
     serde_json::from_slice(&json).unwrap()
 }
 
 fn write_state(p: &Path, v: &serde_json::Value) {
     let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     std::io::Write::write_all(&mut enc, &serde_json::to_vec(v).unwrap()).unwrap();
-    std::fs::write(p, enc.finish().unwrap()).unwrap();
+    std::fs::write(p, framed(&enc.finish().unwrap())).unwrap();
+}
+
+/// A stored file is the SHA-256 of its body in hex, a newline, the body.
+fn framed(body: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let hex: String = Sha256::digest(body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    [hex.as_bytes(), b"\n", body].concat()
 }
 
 /// A state that no longer matches what its tree builds: the first file's
@@ -668,4 +669,32 @@ fn a_damaged_stored_draft_fails_cleanly_even_when_nothing_is_rechecked() {
     .err()
     .expect("a damaged draft fails the run");
     assert!(err.contains("stored tree state"), "{err}");
+}
+
+#[test]
+fn an_edited_tree_state_or_flag_set_is_a_miss_and_built_again() {
+    let f = Fixture::standard("digest2");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    let want = tree_of(&f.out("o"));
+    // The state is edited without a new digest (edited bytes after the line).
+    for p in states(&f.out("o")) {
+        let mut st = read_state(&p);
+        st["drafts"][0]["raw"]["text"] = "-- tampered\n".into();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut enc, &serde_json::to_vec(&st).unwrap()).unwrap();
+        let mut bytes = std::fs::read(&p).unwrap();
+        bytes.truncate(65);
+        bytes.extend(enc.finish().unwrap());
+        std::fs::write(&p, bytes).unwrap();
+    }
+    // `--recheck none` samples nothing: only the digest can refuse it.
+    convert_into(
+        &with_recheck(f.job("o", true, false), tree::Recheck::None),
+        &Hooks::default(),
+    )
+    .unwrap();
+    let sql = |t: Vec<(String, String)>| -> Vec<(String, String)> {
+        t.into_iter().filter(|(p, _)| p.ends_with(".sql")).collect()
+    };
+    assert_eq!(sql(want), sql(tree_of(&f.out("o"))));
 }
