@@ -285,7 +285,7 @@ fn share_notes(v: &mut serde_json::Value) {
         return;
     };
     let mut table: Vec<serde_json::Value> = Vec::new();
-    let mut at: std::collections::HashMap<String, usize> = Default::default();
+    let mut at: std::collections::BTreeMap<String, usize> = Default::default();
     for u in units.iter_mut() {
         let Some(notes) = u.get_mut("notes").and_then(|n| n.as_array_mut()) else {
             continue;
