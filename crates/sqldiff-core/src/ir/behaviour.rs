@@ -1140,6 +1140,11 @@ fn pairs(pa: &[Outcome], pb: &[Outcome]) -> (Vec<(usize, usize)>, bool) {
 /// only ever removes pairs a real input cannot produce, so every input still
 /// has its pair and a divergence shown by all remaining pairs is shown by
 /// every input.
+///
+/// Conditions are identified by their text only: this assumes, as the exact
+/// pairing does, that the same text has the same truth value on both sides.
+/// A row-count test after a failed statement is named with the dialect, since
+/// its value after an error differs between dialects.
 fn feasible(a: &[(String, bool)], b: &[(String, bool)]) -> bool {
     // A condition decided more than once on a path (a loop test, or the same
     // text at two places) can have different values each time: its values

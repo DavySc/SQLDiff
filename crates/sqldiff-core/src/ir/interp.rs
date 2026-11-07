@@ -222,6 +222,9 @@ struct State {
     /// The statement whose row count `no_rows` / `@@ROWCOUNT` / `FOUND`
     /// reads now (names the condition of a row-count test in a signature).
     rows_stmt: Option<NodeId>,
+    /// That statement failed, so the row count is what the dialect leaves
+    /// after an error (T-SQL 0, PG unchanged, Db2 the error code).
+    rows_failed: bool,
     partial: BTreeSet<String>,
     entry_depth: u32,
     faults_done: BTreeSet<NodeId>,
@@ -272,6 +275,7 @@ impl State {
             last_error,
             no_rows,
             rows_stmt,
+            rows_failed,
             entry_depth,
             loop_seen,
             ret,
@@ -310,6 +314,7 @@ impl State {
             || *last_error != b.last_error
             || *no_rows != b.no_rows
             || *rows_stmt != b.rows_stmt
+            || *rows_failed != b.rows_failed
             || *entry_depth != b.entry_depth
             || *loop_seen != b.loop_seen
             || *ret != b.ret
@@ -1329,6 +1334,7 @@ impl Interp<'_> {
             last_error: None,
             no_rows: None,
             rows_stmt: None,
+            rows_failed: false,
             partial: BTreeSet::new(),
             entry_depth: 0,
             faults_done: BTreeSet::new(),
@@ -1561,7 +1567,13 @@ impl Interp<'_> {
             },
             None => "the start".to_string(),
         };
-        format!("no rows from {what}")
+        if st.rows_failed {
+            // Dialect-specific after an error, so the dialect is part of the
+            // identity: the two sides' tests are not the same test.
+            format!("no rows after failed {what} ({})", self.cfg.dialect.id())
+        } else {
+            format!("no rows from {what}")
+        }
     }
 
     fn digest(&self, st: &State) -> String {
@@ -1586,6 +1598,7 @@ impl Interp<'_> {
         if d != Dialect::Postgres || s.category.is_some() || s.kind == StmtKind::Select {
             st.no_rows = None;
             st.rows_stmt = Some(id);
+            st.rows_failed = false;
         }
         // IMPLICIT_TRANSACTIONS opens the transaction when DML starts, even if
         // it then touches no rows or fails.
@@ -2102,6 +2115,8 @@ impl Interp<'_> {
         self.row(&mut st, &rule.id, rule.fact.as_deref(), rule.status);
         if kind == ErrorKind::NotFound {
             st.no_rows = Some(true);
+        } else {
+            st.rows_failed = true;
         }
         // The failing statement's own rows.
         if form.is_none() && s.multi_row && !self.prof.is_warning(kind) {

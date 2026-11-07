@@ -59,3 +59,31 @@ fn the_opposite_branch_is_still_found_different() {
             .collect::<Vec<_>>()
     );
 }
+
+/// A row-count test read after a failed statement is not the same test in
+/// the two dialects: T-SQL `@@ROWCOUNT` is 0 after an error, PG `FOUND` is
+/// untouched by a statement that never completed. Both sides continue past
+/// the fault (T-SQL has no XACT_ABORT, PG swallows it), so the pair (A true,
+/// B false) is real and the durability/control divergence must still show.
+#[test]
+fn a_row_count_test_after_a_failed_statement_is_not_pruned_across_dialects() {
+    let a = "CREATE PROCEDURE dbo.p @id int, @v int AS\nBEGIN\n  SELECT @v = a FROM dbo.t WHERE id = 1;\n  UPDATE dbo.t SET a = @v WHERE id = @id;\n  IF @@ROWCOUNT = 0\n    INSERT INTO dbo.log (id) VALUES (@id);\nEND\nGO\n";
+    let b = "CREATE OR REPLACE PROCEDURE p(p_id integer, p_v integer) LANGUAGE plpgsql AS $$\nBEGIN\n  SELECT a INTO p_v FROM t WHERE id = 1;\n  BEGIN\n    UPDATE t SET a = p_v WHERE id = p_id;\n  EXCEPTION WHEN OTHERS THEN NULL;\n  END;\n  IF NOT FOUND THEN INSERT INTO log (id) VALUES (p_id); END IF;\n  IF p_v > 0 THEN RAISE NOTICE 'x'; END IF;\nEND; $$;\n";
+    let r = diff(
+        &Artifact::new("a.sql", Dialect::Tsql, a.to_string()),
+        &Artifact::new("b.sql", Dialect::Postgres, b.to_string()),
+        &Options::default(),
+    );
+    assert!(
+        r.findings.iter().any(|f| f.rule == "txn.durability"
+            && f.verdict == Verdict::Unknown
+            && f.witness.contains("constraint violation")
+            && f.witness
+                .contains("side A (T-SQL) keeps the INSERT into log")),
+        "{:?}",
+        r.findings
+            .iter()
+            .map(|f| (&f.rule, f.verdict, &f.witness))
+            .collect::<Vec<_>>()
+    );
+}
