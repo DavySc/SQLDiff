@@ -5,6 +5,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/// The callback of [`Hooks::file_done`]: a file's path and status label.
+pub type FileDone = Box<dyn Fn(&str, &str) + Send + Sync>;
+
 /// Progress and cancel. The default has neither; a conversion with no
 /// progress callback prints `checked n/total` to stderr every 50 files, as
 /// the command line shows it.
@@ -16,6 +19,10 @@ pub struct Hooks {
     /// Once set, checks not yet started are skipped and the work fails with
     /// [`CANCELLED`], before anything more is written.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Called as each file's own check finishes (or is taken from the
+    /// store) with the file's path and its status label. Provisional: the
+    /// passes across files that follow can only make a status worse.
+    pub file_done: Option<FileDone>,
 }
 
 /// The error of work stopped through [`Hooks::cancel`].
@@ -32,6 +39,13 @@ impl Hooks {
         match self.cancelled() {
             true => Err(CANCELLED.to_string()),
             false => Ok(()),
+        }
+    }
+
+    /// Reports a finished file to the `file_done` callback, if any.
+    pub fn file_done(&self, path: &str, status: &str) {
+        if let Some(f) = &self.file_done {
+            f(path, status);
         }
     }
 

@@ -1215,6 +1215,7 @@ impl Runs {
                 p.0.store(checked, Ordering::Relaxed);
             })),
             cancel: None,
+            ..Default::default()
         };
         let r = Arc::clone(run);
         std::thread::Builder::new()
@@ -2358,6 +2359,7 @@ fn execute(run: &Arc<Run>, work: Work, stored: Option<&Arc<Stored>>) -> State {
             r.checked.store(checked, Ordering::Relaxed);
         })),
         cancel: Some(Arc::clone(&run.cancel)),
+        ..Default::default()
     };
     let finished = sqldiff_review::time::now;
     let stopped = |e: String| match e == tree::CANCELLED {

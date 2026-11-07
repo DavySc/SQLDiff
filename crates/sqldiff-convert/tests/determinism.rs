@@ -399,6 +399,7 @@ fn a_run_cancelled_before_it_starts_leaves_the_folder_as_it_was() {
     let hooks = Hooks {
         progress: None,
         cancel: Some(Arc::new(AtomicBool::new(true))),
+        ..Default::default()
     };
     let _ = convert_into(
         &f.job("c", 1, Select::default(), Dialect::Postgres, &[]),

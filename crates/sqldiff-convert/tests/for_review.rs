@@ -195,3 +195,37 @@ fn a_run_and_a_review_share_one_store_without_wiping_each_other() {
     );
     assert!(review_same);
 }
+
+#[test]
+fn every_file_is_reported_once_as_its_own_check_finishes() {
+    let d = tree_dir();
+    let out = d.join("out-rows");
+    let a = args(&d);
+    let (inputs, unreadable) = tree::read(&a).unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+    let s = seen.clone();
+    let hooks = tree::Hooks {
+        file_done: Some(Box::new(move |p, st| {
+            s.lock().unwrap().push((p.to_string(), st.to_string()))
+        })),
+        ..Default::default()
+    };
+    // A first run checks every file; the second takes them from the store.
+    for _ in 0..2 {
+        seen.lock().unwrap().clear();
+        let t = tree::convert_stored(&a, &inputs, unreadable.clone(), &out, &hooks, false).unwrap();
+        let mut rows = seen.lock().unwrap().clone();
+        rows.sort();
+        let mut want: Vec<(String, String)> = t
+            .report
+            .files
+            .iter()
+            .map(|f| (f.path.clone(), f.status.label().to_string()))
+            .collect();
+        want.sort();
+        // No cross-file pass made a file worse in this tree, so the rows
+        // equal the final statuses; in general a row is never worse than it.
+        assert_eq!(rows, want);
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}

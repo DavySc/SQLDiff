@@ -420,6 +420,7 @@ pub fn check(a: &Args, hooks: &Hooks) -> Result<Checked, String> {
         let inner = Hooks {
             progress: None,
             cancel: hooks.cancel.clone(),
+            ..Default::default()
         };
         for (d, dir) in a.trees.iter().filter(|(d, _)| *d != reference) {
             hooks.stop_if_cancelled()?;

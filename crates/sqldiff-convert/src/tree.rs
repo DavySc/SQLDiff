@@ -1540,6 +1540,7 @@ fn convert_files(
         if stored.is_none() && in_increment.as_ref().is_some_and(|m| !m[idx]) {
             let mut c = crate::not_checked(&input.text, draft);
             finish.apply(&mut c);
+            hooks.file_done(&input.rel, crate::callees::file_status(&c).label());
             progress.tick();
             return Some((Held::Whole(Box::new(c)), 0.0, false, true));
         }
@@ -1600,6 +1601,7 @@ fn convert_files(
             if !sample.contains(&idx) {
                 let mut conv = conv.clone();
                 finish.apply(&mut conv);
+                hooks.file_done(&input.rel, crate::callees::file_status(&conv).label());
                 progress.tick();
                 return Some((hold(conv, Some(k), true, true), 0.0, true, false));
             }
@@ -1651,6 +1653,7 @@ fn convert_files(
             }
         }
         finish.trim(&mut c);
+        hooks.file_done(&input.rel, crate::callees::file_status(&c).label());
         progress.tick();
         Some((hold(c, key.as_ref(), in_store, false), secs, false, false))
     });
