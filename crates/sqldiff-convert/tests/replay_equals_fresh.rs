@@ -156,14 +156,20 @@ fn report(out: &Path) -> serde_json::Value {
     serde_json::from_slice(&std::fs::read(out.join("conversion-report.json")).unwrap()).unwrap()
 }
 
-/// `(files reused, files in the report)` of a run.
-fn reuse(out: &Path) -> (usize, usize) {
+/// `(files reused, files in the report)` of a run, and the files it checked
+/// again.
+fn reuse(out: &Path) -> ((usize, usize), Vec<String>) {
     let j = report(out);
     let files = j["run"]["files"]
         .as_array()
         .expect("the run lists its files");
     let reused = files.iter().filter(|f| f["reused"] == true).count();
-    (reused, files.len())
+    let again = files
+        .iter()
+        .filter(|f| f["reused"] != true)
+        .map(|f| f["path"].as_str().unwrap().to_string())
+        .collect();
+    ((reused, files.len()), again)
 }
 
 /// What a file's check gave: its report entry and its converted text.
@@ -217,10 +223,48 @@ fn compare(a: &[(String, String)], b: &[(String, String)], what: &str) {
     }
 }
 
+/// The most files an edit may make a resume check again: the files that read
+/// what it changed, as measured, plus two for the sample (one stored file in
+/// 50, seeded). A file that reads nothing the edit touched is taken from the
+/// store, so a bound that is too low means a read is recorded too widely, and
+/// the test failing on a bound too high is not what it is for: lowering a
+/// bound is how a better recording shows.
+///
+/// The anchor tables are read by about twenty dependents each (a dependent
+/// names a table, or a column of it, directly), hence the wide table edits;
+/// `VersioningOn` makes a HIDDEN column appear, which every file that
+/// expands a star reads; the narrow edits (a view, a routine, a trigger,
+/// a schema, the base catalog) check a handful.
+fn recheck_at_most(e: &Edit) -> usize {
+    let measured = match e {
+        Edit::NoOpComment | Edit::NoOpReorderTables => 0,
+        Edit::AddTable => 5,
+        Edit::DropTable => 23,
+        Edit::RenameTable
+        | Edit::AddColumn
+        | Edit::AddMixedCaseColumn
+        | Edit::DropColumn
+        | Edit::RetypeColumn
+        | Edit::ReorderColumns
+        | Edit::FlipNullability
+        | Edit::ChangeDefault
+        | Edit::ToggleIndex => 24,
+        Edit::ViewBody | Edit::AddRoutine | Edit::DropRoutine | Edit::AddTrigger => 5,
+        Edit::ChangeParameterType | Edit::AddSchemaTable | Edit::BaseDrop => 6,
+        Edit::DropTrigger => 3,
+        Edit::VersioningOn => usize::MAX / 2,
+        Edit::BaseRetype => 5,
+        Edit::BaseTable => 4,
+    };
+    measured.saturating_add(2)
+}
+
 /// What one edit showed.
 struct Outcome {
     /// Files the resumed run took from the store, and files it listed.
     reused: (usize, usize),
+    /// The files it checked again.
+    again: Vec<String>,
     /// Files whose own text is the same after the edit but whose fresh
     /// output is not: the files that could be reused stale.
     dependents_changed: Vec<String>,
@@ -257,8 +301,10 @@ fn one(to: Dialect, seed: u64, edit: &Edit) -> Outcome {
         .filter(|(path, old)| same_text(path) && after.get(*path).is_some_and(|n| n != *old))
         .map(|(path, _)| path.clone())
         .collect();
+    let (reused, again) = reuse(&f.dir.join("res"));
     Outcome {
-        reused: reuse(&f.dir.join("res")),
+        reused,
+        again,
         dependents_changed,
     }
 }
@@ -279,12 +325,23 @@ fn every_edit(to: Dialect) {
                     "{to:?} seed {seed} {e:?}: only {reused} of {total} reused"
                 );
             } else {
-                // Today the result key holds both whole catalog digests, so
-                // an edit that changes a catalog reuses nothing. PR 3b
-                // replaces this line with the files each edit leaves valid.
-                assert_eq!(
-                    reused, 0,
-                    "{to:?} seed {seed} {e:?}: {reused} of {total} reused"
+                // T2, soundness side: every file whose output the edit
+                // changed was checked again, not taken from the store.
+                for d in &o.dependents_changed {
+                    assert!(
+                        o.again.contains(d),
+                        "{to:?} seed {seed} {e:?}: {d} changed but was reused"
+                    );
+                }
+                // T2, reuse side: only the files that read what the edit
+                // changed are checked again (the bound is what a run
+                // measured, and two more for the sample of one file in 50).
+                let at_most = recheck_at_most(e);
+                assert!(
+                    o.again.len() <= at_most,
+                    "{to:?} seed {seed} {e:?}: {} files checked again, at most {at_most} expected: {:?}",
+                    o.again.len(),
+                    o.again
                 );
                 *shown.entry(format!("{e:?}")).or_default() |= !o.dependents_changed.is_empty();
             }
