@@ -33,7 +33,9 @@ pub mod tokens;
 pub mod treediff;
 
 pub use artifact::Artifact;
-pub use engine::{check, diff, identity, overlay, pair_states, what_if, Options, TOOL_VERSION};
+pub use engine::{
+    check, diff, identity, overlay, pair_states, shared_conditions, what_if, Options, TOOL_VERSION,
+};
 pub use model::{ChangeClass, Finding, Report, Severity, Verdict};
 pub use sqldiff_syntax::Dialect;
 

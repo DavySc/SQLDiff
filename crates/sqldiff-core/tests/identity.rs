@@ -45,11 +45,12 @@ fn not_identified(c: &[Class]) {
 #[test]
 fn a_parameter_only_condition_is_identified() {
     let c = classes(
-        &tsql(
-            "@x int",
-            "IF @x > 5 UPDATE t SET c = 1;",
+        &tsql("@x int", "IF @x > 5 UPDATE t SET c = 1;"),
+        &pg(
+            "p_x integer",
+            "",
+            "IF p_x > 5 THEN UPDATE t SET c = 1; END IF;",
         ),
-        &pg("p_x integer", "", "IF p_x > 5 THEN UPDATE t SET c = 1; END IF;"),
     );
     assert_eq!(first(&c), &Class::Value, "{c:?}");
 }
@@ -315,7 +316,11 @@ fn parameter_types_that_store_values_differently_are_not_identified() {
 fn the_report_is_the_same_twice() {
     let (a, b) = (
         tsql("@x int", "IF @x > 5 UPDATE t SET c = 1;"),
-        pg("p_x integer", "", "IF p_x > 5 THEN UPDATE t SET c = 1; END IF;"),
+        pg(
+            "p_x integer",
+            "",
+            "IF p_x > 5 THEN UPDATE t SET c = 1; END IF;",
+        ),
     );
     assert_eq!(classes(&a, &b), classes(&a, &b));
 }

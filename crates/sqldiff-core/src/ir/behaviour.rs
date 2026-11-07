@@ -2425,6 +2425,72 @@ pub const PAIR_VARIANTS: [super::interp::pairs::Variant; 6] = {
     ]
 };
 
+/// The conditions the explorer treats as one decision because their folded
+/// text is equal (`norm_cond`; `pairs()` and `feasible()`), per routine pair:
+/// the start offsets of the `Test::Unknown` nodes on each side that carry it.
+/// Report only (perf plan W6c, E2): nothing in `analyze` calls it.
+#[derive(Debug, Clone)]
+pub struct SharedText {
+    pub routine: String,
+    pub text: String,
+    pub a: Vec<usize>,
+    pub b: Vec<usize>,
+}
+
+pub fn shared_conditions(a: &Analyzed, b: &Analyzed) -> Vec<SharedText> {
+    let pairs: Vec<(Option<SyntaxNode>, Option<SyntaxNode>, String)> = match meet(a, b) {
+        None => vec![(
+            routines_of(a).first().cloned(),
+            routines_of(b).first().cloned(),
+            String::new(),
+        )],
+        Some(m) => m
+            .pairs
+            .iter()
+            .map(|(x, y)| {
+                (
+                    Some(x.clone()),
+                    Some(y.clone()),
+                    sqldiff_syntax::ast::routine_name(x).unwrap_or_default(),
+                )
+            })
+            .collect(),
+    };
+    let tests = |c: &Cfg| -> BTreeMap<String, Vec<usize>> {
+        let mut m: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for n in &c.nodes {
+            if let super::cfg::Op::Test {
+                test: super::cfg::Test::Unknown(t),
+                ..
+            } = &n.op
+            {
+                if let Some(s) = &n.syntax {
+                    m.entry(norm_cond(t))
+                        .or_default()
+                        .push(sqldiff_syntax::ast::sig_range(s).0);
+                }
+            }
+        }
+        m
+    };
+    let mut out = Vec::new();
+    for (ra, rb, name) in pairs {
+        let (sa, sb) = (SideIr::new(a, b, ra), SideIr::new(b, a, rb));
+        let (ta, tb) = (tests(&sa.cfg), tests(&sb.cfg));
+        for (text, xs) in ta {
+            if let Some(ys) = tb.get(&text) {
+                out.push(SharedText {
+                    routine: name.clone(),
+                    text,
+                    a: xs,
+                    b: ys.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Measures the lockstep pair-state counts of every routine pair of `a` and
 /// `b` (the pairs `analyze` would analyse). On demand only: nothing in
 /// `analyze` calls it, so verdicts cannot depend on it.

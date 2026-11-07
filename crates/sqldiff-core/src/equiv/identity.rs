@@ -656,7 +656,8 @@ fn side<'a>(u: &'a Unit, items: &'a [Item]) -> Result<Side<'a>, String> {
         s.tainted.extend(t);
     }
     let blocks = structure(&s.ev).ok_or("IF / loop markers do not nest")?;
-    let mut st: State = Rc::new(vec![Rc::new(vec![Def::Undefined]); n]);
+    let undefined: Defs = Rc::new(vec![Def::Undefined]);
+    let mut st: State = Rc::new((0..n).map(|_| undefined.clone()).collect());
     for i in 0..u.params.len() {
         Rc::make_mut(&mut st)[i] = Rc::new(vec![Def::Param]);
     }

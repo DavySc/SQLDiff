@@ -50,6 +50,32 @@ fn main() {
             let bb = Artifact::new(rel_s.clone(), to, tb);
             sqldiff_core::identity(&aa, &bb, &Options::default())
         });
+        let shared = sqldiff_core::with_engine_stack(|| {
+            let aa = Artifact::new(rel_s.clone(), from, std::fs::read_to_string(&f).unwrap());
+            let bb = Artifact::new(rel_s.clone(), to, std::fs::read_to_string(&g).unwrap());
+            sqldiff_core::shared_conditions(&aa, &bb, &Options::default())
+        });
+        // E2: the conditions `pairs()` and `feasible()` treat as one decision
+        // because their folded text is equal. Identified only when every
+        // condition with that text on either side sits in an identified pair
+        // with a condition of the same text on the other side.
+        let ident = |a_start: usize, b_start: usize| {
+            reports
+                .iter()
+                .flat_map(|r| &r.rows)
+                .any(|c| c.a_start == a_start && c.b_start == b_start && c.class.identified())
+        };
+        for s in &shared {
+            let ok = s.a.iter().all(|x| s.b.iter().any(|y| ident(*x, *y)))
+                && s.b.iter().all(|y| s.a.iter().any(|x| ident(*x, *y)));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "file": rel_s, "e2": s.routine, "text": s.text,
+                    "a": s.a.len(), "b": s.b.len(), "identified": ok,
+                })
+            );
+        }
         for (u, r) in reports.iter().enumerate() {
             println!(
                 "{}",
