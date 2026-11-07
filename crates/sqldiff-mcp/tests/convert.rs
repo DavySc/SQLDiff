@@ -752,3 +752,50 @@ fn the_server_waits_for_a_background_run_when_its_input_ends() {
     result(&r[0]);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+
+fn compare_runs_lists_what_changed_between_two_conversions() {
+    let d = scratch("compare");
+    let (s1, s2) = (d.join("s1"), d.join("s2"));
+    write(&s1.join("x.sql"), "CREATE TABLE t (id int NOT NULL);\n");
+    write(
+        &s2.join("x.sql"),
+        "CREATE TABLE t (id int NOT NULL);\nCREATE TABLE u (id int NOT NULL);\n",
+    );
+    write(&s2.join("y.sql"), "CREATE TABLE v (id int NOT NULL);\n");
+    let (o1, o2) = (d.join("o1"), d.join("o2"));
+    let r = session(&[
+        call(
+            1,
+            "convert_tree",
+            json!({ "src": s1, "to": "postgres", "out": o1 }),
+        ),
+        call(
+            2,
+            "convert_tree",
+            json!({ "src": s2, "to": "postgres", "out": o2 }),
+        ),
+        call(3, "compare_runs", json!({ "a": "tree-1", "b": "tree-2" })),
+        call(4, "compare_runs", json!({ "a": "tree-1", "b": "tree-1" })),
+        // A baseline from a report on disk gives the same answer.
+        call(5, "compare_runs", json!({ "a": o1, "b": "tree-2" })),
+        call(6, "compare_runs", json!({ "a": "tree-9", "b": "tree-2" })),
+    ]);
+    let c = result(&r[2]);
+    assert_eq!(c["new"], 2, "{c:#}");
+    assert_eq!(c["gone"], 0);
+    assert_eq!(c["regressed"], 0);
+    assert_eq!(c["unchanged"], 1);
+    assert_eq!(c["rows"][0]["change"], "new");
+    assert_eq!(c["rows"][0]["path"], "x.sql");
+    let same = result(&r[3]);
+    assert_eq!(
+        same["unchanged"],
+        2.min(same["unchanged"].as_u64().unwrap())
+    );
+    assert_eq!(same["rows"].as_array().unwrap().len(), 0);
+    assert_eq!(result(&r[4])["rows"], c["rows"]);
+    assert_eq!(r[5]["result"]["isError"], true);
+    let _ = std::fs::remove_dir_all(&d);
+}
