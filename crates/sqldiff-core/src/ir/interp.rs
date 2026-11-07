@@ -575,6 +575,11 @@ const JOIN_KEY_BYTES: usize = 16 * 1024;
 enum Step {
     Go(NodeId, Box<State>),
     Fork(Vec<(NodeId, Box<State>)>),
+    /// A decision whose second branch the path budget drops: the first
+    /// branch continues (as `Fork`'s first entry would) and the dropped
+    /// branch is only named. Made when the caller says there is no room
+    /// (`step_in`), so the state is not copied for a branch nobody runs.
+    Pruned(NodeId, Box<State>, NodeId),
     Done(Box<Outcome>),
 }
 
@@ -635,6 +640,11 @@ struct JoinEntry {
     done_at: Option<usize>,
     /// Some outcome of the subtree was cut by the step budget.
     step_cut: bool,
+    /// The explorer steps counted when the path arrived, and what the
+    /// finished subtree cost: a path that joins the entry is charged this,
+    /// the work it would have done unjoined.
+    spent_at: u64,
+    cost: u64,
 }
 
 impl Join {
@@ -675,6 +685,9 @@ impl Join {
             if let Some(e) = self.memo.borrow_mut().get_mut(&key) {
                 e.outs_to = Some(outs.len());
                 e.done_at = Some(self.tick);
+                e.cost = sqldiff_model::work::now()
+                    .get(sqldiff_model::work::Site::ExplorerSteps)
+                    .saturating_sub(e.spent_at);
                 e.step_cut = outs[e.outs_from..]
                     .iter()
                     .any(|o| o.imprecise.iter().any(|i| i == STEP_CUT));
@@ -901,6 +914,8 @@ pub struct Explorer {
     key_nodes: Vec<Vec<NodeId>>,
     merges: std::cell::Cell<usize>,
     joined: usize,
+    /// What making the explorer cost (see [`Explorer::built`]).
+    built: sqldiff_model::work::Work,
 }
 
 /// What the fault-free run looked like at one step.
@@ -920,6 +935,9 @@ struct Tick {
     small: u64,
     /// The path was dropped here by joining.
     dropped: bool,
+    /// Explorer steps counted before this tick (joined paths included at
+    /// what they would have cost): the logical cost of reaching it.
+    spent: u64,
 }
 
 impl Explorer {
@@ -943,6 +961,7 @@ impl Explorer {
         keys: &KeyUniverse,
         join: bool,
     ) -> Explorer {
+        let started = sqldiff_model::work::now();
         let base = Scenario {
             faults: Vec::new(),
             ..base.clone()
@@ -1021,6 +1040,11 @@ impl Explorer {
                 outs_end: 0,
                 small,
                 dropped: false,
+                // Relative to the start of this explorer: what ran earlier in
+                // the file is not part of reaching this tick.
+                spent: sqldiff_model::work::now()
+                    .get(sqldiff_model::work::Site::ExplorerSteps)
+                    .saturating_sub(started.get(sqldiff_model::work::Site::ExplorerSteps)),
             });
             it.tick(&mut m);
             // A path dropped by joining ran nothing: a replay must not merge
@@ -1076,7 +1100,15 @@ impl Explorer {
             key_nodes,
             merges: std::cell::Cell::new(0),
             joined: m.join.as_ref().map_or(0, |j| j.joined),
+            built: sqldiff_model::work::now().since(&started),
         }
+    }
+
+    /// What making this explorer cost. A user of a cached explorer charges it
+    /// again (`work::charge`): the work of an analysis does not depend on
+    /// whether an earlier one had already made the run.
+    pub fn built(&self) -> sqldiff_model::work::Work {
+        self.built
     }
 
     /// The fault-free scenario this explorer ran.
@@ -1132,11 +1164,17 @@ impl Explorer {
             j.live = false;
             j.open.clear();
         }
-        while at < t {
-            m.next_node()?;
-            base.tick(&mut m);
-            at += 1;
-        }
+        // Re-running from the checkpoint is not counted: how far apart the
+        // checkpoints are is not part of the analysis, and the cost of the
+        // ticks before `t` is charged by the caller (`Tick::spent`).
+        sqldiff_model::work::muted(|| {
+            while at < t {
+                m.next_node()?;
+                base.tick(&mut m);
+                at += 1;
+            }
+            Some(())
+        })?;
         Some(m)
     }
 
@@ -1163,6 +1201,13 @@ impl Explorer {
         if m.next_node() != Some(fault.node) {
             return self.full(cfg, sc);
         }
+        // The scenario's own run starts where the fault-free one was at `t`:
+        // what that took is the cost of its prefix. (Charged after the check
+        // above, so the fallback to a full run is not charged twice.)
+        sqldiff_model::work::spend(
+            sqldiff_model::work::Site::ExplorerSteps,
+            self.ticks[t].spent,
+        );
         // The replay runs every path to its end: what joining dropped from the
         // fault-free run cannot reach the failing statement (it is first
         // reached at tick `t`), so those paths are as in the fault-free run.
@@ -1664,8 +1709,16 @@ impl Interp<'_> {
             m.outs.push(self.finish(Exit::Normal, *st));
             return;
         }
-        match self.step(node, st) {
+        // Whether a decision's second branch would be kept (see below).
+        let over = m.join.as_ref().is_some_and(|j| j.tick >= JOIN_TICKS);
+        let room = m.work.len() + m.outs.len() + 1 < MAX_PATHS && !over;
+        match self.step_in(node, st, room) {
             Step::Go(n, s) => m.cur = Some((n, s)),
+            Step::Pruned(n, mut s, dropped) => {
+                s.imprecise.push("path budget exhausted".into());
+                s.cut.push(dropped);
+                m.cur = Some((n, s));
+            }
             Step::Fork(mut v) => {
                 let (n, mut s) = v.remove(0);
                 // Paths dropped by joining are not outcomes, so the path budget
@@ -1732,6 +1785,9 @@ impl Interp<'_> {
                         outs_to: None,
                         done_at: None,
                         step_cut: false,
+                        spent_at: sqldiff_model::work::now()
+                            .get(sqldiff_model::work::Site::ExplorerSteps),
+                        cost: 0,
                     },
                 );
                 drop(memo);
@@ -1753,8 +1809,15 @@ impl Interp<'_> {
         if st.steps < e.steps && e.step_cut {
             return false;
         }
+        // `e.cost` is the unjoined cost of the subtree. When the entry's
+        // subtree was cut by the step budget and this path has fewer steps
+        // left, it would have been cut sooner: a slight, deterministic
+        // overcharge.
+        let (arrived, cost) = (e.arrived, e.cost);
         j.joined += 1;
-        j.last_arrived = e.arrived;
+        j.last_arrived = arrived;
+        // The dropped path would have run the entry's subtree.
+        sqldiff_model::work::spend(sqldiff_model::work::Site::ExplorerSteps, cost);
         true
     }
 
@@ -1940,7 +2003,13 @@ impl Interp<'_> {
         }
     }
 
-    fn step(&self, id: NodeId, mut st: Box<State>) -> Step {
+    fn step(&self, id: NodeId, st: Box<State>) -> Step {
+        self.step_in(id, st, true)
+    }
+
+    /// One step of `st` at `id`. `room`: a decision's second branch has a
+    /// place to wait; without one it is dropped, so it is not made.
+    fn step_in(&self, id: NodeId, mut st: Box<State>, room: bool) -> Step {
         let node = self.cfg.node(id);
         match &node.op {
             Op::Entry | Op::Nop => self.next(id, st),
@@ -2018,6 +2087,10 @@ impl Interp<'_> {
                         Rc::make_mut(&mut st.loop_seen).remove(&id);
                         return Step::Go(f, st);
                     }
+                }
+                if !room {
+                    st.signature.push((text, tv));
+                    return Step::Pruned(t, st, f);
                 }
                 let mut a = st.clone();
                 a.signature.push((text.clone(), tv));

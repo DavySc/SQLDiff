@@ -1148,15 +1148,35 @@ fn tests_by_text(c: &Cfg) -> BTreeMap<String, Vec<usize>> {
 /// pair. Verdicts only get stricter.
 fn mark_unidentified(a: &mut Cfg, b: &mut Cfg, done: &BTreeSet<(usize, usize)>) {
     let (ta, tb) = (tests_by_text(a), tests_by_text(b));
+    // Which tests (by start offset and text) have a counterpart in `done`
+    // with the same text: read off `done` once, not searched for per test.
+    fn by_pos(t: &BTreeMap<String, Vec<usize>>) -> BTreeMap<usize, Vec<&String>> {
+        let mut m: BTreeMap<usize, Vec<&String>> = BTreeMap::new();
+        for (text, xs) in t {
+            for &x in xs {
+                m.entry(x).or_default().push(text);
+            }
+        }
+        m
+    }
+    let (pa, pb) = (by_pos(&ta), by_pos(&tb));
+    let mut covered_a: BTreeSet<(usize, &String)> = BTreeSet::new();
+    let mut covered_b: BTreeSet<(usize, &String)> = BTreeSet::new();
+    for &(x, y) in done {
+        let (Some(tx), Some(ty)) = (pa.get(&x), pb.get(&y)) else {
+            continue;
+        };
+        for text in tx.iter().filter(|t| ty.contains(t)) {
+            covered_a.insert((x, text));
+            covered_b.insert((y, text));
+        }
+    }
     let ident: BTreeSet<&String> = ta
         .iter()
         .filter(|(text, xs)| {
             tb.get(*text).is_some_and(|ys| {
-                xs.iter()
-                    .all(|x| ys.iter().any(|y| done.contains(&(*x, *y))))
-                    && ys
-                        .iter()
-                        .all(|y| xs.iter().any(|x| done.contains(&(*x, *y))))
+                xs.iter().all(|x| covered_a.contains(&(*x, *text)))
+                    && ys.iter().all(|y| covered_b.contains(&(*y, *text)))
             })
         })
         .map(|(t, _)| t)
@@ -1183,10 +1203,18 @@ fn pairs(pa: &[Outcome], pb: &[Outcome]) -> (Vec<(usize, usize)>, bool) {
     if pa.len() == 1 && pb.len() == 1 {
         return (vec![(0, 0)], true);
     }
+    // The paths of one side share most conditions: each text is folded once.
+    let folded: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
     let sig = |o: &Outcome| -> Vec<(String, bool)> {
         o.signature
             .iter()
-            .map(|(c, b)| (norm_cond(c), *b))
+            .map(|(c, b)| {
+                let mut f = folded.borrow_mut();
+                if !f.contains_key(c) {
+                    f.insert(c.clone(), norm_cond(c));
+                }
+                (f[c].clone(), *b)
+            })
             .collect()
     };
     let (siga, sigb): (Vec<_>, Vec<_>) =
@@ -1208,10 +1236,14 @@ fn pairs(pa: &[Outcome], pb: &[Outcome]) -> (Vec<(usize, usize)>, bool) {
     }
     // Not the same set of paths: every pair of outcomes except those no input
     // can produce (see `feasible`).
+    let (fa, fb): (Vec<_>, Vec<_>) = (
+        siga.iter().map(|x| once_flags(x)).collect(),
+        sigb.iter().map(|y| once_flags(y)).collect(),
+    );
     let mut v = Vec::new();
     for (i, x) in siga.iter().enumerate() {
         for (j, y) in sigb.iter().enumerate() {
-            if feasible(x, y) {
+            if feasible_with(x, &fa[i], y, &fb[j]) {
                 v.push((i, j));
             }
         }
@@ -1233,13 +1265,26 @@ fn pairs(pa: &[Outcome], pb: &[Outcome]) -> (Vec<(usize, usize)>, bool) {
 /// pairing does, that the same text has the same truth value on both sides.
 /// A row-count test after a failed statement is named with the dialect, since
 /// its value after an error differs between dialects.
+#[cfg(test)]
 fn feasible(a: &[(String, bool)], b: &[(String, bool)]) -> bool {
-    // A condition decided more than once on a path (a loop test, or the same
-    // text at two places) can have different values each time: its values
-    // say nothing about the other side's.
-    let once = |p: &[(String, bool)], c: &str| p.iter().filter(|x| x.0 == c).count() == 1;
-    for (x, y) in a.iter().zip(b) {
-        if x.0 != y.0 || !once(a, &x.0) || !once(b, &x.0) {
+    feasible_with(a, &once_flags(a), b, &once_flags(b))
+}
+
+/// For each decision of a path: whether its condition is decided only there
+/// on the path.
+#[allow(clippy::disallowed_methods)] // hash order cannot reach an output: counts looked up by key
+fn once_flags(p: &[(String, bool)]) -> Vec<bool> {
+    let mut count: HashMap<&str, usize> = HashMap::new();
+    for x in p {
+        *count.entry(x.0.as_str()).or_default() += 1;
+    }
+    p.iter().map(|x| count[x.0.as_str()] == 1).collect()
+}
+
+/// [`feasible`] with the paths' `once_flags` made once, not for every pair.
+fn feasible_with(a: &[(String, bool)], fa: &[bool], b: &[(String, bool)], fb: &[bool]) -> bool {
+    for (k, (x, y)) in a.iter().zip(b).enumerate() {
+        if x.0 != y.0 || !fa[k] || !fb[k] {
             return true;
         }
         if x.1 != y.1 {
@@ -1300,7 +1345,7 @@ struct Collector<'x, 'a> {
     cut_b: BTreeSet<NodeId>,
     /// The divergences of a scenario with a default flipped (`persists`),
     /// by scenario.
-    flipped: RefCell<HashMap<String, Rc<Divergences>>>,
+    flipped: RefCell<HashMap<String, (Rc<Divergences>, sqldiff_model::work::Work)>>,
     /// `diff` calls spent by this routine pair, and whether a budget ran out.
     spent: Cell<u64>,
     out_of_budget: Cell<bool>,
@@ -1427,6 +1472,8 @@ impl<'x, 'a> Collector<'x, 'a> {
         };
         let mut c = cache.borrow_mut();
         if let Some(x) = c.iter().find(|x| *x.base_scenario() == env) {
+            // The run is already made; the work of making it counts again.
+            sqldiff_model::work::charge(&x.built());
             return x.clone();
         }
         // Paths of this side that reach the same state are joined when the
@@ -1465,14 +1512,21 @@ impl<'x, 'a> Collector<'x, 'a> {
         let key = format!("{sc:?}|{scen_a:?}|{scen_b:?}");
         let known = self.flipped.borrow().get(&key).cloned();
         let set = match known {
-            Some(set) => set,
+            Some((set, cost)) => {
+                // Made before (or dropped from the cache since): the work of
+                // making it counts every time, whatever the cache held.
+                sqldiff_model::work::charge(&cost);
+                set
+            }
             None => {
+                let started = sqldiff_model::work::now();
                 let set = Rc::new(self.divergences_of(sc, scen_a, scen_b));
+                let cost = sqldiff_model::work::now().since(&started);
                 let mut c = self.flipped.borrow_mut();
                 if c.len() >= FLIPPED_MAX {
                     c.clear();
                 }
-                c.insert(key, set.clone());
+                c.insert(key, (set.clone(), cost));
                 set
             }
         };
