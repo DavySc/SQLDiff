@@ -480,7 +480,7 @@ fn stand_in_flags_come_from_the_store_without_changing_the_output() {
         catalogs: &[],
     };
     run(&f, &c, "a", 2, Select::default(), true);
-    let base = tree_of(&f.out("a"), false);
+    let base = tree_of(&f.out("a"));
     let flags = f.out("a").join(".sqldiff/flags");
     let stored = std::fs::read_dir(&flags).map(|d| d.count()).unwrap_or(0);
     assert!(
@@ -496,7 +496,7 @@ fn stand_in_flags_come_from_the_store_without_changing_the_output() {
         run(&f, &c, "a", jobs, Select::default(), false);
         same(
             &base,
-            &tree_of(&f.out("a"), false),
+            &tree_of(&f.out("a")),
             "resumed with stored flags",
         );
     }
@@ -507,5 +507,5 @@ fn stand_in_flags_come_from_the_store_without_changing_the_output() {
         }
     }
     run(&f, &c, "a", 2, Select::default(), false);
-    same(&base, &tree_of(&f.out("a"), false), "unreadable flags");
+    same(&base, &tree_of(&f.out("a")), "unreadable flags");
 }
