@@ -549,6 +549,7 @@ dependencies = [
  "sqldiff-core",
  "sqldiff-source",
  "sqldiff-syntax",
+ "sqldiff-units",
  "toml",
 ]
 
@@ -671,6 +672,15 @@ version = "0.1.0"
 dependencies = [
  "regex",
  "rowan",
+]
+
+[[package]]
+name = "sqldiff-units"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sha2",
+ "sqldiff-syntax",
 ]
 
 [[package]]

@@ -196,3 +196,24 @@ no type reachable from `Draft` has a hand-written lossy `Debug` (or
    edit to `tsql` that changes only the mix, an edit to a pass-1-only file
    outside `tsql` (`refused.rs`), an edit to `ir` (drafts kept, results not),
    and the claims case above. This is the behaviour change.
+
+## Step 5: `sqldiff-units` (PR 1 of the stage-fingerprint plan)
+
+The data both stages read moves into `sqldiff-units`, which depends on
+`sqldiff-syntax` only: `Draft` (and `Out`, `RawUnit`), `Note`, `Step`,
+`Status`, `Written`, `By`, `RuleOptions`, `Shared`/`Pool`, and the unit-id
+hash (`ids_of`). `sqldiff-convert` re-exports them under their old paths.
+
+What the move forced, none of it changes what is computed:
+
+- `Draft`'s fields are `pub` (the construction and the splitting in
+  `lib.rs` need them across the crate boundary) and its `pub(crate)` helpers
+  (`well_formed`, `canonical`, `worst_note`) are `pub`.
+- `Pool::share_notes(&Conversion)` becomes a loop in `tree.rs` (`Conversion`
+  is not part of the units).
+- `impl From<rules::Status> for Status` would be an orphan impl; it is the
+  function `tsql::unit_status`.
+- `tests/debug_is_complete.rs` guards the key: only `Shared` has a
+  hand-written `Debug` (and it prints the string it holds), and a draft that
+  differs in any one field prints differently, so `Draft::canonical()` (the
+  `Debug` text) separates every pair of drafts.
