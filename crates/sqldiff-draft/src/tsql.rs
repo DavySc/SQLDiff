@@ -2123,8 +2123,7 @@ impl<'a> Cx<'a> {
     }
 
     fn while_stmt(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize) {
-        let ts = tokens(n);
-        if !ts.iter().find(|t| t.sig()).is_some_and(|t| t.is("WHILE")) {
+        if !crate::tok::starts_with_word(n, "WHILE") {
             return self.refuse(out, n, indent, "loop form not supported");
         }
         if let Some(plan) = self.fetch_loop(n) {
@@ -11549,6 +11548,11 @@ fn from_item_start(ts: &[T], i: usize) -> bool {
     };
     if ts[p].is("JOIN") {
         return true;
+    }
+    // Only a FROM or a comma can start a list item from here; the paren
+    // depths of the whole slice are not worth computing for any other word.
+    if !(ts[p].is("FROM") || ts[p].k == COMMA) {
+        return false;
     }
     let ds = crate::tok::depths(ts);
     // A query's FROM: not `DELETE FROM`, nor `TRIM(' ' FROM s)` inside a call.

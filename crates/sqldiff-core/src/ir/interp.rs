@@ -198,6 +198,82 @@ enum Log {
     Temp(String, TempState),
 }
 
+/// An append-only list whose copies share their common prefix: a path that
+/// forks keeps its history without copying it (a deep path's signature and
+/// notes were copied in full at every fork, which made a long path cost its
+/// length in allocations per step). Reads in order go through `to_vec`.
+struct Hist<T> {
+    tail: Option<Rc<HistNode<T>>>,
+    len: usize,
+}
+
+struct HistNode<T> {
+    prev: Option<Rc<HistNode<T>>>,
+    item: T,
+}
+
+impl<T> Hist<T> {
+    fn new() -> Self {
+        Hist { tail: None, len: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn push(&mut self, item: T) {
+        let prev = self.tail.take();
+        self.tail = Some(Rc::new(HistNode { prev, item }));
+        self.len += 1;
+    }
+
+    fn last(&self) -> Option<&T> {
+        self.tail.as_ref().map(|n| &n.item)
+    }
+}
+
+impl<T: Clone> Hist<T> {
+    fn to_vec(&self) -> Vec<T> {
+        let mut v = Vec::with_capacity(self.len);
+        let mut at = self.tail.as_ref();
+        while let Some(n) = at {
+            v.push(n.item.clone());
+            at = n.prev.as_ref();
+        }
+        v.reverse();
+        v
+    }
+}
+
+impl<T> Clone for Hist<T> {
+    fn clone(&self) -> Self {
+        Hist {
+            tail: self.tail.clone(),
+            len: self.len,
+        }
+    }
+}
+
+impl<T: Clone + std::fmt::Debug> std::fmt::Debug for Hist<T> {
+    /// As the `Vec` it stands for.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.to_vec().fmt(f)
+    }
+}
+
+impl<T> Drop for Hist<T> {
+    /// Unlinks iteratively: a long history must not drop recursively.
+    fn drop(&mut self) {
+        let mut at = self.tail.take();
+        while let Some(n) = at {
+            match Rc::try_unwrap(n) {
+                Ok(mut node) => at = node.prev.take(),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct State {
     depth: u32,
@@ -234,9 +310,10 @@ struct State {
     raised: bool,
     ret: Option<String>,
     raising: Option<ErrorKind>,
-    loop_seen: HashMap<NodeId, Vec<String>>,
-    signature: Vec<(String, bool)>,
-    imprecise: Vec<String>,
+    /// Shared between forked paths (`Rc::make_mut` copies on change).
+    loop_seen: Rc<HashMap<NodeId, Vec<String>>>,
+    signature: Hist<(String, bool)>,
+    imprecise: Hist<String>,
     cut: Vec<NodeId>,
     durability_unknown: Option<String>,
     rows: BTreeSet<String>,
@@ -1336,9 +1413,9 @@ impl Explorer {
                         .filter(|r| !b.temp_reads.contains(*r))
                         .cloned(),
                 );
-                let mut signature = p.signature.clone();
+                let mut signature = p.signature.to_vec();
                 signature.extend(o.signature[b.signature.len()..].iter().cloned());
-                let mut imprecise = p.imprecise.clone();
+                let mut imprecise = p.imprecise.to_vec();
                 imprecise.extend(o.imprecise[b.imprecise.len()..].iter().cloned());
                 let mut cut = p.cut.clone();
                 cut.extend(o.cut[b.cut.len()..].iter().copied());
@@ -1760,9 +1837,9 @@ impl Interp<'_> {
             raised: false,
             ret: None,
             raising: None,
-            loop_seen: HashMap::new(),
-            signature: Vec::new(),
-            imprecise: Vec::new(),
+            loop_seen: Rc::new(HashMap::new()),
+            signature: Hist::new(),
+            imprecise: Hist::new(),
             cut: Vec::new(),
             durability_unknown: None,
             rows: BTreeSet::new(),
@@ -1959,7 +2036,7 @@ impl Interp<'_> {
                 };
                 if *is_loop {
                     let digest = self.digest(&st);
-                    let seen = st.loop_seen.entry(id).or_default();
+                    let seen = Rc::make_mut(&mut st.loop_seen).entry(id).or_default();
                     seen.push(digest);
                     let n = seen.len();
                     if n > 2 {
@@ -1969,7 +2046,7 @@ impl Interp<'_> {
                                 plain_cond(&text)
                             ));
                         }
-                        st.loop_seen.remove(&id);
+                        Rc::make_mut(&mut st.loop_seen).remove(&id);
                         return Step::Go(f, st);
                     }
                 }
@@ -2727,8 +2804,8 @@ impl Interp<'_> {
             depth: st.depth,
             left_open,
             doomed: st.doomed,
-            signature: st.signature,
-            imprecise: st.imprecise,
+            signature: st.signature.to_vec(),
+            imprecise: st.imprecise.to_vec(),
             cut: st.cut,
             durability_unknown: st.durability_unknown,
             rows: st.rows,
@@ -2736,5 +2813,34 @@ impl Interp<'_> {
             untested: st.untested,
             unit_commit,
         }
+    }
+}
+
+#[cfg(test)]
+mod hist_tests {
+    use super::Hist;
+
+    #[test]
+    fn copies_share_a_prefix_and_read_back_in_order() {
+        let mut a: Hist<u32> = Hist::new();
+        a.push(1);
+        a.push(2);
+        let mut b = a.clone();
+        a.push(3);
+        b.push(4);
+        assert_eq!(a.to_vec(), [1, 2, 3]);
+        assert_eq!(b.to_vec(), [1, 2, 4]);
+        assert_eq!((a.len(), b.len()), (3, 3));
+        assert_eq!(b.last(), Some(&4));
+        assert_eq!(format!("{b:?}"), format!("{:?}", vec![1, 2, 4]));
+    }
+
+    #[test]
+    fn a_long_history_drops_without_recursing() {
+        let mut h: Hist<u64> = Hist::new();
+        for i in 0..2_000_000 {
+            h.push(i);
+        }
+        drop(h);
     }
 }
