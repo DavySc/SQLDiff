@@ -119,6 +119,7 @@ fn progress_counts_every_check_and_the_output_is_what_the_plain_call_writes() {
     let hooks = Hooks {
         progress: Some(Box::new(move |n, total| s.lock().unwrap().push((n, total)))),
         cancel: Some(Arc::new(AtomicBool::new(false))),
+        ..Default::default()
     };
     let watched = convert_into(&f.job("watched"), &hooks).unwrap();
     let plain = convert_into(&f.job("plain"), &Hooks::default()).unwrap();
@@ -153,6 +154,7 @@ fn a_cancelled_job_fails_and_writes_nothing() {
     let hooks = Hooks {
         progress: None,
         cancel: Some(Arc::new(AtomicBool::new(true))),
+        ..Default::default()
     };
     let e = convert_into(&f.job("out"), &hooks).err().unwrap();
     assert_eq!(e, CANCELLED);
@@ -171,6 +173,7 @@ fn a_cancelled_job_fails_and_writes_nothing() {
             c.store(true, Ordering::Relaxed);
         })),
         cancel: Some(cancel),
+        ..Default::default()
     };
     let e = convert_into(&job, &hooks).err().unwrap();
     assert_eq!(e, CANCELLED);

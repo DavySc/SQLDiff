@@ -167,7 +167,7 @@ fn key(schema: Option<&str>, name: &str) -> String {
 }
 
 /// The worst status in a converted file, counting what names no unit.
-fn file_status<C: Cored>(c: &C) -> Status {
+pub(crate) fn file_status<C: Cored>(c: &C) -> Status {
     let mut worst = c
         .units()
         .iter()

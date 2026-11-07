@@ -109,6 +109,9 @@ struct Run {
         std::sync::atomic::AtomicUsize,
         std::sync::atomic::AtomicUsize,
     )>,
+    /// (path, status label) of each file whose own check has finished, in
+    /// the order the worker threads finished them.
+    files: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
     handle: Option<std::thread::JoinHandle<RunResult>>,
     /// The final answer once collected: reported the same on every call.
     done: Option<(String, Value)>,
@@ -1487,7 +1490,16 @@ impl Server {
         let id = format!("run-{}", self.run_count);
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+        let files: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
         let hooks = tree::Hooks {
+            file_done: Some({
+                let f = files.clone();
+                Box::new(move |path, status| {
+                    if let Ok(mut v) = f.lock() {
+                        v.push((path.to_string(), status.to_string()));
+                    }
+                })
+            }),
             cancel: Some(cancel.clone()),
             progress: Some({
                 let p = progress.clone();
@@ -1496,6 +1508,7 @@ impl Server {
                     p.1.store(total, Ordering::Relaxed);
                 })
             }),
+            ..Default::default()
         };
         let worker_args = args.clone();
         let handle = std::thread::Builder::new()
@@ -1512,6 +1525,7 @@ impl Server {
             args: args.clone(),
             cancel,
             progress,
+            files,
             handle: Some(handle),
             done: None,
         });
@@ -1645,13 +1659,50 @@ impl Server {
                 r.progress.1.load(Ordering::Relaxed),
             );
             let cancelling = r.cancel.load(Ordering::Relaxed);
-            let text = format!(
-                "[{id}] {} {c}/{n} checks\n",
-                if cancelling { "stopping" } else { "running" }
-            );
+            let mut rows: Vec<(String, String)> =
+                r.files.lock().map(|v| v.clone()).unwrap_or_default();
+            // The finishing order depends on the threads; the report does not.
+            rows.sort();
+            let mut by_status: BTreeMap<&str, usize> = BTreeMap::new();
+            for (_, st) in &rows {
+                *by_status.entry(st.as_str()).or_default() += 1;
+            }
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map_or(DEFAULT_TREE_LIMIT, |n| n as usize);
+            let state = if cancelling { "stopping" } else { "running" };
+            let mut text = format!("[{id}] {state} {c}/{n} checks\n");
+            let shown: Vec<&(String, String)> = rows
+                .iter()
+                .filter(|(_, st)| st != "converted")
+                .take(limit)
+                .collect();
+            if !rows.is_empty() {
+                text.push_str(&format!(
+                    "{} file(s) checked so far (provisional: the passes across files that follow can only make a status worse):\n",
+                    rows.len()
+                ));
+                for (st, count) in &by_status {
+                    text.push_str(&format!("  {count:>5}  {st}\n"));
+                }
+                for (path, st) in &shown {
+                    text.push_str(&format!("{path}: {st}\n"));
+                }
+            }
+            let listed: Vec<Value> = shown
+                .iter()
+                .map(|(p, st)| json!({ "path": p, "status": st }))
+                .collect();
             return Ok((
                 text,
-                json!({ "run": id, "state": if cancelling { "stopping" } else { "running" }, "checked": c, "total": n }),
+                json!({
+                    "run": id, "state": state, "checked": c, "total": n,
+                    "provisional": true,
+                    "files_checked": rows.len(),
+                    "by_status": by_status,
+                    "files": listed,
+                }),
             ));
         }
         let handle = self.runs[k]
@@ -2386,10 +2437,13 @@ fn tools() -> Value {
         {
             "name": "run_status",
             "title": "Status of a background run",
-            "description": "Where a `convert_tree` started with `background` is: running (checks done of total), stopping, or finished. A finished run is reported here exactly as `convert_tree` reports (same arguments, same tree id for `converted_file`), cancelled, or failed; later calls return the same answer.",
+            "description": "Where a `convert_tree` started with `background` is: running (checks done of total, with the files checked so far and their statuses, provisional because the passes across files that follow can only make a status worse), stopping, or finished. A finished run is reported here exactly as `convert_tree` reports (same arguments, same tree id for `converted_file`), cancelled, or failed; later calls return the same answer.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "run": { "type": "string", "description": "Run id from `convert_tree`" } },
+                "properties": {
+                    "run": { "type": "string", "description": "Run id from `convert_tree`" },
+                    "limit": { "type": "integer", "minimum": 0, "description": "While running: cap on files listed (default 25; only files not plainly converted are listed, the counts cover all)" },
+                },
                 "required": ["run"],
             },
             "annotations": ro,
