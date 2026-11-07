@@ -1295,11 +1295,11 @@ fn load(s: &Setup, prev: Option<Loaded>, hooks: &tree::Hooks) -> Result<Loaded, 
         }
         _ => {
             let started = Instant::now();
-            let t = tree::convert_for_review(
+            let t = tree::convert_for_review_stored(
                 &s.tree,
                 &inputs,
                 unreadable.clone(),
-                Some(&s.out),
+                &s.out,
                 hooks,
             )?;
             (t, started.elapsed().as_secs_f64() * 1000.0, true)

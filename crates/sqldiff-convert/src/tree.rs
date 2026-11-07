@@ -643,6 +643,30 @@ pub fn convert_for_review(
     convert_kept(a, inputs, unreadable, out, hooks, true, None, None)
 }
 
+/// [`convert_for_review`] keeping each file's checked result in the store of
+/// `out` and reusing the ones whose key matches, as [`convert_stored`] does.
+/// The result of a trimmed conversion is the same as a whole one (`trim` is
+/// part of the stored key), so a review of a tree that was converted before
+/// costs lookups, not a new check.
+pub fn convert_for_review_stored(
+    a: &Args,
+    inputs: &[Input],
+    unreadable: Vec<String>,
+    out: &Path,
+    hooks: &Hooks,
+) -> Result<Tree, String> {
+    convert_kept(
+        a,
+        inputs,
+        unreadable,
+        Some(out),
+        hooks,
+        true,
+        Some(false),
+        None,
+    )
+}
+
 /// What is kept of each file as it is checked: its notes, shared with the
 /// tree's (`shared::Pool`), and with `trim` only what a review reads of the
 /// engine's reports.
@@ -652,16 +676,27 @@ struct Finish {
 }
 
 impl Finish {
-    fn apply(&self, c: &mut Conversion) {
+    /// Shares the notes' text. What the result store holds is only shared,
+    /// never trimmed: a review and a run keep the same stored results.
+    fn share(&self, c: &mut Conversion) {
         for u in &mut c.units {
             for n in &mut u.notes {
                 self.pool.share(&mut n.rule);
                 self.pool.share(&mut n.text);
             }
         }
+    }
+
+    /// Lets go of the reports a review does not read, in memory only.
+    fn trim(&self, c: &mut Conversion) {
         if self.trim {
             crate::trim_reports(c);
         }
+    }
+
+    fn apply(&self, c: &mut Conversion) {
+        self.share(c);
+        self.trim(c);
     }
 }
 
@@ -733,7 +768,6 @@ fn convert_kept(
             build: crate::instances::build_hash()?,
             check_build: crate::instances::check_build_hash(),
             fresh,
-            trim,
         }),
         _ => None,
     };
@@ -810,6 +844,7 @@ fn convert_kept(
                 }
             },
         };
+        finish.trim(&mut c);
         core.restore(&mut c);
         finished.push((c, secs));
     }
@@ -1412,7 +1447,7 @@ fn convert_files(
                         build: &c.check_build,
                         from: a.from,
                         to: a.to,
-                        trim: c.trim,
+                        trim: false,
                         helpers: &a.helpers,
                         text: &i.text,
                         draft: d,
@@ -1609,11 +1644,12 @@ fn convert_files(
         }
         let t = Instant::now();
         let (mut c, mix) = crate::check_with_mix(&input.text, draft, &opts, rebuild);
-        finish.apply(&mut c);
+        // Shared but whole while it is compared and stored; trimmed after.
+        finish.share(&mut c);
         let secs = t.elapsed().as_secs_f64();
         if let Some((cc, k, old, old_mix)) = &stored {
             let mut old = old.clone();
-            finish.apply(&mut old);
+            finish.share(&mut old);
             if !crate::store::compare(&old, &c) || *old_mix != mix {
                 cc.store.bundle(k, &old, &c);
                 mismatch.lock().unwrap().push(format!(
@@ -1633,6 +1669,7 @@ fn convert_files(
                 Err(e) => eprintln!("sqldiff: result not stored: {e}"),
             }
         }
+        finish.trim(&mut c);
         progress.tick();
         Some((hold(c, key.as_ref(), in_store, false), secs, false, false))
     });
@@ -1680,7 +1717,6 @@ struct Cache {
     check_build: String,
     /// Reuse nothing; store every result again.
     fresh: bool,
-    trim: bool,
 }
 
 /// Reads the review ledger in `out`, if there is one.
@@ -3905,5 +3941,48 @@ END;
             .err()
             .expect("a mix that differs fails the re-check");
         assert!(err.contains("differs from a fresh check"), "{err}");
+    }
+
+    #[test]
+    fn a_stored_review_conversion_follows_the_same_mix_rules() {
+        // `convert_for_review_stored` shares the result store with a run:
+        // it takes a result with its mix when it can build the mix again,
+        // and under a review ledger (no rebuild) it takes none.
+        let f = Fixture::new("review", true);
+        f.run(true);
+        assert!(f.with_mix().is_some());
+        let args = Args {
+            recheck: Recheck::None,
+            ..super::tree_state_tests::args(&f.dir.join("src"))
+        };
+        let review = || {
+            let (inputs, unreadable) = read(&args).unwrap();
+            let t =
+                convert_for_review_stored(&args, &inputs, unreadable, &f.out(), &Hooks::default())
+                    .unwrap();
+            t.report
+                .run
+                .files
+                .iter()
+                .find(|x| x.path == "procs.sql")
+                .unwrap()
+                .reused
+        };
+        assert!(
+            review(),
+            "an untouched review did not reuse the stored result"
+        );
+        assert!(f.with_mix().is_some());
+        let ledger = f.out().join(crate::review::LEDGER_FILE);
+        std::fs::write(&ledger, "").unwrap();
+        assert!(
+            !review(),
+            "a review under a ledger took a result with a mix"
+        );
+        assert!(f.with_mix().is_none());
+        std::fs::remove_file(&ledger).unwrap();
+        assert!(!review(), "a review took a result stored without a try");
+        assert!(f.with_mix().is_some());
+        assert!(review());
     }
 }
