@@ -799,3 +799,86 @@ fn compare_runs_lists_what_changed_between_two_conversions() {
     assert_eq!(r[7]["result"]["isError"], true, "{}", r[7]);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// One server process the test talks to a request at a time, so it can edit
+/// files between requests.
+struct Live {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    out: BufReader<std::process::ChildStdout>,
+    id: u64,
+}
+
+impl Live {
+    fn start(config: &Path) -> Live {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_sqldiff-mcp"))
+            .arg("--isolated")
+            .arg("--config")
+            .arg(config)
+            .env(
+                "SQLDIFF_DATA_DIR",
+                std::env::temp_dir().join(format!("sqldiff-mcp-live-{}", std::process::id())),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let out = BufReader::new(child.stdout.take().unwrap());
+        Live {
+            child,
+            stdin,
+            out,
+            id: 0,
+        }
+    }
+
+    fn call(&mut self, name: &str, args: Value) -> Value {
+        self.id += 1;
+        writeln!(self.stdin, "{}", call(self.id, name, args)).unwrap();
+        self.stdin.flush().unwrap();
+        let mut line = String::new();
+        self.out.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    fn finish(mut self) {
+        drop(self.stdin);
+        assert!(self.child.wait().unwrap().success());
+    }
+}
+
+#[test]
+fn engine_reports_fingerprints_and_reload_config_picks_up_an_edit() {
+    let d = scratch("reload");
+    let cfg = d.join("sqldiff.toml");
+    write(&cfg, "excerpt_lines = 3\n");
+    let mut s = Live::start(&cfg);
+    let e1 = s.call("engine", json!({}));
+    let e1 = result(&e1).clone();
+    let fp = e1["engine_fingerprint"].as_str().unwrap();
+    let check = e1["check_fingerprint"].as_str().unwrap();
+    assert!(!fp.is_empty() && !check.is_empty() && fp != check);
+    assert_eq!(e1["can_reload_config"], true);
+
+    // Nothing edited: nothing changed.
+    let r = s.call("reload_config", json!({}));
+    assert_eq!(result(&r)["changed"], false, "{r}");
+
+    // An edit shows up in the layer hash, and the next engine call sees it.
+    write(&cfg, "excerpt_lines = 5\n");
+    let r = s.call("reload_config", json!({}));
+    assert_eq!(result(&r)["changed"], true, "{r}");
+    let e2 = s.call("engine", json!({}));
+    assert_ne!(result(&e2)["config"], e1["config"]);
+    assert_eq!(result(&e2)["engine_fingerprint"], e1["engine_fingerprint"]);
+
+    // A configuration that does not load changes nothing.
+    write(&cfg, "excerpt_lines = [not valid\n");
+    let r = s.call("reload_config", json!({}));
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    let e3 = s.call("engine", json!({}));
+    assert_eq!(result(&e3)["config"], result(&e2)["config"]);
+    s.finish();
+    let _ = std::fs::remove_dir_all(&d);
+}
