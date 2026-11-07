@@ -190,6 +190,10 @@ struct Routine<'x, 'a> {
     spelling: std::cell::OnceCell<std::rc::Rc<HashMap<String, String>>>,
     /// Opening and closing parentheses of the whole routine (see `validity`).
     parens: std::cell::OnceCell<(usize, usize)>,
+    /// Sorted start offsets of every statement whose first word can make it
+    /// jump (see `jump`) and of every label, built on first use: a subtree
+    /// with none of them cannot hold a jump.
+    jump_marks: std::cell::OnceCell<Vec<usize>>,
 }
 
 impl<'x, 'a> Routine<'x, 'a> {
@@ -257,6 +261,7 @@ impl<'x, 'a> Routine<'x, 'a> {
             starts: std::cell::OnceCell::new(),
             spelling: std::cell::OnceCell::new(),
             parens: std::cell::OnceCell::new(),
+            jump_marks: std::cell::OnceCell::new(),
         };
         r.scan();
         r
@@ -847,6 +852,22 @@ enum Scan {
     Untouched,
 }
 
+/// The first words of a statement that `Routine::jump` may call a jump.
+const JUMP_WORDS: &[&str] = &[
+    "RETURN",
+    "GOTO",
+    "SIGNAL",
+    "RESIGNAL",
+    "THROW",
+    "RAISE",
+    "RAISERROR",
+    "BREAK",
+    "CONTINUE",
+    "EXIT",
+    "LEAVE",
+    "ITERATE",
+];
+
 impl<'x, 'a> Routine<'x, 'a> {
     fn line(&self, n: &SyntaxNode) -> usize {
         self.side.line_of(n)
@@ -891,6 +912,32 @@ impl<'x, 'a> Routine<'x, 'a> {
 
     /// Whether some statement inside `u` may jump out of the sequence that holds `target`.
     fn has_jump(&self, u: &SyntaxNode, target: &SyntaxNode) -> bool {
+        // `jump` is `Some` only for a statement whose first word is one of
+        // `JUMP_WORDS`, and a label always counts: a subtree holding no such
+        // mark has no jump, which skips the walk for the common leaf.
+        let marks = self.jump_marks.get_or_init(|| {
+            let mut v: Vec<usize> = self
+                .side
+                .root
+                .descendants()
+                .filter(|x| match x.kind() {
+                    SyntaxKind::LABEL => true,
+                    SyntaxKind::STATEMENT => cst::first_words(x, 1)
+                        .first()
+                        .is_some_and(|w| JUMP_WORDS.contains(&w.as_str())),
+                    _ => false,
+                })
+                .map(|x| usize::from(x.text_range().start()))
+                .collect();
+            v.sort_unstable();
+            v
+        });
+        let range = u.text_range();
+        let (lo, hi) = (usize::from(range.start()), usize::from(range.end()));
+        let k = marks.partition_point(|&m| m < lo);
+        if marks.get(k).map_or(true, |&m| m >= hi) {
+            return false;
+        }
         u.descendants_with_tokens().any(|e| {
             e.as_node().is_some_and(|x| {
                 x.kind() == SyntaxKind::STATEMENT && self.jump(x, target).is_some()
