@@ -1585,6 +1585,7 @@ impl Interp<'_> {
             return;
         }
         st.steps += 1;
+        sqldiff_model::work::spend(sqldiff_model::work::Site::ExplorerSteps, 1);
         if st.steps > MAX_STEPS {
             st.imprecise.push(STEP_CUT.into());
             st.cut.push(node);

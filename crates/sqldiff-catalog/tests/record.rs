@@ -389,3 +389,98 @@ fn two_answers_to_one_question_are_flagged() {
     assert_eq!(reads.0.len(), 1);
     assert_eq!(conflicts, vec![(Side::Source, Query::Supplied)]);
 }
+
+// ---- RecordingView -------------------------------------------------------
+
+mod recording_view {
+    use super::*;
+    use sqldiff_catalog::record::{NoSink, RecordingView};
+    use sqldiff_catalog::{ddl, CatalogView, Ident, Lookup};
+    use sqldiff_syntax::Dialect;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn view() -> CatalogView {
+        let cat = ddl::load(
+            "CREATE TABLE dbo.orders (id int NOT NULL, note varchar(10));",
+            Dialect::Tsql,
+            "t.sql",
+        );
+        CatalogView::new(Dialect::Tsql, &[&cat])
+    }
+
+    fn ident(t: &str, quoted: bool) -> Ident {
+        Ident::new(t, quoted)
+    }
+
+    #[test]
+    fn every_question_is_recorded_as_posed_with_the_digest_of_its_answer() {
+        let v = view();
+        let rec = Recorder::default();
+        let rv = RecordingView::new(&v, Side::Target, &rec);
+        let name = [ident("dbo", false), ident("Orders", true)];
+        let found = rv.table(&name);
+        assert!(matches!(found, Lookup::Found(_)));
+        let found_digest = Outcome::of(&found);
+        assert!(rv.supplied());
+        assert!(rv.tables_authoritative());
+        let _ = rv.origin();
+        let _ = rv.routines(&[ident("f", false)]);
+        let _ = rv.whole();
+        let (reads, conflicts) = rec.finish();
+        assert!(conflicts.is_empty());
+        let key = |q: Query| (Side::Target, q);
+        // The question keeps its text and its quoting.
+        let q = Query::Table(vec![("dbo".into(), false), ("Orders".into(), true)]);
+        assert_eq!(reads.0[&key(q)], found_digest);
+        for q in [
+            Query::Supplied,
+            Query::Origin,
+            Query::TablesAuthoritative,
+            Query::Routines(vec![("f".into(), false)]),
+            Query::WholeCatalog,
+        ] {
+            assert!(reads.0.contains_key(&key(q.clone())), "{q:?} not recorded");
+        }
+        assert_eq!(reads.0.len(), 6);
+        // A different question about the same table is a different read.
+        let other = Query::Table(vec![("dbo".into(), false), ("Orders".into(), false)]);
+        assert!(!reads.0.contains_key(&key(other)));
+    }
+
+    #[test]
+    fn the_answer_digest_follows_the_catalog() {
+        let digest = |ddl_text: &str| {
+            let cat = ddl::load(ddl_text, Dialect::Tsql, "t.sql");
+            let v = CatalogView::new(Dialect::Tsql, &[&cat]);
+            let rec = Recorder::default();
+            let rv = RecordingView::new(&v, Side::Source, &rec);
+            let _ = rv.table(&[ident("dbo", false), ident("orders", false)]);
+            let (reads, _) = rec.finish();
+            reads.0.into_values().next().unwrap()
+        };
+        let a = digest("CREATE TABLE dbo.orders (id int NOT NULL);");
+        assert_eq!(a, digest("CREATE TABLE dbo.orders (id int NOT NULL);"));
+        assert_ne!(a, digest("CREATE TABLE dbo.orders (id bigint NOT NULL);"));
+    }
+
+    #[test]
+    fn a_sink_that_keeps_nothing_costs_no_digest() {
+        struct Counting(AtomicUsize);
+        impl ReadSink for Counting {
+            fn record(&self, _: Side, _: &Query, _: Outcome) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn active(&self) -> bool {
+                false
+            }
+        }
+        let v = view();
+        let s = Counting(AtomicUsize::new(0));
+        let rv = RecordingView::new(&v, Side::Source, &s);
+        let _ = rv.table(&[ident("orders", false)]);
+        let _ = rv.whole();
+        assert_eq!(s.0.load(Ordering::SeqCst), 0);
+        let none = RecordingView::new(&v, Side::Source, &NoSink);
+        assert!(none.supplied());
+    }
+}

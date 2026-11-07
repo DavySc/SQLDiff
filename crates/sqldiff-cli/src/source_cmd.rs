@@ -110,7 +110,7 @@ fn load_catalog(
     dialect: Dialect,
     cache: &mut HashMap<PathBuf, CatalogFile>,
     ddl: &mut Vec<Artifact>,
-    facts: &mut Vec<Arc<sqldiff_core::catalog::Catalog>>,
+    facts: &mut Vec<sqldiff_core::Facts>,
 ) -> Result<(), String> {
     if !cache.contains_key(path) {
         let file = if path
@@ -132,7 +132,7 @@ fn load_catalog(
     match &cache[path] {
         CatalogFile::Bundle(bundle, core) => {
             let short = &bundle.snapshot_id[..bundle.snapshot_id.len().min(12)];
-            facts.extend(core.iter().cloned());
+            facts.extend(core.iter().cloned().map(sqldiff_core::Facts::from));
             for o in &bundle.objects {
                 if o.info.kind != "script" && o.info.dialect.as_deref() == Some(dialect.id()) {
                     ddl.push(Artifact::new(

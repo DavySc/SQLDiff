@@ -590,6 +590,7 @@ dependencies = [
  "sha2",
  "sqldiff-core",
  "sqldiff-draft",
+ "sqldiff-model",
  "sqldiff-source",
  "sqldiff-syntax",
  "sqldiff-units",

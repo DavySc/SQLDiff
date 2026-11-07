@@ -310,6 +310,10 @@ pub fn lcs_pairs_checked<T: Ord>(a: &[T], b: &[T]) -> (Vec<(usize, usize)>, bool
 pub fn lcs_pairs_bounded<T: Ord>(a: &[T], b: &[T], work: usize) -> (Vec<(usize, usize)>, bool) {
     let (n, m) = (a.len(), b.len());
     if n.saturating_mul(m) <= LCS_CELLS {
+        sqldiff_model::work::spend(
+            sqldiff_model::work::Site::AlignCells,
+            (n as u64).saturating_mul(m as u64),
+        );
         return (lcs_table(a, b, 0, 0), true);
     }
     let pre = a.iter().zip(b).take_while(|(x, y)| x == y).count();
@@ -322,6 +326,9 @@ pub fn lcs_pairs_bounded<T: Ord>(a: &[T], b: &[T], work: usize) -> (Vec<(usize, 
     let (ma, mb) = (&a[pre..n - suf], &b[pre..m - suf]);
     let mut out: Vec<(usize, usize)> = (0..pre).map(|i| (i, i)).collect();
     let cells = ma.len().saturating_mul(mb.len());
+    if cells <= work {
+        sqldiff_model::work::spend(sqldiff_model::work::Site::AlignCells, cells as u64);
+    }
     let mut exact = true;
     if cells <= LCS_CELLS {
         out.extend(lcs_table(ma, mb, pre, pre));

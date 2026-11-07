@@ -11,6 +11,7 @@ use sqldiff_syntax::{parse, Dialect};
 use super::ast::Type;
 use super::literal::Target;
 use crate::artifact::Artifact;
+use crate::catalog::record::RecordingView;
 use crate::catalog::{ddl, Catalog, CatalogView, DataType, TableKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -394,9 +395,17 @@ fn pg_system() -> &'static Schema {
 }
 
 impl Schema {
-    /// The supplied catalog, if any.
-    pub fn catalog(&self) -> Option<&CatalogView> {
-        self.view.as_deref()
+    /// The catalog of this side, as a check may read it: every question
+    /// goes through a [`RecordingView`]. Under no sink until PR 3 hands each
+    /// check's sink and side down; nothing is recorded yet.
+    pub fn catalog(&self) -> Option<RecordingView<'_>> {
+        self.view.as_deref().map(|v| {
+            RecordingView::new(
+                v,
+                crate::catalog::record::Side::Source,
+                &crate::catalog::record::NO_SINK,
+            )
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -639,26 +648,26 @@ impl Schema {
     pub fn from_view(view: &CatalogView) -> Schema {
         Self::build(
             view,
-            view.supplied.then(|| std::sync::Arc::new(view.clone())),
+            view.supplied().then(|| std::sync::Arc::new(view.clone())),
         )
     }
 
     /// As `from_view`, keeping the shared view instead of copying it.
     pub fn from_shared_view(view: &std::sync::Arc<CatalogView>) -> Schema {
-        Self::build(view, view.supplied.then(|| std::sync::Arc::clone(view)))
+        Self::build(view, view.supplied().then(|| std::sync::Arc::clone(view)))
     }
 
     fn build(view: &CatalogView, shared: Option<std::sync::Arc<CatalogView>>) -> Schema {
         let d = view.dialect;
         let mut s = Schema {
-            sources: view.origins.clone(),
+            sources: view.origins().to_vec(),
             pg_system: d == Dialect::Postgres,
             tsql_system: d == Dialect::Tsql,
             view: shared,
             ..Schema::default()
         };
         if d == Dialect::Postgres {
-            let c = &view.catalog();
+            let c = &view.unrecorded_catalog();
             let names = c
                 .schemas
                 .iter()
@@ -683,14 +692,14 @@ impl Schema {
             }
         }
         std::sync::Arc::make_mut(&mut s.star_views).extend(
-            view.catalog()
+            view.unrecorded_catalog()
                 .tables
                 .iter()
                 .filter(|t| t.kind == TableKind::View && t.star_outputs)
                 .map(|t| t.name.to_lowercase()),
         );
         for t in view
-            .catalog()
+            .unrecorded_catalog()
             .tables
             .iter()
             .filter(|t| t.kind == TableKind::View && t.types_from_source && !t.star_outputs)
@@ -701,7 +710,7 @@ impl Schema {
             // source column with that very type (an ALTER COLUMN, or a
             // table dropped and created again, leaves the copy stale).
             let sources: Vec<&crate::catalog::Table> = view
-                .catalog()
+                .unrecorded_catalog()
                 .tables
                 .iter()
                 .filter(|b| {
@@ -742,7 +751,7 @@ impl Schema {
         // Base and temporary tables only: view columns are derived, and their
         // types and nullability are not facts equivalence may rely on.
         for t in view
-            .catalog()
+            .unrecorded_catalog()
             .tables
             .iter()
             .filter(|t| matches!(t.kind, TableKind::Table | TableKind::Temporary))
