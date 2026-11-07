@@ -788,6 +788,13 @@ proof = "engine"
 sites = ["sqldiff-draft/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.join.apply"
+kind = "converter"
+proof = "engine"
+note = "CROSS APPLY / OUTER APPLY as CROSS JOIN LATERAL / LEFT JOIN LATERAL ... ON TRUE"
+sites = ["sqldiff-draft/src/tsql/apply.rs"]
+
+[[rule]]
 id = "tsql.key-order"
 kind = "converter"
 proof = "engine"

@@ -24,6 +24,7 @@ use crate::tok::{
 use sqldiff_units::out::Out;
 use sqldiff_units::{Note, Status};
 
+mod apply;
 mod bits;
 mod geography;
 mod paging;
@@ -8361,7 +8362,8 @@ impl<'a> Cx<'a> {
 
     fn expr(&mut self, ts: &[T]) -> String {
         let paged = self.paging(ts);
-        let ts: &[T] = &paged;
+        let lateral = self.laterals(&paged);
+        let ts: &[T] = &lateral;
         let mut edits = self.bit_edits(ts);
         self.geography_edits(ts, &mut edits);
         if let Some(outer) = self.bit_outer.take() {
