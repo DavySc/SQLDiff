@@ -105,11 +105,14 @@ pub fn tokens_shared(node: &SyntaxNode) -> std::rc::Rc<[Tok]> {
     if toks.len() <= SHARED_NODE_MAX {
         SHARED.with(|c| {
             let mut c = c.borrow_mut();
-            if c.total + toks.len() > SHARED_TOTAL_MAX {
+            // An entry weighs at least 1 (it holds a node and its tree), so
+            // empty statements cannot grow the cache without bound.
+            let weight = toks.len().max(1);
+            if c.total + weight > SHARED_TOTAL_MAX {
                 c.by_node.clear();
                 c.total = 0;
             }
-            c.total += toks.len();
+            c.total += weight;
             c.by_node.insert(node.clone(), toks.clone());
         });
     }
