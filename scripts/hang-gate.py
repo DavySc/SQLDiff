@@ -32,21 +32,14 @@ OVERRIDES = {}
 # An entry that finishes (slowly) rather than being killed is a tuple
 # (reason, seconds, MB): the limits it is known to break, used in that mode.
 KNOWN_OPEN = {
-    "a_procs_50x20": ("R1: IF-guarded writes per routine, 49 to 75 s", 30, 2048),
-    "j_branches_14": (
-        "R1: nested IF/ELSE depth 14, 94 to 99 s, 1 GB; time ~2.4x per doubling",
-        30,
+    "j_branches_16": "R1: nested IF/ELSE is 2^depth through the alignment; depth 14 takes 70 s and 1 GB (guarded in the normal run)",
+    "a_procs_50x200": "R1: 50 routines of 200 IF-guarded writes, killed at 300 s",
+    "a_procs_200x20": (
+        "R1: 0.6 s per routine of 20 IF-guarded writes, 118 s for 200 routines",
+        60,
         2048,
     ),
-    "a_procs_50x200": "R1: killed at 120 s, 937 MB",
-    "a_procs_200x20": "R1: killed at 120 s",
-    "a_procs_500x20": "R1: killed at 120 s",
-    "k_seq_ifs_200": "R1: sequential IF-guarded writes, killed at 120 s",
-    "n_h02_select_no_from_db2i": (
-        "findings of unterminated SELECTs span to the end of the file, so excerpts "
-        "grow as n^2/2 lines: 10k lines 4 s / 542 MB, 20k lines 17 s / 2 GB (audit h02)",
-        10, 512,
-    ),
+    "a_procs_500x20": "R1: 246 s (0.5 s per routine)",
     "n_h04_nested_while": "R2: 4000 nested WHILE, killed at 120 s, 2.3 GB (audit h04)",
 }
 

@@ -58,6 +58,16 @@ impl Work {
         self.counts[site as usize]
     }
 
+    /// What was counted after `earlier` (a snapshot from [`now`] of the same
+    /// scope).
+    pub fn since(&self, earlier: &Work) -> Work {
+        let mut d = Work::default();
+        for i in 0..SITES {
+            d.counts[i] = self.counts[i].saturating_sub(earlier.counts[i]);
+        }
+        d
+    }
+
     /// The sum over all sites: the file's total work.
     pub fn total(&self) -> u64 {
         self.counts.iter().sum()
@@ -79,6 +89,8 @@ thread_local! {
     static METER: RefCell<Option<Work>> = const { RefCell::new(None) };
     /// Whether the open scope is the outermost one's (it prints).
     static DEPTH: Cell<usize> = const { Cell::new(0) };
+    /// Open [`muted`] sections: counts are dropped while it is above 0.
+    static MUTED: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Events counted with no scope open: an entry point nobody metered. Once a
@@ -96,6 +108,9 @@ pub fn unmetered() -> u64 {
 /// Counts `n` events at `site` in the open scope. Call it per batch (a
 /// call, a row, a run of steps), not per cell.
 pub fn spend(site: Site, n: u64) {
+    if MUTED.with(Cell::get) > 0 {
+        return;
+    }
     METER.with(|m| match m.borrow_mut().as_mut() {
         Some(w) => {
             let c = &mut w.counts[site as usize];
@@ -105,6 +120,47 @@ pub fn spend(site: Site, n: u64) {
             UNMETERED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         }
     });
+}
+
+/// The counts of the open scope so far (zero when none is open).
+pub fn now() -> Work {
+    METER.with(|m| m.borrow().unwrap_or_default())
+}
+
+/// Counts a recorded amount of work again, per site: what a cache or memo
+/// entry cost when it was made, charged when it is used instead, so that the
+/// total is what the algorithm does and not what its caches happened to save.
+pub fn charge(w: &Work) {
+    for (i, &n) in w.counts.iter().enumerate() {
+        if n > 0 {
+            spend(SITE_LIST[i], n);
+        }
+    }
+}
+
+const SITE_LIST: [Site; SITES] = [
+    Site::ExplorerSteps,
+    Site::DiffCalls,
+    Site::AlignCells,
+    Site::EditReach,
+    Site::EditClosure,
+    Site::WitnessTries,
+    Site::BehaviourDiffs,
+];
+
+/// Runs `f` without counting: work that only re-creates a state whose cost
+/// was counted when it was first made (a replay from a checkpoint). The
+/// caller charges what the work is worth logically.
+pub fn muted<R>(f: impl FnOnce() -> R) -> R {
+    struct Unmute;
+    impl Drop for Unmute {
+        fn drop(&mut self) {
+            MUTED.with(|m| m.set(m.get() - 1));
+        }
+    }
+    MUTED.with(|m| m.set(m.get() + 1));
+    let _u = Unmute;
+    f()
 }
 
 /// Runs `f` with a meter and returns its result with the counts. A scope
@@ -145,6 +201,14 @@ pub fn scope<R>(label: &str, f: impl FnOnce() -> R) -> (R, Work) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_site_list_matches_the_sites() {
+        for (i, s) in SITE_LIST.iter().enumerate() {
+            assert_eq!(*s as usize, i);
+        }
+        assert_eq!(NAMES.len(), SITES);
+    }
 
     #[test]
     fn counts_in_a_scope_and_nothing_outside() {
