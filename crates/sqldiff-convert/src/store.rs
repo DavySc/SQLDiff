@@ -671,6 +671,27 @@ impl Store {
         }
     }
 
+    /// Writes what a stand-in flags mismatch found: the flags the store held
+    /// and the ones computed again for the same result.
+    pub fn bundle_flags(
+        &self,
+        result: &Key,
+        flags: &Key,
+        stored: &[crate::refused::UnitFlag],
+        fresh: &[crate::refused::UnitFlag],
+    ) {
+        let rel = format!("{MISMATCH_DIR}/flags-{}.json", flags.0);
+        let body = serde_json::json!({
+            "result": result.0,
+            "flags": flags.0,
+            "stored": stored,
+            "fresh": fresh,
+        });
+        if let Ok(b) = serde_json::to_vec_pretty(&body) {
+            let _ = crate::tree::write_under(&self.out, &rel, &b);
+        }
+    }
+
     /// Writes what a mismatch found, for whoever looks into it.
     pub fn bundle(&self, key: &Key, stored: &Conversion, fresh: &Conversion) {
         let rel = format!("{MISMATCH_DIR}/{}.json", key.0);
