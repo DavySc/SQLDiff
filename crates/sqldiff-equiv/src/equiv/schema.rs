@@ -358,6 +358,15 @@ pub struct Schema {
     /// sides of a comparison when either has a table with HIDDEN columns
     /// (`Schema::list_stars_with`).
     pub list_stars: bool,
+    /// Tables added on top of `tables` by `with_ddl` (they replace tables of
+    /// the same name). Adding one table must not copy every table of the
+    /// catalog, so the added names live in these small layers; readers go
+    /// through `table_by_key`, `tables_by_key`, `is_ambiguous`,
+    /// `is_star_view` and `spellings_of`.
+    extra_tables: std::sync::Arc<HashMap<String, Table>>,
+    extra_ambiguous: std::sync::Arc<std::collections::HashSet<String>>,
+    extra_star_views: std::sync::Arc<std::collections::HashSet<String>>,
+    extra_spellings: std::sync::Arc<HashMap<String, std::collections::BTreeSet<String>>>,
 }
 
 /// The SQL Server catalog views in `sys_catalog.sql`.
@@ -409,13 +418,68 @@ impl Schema {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tables.is_empty()
+        self.tables.is_empty() && self.extra_tables.is_empty()
+    }
+
+    /// A user table by its lower-cased unqualified name, the layer added by
+    /// `with_ddl` first.
+    fn table_by_key(&self, key: &str) -> Option<&Table> {
+        self.extra_tables.get(key).or_else(|| self.tables.get(key))
+    }
+
+    /// Every user table with its key, once each (the added layer wins).
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: its consumers need all tables to agree
+    fn tables_by_key(&self) -> impl Iterator<Item = (&String, &Table)> {
+        self.extra_tables.iter().chain(
+            self.tables
+                .iter()
+                .filter(|(k, _)| !self.extra_tables.contains_key(*k)),
+        )
+    }
+
+    fn is_ambiguous(&self, key: &str) -> bool {
+        self.ambiguous.contains(key) || self.extra_ambiguous.contains(key)
+    }
+
+    /// Whether the view `key` was defined with a `*` select list.
+    pub fn is_star_view(&self, key: &str) -> bool {
+        self.star_views.contains(key) || self.extra_star_views.contains(key)
+    }
+
+    /// Copies the added layer into the base maps, for the edits that change
+    /// the base (`with_images`, `with_local`).
+    #[allow(clippy::disallowed_methods, clippy::iter_over_hash_type)] // hash order cannot reach an output: set union / membership; each name gets its own entry
+    fn flatten(&mut self) {
+        if self.extra_tables.is_empty()
+            && self.extra_ambiguous.is_empty()
+            && self.extra_star_views.is_empty()
+            && self.extra_spellings.is_empty()
+        {
+            return;
+        }
+        let (t, a, v, sp) = (
+            std::mem::take(&mut self.extra_tables),
+            std::mem::take(&mut self.extra_ambiguous),
+            std::mem::take(&mut self.extra_star_views),
+            std::mem::take(&mut self.extra_spellings),
+        );
+        std::sync::Arc::make_mut(&mut self.tables)
+            .extend(t.iter().map(|(k, v)| (k.clone(), v.clone())));
+        std::sync::Arc::make_mut(&mut self.ambiguous).extend(a.iter().cloned());
+        std::sync::Arc::make_mut(&mut self.star_views).extend(v.iter().cloned());
+        let spellings = std::sync::Arc::make_mut(&mut self.spellings);
+        for (k, v) in sp.iter() {
+            spellings
+                .entry(k.clone())
+                .or_default()
+                .extend(v.iter().cloned());
+        }
     }
 
     /// The tables of the catalog (system catalogs left out).
     #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: its consumer needs all tables to agree
     pub fn tables(&self) -> impl Iterator<Item = &Table> {
-        self.tables.values()
+        self.tables_by_key().map(|(_, t)| t)
     }
 
     /// A table by name, qualified or not; user tables are found by their
@@ -431,7 +495,7 @@ impl Schema {
                 .then(|| tsql_system().tables.get(last))
                 .flatten();
         }
-        self.tables.get(last).or_else(|| {
+        self.table_by_key(last).or_else(|| {
             // pg_catalog comes first on every search path.
             (self.pg_system && last.starts_with("pg_"))
                 .then(|| pg_system().tables.get(last))
@@ -455,10 +519,10 @@ impl Schema {
     /// no other schema has a table of that name.
     pub fn table_exact(&self, schema: Option<&str>, name: &str) -> Option<&Table> {
         let name = name.to_lowercase();
-        if self.ambiguous.contains(&name) {
+        if self.is_ambiguous(&name) {
             return None;
         }
-        let t = self.tables.get(&name)?;
+        let t = self.table_by_key(&name)?;
         (t.schema.as_deref() == schema.map(str::to_lowercase).as_deref()).then_some(t)
     }
 
@@ -478,6 +542,7 @@ impl Schema {
         }
         .clone();
         let mut out = self.clone();
+        out.flatten();
         for &name in images {
             let mut copy = t.clone();
             copy.schema = None;
@@ -496,23 +561,22 @@ impl Schema {
         ddl::load_tree(&mut cat, &parse(ddl, d).syntax(), d);
         let extra = Schema::from_view(&CatalogView::new(d, &[&cat]));
         let mut s = self.clone();
-        let (ambiguous, star_views, tables, spellings) = (
-            std::sync::Arc::make_mut(&mut s.ambiguous),
-            std::sync::Arc::make_mut(&mut s.star_views),
-            std::sync::Arc::make_mut(&mut s.tables),
-            std::sync::Arc::make_mut(&mut s.spellings),
-        );
+        let mut ambiguous = (*s.extra_ambiguous).clone();
         for n in extra.tables.keys() {
-            if tables
-                .get(n)
+            if self
+                .table_by_key(n)
                 .is_some_and(|t| t.schema != extra.tables[n].schema)
             {
                 ambiguous.insert(n.clone());
             }
         }
         ambiguous.extend(extra.ambiguous.iter().cloned());
+        let star_views = std::sync::Arc::make_mut(&mut s.extra_star_views);
         star_views.extend(extra.star_views.iter().cloned());
-        tables.extend(extra.tables.iter().map(|(k, v)| (k.clone(), v.clone())));
+        std::sync::Arc::make_mut(&mut s.extra_tables)
+            .extend(extra.tables.iter().map(|(k, v)| (k.clone(), v.clone())));
+        s.extra_ambiguous = std::sync::Arc::new(ambiguous);
+        let spellings = std::sync::Arc::make_mut(&mut s.extra_spellings);
         for (k, v) in extra.spellings.iter() {
             spellings
                 .entry(k.clone())
@@ -546,6 +610,7 @@ impl Schema {
         let extra = Schema::from_view(&CatalogView::new(d, &[&cat]));
         let table = extra.tables.values().next()?.clone();
         let mut s = self.clone();
+        s.flatten();
         std::sync::Arc::make_mut(&mut s.ambiguous).remove(&key);
         std::sync::Arc::make_mut(&mut s.tables).insert(key, table);
         Some(s)
@@ -560,7 +625,18 @@ impl Schema {
     /// be a catalog name.
     pub fn case_check(&self, stored: &str, known: bool) -> Result<(), String> {
         let lower = stored.to_lowercase();
-        match self.spellings.get(&lower) {
+        let merged;
+        let found = match (self.spellings.get(&lower), self.extra_spellings.get(&lower)) {
+            (Some(a), Some(b)) => {
+                merged = a
+                    .union(b)
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>();
+                Some(&merged)
+            }
+            (a, b) => a.or(b),
+        };
+        match found {
             None if known && stored != lower => Err(format!(
                 "the quoted name \"{stored}\" is not in the catalog, so how PostgreSQL resolves it is not known"
             )),
@@ -604,9 +680,7 @@ impl Schema {
     /// Whether a table has a HIDDEN column (T-SQL period column).
     #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: `any`
     pub fn hides_columns(&self) -> bool {
-        self.tables
-            .values()
-            .any(|t| t.columns.iter().any(|c| c.hidden))
+        self.tables().any(|t| t.columns.iter().any(|c| c.hidden))
     }
 
     /// Both sides of a comparison list their stars when either side has a
@@ -624,9 +698,9 @@ impl Schema {
             // its visible columns (the historyless conversion). Otherwise a
             // star over such a view is refused (`Canon::visible_star`).
             let mirrored = |a: &Schema, b: &Schema| {
-                a.tables.iter().all(|(n, t)| {
+                a.tables_by_key().all(|(n, t)| {
                     !t.columns.iter().any(|c| c.hidden)
-                        || b.tables.get(n).is_some_and(|o| {
+                        || b.table_by_key(n).is_some_and(|o| {
                             o.complete
                                 && o.columns.iter().map(|c| &c.name).eq(t
                                     .columns
@@ -639,6 +713,8 @@ impl Schema {
             if mirrored(self, other) && mirrored(other, self) {
                 self.star_views = Default::default();
                 other.star_views = Default::default();
+                self.extra_star_views = Default::default();
+                other.extra_star_views = Default::default();
             }
         }
     }
@@ -825,6 +901,34 @@ pub(super) fn ty_of(t: &DataType, d: Dialect) -> Ty {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `with_ddl` adds tables in a layer; every reader must see them as if
+    /// they had been in the catalog all along, and the base stays unchanged.
+    #[test]
+    fn with_ddl_layer_reads_like_a_merged_schema() {
+        let d = Dialect::Postgres;
+        let base = Schema::load(&[Artifact::new(
+            "a.sql",
+            d,
+            "CREATE TABLE t1 (id int, \"Mixed\" int); CREATE TABLE s.t2 (x int);",
+        )]);
+        let more = base.with_ddl("CREATE TABLE t3 (y int); CREATE TABLE t1 (z int);", d);
+        // The layer wins for a table of the same name; the base keeps its own.
+        assert_eq!(more.table("t1").unwrap().columns.len(), 1);
+        assert_eq!(base.table("t1").unwrap().columns.len(), 2);
+        assert!(more.table("t3").is_some() && base.table("t3").is_none());
+        assert!(more.table("t2").is_some());
+        // Each table once.
+        assert_eq!(more.tables().count(), 3);
+        assert_eq!(base.tables().count(), 2);
+        // A layered schema is layered again.
+        let again = more.with_ddl("CREATE TABLE t4 (w int);", d);
+        assert_eq!(again.tables().count(), 4);
+        assert!(again.table("t3").is_some() && again.table("t4").is_some());
+        // Names of the layer take part in the letter-case check.
+        assert!(base.case_check("mixed", false).is_err());
+        assert!(more.case_check("z", true).is_ok());
+    }
 
     #[test]
     fn tsql_timestamp_is_rowversion_not_a_time() {
