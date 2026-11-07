@@ -14,6 +14,10 @@
 //! - [`queue`]: every pair of a source diffed and ranked for review, with
 //!   session-local assumption flips and GUI deep links.
 
+// Determinism guard (perf plan W0): iterating a hash map or set in a `for` loop is
+// as order-dependent as `.iter()`; each site needs a reasoned `#[allow]`.
+#![warn(clippy::iter_over_hash_type)]
+
 pub mod bundle;
 pub mod changes;
 pub mod compose;

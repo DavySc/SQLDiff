@@ -88,6 +88,15 @@ pub fn decide(
             sides.1.fast.len(),
             sides.1.candidates
         );
+        for (name, side) in [("A", &sides.0), ("B", &sides.1)] {
+            let by_reach = side.fast.values().filter(|f| f.reach.is_some()).count();
+            let reaching = side
+                .fast
+                .values()
+                .filter(|f| matches!(f.reach, Some(Some(_))))
+                .count();
+            eprintln!("edit checker: side {name}: {by_reach} answered by the reach sweep, {reaching} of them reach changed code, {} steps", side.reach_steps);
+        }
     }
     for (i, f) in findings.iter_mut().enumerate() {
         if !candidate(f) {
@@ -596,7 +605,7 @@ impl<'x, 'a> Routine<'x, 'a> {
     }
 
     /// Facts about every parameter and variable, as seen at `at`.
-    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: names are inserted independently
+    #[allow(clippy::disallowed_methods, clippy::iter_over_hash_type)] // hash order cannot reach an output: each name gets its own entry in `out`
     fn facts(&self, at: usize, node: &SyntaxNode) -> HashMap<String, VarFact> {
         let mut out = HashMap::new();
         let names: HashSet<&String> = self.params.keys().chain(self.locals.keys()).collect();
@@ -1664,6 +1673,7 @@ impl Taint {
 impl<'x, 'a> Routine<'x, 'a> {
     /// Names unit `n` (a statement) writes: assigned variables, written
     /// tables and everything a statement sets as a side effect.
+    #[allow(clippy::iter_over_hash_type)] // hash order cannot reach an output: names are only inserted into a set
     fn statement_writes(&self, n: &SyntaxNode) -> HashSet<String> {
         let (s, e) = cst::sig_range(n);
         let mut w: HashSet<String> = STATUS.iter().map(|x| x.to_string()).collect();
@@ -1751,6 +1761,7 @@ impl<'x, 'a> Routine<'x, 'a> {
                             writes.extend(self.statement_writes(&s));
                         }
                         let (ps, pe) = cst::sig_range(&p);
+                        #[allow(clippy::iter_over_hash_type)] // names are only inserted into a set
                         for (name, sites) in &self.sites {
                             if sites.iter().any(|x| ps <= x.start && x.start < pe) {
                                 writes.insert(name.trim_start_matches('@').to_string());
@@ -1846,6 +1857,10 @@ impl<'x, 'a> Routine<'x, 'a> {
         let Some(fast) = side.fast.get(&i) else {
             return self.interacts_exact(n, &side.without(i), reach);
         };
+        SHARED_ANSWERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if fast.reach.is_some() {
+            REACH_ANSWERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let got = self.interacts_shared(n, side, fast, reach);
         if side.oracle {
             let want = self.interacts_exact(n, &side.without(i), reach);
@@ -1895,6 +1910,14 @@ impl<'x, 'a> Routine<'x, 'a> {
                     "it reads what the changed code at line {} may write",
                     line(first)
                 ),
+            });
+        }
+        if let Some(found) = fast.reach {
+            return found.map(|start| {
+                format!(
+                    "its result reaches the changed code at line {}",
+                    line(start)
+                )
             });
         }
         let index = self.unit_index().expect("the sweep needs the index");
@@ -2153,6 +2176,10 @@ struct FastTaint {
     /// The names the edit reads meet the taint: `Some(first shared name)`
     /// (`None` inside: only the any-name is shared).
     hit: Option<Option<u32>>,
+    /// What the edit writes reaches changed code: `Some(start of the first
+    /// such unit)`, or `Some(None)` when it does not; `None` when the reach
+    /// sweep did not answer (the exact scan then does).
+    reach: Option<Option<usize>>,
 }
 
 /// One side's edits, prepared once per `decide`.
@@ -2167,6 +2194,8 @@ struct SideEdits {
     oracle: bool,
     /// Candidate edits on this side.
     candidates: usize,
+    /// Steps the reach sweep took.
+    reach_steps: usize,
 }
 
 impl SideEdits {
@@ -2198,6 +2227,7 @@ impl SideEdits {
             fast: std::collections::BTreeMap::new(),
             oracle,
             candidates: 0,
+            reach_steps: 0,
         };
         // The edits the shared sweep can answer: not inside a loop (the
         // code's own test), and the finding's span lies inside the
@@ -2240,6 +2270,27 @@ impl SideEdits {
                 let fast = sweep.answer(node, *here);
                 me.fast.insert(*j, fast);
             }
+            // What each edit writes reaches, from the right end of the
+            // routine to the left. Only edits the taint half did not already
+            // decide need it.
+            let mut todo: Vec<&(usize, usize, SyntaxNode, Span)> = eligible
+                .iter()
+                .filter(|e| me.fast.get(&e.1).is_some_and(|f| f.hit.is_none()))
+                .collect();
+            todo.sort_by_key(|e| (std::cmp::Reverse(e.3 .1), e.1));
+            let mut reach = ReachSweep::new(r, &me.set, REACH_STEPS);
+            for (_, j, _, here) in todo {
+                match reach.answer(*here) {
+                    Some(line) => {
+                        if let Some(f) = me.fast.get_mut(j) {
+                            f.reach = Some(line);
+                        }
+                    }
+                    // Out of steps: this and every later edit take the exact scan.
+                    None => break,
+                }
+            }
+            me.reach_steps = reach.steps;
         }
         me
     }
@@ -2405,7 +2456,218 @@ impl<'r, 'x, 'a> TaintSweep<'r, 'x, 'a> {
             jump,
             first_change: self.first_change,
             hit,
+            reach: None,
         }
+    }
+}
+
+/// How many edit answers came from the shared sweeps, and how many of them
+/// from the reach sweep. Counted for tests only (the oracle tests assert a
+/// minimum so they cannot go vacuous if eligibility silently drops to zero);
+/// no output ever reads them.
+static SHARED_ANSWERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static REACH_ANSWERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `(answers from the shared sweeps, of them answered by the reach sweep)`
+/// so far in this process.
+#[doc(hidden)]
+pub fn shared_answer_counts() -> (usize, usize) {
+    (
+        SHARED_ANSWERS.load(std::sync::atomic::Ordering::Relaxed),
+        REACH_ANSWERS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// How far the reach sweep may go before the remaining edits take the exact
+/// scan: steps are units offered to a name's closure plus names it reaches.
+/// A step count, never time, and a memory guard: every step is at most one
+/// entry in a name's reached or fired set, so the sets stay within a few
+/// hundred megabytes however many distinct names the edits write. It only
+/// decides which path answers; both give the same answer. The count is
+/// `ReachSweep::steps`, for the per-file work meter.
+const REACH_STEPS: usize = 10_000_000;
+
+/// The names one seed name reaches, kept as units are offered from the end of
+/// the routine towards its start.
+struct NameReach {
+    reached: std::collections::BTreeSet<u32>,
+    fired: std::collections::BTreeSet<u32>,
+    /// How many of the offered units this closure has taken in.
+    upto: usize,
+}
+
+/// The reach half of `interacts`, for edits outside loops, visited from the
+/// right end of the routine. For such an edit the units "after" it are those
+/// starting at or after its end: more of them for each edit further left, so
+/// what a name reaches only grows. The closure of a set of names is the union
+/// of the closures of each name (every unit fires on an existential test), so
+/// one closure per seed name is kept and extended.
+struct ReachSweep<'r> {
+    units: &'r [Unit],
+    status: &'r [bool],
+    changed: Vec<bool>,
+    /// Numbers of the changed units, ascending.
+    changed_list: Vec<usize>,
+    readers: Vec<Vec<u32>>,
+    index: &'r UnitIndex,
+    /// Units with a number from here on have been offered.
+    low: usize,
+    /// Offered unchanged units, in the order they were offered.
+    order: Vec<u32>,
+    pos: Vec<usize>,
+    reaches: std::collections::BTreeMap<u32, NameReach>,
+    steps: usize,
+    budget: usize,
+}
+
+impl<'r> ReachSweep<'r> {
+    fn new(r: &'r Routine, set: &SpanSet, budget: usize) -> ReachSweep<'r> {
+        let units = r.units();
+        let names = r.unit_names();
+        let mut readers = vec![Vec::new(); names.names.len()];
+        for (i, u) in units.iter().enumerate() {
+            for &id in &u.reads {
+                readers[id as usize].push(i as u32);
+            }
+        }
+        let changed: Vec<bool> = units
+            .iter()
+            .map(|u| set.overlaps((u.start, u.end)))
+            .collect();
+        ReachSweep {
+            units,
+            status: &names.status,
+            changed_list: (0..units.len()).filter(|&i| changed[i]).collect(),
+            changed,
+            readers,
+            index: r.unit_index().expect("a sweep needs the index"),
+            low: units.len(),
+            order: Vec::new(),
+            pos: vec![usize::MAX; units.len()],
+            reaches: std::collections::BTreeMap::new(),
+            steps: 0,
+            budget,
+        }
+    }
+
+    /// Offers every unit that starts at or after `p`.
+    fn advance(&mut self, p: usize) {
+        while self.low > 0 && self.units[self.low - 1].start >= p {
+            self.low -= 1;
+            if !self.changed[self.low] {
+                self.pos[self.low] = self.order.len();
+                self.order.push(self.low as u32);
+            }
+        }
+    }
+
+    fn meets(&self, r: &NameReach, reads: &[u32]) -> bool {
+        !reads.is_empty()
+            && !r.reached.is_empty()
+            && (r.reached.contains(&ANY_ID)
+                || reads.iter().any(|&i| i == ANY_ID || r.reached.contains(&i)))
+    }
+
+    /// Adds names to a closure and everything that follows from them. A
+    /// unit that reads the any-name needs no wake-up when the closure's
+    /// first name arrives: that happens at creation, before any unit has been
+    /// taken in (`upto` is 0), and later units are tested when taken in.
+    fn reach_all(&mut self, r: &mut NameReach, names: Vec<u32>) {
+        let mut stack = names;
+        while let Some(x) = stack.pop() {
+            if self.status[x as usize] {
+                continue;
+            }
+            if !r.reached.insert(x) {
+                continue;
+            }
+            self.steps += 1;
+            let mut wake: Vec<u32> = Vec::new();
+            if x == ANY_ID {
+                wake.extend(self.order[..r.upto].iter().copied());
+            } else {
+                wake.extend(self.readers[x as usize].iter().copied());
+            }
+            for u in wake {
+                let u = u as usize;
+                if !self.changed[u]
+                    && self.pos[u] < r.upto
+                    && !r.fired.contains(&(u as u32))
+                    && self.meets(r, &self.units[u].reads)
+                {
+                    r.fired.insert(u as u32);
+                    stack.extend(self.units[u].writes.iter().copied());
+                }
+            }
+        }
+    }
+
+    /// Takes the units offered since the last time into the closure.
+    fn catch_up(&mut self, r: &mut NameReach) {
+        while r.upto < self.order.len() {
+            let u = self.order[r.upto] as usize;
+            r.upto += 1;
+            self.steps += 1;
+            if !r.fired.contains(&(u as u32)) && self.meets(r, &self.units[u].reads) {
+                r.fired.insert(u as u32);
+                let writes = self.units[u].writes.clone();
+                self.reach_all(r, writes);
+            }
+        }
+    }
+
+    /// The start of the first changed unit after `here` that jumps or
+    /// touches what the units overlapping `here` write (`Some(None)`: there
+    /// is none), or `None` when out of steps.
+    fn answer(&mut self, here: Span) -> Option<Option<usize>> {
+        if self.steps > self.budget {
+            return None;
+        }
+        self.advance(here.1);
+        let mut seed: Vec<u32> = Vec::new();
+        for u in self.index.overlapping(here) {
+            seed.extend(
+                self.units[u]
+                    .writes
+                    .iter()
+                    .copied()
+                    .filter(|&w| !self.status[w as usize]),
+            );
+        }
+        seed.sort_unstable();
+        seed.dedup();
+        if seed.is_empty() {
+            return Some(None);
+        }
+        for &x in &seed {
+            let mut r = self.reaches.remove(&x).unwrap_or_else(|| NameReach {
+                reached: std::collections::BTreeSet::new(),
+                fired: std::collections::BTreeSet::new(),
+                upto: 0,
+            });
+            if r.reached.is_empty() {
+                self.reach_all(&mut r, vec![x]);
+            }
+            self.catch_up(&mut r);
+            self.reaches.insert(x, r);
+            if self.steps > self.budget {
+                return None;
+            }
+        }
+        let k = self
+            .changed_list
+            .partition_point(|&u| self.units[u].start < here.1);
+        for &u in &self.changed_list[k..] {
+            let unit = &self.units[u];
+            if unit.jumps
+                || seed
+                    .iter()
+                    .any(|x| self.meets(&self.reaches[x], &unit.touches))
+            {
+                return Some(Some(unit.start));
+            }
+        }
+        Some(None)
     }
 }
 
@@ -3442,7 +3704,7 @@ impl Hints<'_> {
 
 // ---- examination ------------------------------------------------------------------
 
-#[allow(clippy::disallowed_methods, clippy::too_many_arguments)] // hash order cannot reach an output: records are only tested with `contains`
+#[allow(clippy::disallowed_methods, clippy::too_many_arguments)] // hash order cannot reach an output: records are only tested with `contains`, and the variable facts are walked in sorted name order
 fn examine(
     ra: &Routine,
     rb: &Routine,
@@ -3483,8 +3745,11 @@ fn examine(
     let facts_a = ra.facts(at_a, na);
     let facts_b = rb.facts(at_b, nb);
     // Variables must mean the same on both sides.
-    for (k, fa) in &facts_a {
-        if let Some(fb) = facts_b.get(k) {
+    // In name order, so the variable the reason names is the same every run.
+    let mut names: Vec<&String> = facts_a.keys().collect();
+    names.sort();
+    for k in names {
+        if let (Some(fa), Some(fb)) = (facts_a.get(k), facts_b.get(k)) {
             if fa.value != fb.value || fa.origin != fb.origin || fa.ty != fb.ty {
                 return Err(format!("variable {k} differs between the versions"));
             }
@@ -4590,10 +4855,17 @@ fn describe_inputs(f: &Found, d: Dialect) -> String {
             }
         }
     }
-    for (t, n) in &f.shape {
-        if *n == 0 {
-            parts.push(format!("{} has no rows", spell(t)));
-        }
+    // In name order: the witness text must not depend on the hash layout.
+    #[allow(clippy::disallowed_methods)] // sorted on the next line
+    let mut empty: Vec<&String> = f
+        .shape
+        .iter()
+        .filter(|(_, n)| **n == 0)
+        .map(|(t, _)| t)
+        .collect();
+    empty.sort();
+    for t in empty {
+        parts.push(format!("{} has no rows", spell(t)));
     }
     for (t, row, cols) in tables {
         let n = f.shape.get(&t).copied().unwrap_or(1);

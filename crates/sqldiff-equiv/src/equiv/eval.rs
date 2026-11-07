@@ -5072,9 +5072,12 @@ fn dfs(
         Err(e) => Err(e.clone()),
     };
     if std::env::var_os("SQLDIFF_DEBUG_SEARCH").is_some() {
+        // Sorted: the trace must not vary with the hash layout.
+        #[allow(clippy::disallowed_methods)] // collected into an ordered map
+        let shape: std::collections::BTreeMap<&String, &usize> = c.shape.iter().collect();
         eprintln!(
             "  shape {:?} values {:?}\n    A {:?}\n    B {:?}",
-            c.shape, c.values, ra, rb
+            shape, c.values, ra, rb
         );
     }
     let need = match (&ra, &rb) {

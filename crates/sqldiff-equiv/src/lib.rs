@@ -5,6 +5,10 @@
 //! `sqldiff-core` re-exports every module under its old path. See
 //! `docs/crate-split.md`.
 
+// Determinism guard (perf plan W0): iterating a hash map or set in a `for` loop is
+// as order-dependent as `.iter()`; each site needs a reasoned `#[allow]`.
+#![warn(clippy::iter_over_hash_type)]
+
 pub mod classify;
 pub mod coverage;
 pub mod equiv;

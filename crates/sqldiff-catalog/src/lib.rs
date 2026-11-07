@@ -7,6 +7,10 @@
 //! `sqldiff-source`), and from objects an artifact creates itself (temporary
 //! tables, table variables, routines defined in the same file).
 
+// Determinism guard (perf plan W0): iterating a hash map or set in a `for` loop is
+// as order-dependent as `.iter()`; each site needs a reasoned `#[allow]`.
+#![warn(clippy::iter_over_hash_type)]
+
 pub mod builtins;
 pub mod ddl;
 pub mod tokens;

@@ -8,6 +8,10 @@
 //! [`Draft`] (`Draft::canonical`): no type reachable from it may have a
 //! `Debug` that leaves a field out (a test scans for hand-written ones).
 
+// Determinism guard (perf plan W0): iterating a hash map or set in a `for` loop is
+// as order-dependent as `.iter()`; each site needs a reasoned `#[allow]`.
+#![warn(clippy::iter_over_hash_type)]
+
 use serde::{Deserialize, Serialize};
 use sqldiff_syntax::Dialect;
 
