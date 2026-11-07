@@ -1093,6 +1093,15 @@ pub(crate) fn verify_tree_state(
     if st.drafts.len() != inputs.len() || st.source.is_some() == a.no_catalog {
         return wrong("its shape");
     }
+    // Whatever else is compared, a damaged draft is never used.
+    if let Some(i) = inputs
+        .iter()
+        .zip(&st.drafts)
+        .find(|(i, d)| !d.well_formed(&i.text))
+        .map(|(i, _)| i)
+    {
+        return wrong(&format!("the draft of {}", i.rel));
+    }
     if a.recheck == Recheck::None {
         return None;
     }
@@ -1182,7 +1191,12 @@ pub(crate) fn build_tree_state(
     let built = parallel(jobs, inputs, |i| {
         if let Some(c) = drafts_of {
             if c.read {
-                if let Some(d) = c.store.get_draft(c.key, &i.rel) {
+                // A damaged stored draft is a miss: it is built again.
+                if let Some(d) = c
+                    .store
+                    .get_draft(c.key, &i.rel)
+                    .filter(|d| d.well_formed(&i.text))
+                {
                     return (d, true);
                 }
             }
