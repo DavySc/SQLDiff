@@ -350,16 +350,32 @@ impl<'a> Parser<'a> {
     fn parse_statement(&mut self) {
         if self.nest >= MAX_STATEMENT_NESTING {
             self.bump_trivia();
-            self.diag_here(format!(
-                "statements nested deeper than {MAX_STATEMENT_NESTING}: nesting too deep"
-            ));
+            let offset = self
+                .sig_index(0)
+                .map(|i| self.tokens[i].start)
+                .unwrap_or(self.src.len());
             self.too_deep = true;
             self.start(ERROR);
             // Stop at the next batch separator: the objects after a deep
-            // routine are separate batches and still parse.
-            while self.nth_kind(0).is_some_and(|k| k != BATCH_SEP) {
+            // routine are separate batches and still parse. The statements
+            // swallowed (each `;`) are counted for the report.
+            let mut skipped = 0usize;
+            while let Some(k) = self.nth_kind(0).filter(|k| *k != BATCH_SEP) {
+                skipped += usize::from(k == SEMICOLON);
                 self.bump();
             }
+            let end = if self.nth_kind(0).is_some() {
+                "the next batch separator"
+            } else {
+                "the end of the file"
+            };
+            self.diags.push(Diagnostic {
+                offset,
+                message: format!(
+                    "statements nested deeper than {MAX_STATEMENT_NESTING}: nesting too deep; \
+                     {skipped} statements up to {end} were not read"
+                ),
+            });
             self.finish();
             return;
         }
@@ -1482,6 +1498,15 @@ mod tests {
                 "{d:?}"
             );
             assert_eq!(bad.syntax().text().to_string(), deep, "{d:?}: lossless");
+            // The innermost SELECT's `;` and one `;`-less END per level: only
+            // the `;` count, so exactly one statement is reported skipped.
+            assert!(
+                bad.diagnostics
+                    .iter()
+                    .any(|x| x.message.contains("1 statements up to the end of the file")),
+                "{:?}",
+                bad.diagnostics
+            );
             assert!(
                 !good
                     .diagnostics
