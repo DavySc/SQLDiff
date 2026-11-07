@@ -7,6 +7,26 @@
 //! check, in program order: the same input gives the same totals whatever the
 //! thread count, the order files are checked in, or what is in the store.
 //!
+//! What is counted is work the engine does, as a fixed function of the file:
+//!
+//! * A speed-up is never counted differently for hitting. The explorer cache
+//!   and the flipped-scenario cache of the behaviour model count the first
+//!   request for an entry (the run is made, its steps are spent) and nothing
+//!   for a repeat, whether the cache answered or, with the caches off, the
+//!   entry was made again (not counted: [`muted`]). The tests turn the caches
+//!   off and compare. The ledger of first requests belongs to one routine
+//!   pair's analysis, so it never carries over between files.
+//! * Joining paths that reach the same state is part of the algorithm, not a
+//!   cache: which paths join is fixed by the file (the memo is made by the
+//!   fault-free run and only read afterwards). A drop is one event.
+//! * A fault scenario resumed from a checkpoint counts what it runs from the
+//!   fault on. The restore from the nearest checkpoint is [`muted`], so the
+//!   spacing of the checkpoints does not matter; the ticks before the fault
+//!   were counted when the fault-free run was made.
+//! * Knobs that only cut work short, such as the bound on merge tries of a
+//!   replay (`MAX_MERGE_TRIES`), change what a scenario runs, so tuning one
+//!   moves the totals. They are listed with the cap when it exists.
+//!
 //! This module only counts. It never changes a result or ends a loop; a cap
 //! (a new bound) is a later change with its own review. The totals are read
 //! by tests and by `SQLDIFF_WORK=1`, which prints one line per outermost

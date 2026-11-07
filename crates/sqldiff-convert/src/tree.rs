@@ -1645,7 +1645,10 @@ fn convert_files(
             }
         }
         let t = Instant::now();
-        let (mut c, mix) = crate::check_with_mix(&input.text, draft, &opts, rebuild);
+        // One meter per file, named by the file (`SQLDIFF_WORK=1` prints it).
+        let ((mut c, mix), _) = sqldiff_model::work::scope(&input.rel, || {
+            crate::check_with_mix(&input.text, draft, &opts, rebuild)
+        });
         // Shared but whole while it is compared and stored; trimmed after.
         finish.share(&mut c);
         let secs = t.elapsed().as_secs_f64();

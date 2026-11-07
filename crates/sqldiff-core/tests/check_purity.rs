@@ -22,6 +22,9 @@
 //!   result store and seeds the sampled re-check, none of which the check sees; timings are kept out of the
 //!   bytes a stored result is compared by; `tree.rs` also memoises the tree
 //!   claims (derived from the inputs) in a `OnceLock` for the per-routine rebuild.
+//! - `behaviour.rs` (`sqldiff-core`) holds a test-only switch that turns its
+//!   explorer and flipped-scenario caches off; results and work counts are
+//!   the same either way.
 //! - `work.rs` (`sqldiff-model`): the per-file work meter, a thread-local
 //!   counter of deterministic events; `SQLDIFF_WORK` only prints it. It
 //!   counts and never changes a result.
@@ -94,7 +97,10 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("sqldiff-equiv/src/equiv/mod.rs", &["OnceCell", "env::var"]),
     ("sqldiff-equiv/src/equiv/schema.rs", &["OnceLock", "fs::"]),
     ("sqldiff-core/src/format/tests.rs", &["fs::"]),
-    ("sqldiff-core/src/ir/behaviour.rs", &["OnceCell"]),
+    (
+        "sqldiff-core/src/ir/behaviour.rs",
+        &["OnceCell", "thread_local!"],
+    ),
     ("sqldiff-model/src/profile.rs", &["OnceLock"]),
     ("sqldiff-core/src/lint.rs", &["OnceLock"]),
     ("sqldiff-core/src/rule_proofs.rs", &["OnceLock"]),
