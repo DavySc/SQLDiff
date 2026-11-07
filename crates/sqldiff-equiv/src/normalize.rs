@@ -247,7 +247,20 @@ pub fn strict_hash(toks: &[NormTok]) -> String {
 }
 
 /// Length of the longest common subsequence of two sequences.
-pub fn lcs_len<T: PartialEq>(a: &[T], b: &[T]) -> usize {
+///
+/// Bit-parallel like [`lcs_row`] (the same value as the plain recurrence,
+/// [`lcs_len_scalar`]): 64 columns per word instead of one cell at a time,
+/// which matters for the similarity of two long token lists.
+pub fn lcs_len<T: Ord>(a: &[T], b: &[T]) -> usize {
+    let v = lcs_bits(a, b, false);
+    (0..b.len())
+        .filter(|&j| (v[j >> 6] >> (j & 63)) & 1 == 0)
+        .count()
+}
+
+/// The length by the plain recurrence: the reference for [`lcs_len`].
+#[cfg(test)]
+fn lcs_len_scalar<T: PartialEq>(a: &[T], b: &[T]) -> usize {
     let mut prev = vec![0usize; b.len() + 1];
     let mut cur = vec![0usize; b.len() + 1];
     for x in a {
@@ -345,6 +358,22 @@ pub fn lcs_pairs_exact<T: Ord>(a: &[T], b: &[T], work: usize) -> Option<Vec<(usi
 /// Hirschberg picks from them, and so the pairs, do not change.
 fn lcs_row<T: Ord>(a: &[T], b: &[T], rev: bool) -> Vec<u32> {
     let m = b.len();
+    let v = lcs_bits(a, b, rev);
+    let mut out = vec![0u32; m + 1];
+    let mut zeros = 0u32;
+    for j in 0..m {
+        if (v[j >> 6] >> (j & 63)) & 1 == 0 {
+            zeros += 1;
+        }
+        out[j + 1] = zeros;
+    }
+    out
+}
+
+/// The bit row after all of `a`: bit `j` is 0 where the LCS length of `a`
+/// against the prefixes of `b` grows from `j` to `j + 1`.
+fn lcs_bits<T: Ord>(a: &[T], b: &[T], rev: bool) -> Vec<u64> {
+    let m = b.len();
     let words = m.div_ceil(64);
     // Where each item occurs in `b`, in the direction read.
     let mut at: std::collections::BTreeMap<&T, Vec<u32>> = std::collections::BTreeMap::new();
@@ -377,15 +406,7 @@ fn lcs_row<T: Ord>(a: &[T], b: &[T], rev: bool) -> Vec<u32> {
             mask[(p >> 6) as usize] = 0;
         }
     }
-    let mut out = vec![0u32; m + 1];
-    let mut zeros = 0u32;
-    for j in 0..m {
-        if (v[j >> 6] >> (j & 63)) & 1 == 0 {
-            zeros += 1;
-        }
-        out[j + 1] = zeros;
-    }
-    out
+    v
 }
 
 /// The row by the plain recurrence: the reference for [`lcs_row`].
@@ -698,6 +719,24 @@ mod lcs_tests {
             }
         }
         lcs_row(&[K(1, 1)], &[K(1, 2)], false);
+    }
+
+    /// The bit-parallel length equals the plain recurrence's.
+    #[test]
+    fn bit_length_equals_the_scalar_length() {
+        let mut rng = Lcg(0xabc);
+        for &n in &LENS {
+            for &m in &LENS {
+                for alphabet in [1u64, 2, 3, 10, 1000] {
+                    let (a, b) = (seq(&mut rng, n, alphabet), seq(&mut rng, m, alphabet));
+                    assert_eq!(
+                        lcs_len(&a, &b),
+                        lcs_len_scalar(&a, &b),
+                        "n={n} m={m} alphabet={alphabet}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
