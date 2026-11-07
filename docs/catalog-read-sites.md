@@ -106,7 +106,7 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 | `sqldiff-equiv/src/equiv/canon.rs` | check | 3 |
 | `sqldiff-equiv/src/equiv/edit.rs` | check | 1 |
 | `sqldiff-equiv/src/equiv/mod.rs` | check | 9 |
-| `sqldiff-equiv/src/equiv/schema.rs` | check | 1 |
+| `sqldiff-equiv/src/equiv/schema.rs` | check | 2 |
 | `sqldiff-equiv/src/equiv/trigger.rs` | check | 2 |
 
 ### options catalogs
@@ -135,12 +135,12 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 
 ### schema fields
 
-`\.(star_views|list_stars)\b`: `StarView(lower name)`. `Schema::star_views` and `list_stars` are public fields: a read of either is a read of the catalog.
+`\.(star_views|list_stars|is_star_view)\b`: `StarView(lower name)`. `Schema::star_views` and `list_stars` are public fields: a read of either is a read of the catalog.
 
 | file | stage | count |
 |---|---|---|
 | `sqldiff-equiv/src/equiv/canon.rs` | check | 2 |
-| `sqldiff-equiv/src/equiv/schema.rs` | check | 7 |
+| `sqldiff-equiv/src/equiv/schema.rs` | check | 8 |
 
 ### pass 1 catalog
 
@@ -187,6 +187,7 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 |---|---|
 | `catalog` | the view door (Supplied) |
 | `is_empty` | SchemaTables (any) |
+| `is_star_view` | StarView |
 | `tables` | SchemaTables / ColumnNamed |
 | `table` | SchemaTables |
 | `view_column_is_not_char` | ViewFamily |
