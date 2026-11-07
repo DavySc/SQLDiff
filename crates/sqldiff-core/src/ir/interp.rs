@@ -177,6 +177,62 @@ enum Live {
     Undone,
 }
 
+/// The effects that ran, by key index (ascending): `Some` slots of a vector
+/// with one slot per key, kept as just those, so that a state costs what its
+/// path ran and not the number of statements in the routine.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LiveMap(Vec<(u32, Live)>);
+
+impl LiveMap {
+    fn get(&self, k: usize) -> Option<Live> {
+        let i = self.0.binary_search_by_key(&(k as u32), |(j, _)| *j).ok()?;
+        Some(self.0[i].1)
+    }
+
+    fn set(&mut self, k: usize, l: Live) {
+        match self.0.binary_search_by_key(&(k as u32), |(j, _)| *j) {
+            Ok(i) => self.0[i].1 = l,
+            Err(i) => self.0.insert(i, (k as u32, l)),
+        }
+    }
+
+    /// `to` for the key `k` if it is `Pending`.
+    fn settle(&mut self, k: usize, to: Live) {
+        if let Ok(i) = self.0.binary_search_by_key(&(k as u32), |(j, _)| *j) {
+            if self.0[i].1 == Live::Pending {
+                self.0[i].1 = to;
+            }
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (usize, Live)> + '_ {
+        self.0.iter().map(|&(i, l)| (i as usize, l))
+    }
+
+    /// Whether the states of some key outside `spent` differ in `self` and `b`.
+    fn differs_outside(&self, b: &LiveMap, spent: &[usize]) -> bool {
+        let (mut x, mut y) = (self.0.iter().peekable(), b.0.iter().peekable());
+        loop {
+            let (k, same) = match (x.peek(), y.peek()) {
+                (None, None) => return false,
+                (Some(&&(i, l)), Some(&&(j, m))) if i == j => (i, l == m),
+                (Some(&&(i, _)), Some(&&(j, _))) if i < j => (i, false),
+                (Some(&&(i, _)), None) => (i, false),
+                (_, Some(&&(j, _))) => (j, false),
+            };
+            if !same && !spent.contains(&(k as usize)) {
+                return true;
+            }
+            if x.peek().is_some_and(|&&(i, _)| i == k) {
+                x.next();
+            }
+            if y.peek().is_some_and(|&&(j, _)| j == k) {
+                y.next();
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Owner {
     /// Statements commit on their own unless the artifact opens a transaction.
@@ -285,7 +341,7 @@ struct State {
     xact_abort_local: bool,
     implicit: bool,
     /// State of each effect that ran, by key id (see [`Keys`]).
-    live: Vec<Option<Live>>,
+    live: LiveMap,
     log: Vec<Log>,
     temp: BTreeMap<String, TempState>,
     scopes: Vec<(ScopeId, usize)>,
@@ -398,7 +454,6 @@ impl State {
             || *raising != b.raising
             || *durability_unknown != b.durability_unknown
             || *steps != b.steps
-            || live.len() != b.live.len()
             || !b.faults_done.is_empty()
         {
             return None;
@@ -452,12 +507,7 @@ impl State {
         if !marks(&ms(scopes), &ms(&b.scopes)) || !marks(&mv(savepoints), &mv(&b.savepoints)) {
             return None;
         }
-        let same = live
-            .iter()
-            .zip(&b.live)
-            .enumerate()
-            .all(|(i, (x, y))| x == y || spent.contains(&i));
-        same.then_some(shifted)
+        (!live.differs_outside(&b.live, spent)).then_some(shifted)
     }
 
     /// The state of a path but for `steps`, the signature, the trace and the
@@ -719,6 +769,8 @@ struct Interp<'c> {
 /// of a map keyed by name.
 struct Keys {
     names: Rc<Vec<Rc<str>>>,
+    /// One zero per key, shared by every outcome made here.
+    zeros: Rc<Vec<u8>>,
     ids: HashMap<Rc<str>, usize>,
 }
 
@@ -734,7 +786,11 @@ impl Keys {
             .enumerate()
             .map(|(i, k)| (k.clone(), i))
             .collect();
-        Keys { names, ids }
+        Keys {
+            zeros: u.1.clone(),
+            names,
+            ids,
+        }
     }
 
     fn id(&self, key: &str) -> usize {
@@ -746,7 +802,7 @@ impl Keys {
 /// in key order. Explorers over the same universe number their effects the
 /// same way, so that outcomes of two versions are compared slot by slot.
 #[derive(Clone)]
-pub struct KeyUniverse(Rc<Vec<Rc<str>>>);
+pub struct KeyUniverse(Rc<Vec<Rc<str>>>, Rc<Vec<u8>>);
 
 impl KeyUniverse {
     pub(super) fn names(&self) -> &[Rc<str>] {
@@ -767,22 +823,19 @@ impl KeyUniverse {
                 }
             }
         }
-        KeyUniverse(Rc::new(all.into_iter().map(Rc::from).collect()))
+        let names: Vec<Rc<str>> = all.into_iter().map(Rc::from).collect();
+        let zeros = Rc::new(vec![0u8; names.len()]);
+        KeyUniverse(Rc::new(names), zeros)
     }
 }
 
 /// Live effects formatted as the map from key to state they stand for.
-struct LiveByName<'a>(&'a [Option<Live>], &'a [Rc<str>]);
+struct LiveByName<'a>(&'a LiveMap, &'a [Rc<str>]);
 
 impl std::fmt::Debug for LiveByName<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_map()
-            .entries(
-                self.0
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, l)| Some((&self.1[i], l.as_ref()?))),
-            )
+            .entries(self.0.iter().map(|(i, l)| (&self.1[i], l)))
             .finish()
     }
 }
@@ -1155,6 +1208,22 @@ impl Explorer {
     /// [`explore`] of `sc`, reusing the fault-free run when `sc` differs from
     /// the base scenario only by at most one injected fault.
     pub fn explore(&self, cfg: &Cfg, sc: &Scenario) -> Vec<Outcome> {
+        self.explore_where(cfg, sc, &|_| true)
+    }
+
+    /// [`Explorer::explore`], keeping only the outcomes `keep` accepts, in
+    /// order. A scenario whose answer is the fault-free outcomes themselves
+    /// clones only the kept ones: a routine whose paths were cut by the path
+    /// budget leaves most failing statements unreached, and each of those
+    /// scenarios used to clone every outcome only for the caller to drop
+    /// them again.
+    pub fn explore_where(
+        &self,
+        cfg: &Cfg,
+        sc: &Scenario,
+        keep: &dyn Fn(&Outcome) -> bool,
+    ) -> Vec<Outcome> {
+        let kept = || self.outs.iter().filter(|o| keep(o)).cloned().collect();
         let same_env = Scenario {
             faults: Vec::new(),
             ..sc.clone()
@@ -1163,11 +1232,11 @@ impl Explorer {
             return self.full(cfg, sc);
         }
         let Some(fault) = sc.faults.first() else {
-            return self.outs.clone();
+            return kept();
         };
         // Never reached: the run is the fault-free one.
         let Some(&t) = self.first.get(&fault.node) else {
-            return self.outs.clone();
+            return kept();
         };
         let Some(mut m) = self.machine_at(cfg, t) else {
             return self.full(cfg, sc);
@@ -1366,7 +1435,7 @@ impl Explorer {
                     {
                         unit_commit -= 1;
                     }
-                    match p.live[k] {
+                    match p.live.get(k) {
                         None => {
                             over.insert(k, None);
                             open.insert(k, false);
@@ -1817,7 +1886,7 @@ impl Interp<'_> {
             xact_abort: sc.xact_abort || trigger,
             xact_abort_local: trigger,
             implicit: sc.implicit_transactions,
-            live: vec![None; self.keys.names.len()],
+            live: LiveMap::default(),
             log: Vec::new(),
             temp: BTreeMap::new(),
             scopes: Vec::new(),
@@ -1937,7 +2006,7 @@ impl Interp<'_> {
         if sc.caller_txn && st.depth > 0 {
             // The caller's own uncommitted work, so its fate can be followed.
             let c = self.keys.id(CALLER);
-            st.live[c] = Some(Live::Pending);
+            st.live.set(c, Live::Pending);
             st.log.push(Log::Effect(c));
         }
         st.entry_depth = st.depth;
@@ -2126,7 +2195,7 @@ impl Interp<'_> {
                 if st.before_fault.is_none() {
                     st.before_fault = Some(BeforeFault::new(
                         self.keys.names.clone(),
-                        st.live.iter().map(Option::is_some).collect(),
+                        st.live.iter().map(|(i, _)| i as u32).collect(),
                     ));
                     st.faulted = s.durable_effect().map(|e| e.key.clone());
                 }
@@ -2263,14 +2332,14 @@ impl Interp<'_> {
 
     fn write(&self, st: &mut State, key: usize) {
         if st.no_commit {
-            st.live[key] = Some(Live::Durable);
+            st.live.set(key, Live::Durable);
             return;
         }
         if st.depth > 0 {
-            st.live[key] = Some(Live::Pending);
+            st.live.set(key, Live::Pending);
             st.log.push(Log::Effect(key));
         } else {
-            st.live[key] = Some(Live::Durable);
+            st.live.set(key, Live::Durable);
         }
     }
 
@@ -2292,9 +2361,7 @@ impl Interp<'_> {
     fn make_durable(&self, st: &mut State) {
         for l in st.log.drain(..) {
             if let Log::Effect(k) = l {
-                if let Some(v @ Live::Pending) = &mut st.live[k] {
-                    *v = Live::Durable;
-                }
+                st.live.settle(k, Live::Durable);
             }
         }
         for (t, obj) in &self.cfg.temps {
@@ -2312,9 +2379,7 @@ impl Interp<'_> {
         while st.log.len() > marker {
             match st.log.pop() {
                 Some(Log::Effect(k)) => {
-                    if let Some(v @ Live::Pending) = &mut st.live[k] {
-                        *v = Live::Undone;
-                    }
+                    st.live.settle(k, Live::Undone);
                 }
                 Some(Log::Temp(t, prev)) => {
                     let obj = self.cfg.temps.get(&t);
@@ -2766,14 +2831,12 @@ impl Interp<'_> {
                 st.raised = true;
             }
         }
-        let n = self.keys.names.len();
-        let (mut fates, mut open) = (vec![0u8; n], vec![0u8; n]);
-        for (i, l) in st.live.iter().enumerate() {
-            let Some(l) = l else {
-                continue;
-            };
-            let (fate, opened, committed) = self.fate_of(*l, st.owner, st.doomed, raised_exit);
-            open[i] = u8::from(opened);
+        let (mut fates, mut open) = (Vec::new(), Vec::new());
+        for (i, l) in st.live.iter() {
+            let (fate, opened, committed) = self.fate_of(l, st.owner, st.doomed, raised_exit);
+            if opened {
+                open.push(i as u32);
+            }
             unit_commit += usize::from(committed);
             let fate = if fate == Fate::Durable
                 && !st.partial.is_empty()
@@ -2783,7 +2846,7 @@ impl Interp<'_> {
             } else {
                 fate
             };
-            fates[i] = fate_code(Some(fate));
+            fates.push((i as u32, fate_code(Some(fate))));
         }
         if unit_commit > 0 {
             st.assumptions.insert("ASM-CALLER-COMMITS".into());
@@ -2793,8 +2856,8 @@ impl Interp<'_> {
             trace: Trace::new(st.trace),
             fault_index: st.fault_index,
             fault_route: st.fault_route,
-            effects: Effects::dense(self.keys.names.clone(), fates),
-            open: KeySet::dense(self.keys.names.clone(), open),
+            effects: Effects::sparse(self.keys.names.clone(), self.keys.zeros.clone(), fates),
+            open: KeySet::sparse(self.keys.names.clone(), self.keys.zeros.clone(), open),
             partial: st.partial,
             before_fault: st.before_fault.unwrap_or_default(),
             faulted: st.faulted,
@@ -2842,5 +2905,83 @@ mod hist_tests {
             h.push(i);
         }
         drop(h);
+    }
+}
+
+#[cfg(test)]
+mod live_map_tests {
+    use super::{Live, LiveMap};
+
+    fn dense(m: &LiveMap, n: usize) -> Vec<Option<Live>> {
+        (0..n).map(|k| m.get(k)).collect()
+    }
+
+    fn build(spec: &[Option<Live>]) -> LiveMap {
+        let mut m = LiveMap::default();
+        // Out of order on purpose: `set` keeps the keys sorted.
+        for (k, l) in spec.iter().enumerate().rev() {
+            if let Some(l) = l {
+                m.set(k, *l);
+            }
+        }
+        m
+    }
+
+    /// The slot-by-slot comparison `same_run` made over one vector slot per key.
+    fn differs_dense(a: &[Option<Live>], b: &[Option<Live>], spent: &[usize]) -> bool {
+        !a.iter()
+            .zip(b)
+            .enumerate()
+            .all(|(i, (x, y))| x == y || spent.contains(&i))
+    }
+
+    #[test]
+    fn differs_outside_agrees_with_the_slot_by_slot_comparison() {
+        let states = [
+            None,
+            Some(Live::Durable),
+            Some(Live::Pending),
+            Some(Live::Undone),
+        ];
+        let n = 5;
+        // Every pair of states over five keys, with and without a spent key.
+        let total = states.len().pow(n as u32);
+        let at = |mut x: usize| -> Vec<Option<Live>> {
+            (0..n)
+                .map(|_| {
+                    let s = states[x % states.len()];
+                    x /= states.len();
+                    s
+                })
+                .collect()
+        };
+        for i in (0..total).step_by(7) {
+            for j in (0..total).step_by(11) {
+                let (a, b) = (at(i), at(j));
+                let (ma, mb) = (build(&a), build(&b));
+                assert_eq!(dense(&ma, n), a);
+                for spent in [&[][..], &[2][..], &[0, 4][..]] {
+                    assert_eq!(
+                        ma.differs_outside(&mb, spent),
+                        differs_dense(&a, &b, spent),
+                        "{a:?} against {b:?}, spent {spent:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn settle_changes_only_a_pending_key() {
+        let mut m = LiveMap::default();
+        m.set(3, Live::Pending);
+        m.set(1, Live::Durable);
+        m.settle(3, Live::Undone);
+        m.settle(1, Live::Undone);
+        m.settle(2, Live::Undone);
+        assert_eq!(
+            m.iter().collect::<Vec<_>>(),
+            vec![(1, Live::Durable), (3, Live::Undone)]
+        );
     }
 }
