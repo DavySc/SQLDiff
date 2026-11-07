@@ -46,3 +46,32 @@ next piece of work; each break is its own PR.
   full `cargo test --workspace`.
 - Conversion output of a fixed subset is identical before and after
   (`diff -r`, excluding `.sqldiff`), at `-j1` and `-j4`.
+
+## Step 2: `sqldiff-model` (breaking the model/ir/ledger/engine cycles)
+
+The cycles had one hub, `model` (the report types). `model` used six things
+that sat in modules which themselves use `model`:
+
+| `model` used | was in | now |
+|---|---|---|
+| `assumptions::lookup` (a debug check) | `assumptions` | moved into `sqldiff-model` |
+| `session::derive_verdict` | `session` | moved |
+| `proof::Proof` | `proof` (with `artifact`) | moved with `artifact` and `target` |
+| `ir::witness::Witness` | `ir/witness.rs` (with `ir/profile.rs`) | moved to `sqldiff-model::witness` and `::profile` |
+| `ledger::Discharge` | `ledger` | the struct moved into `model`; `ledger` re-exports it |
+
+`sqldiff-model` holds `model`, `assumptions`, `session`, `proof`, `artifact`,
+`target`, `profile` and `witness`, plus their data (`profiles/assumptions.toml`,
+`lifecycle.toml`, `semantics/*.toml`). It depends only on `sqldiff-syntax`.
+`sqldiff-core` re-exports the modules under their old paths
+(`sqldiff_core::model`, `ir::profile` and so on), so no caller changes.
+
+What stays in `sqldiff-core` and is still tangled: `ir` (cfg, interp,
+behaviour), `ledger`, `engine`, `facts`, `classify`, `equiv`. `ledger` uses
+`ir::cfg` and `ir::behaviour`, and `ir` uses `ledger`/`facts`/`equiv`: that
+is the remaining cycle. `ledger` is the smallest piece to break next.
+
+Two visibility changes the move forced, with no change in what can be done:
+`Report.verdict` stays private (reads use `Report::verdict()`; reports are
+built with `Report::draft` and settled by `finish`, as before) and
+`proof::apply` is `pub`.
