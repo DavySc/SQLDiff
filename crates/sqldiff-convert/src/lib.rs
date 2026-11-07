@@ -20,11 +20,9 @@ pub use sqldiff_units::{trace_text, Draft, Note, RuleOptions, Status, Step, Writ
 
 include!(concat!(env!("OUT_DIR"), "/fingerprint.rs"));
 
-mod check;
+pub mod check;
 pub use check::{check, gates, splice_unit, undecided, NOT_CHECKED, NOT_COMPARED};
-pub(crate) use check::{
-    check_with, check_with_mix, not_checked, recount, span, Rebuild, U16Index, EVERY_PAIR,
-};
+pub(crate) use check::{check_with_mix, not_checked, recount, span, Rebuild, U16Index, EVERY_PAIR};
 
 pub mod base;
 pub mod callees;
@@ -298,7 +296,7 @@ mod tests {
 #[cfg(test)]
 mod per_routine_variant {
     use super::*;
-    use crate::check::score_of;
+    use crate::check::{check_with, score_of};
 
     const TABLES: &str = "CREATE TABLE dbo.A (Id int NOT NULL PRIMARY KEY, Qty int NOT NULL);
 CREATE TABLE dbo.B (Id int NOT NULL PRIMARY KEY, Qty int NOT NULL);

@@ -640,7 +640,6 @@ pub(crate) fn span(
     }
 }
 
-
 #[cfg(test)]
 mod u16_index {
     use super::*;
@@ -659,4 +658,3 @@ mod u16_index {
         assert_eq!(empty.at("", 0), 0);
     }
 }
-

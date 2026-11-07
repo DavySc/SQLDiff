@@ -731,6 +731,7 @@ fn convert_kept(
         (Some(fresh), Some(o), None) => Some(Cache {
             store: crate::store::Store::of(o),
             build: crate::instances::build_hash()?,
+            check_build: crate::instances::check_build_hash(),
             fresh,
             trim,
         }),
@@ -800,7 +801,7 @@ fn convert_kept(
         let mut c = match held {
             Held::Whole(c) => *c,
             Held::Stored { key, .. } => match cache.as_ref().and_then(|c| c.store.get(&key)) {
-                Some(c) => c,
+                Some((c, _)) => c,
                 None => {
                     return Err(format!(
                         "the stored result {} is gone or unreadable; run again",
@@ -1408,7 +1409,7 @@ fn convert_files(
             |(i, d)| {
                 Some(
                     crate::store::CheckInput {
-                        build: &c.build,
+                        build: &c.check_build,
                         from: a.from,
                         to: a.to,
                         trim: c.trim,
@@ -1498,8 +1499,40 @@ fn convert_files(
         if hooks.cancelled() {
             return None;
         }
+        let rebuild = |plain_at: &[usize]| {
+            let claims = claims.get_or_init(|| {
+                sqldiff_draft::table_vars::Claims::of(
+                    inputs.iter().map(|i| (i.rel.as_str(), i.text.as_str())),
+                    a.from,
+                )
+            });
+            crate::rewrite_in_tree_plain(
+                &input.text,
+                a.from,
+                a.to,
+                opts.facts_a.first().map(|c| c.as_ref()),
+                Some(claims),
+                a.rules,
+                plain_at,
+            )
+        };
+        // Hand-written output replaces the rules' draft: not built again.
+        let rebuild: Option<crate::Rebuild> = ledger.is_none().then_some(&rebuild);
+        // A stored result is taken only if the mix of draft variants built
+        // for it is still what the draft code builds: the draft code is not
+        // part of the result's fingerprint (`CHECK_FINGERPRINT`), so a mix
+        // that lost before can win now, or the other way. A mix is built
+        // again from the stored routines (pass-1 cost, no check) and
+        // compared; anything else is a miss and the file is checked again.
         let stored = match (cache, key) {
-            (Some(c), Some(k)) if !c.fresh => c.store.get(k).map(|r| (c, k, r)),
+            (Some(c), Some(k)) if !c.fresh => c.store.get(k).and_then(|(r, mix)| {
+                let same = match (&mix, rebuild) {
+                    (None, _) => true,
+                    (Some(m), Some(rb)) => rb(&m.plain_at).canonical() == m.draft,
+                    (Some(_), None) => false,
+                };
+                same.then_some((c, k, r, mix))
+            }),
             _ => None,
         };
         if stored.is_none() && in_increment.as_ref().is_some_and(|m| !m[idx]) {
@@ -1561,7 +1594,7 @@ fn convert_files(
                     _ => Held::Whole(Box::new(c)),
                 }
             };
-        if let Some((_, k, conv)) = &stored {
+        if let Some((_, k, conv, _)) = &stored {
             if !sample.contains(&idx) {
                 let mut conv = conv.clone();
                 finish.apply(&mut conv);
@@ -1570,32 +1603,13 @@ fn convert_files(
             }
         }
         let t = Instant::now();
-        let rebuild = |plain_at: &[usize]| {
-            let claims = claims.get_or_init(|| {
-                sqldiff_draft::table_vars::Claims::of(
-                    inputs.iter().map(|i| (i.rel.as_str(), i.text.as_str())),
-                    a.from,
-                )
-            });
-            crate::rewrite_in_tree_plain(
-                &input.text,
-                a.from,
-                a.to,
-                opts.facts_a.first().map(|c| c.as_ref()),
-                Some(claims),
-                a.rules,
-                plain_at,
-            )
-        };
-        // Hand-written output replaces the rules' draft: not built again.
-        let rebuild: Option<crate::Rebuild> = ledger.is_none().then_some(&rebuild);
-        let mut c = crate::check_with(&input.text, draft, &opts, rebuild);
+        let (mut c, mix) = crate::check_with_mix(&input.text, draft, &opts, rebuild);
         finish.apply(&mut c);
         let secs = t.elapsed().as_secs_f64();
-        if let Some((cc, k, old)) = &stored {
+        if let Some((cc, k, old, old_mix)) = &stored {
             let mut old = old.clone();
             finish.apply(&mut old);
-            if !crate::store::compare(&old, &c) {
+            if !crate::store::compare(&old, &c) || *old_mix != mix {
                 cc.store.bundle(k, &old, &c);
                 mismatch.lock().unwrap().push(format!(
                     "{}: the stored result {} differs from a fresh check of the same input; \
@@ -1609,7 +1623,7 @@ fn convert_files(
         }
         let mut in_store = false;
         if let (Some(cc), Some(k)) = (cache, key) {
-            match cc.store.put(k, &c) {
+            match cc.store.put(k, &c, mix.as_ref()) {
                 Ok(()) => in_store = true,
                 Err(e) => eprintln!("sqldiff: result not stored: {e}"),
             }
@@ -1655,7 +1669,10 @@ enum Held {
 /// The result store of this run and what every key holds besides the file.
 struct Cache {
     store: crate::store::Store,
+    /// The whole engine's fingerprint: keys the tree state and drafts.
     build: String,
+    /// The check stage's: keys the results (`CHECK_FINGERPRINT`).
+    check_build: String,
     /// Reuse nothing; store every result again.
     fresh: bool,
     trim: bool,

@@ -91,7 +91,7 @@ pub fn catalog_digest(c: &Catalog) -> String {
 /// Everything [`crate::check`] reads for one file of a tree: the only
 /// argument a stored result's key is made from.
 pub struct CheckInput<'a> {
-    /// The engine fingerprint (`ENGINE_FINGERPRINT`): another engine may check differently.
+    /// The check stage's fingerprint (`CHECK_FINGERPRINT`): another check may decide differently.
     pub build: &'a str,
     pub from: Dialect,
     pub to: Dialect,
@@ -112,7 +112,7 @@ pub struct CheckInput<'a> {
 impl CheckInput<'_> {
     pub fn key(&self) -> Key {
         let mut k = KeyBuilder::new();
-        k.field("format", b"3");
+        k.field("format", b"4");
         k.field("build", self.build.as_bytes());
         k.field("from", self.from.id().as_bytes());
         k.field("to", self.to.id().as_bytes());
@@ -200,6 +200,11 @@ struct Entry {
     key: String,
     pool: Vec<String>,
     conversion: serde_json::Value,
+    /// The mix of the two variants of the draft that was built for this
+    /// result, whether or not it won ([`crate::check::Mix`]). The draft code
+    /// is not part of a result's fingerprint, so a reuse builds the mix again
+    /// and compares.
+    mix: Option<crate::check::Mix>,
 }
 
 /// The body of a result file: the file is the SHA-256 of its body in hex, a
@@ -396,7 +401,7 @@ impl Store {
 
     /// The stored conversion. A file that does not read back whole, or does
     /// not name its own key, is a miss.
-    pub fn get(&self, key: &Key) -> Option<Conversion> {
+    pub fn get(&self, key: &Key) -> Option<(Conversion, Option<crate::check::Mix>)> {
         let path = crate::tree::dest_under(&self.out, &Self::rel(key)).ok()?;
         let raw = std::fs::read(path).ok()?;
         let body = verified_body(&raw)?;
@@ -406,13 +411,19 @@ impl Store {
         }
         expand(&mut e.conversion, &e.pool)?;
         unshare_notes(&mut e.conversion)?;
-        serde_json::from_value(e.conversion).ok()
+        let conversion = serde_json::from_value(e.conversion).ok()?;
+        Some((conversion, e.mix))
     }
 
     /// Stores a result: written beside its name and renamed into place,
     /// retried a few times because a virus scanner on Windows can hold the
     /// file for a moment.
-    pub fn put(&self, key: &Key, c: &Conversion) -> Result<(), String> {
+    pub fn put(
+        &self,
+        key: &Key,
+        c: &Conversion,
+        mix: Option<&crate::check::Mix>,
+    ) -> Result<(), String> {
         let mut value = serde_json::to_value(c).map_err(|e| e.to_string())?;
         share_notes(&mut value);
         let (pool, conversion) = intern(value);
@@ -420,6 +431,7 @@ impl Store {
             key: key.0.clone(),
             pool,
             conversion,
+            mix: mix.cloned(),
         })
         .map_err(|e| e.to_string())?;
         let bytes = framed(&body);

@@ -1030,7 +1030,7 @@ sites = ["sqldiff-draft/src/tsql.rs"]
 id = "tsql.sqlcmd-include"
 kind = "converter"
 proof = "engine"
-sites = ["sqldiff-convert/src/lib.rs", "sqldiff-draft/src/tsql.rs"]
+sites = ["sqldiff-convert/src/check.rs", "sqldiff-draft/src/tsql.rs"]
 
 [[rule]]
 id = "tsql.stmt.break"

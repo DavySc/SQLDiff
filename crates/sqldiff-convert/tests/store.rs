@@ -698,3 +698,77 @@ fn an_edited_tree_state_or_flag_set_is_a_miss_and_built_again() {
     };
     assert_eq!(sql(want), sql(tree_of(&f.out("o"))));
 }
+
+#[test]
+fn a_stored_mix_that_the_draft_code_no_longer_builds_is_a_miss() {
+    // The draft crate is not in a result's fingerprint (`CHECK_FINGERPRINT`),
+    // so the mix stored with a result is what ties the result to the draft
+    // code: when the mix built again differs from the stored one (here a
+    // stored draft no code builds), the result is not used.
+    let f = Fixture::standard("mix");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    let stored = results(&f.out("o"));
+    assert_eq!(stored.len(), 4);
+    // Nothing here needed a mix.
+    for p in &stored {
+        let e = read_result(p);
+        assert!(e["mix"].is_null(), "{}", e["mix"]);
+    }
+    // Control: untouched results are reused (all but the re-checked sample).
+    convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
+    assert!(reused(&f.out("o")).iter().any(|(_, r)| *r));
+    for p in &results(&f.out("o")) {
+        let mut e = read_result(p);
+        e["mix"] = serde_json::json!({ "plain_at": [0], "draft": "a draft no code builds" });
+        write_result(p, &e);
+    }
+    convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
+    assert!(
+        reused(&f.out("o")).iter().all(|(_, r)| !*r),
+        "a result whose mix is not rebuilt was reused"
+    );
+    // The results are stored again, with the mix this code gives (none).
+    let again = results(&f.out("o"));
+    assert_eq!(again.len(), 4);
+    for p in &again {
+        assert!(read_result(p)["mix"].is_null());
+    }
+}
+
+/// Two routines of one tree whose table variables would map to one
+/// temporary table (see `tests/table_variables.rs`): the later file is
+/// refused. The refusal comes from the claims of the whole tree, which the
+/// draft crate computes; it shows in the draft's text, so a file's stored
+/// result follows an edit of *another* file that lifts the clash.
+#[test]
+fn a_clash_lifted_by_an_edit_of_another_file_changes_the_stored_result() {
+    let first = "CREATE PROCEDURE [dbo].[a b%c d%e^f~g] AS\nBEGIN\n  DECLARE @t TABLE (i int);\n  INSERT INTO @t (i) VALUES (1);\nEND\n";
+    let first_without = "CREATE PROCEDURE [dbo].[a b%c d%e^f~g] AS\nBEGIN\n  SELECT 1;\nEND\n";
+    let second = "CREATE PROCEDURE [dbo].[a-b&c~d!e%f=g] AS\nBEGIN\n  DECLARE @t TABLE (i int);\n  INSERT INTO @t (i) VALUES (2);\nEND\n";
+    let f = Fixture::new("claims", &[("a.sql", first), ("b.sql", second)]);
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    let refused = |out: &Path| {
+        tree_of(out)
+            .into_iter()
+            .find(|(n, _)| n == "b.sql")
+            .unwrap()
+            .1
+    };
+    let before = refused(&f.out("o"));
+    // A second, untouched run gives the same tree.
+    convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
+    assert_eq!(before, refused(&f.out("o")));
+    // `a.sql` no longer declares the table variable: `b.sql` is not refused.
+    f.write("a.sql", first_without);
+    convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
+    let resumed = tree_of(&f.out("o"));
+    let b = reused(&f.out("o"))
+        .into_iter()
+        .find(|(p, _)| p == "b.sql")
+        .unwrap();
+    assert!(!b.1, "b.sql was reused after the clash with it was lifted");
+    assert_ne!(before, refused(&f.out("o")));
+    // And it is what a fresh run gives.
+    convert_into(&f.job("o", true, true), &Hooks::default()).unwrap();
+    assert_eq!(resumed, tree_of(&f.out("o")));
+}
