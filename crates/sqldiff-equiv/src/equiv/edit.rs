@@ -3743,8 +3743,11 @@ fn examine(
     let facts_a = ra.facts(at_a, na);
     let facts_b = rb.facts(at_b, nb);
     // Variables must mean the same on both sides.
-    for (k, fa) in &facts_a {
-        if let Some(fb) = facts_b.get(k) {
+    // In name order, so the variable the reason names is the same every run.
+    let mut names: Vec<&String> = facts_a.keys().collect();
+    names.sort();
+    for k in names {
+        if let (Some(fa), Some(fb)) = (facts_a.get(k), facts_b.get(k)) {
             if fa.value != fb.value || fa.origin != fb.origin || fa.ty != fb.ty {
                 return Err(format!("variable {k} differs between the versions"));
             }
