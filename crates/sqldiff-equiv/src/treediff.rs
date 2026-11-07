@@ -84,7 +84,7 @@ const GAP_BOUND: usize = 4_000_000;
 /// the bound of the alignment, so what lies between the parts that did match
 /// is neither paired nor called added, removed or moved. Equivalence is not
 /// established for it.
-pub(crate) fn alignment_bound_finding(
+pub fn alignment_bound_finding(
     object: &str,
     what: &str,
     na: usize,
