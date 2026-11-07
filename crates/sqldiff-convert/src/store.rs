@@ -433,14 +433,18 @@ impl Store {
     pub fn put_tree(&self, key: &TreeKey, st: &TreeState) -> Result<(), String> {
         // Compressed as it is written: the drafts repeat the same long
         // strings, and nothing is held in memory beside the state itself.
-        let mut enc = flate2::write::GzEncoder::new(
-            std::io::BufWriter::new(Vec::new()),
-            flate2::Compression::fast(),
+        // serde_json writes many tiny pieces and the encoder prepares its
+        // whole output buffer for each write: a buffer in front of it turns
+        // that into a few large writes (this step took a second on WWI).
+        let mut enc = std::io::BufWriter::with_capacity(
+            1 << 16,
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()),
         );
         serde_json::to_writer(&mut enc, st).map_err(|e| e.to_string())?;
         let bytes = enc
+            .into_inner()
+            .map_err(|e| e.into_error().to_string())?
             .finish()
-            .and_then(|w| w.into_inner().map_err(|e| e.into_error()))
             .map_err(|e| e.to_string())?;
         let dest = crate::tree::dest_under(&self.out, &Self::tree_rel(key))?;
         if let Some(p) = dest.parent() {
