@@ -265,6 +265,7 @@ pub(crate) fn is_degraded(i: &Issue) -> bool {
 impl<'a> Binder<'a> {
     /// Demotes proven issues inside doubtful regions to assumptions, and the
     /// references that failed with them.
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: `any` over values
     fn degrade(&mut self, doubts: &[doubt::Doubt]) {
         let mut demoted: HashMap<usize, String> = HashMap::new();
         for (idx, i) in self.out.issues.iter_mut().enumerate() {

@@ -14,7 +14,7 @@
 //! reads files and the review store; it writes only when `convert_tree` is
 //! given an output directory, exactly what `sqldiff convert -o` writes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 use sqldiff_convert::tree;
@@ -80,7 +80,7 @@ pub struct Server {
     flips: Flips,
     pairs: BTreeMap<String, Held>,
     /// Fingerprint → pair id.
-    findings: HashMap<String, String>,
+    findings: BTreeMap<String, String>,
     /// Read-only; re-read before each analysis so decisions made in the CLI
     /// or GUI show up.
     store: Store,
@@ -116,7 +116,7 @@ impl Server {
             gui_url: gui_url.unwrap_or_else(|| queue::DEFAULT_GUI_URL.to_string()),
             flips: Flips::new(),
             pairs: BTreeMap::new(),
-            findings: HashMap::new(),
+            findings: BTreeMap::new(),
             store,
             trees: Vec::new(),
             tree_count: 0,

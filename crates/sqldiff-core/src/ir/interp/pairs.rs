@@ -153,6 +153,7 @@ impl Interp<'_> {
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: sorted right after
     fn side_key(
         &self,
         node: NodeId,

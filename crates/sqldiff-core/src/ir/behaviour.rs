@@ -97,6 +97,7 @@ impl<'x, 'a> SideIr<'x, 'a> {
     /// Lowers one side and indexes its effects and reads: the scenarios
     /// look keys up for every outcome pair, so a scan per lookup made large
     /// routines cubic.
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: sorts each entry independently
     fn new(a: &'x Analyzed<'a>, other: &Analyzed, routine: Option<SyntaxNode>) -> Self {
         let cfg = super::cfg::lower_routine(a, other_temps(a, other), routine);
         let mut at = HashMap::new();
