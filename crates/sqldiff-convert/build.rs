@@ -114,12 +114,21 @@ fn main() {
         "rust-toolchain",
     ] {
         let p = root.join(rel);
-        println!("cargo:rerun-if-changed={}", p.display());
         // Absent files are hashed as absent, so adding one changes the key.
+        // They are not watched: cargo treats a missing watched file as
+        // changed and would rerun this script on every build.
         match std::fs::read(&p) {
-            Ok(b) => put(rel, &lf(b)),
+            Ok(b) => {
+                println!("cargo:rerun-if-changed={}", p.display());
+                put(rel, &lf(b));
+            }
             Err(_) => put(&format!("absent {rel}"), b""),
         }
+    }
+    // A cargo configuration added later is noticed through its folder.
+    let dot_cargo = root.join(".cargo");
+    if dot_cargo.is_dir() {
+        println!("cargo:rerun-if-changed={}", dot_cargo.display());
     }
     // A new or removed file in a crate is not seen through the files that
     // exist: watch the folders too.
