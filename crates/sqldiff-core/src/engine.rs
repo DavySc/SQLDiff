@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::artifact::{content_hash, Analyzed, Artifact};
+use crate::artifact::{exact_hash, Analyzed, Artifact};
 use crate::bind::{self, BindInput, Bindings};
 use crate::catalog::builtins::Helper;
 use crate::catalog::{ddl, Catalog, CatalogView};
@@ -103,7 +103,7 @@ fn ddl_catalog(dialect: sqldiff_syntax::Dialect, ddl: &[Artifact]) -> Arc<Catalo
         key.push('\0');
         key.push_str(a.dialect.id());
         key.push('\0');
-        key.push_str(&content_hash(&a.text));
+        key.push_str(&exact_hash(&a.text));
     }
     let cache = CACHE.get_or_init(Default::default);
     if let Some(c) = cache.lock().ok().and_then(|m| m.get(&key).cloned()) {
@@ -171,7 +171,7 @@ fn side(
         ddl_key.push('\0');
         ddl_key.push_str(a.dialect.id());
         ddl_key.push('\0');
-        ddl_key.push_str(&content_hash(&a.text));
+        ddl_key.push_str(&exact_hash(&a.text));
         ddl_key.push('\0');
     }
     let cache = CACHE.get_or_init(Default::default);

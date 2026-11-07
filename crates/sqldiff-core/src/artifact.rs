@@ -70,6 +70,16 @@ pub fn location_in(
     }
 }
 
+/// A hash of the exact bytes. For cache keys: [`content_hash`] ignores
+/// trailing white space and line ends, which a multi-line string literal
+/// can depend on.
+pub fn exact_hash(text: &str) -> String {
+    hex(&Sha256::digest(text.as_bytes()))
+}
+
+/// A hash of the text as a reader sees it: a byte order mark, line ends and
+/// trailing white space do not count. An identity for objects and queues,
+/// never a key for a cache that holds anything computed from the text.
 pub fn content_hash(text: &str) -> String {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut h = Sha256::new();
