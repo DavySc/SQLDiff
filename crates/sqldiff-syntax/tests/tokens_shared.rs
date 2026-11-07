@@ -103,3 +103,19 @@ fn a_tree_that_is_dropped_does_not_leave_a_stale_entry() {
     }
     clear_shared_tokens();
 }
+
+#[test]
+fn empty_nodes_are_bounded_too() {
+    // Nodes without tokens still weigh something: 250,000 of them pass the
+    // bound, and every answer stays right (empty).
+    let text = ";\n".repeat(250_000);
+    let root = parse(&text, Dialect::Tsql).syntax();
+    clear_shared_tokens();
+    let mut asked = 0;
+    for n in root.descendants() {
+        assert_eq!(plain(&tokens_shared(&n)), plain(&tokens(&n)));
+        asked += 1;
+    }
+    assert!(asked > 100_000, "{asked}");
+    clear_shared_tokens();
+}
