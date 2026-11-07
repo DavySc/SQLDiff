@@ -3583,16 +3583,16 @@ mod tree_state_tests {
                 .map(|e| e.unwrap().path())
                 .find(|p| {
                     let v: serde_json::Value =
-                        serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
+                        serde_json::from_slice(&std::fs::read(p).unwrap()[65..]).unwrap();
                     v["rel"] == rel
                 })
                 .unwrap()
         };
         let (fa, fp) = (by_rel("a.sql"), by_rel("p.sql"));
         let mut v: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&fa).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(&fa).unwrap()[65..]).unwrap();
         v["rel"] = "p.sql".into();
-        std::fs::write(&fp, serde_json::to_vec(&v).unwrap()).unwrap();
+        std::fs::write(&fp, crate::store::framed(&serde_json::to_vec(&v).unwrap())).unwrap();
         let err = (0..8)
             .find_map(|seed| {
                 build_tree_state(&a, &out, &inputs, 1, None, None, Some(&cache(true, seed))).err()
