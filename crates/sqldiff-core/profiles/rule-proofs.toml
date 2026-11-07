@@ -47,40 +47,40 @@ id = "advisory-lock/applock"
 kind = "idiom"
 proof = "axiom:V21"
 note = "sp_getapplock against pg_advisory_xact_lock (ASM-APPLOCK-CHECK-RAISES)"
-sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+sites = ["sqldiff-equiv/profiles/rules/idioms.rules"]
 
 [[rule]]
 id = "cardinality/correlated-update-unrestricted"
 kind = "lint"
 proof = "engine"
 note = "a lint changes no output"
-sites = ["sqldiff-core/profiles/rules/lints.rules"]
+sites = ["sqldiff-equiv/profiles/rules/lints.rules"]
 
 [[rule]]
 id = "charindex/strpos"
 kind = "translate"
 proof = "engine"
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules"]
 
 [[rule]]
 id = "concurrency/insert-if-absent-race"
 kind = "lint"
 proof = "engine"
 note = "a lint changes no output"
-sites = ["sqldiff-core/profiles/rules/lints.rules"]
+sites = ["sqldiff-equiv/profiles/rules/lints.rules"]
 
 [[rule]]
 id = "concurrency/upsert-race"
 kind = "lint"
 proof = "engine"
 note = "a lint changes no output"
-sites = ["sqldiff-core/profiles/rules/lints.rules"]
+sites = ["sqldiff-equiv/profiles/rules/lints.rules"]
 
 [[rule]]
 id = "datediff-day/date-minus"
 kind = "translate"
 proof = "engine"
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules"]
 
 [[rule]]
 id = "db2.lob"
@@ -124,13 +124,13 @@ id = "dbo-schema"
 kind = "translate"
 proof = "engine"
 note = "C3a maps a table's `dbo.t` through the deployment under ASM-DBO-SCHEMA"
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules"]
 
 [[rule]]
 id = "delete-orphans/anti-join"
 kind = "idiom"
 proof = "engine"
-sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+sites = ["sqldiff-equiv/profiles/rules/idioms.rules"]
 
 [[rule]]
 id = "idiom.rollback-rethrow"
@@ -144,58 +144,58 @@ id = "iif/case"
 kind = "translate"
 proof = "engine"
 note = "T-SQL IIF is outside the slice; the searched CASE it becomes is in it"
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules"]
 
 [[rule]]
 id = "insert-identity/lastval"
 kind = "idiom"
 proof = "engine"
 note = "ASM-LASTVAL-SAME-INSERT"
-sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+sites = ["sqldiff-equiv/profiles/rules/idioms.rules"]
 
 [[rule]]
 id = "insert-identity/returning"
 kind = "idiom"
 proof = "engine"
-sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+sites = ["sqldiff-equiv/profiles/rules/idioms.rules"]
 
 [[rule]]
 id = "insert-if-absent/if-not-exists"
 kind = "idiom"
 proof = "engine"
-sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+sites = ["sqldiff-equiv/profiles/rules/idioms.rules"]
 
 [[rule]]
 id = "insert-if-absent/on-conflict"
 kind = "idiom"
 proof = "engine"
-sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+sites = ["sqldiff-equiv/profiles/rules/idioms.rules"]
 
 [[rule]]
 id = "isnull/coalesce"
 kind = "translate"
 proof = "lemma:Sqldiff.Mirror/C2a operators/ISNULL"
 note = "int arguments (C2a), or a string variable or parameter with a fallback that fits it (C2b strings/ISNULL); other types engine (ASM-ISNULL-TYPE)"
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules"]
 
 [[rule]]
 id = "len/length"
 kind = "translate"
 proof = "lemma:Sqldiff.Mirror/C2b strings/LEN"
 note = "`LEN(x)` against `length(rtrim(x))` on a string of the slice (ASM-TSQL-LEN-BMP)"
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules"]
 
 [[rule]]
 id = "newid/gen-random-uuid"
 kind = "translate"
 proof = "engine"
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules"]
 
 [[rule]]
 id = "nolock/plain-read"
 kind = "translate"
 proof = "engine"
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules"]
 
 [[rule]]
 id = "pg.bit-number"
@@ -257,53 +257,53 @@ id = "plus/concat"
 kind = "translate"
 proof = "lemma:Sqldiff.Mirror/C2b strings/Concatenation"
 note = "both operands strings of the slice (ASM-TSQL-PLUS-IS-CONCAT)"
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules"]
 
 [[rule]]
 id = "select-assign/into"
 kind = "translate"
 proof = "engine"
 note = "`SELECT e INTO v FROM ...` is outside C3b except `COUNT(*)` into an int variable (ASM-EXACTLY-ONE-ROW)"
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules"]
 
 [[rule]]
 id = "select-assign2/into"
 kind = "translate"
 proof = "engine"
 note = "as select-assign/into"
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules"]
 
 [[rule]]
 id = "semantic/top-without-order"
 kind = "lint"
 proof = "engine"
 note = "a lint changes no output"
-sites = ["sqldiff-core/profiles/rules/lints.rules"]
+sites = ["sqldiff-equiv/profiles/rules/lints.rules"]
 
 [[rule]]
 id = "string-agg/within-group"
 kind = "translate"
 proof = "engine"
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules"]
 
 [[rule]]
 id = "sysdatetime/statement-timestamp"
 kind = "translate"
 proof = "axiom:V20"
 note = "once per statement on both sides (ASM-TSQL-SYSDATETIME-PER-STATEMENT); the T-SQL part of V20 is partial"
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules"]
 
 [[rule]]
 id = "top-distinct/limit"
 kind = "translate"
 proof = "engine"
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules"]
 
 [[rule]]
 id = "top/limit"
 kind = "translate"
 proof = "engine"
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules"]
 
 [[rule]]
 id = "tsql.*"
@@ -1465,22 +1465,22 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 id = "upsert/if-exists"
 kind = "idiom"
 proof = "engine"
-sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+sites = ["sqldiff-equiv/profiles/rules/idioms.rules"]
 
 [[rule]]
 id = "upsert/if-exists-locked"
 kind = "idiom"
 proof = "engine"
-sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+sites = ["sqldiff-equiv/profiles/rules/idioms.rules"]
 
 [[rule]]
 id = "upsert/merge"
 kind = "idiom"
 proof = "engine"
-sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+sites = ["sqldiff-equiv/profiles/rules/idioms.rules"]
 
 [[rule]]
 id = "upsert/on-conflict"
 kind = "idiom"
 proof = "engine"
-sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+sites = ["sqldiff-equiv/profiles/rules/idioms.rules"]

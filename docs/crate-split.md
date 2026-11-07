@@ -97,3 +97,45 @@ engine, once `sqldiff-convert` is split to depend on `sqldiff-equiv` alone.
 
 Widened for the move: `equiv::script::routine_key` and `equiv::lower::is_do`
 are `pub` (the CFG code in `ir` calls them).
+
+## Step 4: `rules` moves into `sqldiff-equiv`; the plan for stage fingerprints
+
+`rules` (the idiom rule engine and `profiles/rules/*.rules`) uses only the
+equivalence layer and the model, and it is what pass 1 of a conversion
+(`sqldiff-convert/src/tsql.rs`) calls. It moves into `sqldiff-equiv` with its
+data, so the code that writes a draft depends on `sqldiff-syntax`,
+`-catalog`, `-model` and `-equiv` and on nothing above them.
+
+### Why stage fingerprints, and what they must never do
+
+Today one fingerprint (`ENGINE_FINGERPRINT`) keys everything, so any edit,
+also one in `ir` or `engine` that cannot change a draft, discards the stored
+drafts and tree state, and any edit to the draft code discards results
+whose draft did not change. The result key already contains the draft text
+and the rule options (`store::CheckInput::key`), so a result stays valid when
+the draft is byte-identical and the check code is the same. The aim:
+
+| stage | stored under | fingerprint covers |
+|---|---|---|
+| draft (pass 1: drafts, tree state) | tree key | the draft crates only |
+| result (pass 2: check of a draft) | result key (draft text inside) | everything pass 2 runs, **not** the code that wrote the draft |
+
+A stale reuse is the worst outcome, so the cut must be enforced by Cargo
+dependencies, not by a list: the draft stage becomes a crate whose
+dependency closure is the draft fingerprint, and a test asserts that closure
+equals the fingerprinted set (as `engine_fingerprint.rs` does today). The
+check stage's set is the closure of `sqldiff-convert` minus the draft crate,
+asserted the same way, and the draft crate's public API stays limited to
+producing drafts; anything the check stage reads from a draft (its types and
+accessors) lives in a crate both fingerprints cover.
+
+Next PRs, each with no change in behaviour until the last:
+
+1. Move the draft types (`Draft`, `Out`, `Note`, `Status`, `Step`,
+   `Written`, `RuleOptions`) to a small crate both stages cover.
+2. Move the producing code (`tsql`, `tok`, `table_vars`, `impossible`,
+   `rewrite_*`) into `sqldiff-draft`.
+3. Two fingerprints and their closure tests; key the tree state with the
+   draft fingerprint and the results with the check fingerprint. This is the
+   behaviour change (what stored work survives an edit), covered by tests
+   that an edit in each crate invalidates exactly the stages it should.

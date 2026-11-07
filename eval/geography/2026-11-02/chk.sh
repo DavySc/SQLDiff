@@ -2,7 +2,7 @@
 # usage: chk.sh seed n
 cd /tmp/claude-0/w
 python3 ${FUZZ:-polyfuzz.py} $1 $2 > pf$1.txt
-(cd /home/claude/SQLDiff && SQLDIFF_WKB_CASES=/tmp/claude-0/w/pf$1.txt SQLDIFF_WKB_OUT=/tmp/claude-0/w/pf$1.rs CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 TMPDIR=/tmp/claude-0/tt cargo test -p sqldiff-core --lib wkb_decisions -- --ignored >/dev/null 2>&1)
+(cd /home/claude/SQLDiff && SQLDIFF_WKB_CASES=/tmp/claude-0/w/pf$1.txt SQLDIFF_WKB_OUT=/tmp/claude-0/w/pf$1.rs CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 TMPDIR=/tmp/claude-0/tt cargo test -p sqldiff-equiv --lib wkb_decisions -- --ignored >/dev/null 2>&1)
 python3 regions.py pf$1.txt pf$1.reg
 python3 - $1 <<'P'
 import sys,collections

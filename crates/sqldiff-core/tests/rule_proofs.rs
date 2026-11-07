@@ -11,7 +11,7 @@
 //!   code completes (`"tsql.func.{}"`) is a use of the family `tsql.func.*`,
 //!   and a member registered on its own (`tsql.func.len`) is used when its
 //!   family is and its name (`"LEN"`) is a literal in the family's sites;
-//! - in `crates/sqldiff-core/profiles/rules/*.rules`, the head of a
+//! - in `crates/sqldiff-equiv/profiles/rules/*.rules`, the head of a
 //!   `(translate ...)`, `(idiom ...)` or `(lint ...)` form, whose kind must
 //!   match.
 //!
@@ -197,7 +197,7 @@ fn scan() -> Scan {
     let head = Regex::new(r"(?m)^\((translate|idiom|lint)\s+(\S+)").unwrap();
     let mut rules = Vec::new();
     files(
-        &root.join("sqldiff-core/profiles/rules"),
+        &root.join("sqldiff-equiv/profiles/rules"),
         "rules",
         &mut rules,
     );
