@@ -606,14 +606,13 @@ impl Schema {
     pub fn view_column_is_not_char(&self, name: &str, col: &str) -> bool {
         let key = name.to_lowercase();
         let key = key.rsplit('.').next().unwrap_or(&key);
-        self.rec(
-            || Query::ViewFamily(key.to_string()),
-            &self
-                .ext
-                .view_families
-                .get(key)
-                .map(|m| m.iter().collect::<std::collections::BTreeMap<_, _>>()),
-        );
+        #[allow(clippy::disallowed_methods)] // collected into a BTreeMap: ordered
+        let family = self
+            .ext
+            .view_families
+            .get(key)
+            .map(|m| m.iter().collect::<std::collections::BTreeMap<_, _>>());
+        self.rec(|| Query::ViewFamily(key.to_string()), &family);
         self.view_families
             .get(key)
             .and_then(|c| c.get(&col.to_lowercase()))
@@ -1093,6 +1092,7 @@ mod tests {
             target: _,
             collation: _,
         } = &col;
+        #[allow(clippy::type_complexity)]
         let muts: Vec<(&str, Box<dyn Fn(&mut Column)>)> = vec![
             ("name", Box::new(|c| c.name = "b".into())),
             ("ty", Box::new(|c| c.ty.len = Some(9))),
@@ -1123,6 +1123,7 @@ mod tests {
             keys: _,
             complete: _,
         } = &tab;
+        #[allow(clippy::type_complexity)]
         let muts: Vec<(&str, Box<dyn Fn(&mut Table)>)> = vec![
             ("schema", Box::new(|t| t.schema = Some("s".into()))),
             ("name", Box::new(|t| t.name = "u".into())),
@@ -1166,6 +1167,7 @@ mod tests {
     const NAMES: [&str; 5] = ["a", "b", "C", "A", "d"];
     const COLS: [&str; 3] = ["c1", "c2", "c3"];
 
+    #[allow(clippy::type_complexity)]
     fn ddl_of(r: &mut Rng, n: usize) -> (String, Vec<(String, Option<String>, Vec<String>)>) {
         let mut text = String::new();
         let mut made = Vec::new();
