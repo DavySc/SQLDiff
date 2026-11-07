@@ -5444,11 +5444,7 @@ impl<'a> Canon<'a> {
         // keep their symbolic star).
         if self.d == Dialect::Tsql
             && picked.iter().any(|b| {
-                b.derived.is_none()
-                    && self
-                        .schema
-                        .star_views
-                        .contains(&lc(Self::base_table(&b.table)))
+                b.derived.is_none() && self.schema.is_star_view(&lc(Self::base_table(&b.table)))
             })
         {
             return Err(
