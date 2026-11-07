@@ -54,8 +54,9 @@ mod template;
 pub mod tree;
 
 pub use template::{
-    check_template, convert_template, rewrite_template, rewrite_template_as, rewrite_template_with,
-    split_pair, template_fragment, FragmentKind, StandIns, TemplateDraft, TemplateInfo, ValueKind,
+    check_template, convert_template, job_material, rewrite_template, rewrite_template_as,
+    rewrite_template_with, split_pair, template_fragment, FragmentKind, StandIns, TemplateDraft,
+    TemplateInfo, ValueKind,
 };
 
 /// Drops what is read of neither engine report of `c` once its file is
