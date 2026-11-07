@@ -250,3 +250,36 @@ fn an_unqualified_column_in_a_join_is_typed_by_its_own_table() {
     let v = verdict(&ddl("char(6)"), &f("'abc'"), &f("'zzzzzzz'"));
     assert!(!matches!(v, Verdict::Different), "char(6): {v:?}");
 }
+
+/// Outside LIKE the blanks of a `char(n)` value matter too: concatenation
+/// and a cast to varchar. On the row where c = 'abc' (stored
+/// `'abc   '`) each condition below is false in the database, so it is
+/// the same as `1 = 0`; the unpadded value would make it true. `varchar(6)`
+/// is the control: there the difference is real.
+#[test]
+fn padding_outside_like() {
+    let conds = [
+        "c + 'x' = 'abcx'",
+        "CONCAT(c, 'x') = 'abcx'",
+        "CAST(c AS varchar(10)) + 'x' = 'abcx'",
+        "COALESCE(c, 'z') + 'x' = 'abcx'",
+    ];
+    let mut bad = Vec::new();
+    for w in conds {
+        let v = query_verdict(Dialect::Tsql, "char(6)", w, "1 = 0");
+        if matches!(v, Verdict::Different) {
+            bad.push(w);
+        }
+        let v = query_verdict(Dialect::Tsql, "varchar(6)", w, "1 = 0");
+        assert!(matches!(v, Verdict::Different), "control {w}: {v:?}");
+    }
+    assert!(bad.is_empty(), "shown Different on char(6): {bad:?}");
+    // PostgreSQL: bpchar || text drops the blanks, the cast to varchar too.
+    for w in [
+        "c || 'x' = 'abcx'",
+        "CAST(c AS varchar(10)) || 'x' = 'abcx'",
+    ] {
+        let v = query_verdict(Dialect::Postgres, "char(6)", w, "1 = 0");
+        assert!(!matches!(v, Verdict::Different), "pg {w}: {v:?}");
+    }
+}
