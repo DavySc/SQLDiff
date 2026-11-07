@@ -1,0 +1,20 @@
+name: hang-gate
+
+# Adversarial inputs (scripts/gen-adversarial.py) converted under a time limit
+# and a memory ceiling: nothing may be killed, run out of memory or crash.
+# Shapes still open are listed in scripts/hang-gate.py (KNOWN_OPEN).
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p sqldiff-cli
+      - run: python3 scripts/hang-gate.py
