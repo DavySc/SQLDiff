@@ -316,7 +316,13 @@ pub fn db2_select_without_from_hits(root: &SyntaxNode, dialect: Dialect) -> Vec<
             if depth[j] != depth[i] || t.kind() == SyntaxKind::L_PAREN {
                 continue;
             }
-            if ["UNION", "EXCEPT", "INTERSECT"].iter().any(|w| word(j, w)) {
+            // Another SELECT at this depth starts the next query (statements
+            // written with no terminator): this one ends before it, so a
+            // run of such queries is not one span to the end of the file.
+            if ["UNION", "EXCEPT", "INTERSECT", "SELECT"]
+                .iter()
+                .any(|w| word(j, w))
+            {
                 end = j;
                 break;
             }
@@ -371,5 +377,19 @@ pub fn to_finding(a: &Analyzed, h: &Hit) -> Finding {
         a: (a.side == Side::A).then(|| loc.clone()),
         b: (a.side == Side::B).then_some(loc),
         assumptions: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod select_without_from_tests {
+    use super::*;
+
+    #[test]
+    fn unterminated_selects_do_not_span_to_the_end() {
+        let src = "SELECT 1\nSELECT 2\nSELECT 3";
+        let root = sqldiff_syntax::parse(src, Dialect::Db2i).syntax();
+        let hits = db2_select_without_from_hits(&root, Dialect::Db2i);
+        let keys: Vec<&str> = hits.iter().map(|h| h.key.as_str()).collect();
+        assert_eq!(keys, ["SELECT 1", "SELECT 2", "SELECT 3"]);
     }
 }

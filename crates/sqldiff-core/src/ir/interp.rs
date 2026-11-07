@@ -498,6 +498,11 @@ const JOIN_KEY_BYTES: usize = 16 * 1024;
 enum Step {
     Go(NodeId, Box<State>),
     Fork(Vec<(NodeId, Box<State>)>),
+    /// A decision whose second branch the path budget drops: the first
+    /// branch continues (as `Fork`'s first entry would) and the dropped
+    /// branch is only named. Made when the caller says there is no room
+    /// (`step_in`), so the state is not copied for a branch nobody runs.
+    Pruned(NodeId, Box<State>, NodeId),
     Done(Box<Outcome>),
 }
 
@@ -1627,8 +1632,16 @@ impl Interp<'_> {
             m.outs.push(self.finish(Exit::Normal, *st));
             return;
         }
-        match self.step(node, st) {
+        // Whether a decision's second branch would be kept (see below).
+        let over = m.join.as_ref().is_some_and(|j| j.tick >= JOIN_TICKS);
+        let room = m.work.len() + m.outs.len() + 1 < MAX_PATHS && !over;
+        match self.step_in(node, st, room) {
             Step::Go(n, s) => m.cur = Some((n, s)),
+            Step::Pruned(n, mut s, dropped) => {
+                s.imprecise.push("path budget exhausted".into());
+                s.cut.push(dropped);
+                m.cur = Some((n, s));
+            }
             Step::Fork(mut v) => {
                 let (n, mut s) = v.remove(0);
                 // Paths dropped by joining are not outcomes, so the path budget
@@ -1913,7 +1926,13 @@ impl Interp<'_> {
         }
     }
 
-    fn step(&self, id: NodeId, mut st: Box<State>) -> Step {
+    fn step(&self, id: NodeId, st: Box<State>) -> Step {
+        self.step_in(id, st, true)
+    }
+
+    /// One step of `st` at `id`. `room`: a decision's second branch has a
+    /// place to wait; without one it is dropped, so it is not made.
+    fn step_in(&self, id: NodeId, mut st: Box<State>, room: bool) -> Step {
         let node = self.cfg.node(id);
         match &node.op {
             Op::Entry | Op::Nop => self.next(id, st),
@@ -1991,6 +2010,10 @@ impl Interp<'_> {
                         st.loop_seen.remove(&id);
                         return Step::Go(f, st);
                     }
+                }
+                if !room {
+                    st.signature.push((text, tv));
+                    return Step::Pruned(t, st, f);
                 }
                 let mut a = st.clone();
                 a.signature.push((text.clone(), tv));
