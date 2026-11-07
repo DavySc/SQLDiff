@@ -112,6 +112,13 @@ pub struct Options {
     /// For tests that need to reach the bound with small inputs. A count,
     /// never a time, so a result stays a function of the input.
     pub alignment_bound: Option<usize>,
+    /// What the statement-level checker (alignments and gap pairings of the
+    /// same-dialect tree diff) may spend, in units of metered work
+    /// (`Site::AlignCells` and `Site::GapScores`); `None`, the default, is no
+    /// allowance and changes nothing. Past it the lists not yet aligned take
+    /// the `align.bound` exit with a work-budget witness. A count, never a
+    /// time, so a result stays a function of the input.
+    pub statement_work_cap: Option<u64>,
 }
 
 impl Default for Options {
@@ -132,6 +139,7 @@ impl Default for Options {
             skip_witnesses: false,
             work_budgets: None,
             alignment_bound: None,
+            statement_work_cap: None,
         }
     }
 }
@@ -302,11 +310,12 @@ fn diff_inner(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     let mut receipts = Vec::new();
 
     if same {
-        let mut td = treediff::diff(
+        let mut td = treediff::diff_within(
             &aa,
             &ab,
             opts.alignment_bound
                 .unwrap_or(crate::normalize::DEFAULT_ALIGNMENT_BOUND),
+            opts.statement_work_cap,
         );
         // An observer that does not read row counts does not see SET NOCOUNT,
         // unless the code reads them itself: SET resets @@ROWCOUNT (and
