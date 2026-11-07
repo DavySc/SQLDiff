@@ -428,7 +428,7 @@ pub fn prepare(
     hooks: &crate::tree::Hooks,
     rules: crate::RuleOptions,
 ) -> Result<Base, String> {
-    let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let names = logical_names(files.len(), false);
     let source = crate::tree::catalog(
         files.iter().map(|f| f.text.as_str()),
         from,
@@ -437,7 +437,7 @@ pub fn prepare(
         jobs,
     );
     if !b.is_empty() {
-        let names_b: Vec<&str> = b.iter().map(|f| f.path.as_str()).collect();
+        let names_b = logical_names(b.len(), true);
         let target = crate::tree::catalog(
             b.iter().map(|f| f.text.as_str()),
             to,
@@ -634,7 +634,7 @@ pub fn prepare(
                     "{} `{}` ({} line {}: {})",
                     o.kind,
                     o.name,
-                    files[f].path,
+                    logical_names(files.len(), false)[f],
                     all[f][n].line,
                     seen.status.label()
                 ),
@@ -803,8 +803,19 @@ impl Base {
 /// What a side's catalog is called in binding reasons when base catalogs
 /// are used: `what` and the files.
 pub fn origin(what: &str, files: &[CatalogFile]) -> String {
-    let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let names = logical_names(files.len(), false);
     format!("{what} and base catalogs {}", names.join(", "))
+}
+
+/// What the base catalog files are called in reasons and keys: their
+/// position in the order given, never their path. A path is where the files
+/// happen to be on one machine; the content is in the keys already (the
+/// catalog digest), so the same catalogs moved to another folder, or checked
+/// out on another OS, give the same keys and the same reasons. The report
+/// lists the files by path, in the same order.
+fn logical_names(n: usize, target: bool) -> Vec<String> {
+    let side = if target { "target " } else { "" };
+    (1..=n).map(|i| format!("{side}#{i}")).collect()
 }
 
 /// The tree's objects (`texts`, loaded in order) over the `base` catalog: an

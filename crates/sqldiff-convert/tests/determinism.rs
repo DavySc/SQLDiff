@@ -109,9 +109,8 @@ struct Case<'a> {
 }
 
 /// A JSON value without what differs between runs by design. At the top: the
-/// `run` object and the two folder names. In a report of an increment, also
-/// what says which files it checked.
-fn plain(v: &mut serde_json::Value, top: bool, increments: bool) {
+/// `run` object and the two folder names.
+fn plain(v: &mut serde_json::Value, top: bool) {
     match v {
         serde_json::Value::Object(m) => {
             if top {
@@ -123,14 +122,9 @@ fn plain(v: &mut serde_json::Value, top: bool, increments: bool) {
                     l.remove("path");
                 }
             }
-            if increments {
-                for k in ["checked", "progress", "files_not_checked"] {
-                    m.remove(k);
-                }
-            }
-            m.values_mut().for_each(|x| plain(x, false, increments));
+            m.values_mut().for_each(|x| plain(x, false));
         }
-        serde_json::Value::Array(a) => a.iter_mut().for_each(|x| plain(x, false, increments)),
+        serde_json::Value::Array(a) => a.iter_mut().for_each(|x| plain(x, false)),
         _ => {}
     }
 }
@@ -138,7 +132,7 @@ fn plain(v: &mut serde_json::Value, top: bool, increments: bool) {
 /// Every file under `dir` except the store, relative, with its text; the
 /// JSON reports without what may differ. Nothing else is masked: the
 /// markdown reports and every reason compare whole.
-fn tree_of(dir: &Path, increments: bool) -> Vec<(String, String)> {
+fn tree_of(dir: &Path) -> Vec<(String, String)> {
     let mut v = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -159,14 +153,9 @@ fn tree_of(dir: &Path, increments: bool) -> Vec<(String, String)> {
             let text = std::fs::read_to_string(&p).unwrap();
             let text = if rel.ends_with(".json") && rel.starts_with("conversion-report") {
                 let mut j: serde_json::Value = serde_json::from_str(&text).unwrap();
-                plain(&mut j, true, increments);
+                plain(&mut j, true);
                 j.to_string()
             } else if rel.ends_with(".md") && rel.starts_with("conversion-report") {
-                if increments {
-                    // The increment line of the summary; the tables are
-                    // compared through the JSON report.
-                    continue;
-                }
                 // The report names its output folder once, in its heading.
                 text.replace(&dir.display().to_string(), "<out>")
             } else {
@@ -218,40 +207,24 @@ fn matrix(name: &str, c: Case, ledger: Option<&str>) {
     };
     start("o-a");
     run(&f, &c, "o-a", 1, Select::default(), true);
-    let base = tree_of(&f.out("o-a"), false);
+    let base = tree_of(&f.out("o-a"));
     // Fresh with more threads, into another folder.
     start("o-b");
     run(&f, &c, "o-b", 4, Select::default(), true);
-    same(
-        &base,
-        &tree_of(&f.out("o-b"), false),
-        "-j4 fresh, other folder",
-    );
+    same(&base, &tree_of(&f.out("o-b")), "-j4 fresh, other folder");
     // Resumed from the store another thread count made, both ways.
     run(&f, &c, "o-a", 4, Select::default(), false);
-    same(
-        &base,
-        &tree_of(&f.out("o-a"), false),
-        "-j4 resumed on a -j1 store",
-    );
+    same(&base, &tree_of(&f.out("o-a")), "-j4 resumed on a -j1 store");
     run(&f, &c, "o-b", 1, Select::default(), false);
-    same(
-        &base,
-        &tree_of(&f.out("o-b"), false),
-        "-j1 resumed on a -j4 store",
-    );
+    same(&base, &tree_of(&f.out("o-b")), "-j1 resumed on a -j4 store");
     // --fresh over a store that exists.
     run(&f, &c, "o-a", 3, Select::default(), true);
-    same(
-        &base,
-        &tree_of(&f.out("o-a"), false),
-        "--fresh over a store",
-    );
+    same(&base, &tree_of(&f.out("o-a")), "--fresh over a store");
     // Resumed again and again: the re-check samples differ per run, the
     // output does not.
     for n in 0..4 {
         run(&f, &c, "o-a", 1 + n % 3, Select::default(), false);
-        same(&base, &tree_of(&f.out("o-a"), false), "repeated resume");
+        same(&base, &tree_of(&f.out("o-a")), "repeated resume");
     }
     // Increments with alternating thread counts end where the full run does.
     start("o-inc");
@@ -267,8 +240,8 @@ fn matrix(name: &str, c: Case, ledger: Option<&str>) {
     }
     run(&f, &c, "o-inc", 2, Select::default(), false);
     same(
-        &tree_of(&f.out("o-a"), true),
-        &tree_of(&f.out("o-inc"), true),
+        &tree_of(&f.out("o-a")),
+        &tree_of(&f.out("o-inc")),
         "increments",
     );
 }
@@ -282,6 +255,53 @@ fn thread_count_store_and_folder_never_change_the_output() {
             catalogs: &[],
         },
         None,
+    );
+}
+
+/// The files of a run that a different location of the same inputs must not
+/// change: the converted files, the review queue (reasons) and the names of
+/// the stored results (their keys). The reports list the base catalog files
+/// by the path they were given, so they are left out.
+fn location_free(f: &Fixture, out: &str) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = tree_of(&f.out(out))
+        .into_iter()
+        .filter(|(rel, _)| !rel.starts_with("conversion-report"))
+        .collect();
+    let mut keys: Vec<String> = std::fs::read_dir(f.out(out).join(".sqldiff/results"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    keys.sort();
+    v.push((".sqldiff/results".to_string(), keys.join("\n")));
+    v
+}
+
+#[test]
+fn a_base_catalog_moved_to_another_folder_gives_the_same_keys_and_reasons() {
+    let case = Case {
+        to: Dialect::Postgres,
+        catalogs: &["base.sql"],
+    };
+    // The same inputs in two folders; the catalog file has another name too.
+    let (a, b) = (Fixture::new("moved-a"), Fixture::new("moved-b"));
+    std::fs::rename(b.dir.join("base.sql"), b.dir.join("elsewhere.sql")).unwrap();
+    run(&a, &case, "o", 1, Select::default(), true);
+    run(
+        &b,
+        &Case {
+            to: Dialect::Postgres,
+            catalogs: &["elsewhere.sql"],
+        },
+        "o",
+        1,
+        Select::default(),
+        true,
+    );
+    same(
+        &location_free(&a, "o"),
+        &location_free(&b, "o"),
+        "base catalog in another folder",
     );
 }
 
