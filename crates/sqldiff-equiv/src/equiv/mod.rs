@@ -43,6 +43,7 @@ use crate::model::{
 use canon::{asm, Canon, Item};
 use lower::{Unit, UnitKind};
 use schema::Schema;
+use sqldiff_model::work::Allowance;
 use term::{a, n, Term};
 
 /// Result of comparing two artifacts statement by statement.
@@ -327,18 +328,35 @@ pub fn compare(
     sb: &Schema,
     anchors: &[Anchor],
 ) -> Outcome {
+    compare_within(a, b, sa, sb, anchors, &Allowance::new(None))
+}
+
+/// [`compare`] under a statement-level allowance: past it the statements not
+/// yet compared are each named as not compared (an explicit Unknown reason),
+/// never left silent, because in a cross-dialect comparison silence means
+/// equal. What each unit's comparison spent (the meter's delta) is taken
+/// from the allowance after it ran, so the overshoot is one unit's setup
+/// or one statement pair. An allowance that is off is `compare`.
+pub fn compare_within(
+    a: &Analyzed,
+    b: &Analyzed,
+    sa: &Schema,
+    sb: &Schema,
+    anchors: &[Anchor],
+    allowance: &Allowance,
+) -> Outcome {
     let mut out = Outcome::default();
     if let Some(pairs) = trigger::pairs(a, b, sa, sb, &mut out) {
         for (mut ua, mut ub, sa, sb) in pairs {
             tv_names(a, b, &mut ua, &mut ub);
-            compare_units(a, b, &ua, &ub, &sa, &sb, anchors, &mut out);
+            compare_units(a, b, &ua, &ub, &sa, &sb, anchors, allowance, &mut out);
         }
         return out;
     }
     if let Some(e) = trigger::embedded(a, b, sa, sb, &mut out) {
         for (mut ua, mut ub, sa, sb) in e.pairs {
             tv_names(a, b, &mut ua, &mut ub);
-            compare_units(a, b, &ua, &ub, &sa, &sb, anchors, &mut out);
+            compare_units(a, b, &ua, &ub, &sa, &sb, anchors, allowance, &mut out);
         }
         // The rest of the artifacts, with the triggers and what was written
         // for them blanked out (same offsets and lines).
@@ -350,10 +368,10 @@ pub fn compare(
             Analyzed::new(&xa, a.side, a.excerpt_lines),
             Analyzed::new(&xb, b.side, b.excerpt_lines),
         );
-        compare_rest(&ra, &rb, sa, sb, anchors, &mut out);
+        compare_rest(&ra, &rb, sa, sb, anchors, allowance, &mut out);
         return out;
     }
-    compare_rest(a, b, sa, sb, anchors, &mut out);
+    compare_rest(a, b, sa, sb, anchors, allowance, &mut out);
     out
 }
 
@@ -382,6 +400,7 @@ fn compare_rest(
     sa: &Schema,
     sb: &Schema,
     anchors: &[Anchor],
+    allowance: &Allowance,
     out: &mut Outcome,
 ) {
     let mut pairs = script::segment_pairs(a, b, anchors, out).unwrap_or_else(|| {
@@ -401,7 +420,7 @@ fn compare_rest(
     for (mut ua, mut ub) in pairs {
         script::name_locals(&mut ua, &mut ub);
         tv_names(a, b, &mut ua, &mut ub);
-        compare_units(a, b, &ua, &ub, sa, sb, anchors, out);
+        compare_units(a, b, &ua, &ub, sa, sb, anchors, allowance, out);
     }
 }
 
@@ -484,8 +503,55 @@ fn compare_units(
     sa: &Schema,
     sb: &Schema,
     anchors: &[Anchor],
+    allowance: &Allowance,
     out: &mut Outcome,
 ) {
+    let before = sqldiff_model::work::now().total();
+    compare_units_within(a, b, ua, ub, sa, sb, anchors, allowance, out);
+    allowance.take(sqldiff_model::work::now().total().saturating_sub(before));
+}
+
+/// The text of an explicit Unknown for work the statement-level allowance
+/// did not allow.
+fn budget_reason(allowance: &Allowance) -> String {
+    format!(
+        "not compared: past the statement-level work budget ({} of {} units of work)",
+        allowance.spent(),
+        allowance.cap().unwrap_or(0)
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compare_units_within(
+    a: &Analyzed,
+    b: &Analyzed,
+    ua: &Unit,
+    ub: &Unit,
+    sa: &Schema,
+    sb: &Schema,
+    anchors: &[Anchor],
+    allowance: &Allowance,
+    out: &mut Outcome,
+) {
+    if allowance.exhausted() {
+        // A unit not compared at all: each of its statements is named, on
+        // both sides, and so is the unit (its header and signature).
+        let why = budget_reason(allowance);
+        for (side, u) in [(a, ua), (b, ub)] {
+            let name = side_name(side);
+            out.unknown_reasons.push(format!(
+                "{name} line {}: the routine or script segment is {why}",
+                u.stmts.first().map_or(0, |s| side.line_of(&s.node))
+            ));
+            for s in &u.stmts {
+                out.unknown_reasons.push(format!(
+                    "{name} line {}: statement is {why}",
+                    side.line_of(&s.node)
+                ));
+            }
+        }
+        return;
+    }
     let (la, lb) = (local_schema(sa, ua), local_schema(sb, ub));
     let (sa, sb) = (la.as_ref(), lb.as_ref());
     let (na, nb) = (side_name(a), side_name(b));
@@ -622,7 +688,7 @@ fn compare_units(
         certain: ia.len() == 1 && ib.len() == 1 && !ua.txn_control && !ub.txn_control,
     });
     let gaps = [gaps(a, ua, &ia), gaps(b, ub, &ib)];
-    let pairs = pair_items(a, b, &ia, &ib, &gaps, anchors, wit.as_ref(), out);
+    let pairs = pair_items(a, b, &ia, &ib, &gaps, anchors, wit.as_ref(), allowance, out);
     out.identity
         .push(identity::analyze(a, b, ua, ub, &ia, &ib, &pairs));
     calls(a, b, ua, ub, sa, sb, anchors, ((&ia, &ib), &pairs), out);
@@ -4974,6 +5040,7 @@ fn pair_items(
     gaps: &[Vec<Gap>; 2],
     anchors: &[Anchor],
     wit: Option<&Witnessing>,
+    allowance: &Allowance,
     out: &mut Outcome,
 ) -> Vec<(usize, usize)> {
     let ka: Vec<String> = ia.iter().map(|x| key(&x.term)).collect();
@@ -5102,7 +5169,22 @@ fn pair_items(
         })
         .count();
     let wit = wit.filter(|_| all_paired && unequal == 1);
-    for &(i, j) in &pairs {
+    for (n, &(i, j)) in pairs.iter().enumerate() {
+        if allowance.exhausted() {
+            // The pairs from here on are not compared: each statement says
+            // so, because a pair with no finding reads as equal.
+            let why = budget_reason(allowance);
+            for &(i, j) in &pairs[n..] {
+                for (side, it) in [(a, &ia[i]), (b, &ib[j])] {
+                    out.unknown_reasons.push(format!(
+                        "{} line {}: statement is {why}",
+                        side_name(side),
+                        line(side, &it.nodes)
+                    ));
+                }
+            }
+            break;
+        }
         // The other statements are only read for a witness search.
         let (oa, ob) = match wit {
             Some(_) => (other_terms(ia, i), other_terms(ib, j)),
@@ -5116,6 +5198,11 @@ fn pair_items(
             wit.map(|w| (w, [&oa[..], &ob[..]])),
             out,
         );
+        // One unit for the pair: its comparison is mostly unmetered, and an
+        // allowance that only saw the meter would never run out between two
+        // pairs. The metered work of the whole unit is taken when the unit
+        // ends (`compare_units`), not again here.
+        allowance.take(1);
     }
     pairs
 }

@@ -463,7 +463,8 @@ fn diff_inner(
                 findings.push(rules::analysis::to_finding(side, &h, Verdict::Unknown));
             }
         }
-        eq = equiv::compare(&aa, &ab, &schema_a, &schema_b, &opts.anchors);
+        let allowance = sqldiff_model::work::Allowance::new(opts.statement_work_cap);
+        eq = equiv::compare_within(&aa, &ab, &schema_a, &schema_b, &opts.anchors, &allowance);
         findings.append(&mut eq.findings);
         // Rows-affected counts across dialects (decision 1, observer profile).
         let (ca, cb) = (
