@@ -206,7 +206,7 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 |---|---|
 | `for_check` | per-check handle (side + sink) |
 | `catalog` | the view door (Supplied) |
-| `sources` | Spellings (the recorded source list) |
+| `sources` | Supplied / Origin (the recorded source list) |
 | `lists_stars` | HiddenTables (the `list_stars` flag) |
 | `is_star_view` | StarView |
 | `column_types` | ColumnNamed / SchemaTables |

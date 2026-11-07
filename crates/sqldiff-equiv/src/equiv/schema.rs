@@ -806,7 +806,11 @@ impl Schema {
     /// when the columns they return are.
     #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: `all`
     pub fn list_stars_with(&mut self, other: &mut Schema) {
-        if self.hides_columns() || other.hides_columns() {
+        // Both sides are asked, never `||`: a short circuit would leave the
+        // other side's `HiddenTables` read unrecorded although the mirrored
+        // decision below uses it.
+        let (hides_a, hides_b) = (self.hides_columns(), other.hides_columns());
+        if hides_a || hides_b {
             self.list_stars = true;
             other.list_stars = true;
             // A view defined with `*` returns what its sources do, so it is

@@ -106,11 +106,28 @@ fn reads_are_filed_under_the_role_not_the_cache() {
         side(&after, Side::Source),
         "editing the target must not move a read filed under the source"
     );
-    assert_ne!(
-        side(&before, Side::Target),
-        side(&after, Side::Target),
-        "the target's reads must show the edit"
+    // A replay re-asks the recorded queries: it rejects only when a query
+    // already in the read set answers differently (a new key alone would
+    // not make it reject).
+    assert!(
+        moved(&before, &after, Side::Target),
+        "an answer recorded under the target must change when the target is edited"
     );
+    assert!(
+        !moved(&before, &after, Side::Source),
+        "no answer recorded under the source may change"
+    );
+}
+
+/// Whether some read of `before` under `side` answers differently in `after`.
+fn moved(
+    before: &BTreeMap<(Side, Query), Outcome>,
+    after: &BTreeMap<(Side, Query), Outcome>,
+    side: Side,
+) -> bool {
+    before
+        .iter()
+        .any(|(k, o)| k.0 == side && after.get(k).is_some_and(|n| n != o))
 }
 
 #[test]
@@ -163,4 +180,32 @@ fn a_visible_column_added_to_a_hidden_table_moves_the_hidden_read() {
     assert!(before
         .keys()
         .any(|(s, q)| *s == Side::Target && *q == Query::SchemaTables("t".into())));
+}
+
+#[test]
+fn a_hidden_table_added_to_the_target_alone_moves_a_recorded_read() {
+    // The source has a hidden table, so a short-circuited `||` would never
+    // ask the target's `HiddenTables`. Adding a hidden table to the target
+    // alone must change an answer that was already recorded, or a replay
+    // would take a stale result.
+    const OTHER_HIDDEN: &str = "CREATE TABLE dbo.u (k INT NOT NULL PRIMARY KEY, f DATETIME2 GENERATED ALWAYS AS ROW START HIDDEN NOT NULL, e DATETIME2 GENERATED ALWAYS AS ROW END HIDDEN NOT NULL, v INT NULL, PERIOD FOR SYSTEM_TIME (f, e)) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.u_h));";
+    const PLAIN_T: &str = "CREATE TABLE dbo.t (k INT NOT NULL PRIMARY KEY, v INT NULL);";
+    let run = |target: &[&str]| {
+        reads(
+            &catalog(T, &[HIDDEN]),
+            &catalog(T, target),
+            "SELECT 1;",
+            "SELECT 1;",
+        )
+    };
+    let before = run(&[PLAIN_T]);
+    let after = run(&[PLAIN_T, OTHER_HIDDEN]);
+    assert!(
+        before
+            .keys()
+            .any(|(s, q)| *s == Side::Target && *q == Query::HiddenTables),
+        "the target's HiddenTables is recorded although the source hides columns"
+    );
+    assert!(moved(&before, &after, Side::Target));
+    assert!(!moved(&before, &after, Side::Source));
 }
