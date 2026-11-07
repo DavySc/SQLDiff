@@ -102,6 +102,7 @@ pub(crate) fn convert(
 ) -> Out {
     let mut cx = Cx {
         src,
+        lines: std::cell::OnceCell::new(),
         to,
         options,
         catalog,
@@ -388,6 +389,10 @@ struct AliasType {
 
 struct Cx<'a> {
     src: &'a str,
+    /// Line starts of `src`, built when the first refusal needs a line: the
+    /// source line of a statement is found by binary search, not by counting
+    /// newlines from the start of the file for each one.
+    lines: std::cell::OnceCell<sqldiff_syntax::LineIndex>,
     /// Target dialect: PostgreSQL or Db2 for i.
     to: Dialect,
     /// The options this conversion runs with.
@@ -698,7 +703,11 @@ impl<'a> Cx<'a> {
         if self.mode != Mode::Top {
             // Inside a routine or block the rest still runs: stop there
             // rather than skip the statement and carry on.
-            let line = self.src[..Self::range(n).0].matches('\n').count() + 1;
+            let line = self
+                .lines
+                .get_or_init(|| sqldiff_syntax::LineIndex::new(self.src))
+                .line_col(Self::range(n).0)
+                .0;
             let msg = format!("sqldiff: statement at source line {line} was not converted");
             text.push_str(&if self.db2() {
                 format!("SIGNAL SQLSTATE '75001' SET MESSAGE_TEXT = '{msg}';\n")
