@@ -75,7 +75,48 @@ pub struct TreeDiff {
     pub receipts: Vec<Receipt>,
 }
 
-pub fn diff(a: &Analyzed, b: &Analyzed) -> TreeDiff {
+/// The most statements of the two sides that `diff_gap` pairs by similarity
+/// (`x.len() * y.len()` scores, each a comparison of up to 400 tokens): past
+/// it the gap is not looked into.
+const GAP_BOUND: usize = 4_000_000;
+
+/// One Unknown finding for two lists that were not aligned: they are past
+/// the bound of the alignment, so what lies between the parts that did match
+/// is neither paired nor called added, removed or moved. Equivalence is not
+/// established for it.
+pub fn alignment_bound_finding(
+    object: &str,
+    what: &str,
+    na: usize,
+    nb: usize,
+    a: Option<crate::model::Location>,
+    b: Option<crate::model::Location>,
+) -> Finding {
+    let class = ChangeClass::Semantic;
+    let rule = "align.bound";
+    let anchor = format!("{what}:{na}x{nb}");
+    Finding {
+        fingerprint: fingerprint(&FingerprintInput {
+            object,
+            class,
+            rule,
+            anchor_a: &anchor,
+            anchor_b: "",
+        }),
+        rule: rule.to_string(),
+        class,
+        severity: class.default_severity(),
+        verdict: Verdict::Unknown,
+        witness: format!(
+            "{na} {what} on side A and {nb} on side B could not be aligned: the two lists are past the alignment bound. What lies between the parts that matched is not paired and not reported as added, removed or moved. Equivalence is not established."
+        ),
+        a,
+        b,
+        assumptions: Vec::new(),
+    }
+}
+
+pub fn diff(a: &Analyzed, b: &Analyzed, work: usize) -> TreeDiff {
     let ua: Vec<Unit> = ast::structural_children(&a.root)
         .into_iter()
         .map(|n| build_unit(n, a))
@@ -98,6 +139,9 @@ pub fn diff(a: &Analyzed, b: &Analyzed) -> TreeDiff {
         added: Vec::new(),
         hashes_a: all_hashes(&ua),
         hashes_b: all_hashes(&ub),
+        skipped_a: HashSet::new(),
+        skipped_b: HashSet::new(),
+        work,
     };
     ctx.diff_lists(&ua, &ub);
     ctx.resolve_unpaired();
@@ -114,6 +158,13 @@ struct Ctx<'x, 'a> {
     /// twin exists on the other side may have moved.
     hashes_a: HashSet<String>,
     hashes_b: HashSet<String>,
+    /// Content hashes of the units in the stretches that were not aligned
+    /// (past the alignment bound), per side: a unit left without a twin
+    /// whose twin is among them may only have moved there.
+    skipped_a: HashSet<String>,
+    skipped_b: HashSet<String>,
+    /// The exact-alignment bound ([`crate::normalize::lcs_pairs_bounded`]).
+    work: usize,
 }
 
 fn all_hashes(units: &[Unit]) -> HashSet<String> {
@@ -134,13 +185,34 @@ impl Ctx<'_, '_> {
     fn diff_lists(&mut self, a: &[Unit], b: &[Unit]) {
         let ka: Vec<&str> = a.iter().map(|u| u.full.as_str()).collect();
         let kb: Vec<&str> = b.iter().map(|u| u.full.as_str()).collect();
-        let anchors = crate::normalize::lcs_pairs(&ka, &kb);
+        let (anchors, exact) = crate::normalize::lcs_pairs_bounded(&ka, &kb, self.work);
         let (mut ai, mut bj) = (0, 0);
         for (i, j) in anchors
             .into_iter()
             .chain(std::iter::once((a.len(), b.len())))
         {
-            self.diff_gap(&a[ai..i], &b[bj..j]);
+            let (ga, gb) = (&a[ai..i], &b[bj..j]);
+            // A gap with units on both sides is not paired when the
+            // alignment is partial or the gap is too large to score.
+            if !ga.is_empty()
+                && !gb.is_empty()
+                && (!exact || ga.len().saturating_mul(gb.len()) > GAP_BOUND)
+            {
+                let loc = |x: &Analyzed, us: &[Unit]| us.first().map(|u| x.node_location(&u.node));
+                let f = alignment_bound_finding(
+                    self.object(),
+                    "statements",
+                    ga.len(),
+                    gb.len(),
+                    loc(self.a, ga),
+                    loc(self.b, gb),
+                );
+                self.out.findings.push(f);
+                self.skipped_a.extend(all_hashes(ga));
+                self.skipped_b.extend(all_hashes(gb));
+            } else {
+                self.diff_gap(ga, gb);
+            }
             if i < a.len() {
                 self.matched(&a[i], &b[j]);
             }
@@ -560,14 +632,35 @@ impl Ctx<'_, '_> {
         } else {
             (ChangeClass::Structural, Verdict::Unknown)
         };
+        // Its twin may be in a stretch that was not aligned: it may have
+        // moved there, so no counterpart is not shown.
+        let in_skipped = if removed {
+            self.skipped_b.contains(&u.full)
+        } else {
+            self.skipped_a.contains(&u.full)
+        };
+        let verdict = if in_skipped {
+            Verdict::Unknown
+        } else {
+            verdict
+        };
         let side = if removed { self.a } else { self.b };
         let (this, other) = if removed { ("A", "B") } else { ("B", "A") };
-        let witness = format!(
-            "Side {this} runs {} `{}` (line {}); side {other} has no counterpart.",
-            article(u.kind.label()),
-            side.snippet(&u.node, 80),
-            side.line_of(&u.node)
-        );
+        let witness = if in_skipped {
+            format!(
+                "Side {this} runs {} `{}` (line {}); side {other} has no counterpart outside a stretch of statements that was not aligned, where it may have moved to.",
+                article(u.kind.label()),
+                side.snippet(&u.node, 80),
+                side.line_of(&u.node)
+            )
+        } else {
+            format!(
+                "Side {this} runs {} `{}` (line {}); side {other} has no counterpart.",
+                article(u.kind.label()),
+                side.snippet(&u.node, 80),
+                side.line_of(&u.node)
+            )
+        };
         let rule = if removed {
             "stmt.removed"
         } else {
