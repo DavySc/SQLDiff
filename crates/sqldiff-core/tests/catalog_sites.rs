@@ -1,0 +1,537 @@
+//! The inventory of catalog read sites (performance plan W4.3, PR 1).
+//!
+//! `docs/catalog-read-sites.md` lists every place the check reads a catalog
+//! and the [`Query`](sqldiff_catalog::record::Query) it becomes when the
+//! reads are recorded (PRs 2a and 2b). It is generated from this file and
+//! checked against it:
+//!
+//! - the **door counts** are scanned from the non-test sources of the check
+//!   crates; a new read of a catalog changes a count, fails this test, and
+//!   has to be added to the table below with its query before it can land;
+//! - every **site** below names an anchor (a function or a line of code) that
+//!   must still exist in its file, so the table cannot drift from the code;
+//! - the public methods of `CatalogView` and `Schema` are listed with what
+//!   they become, and a method added to either fails the test.
+//!
+//! `SQLDIFF_BLESS=1 cargo test -p sqldiff-core --test catalog_sites`
+//! regenerates the document.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use regex::Regex;
+
+fn crates_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
+}
+
+fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for p in entries {
+        if p.is_dir() {
+            rs_files(&p, out);
+        } else if p.extension().is_some_and(|e| e == "rs") {
+            out.push(p);
+        }
+    }
+}
+
+/// The text without `#[cfg(test)] mod name { ... }` blocks.
+fn without_test_modules(text: &str) -> String {
+    let start =
+        Regex::new(r"(?m)^[ \t]*#\[cfg\(test\)\]\s*(pub(\(crate\))?\s+)?mod\s+\w+\s*\{").unwrap();
+    let mut out = String::new();
+    let mut at = 0;
+    while let Some(m) = start.find_at(text, at) {
+        out.push_str(&text[at..m.start()]);
+        at = m.end() + block_end(&text[m.end()..]);
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
+/// The length of a Rust block's body up to and including the `}` that closes
+/// it; braces in strings, character literals and comments do not count.
+fn block_end(s: &str) -> usize {
+    let b = s.as_bytes();
+    let mut depth = 1usize;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'r' if matches!(b.get(i + 1), Some(b'#' | b'"'))
+                && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) =>
+            {
+                let mut j = i + 1;
+                while b.get(j) == Some(&b'#') {
+                    j += 1;
+                }
+                if b.get(j) == Some(&b'"') {
+                    let close = format!("\"{}", "#".repeat(j - i - 1));
+                    let rest = &s[j + 1..];
+                    i = j + 1 + rest.find(&close).expect("closed raw string") + close.len() - 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'\'' => {
+                if b.get(i + 1) == Some(&b'\\') {
+                    if let Some(k) = s[i + 2..].find('\'') {
+                        i += 2 + k;
+                    }
+                } else if b.get(i + 2) == Some(&b'\'') {
+                    i += 2;
+                } else if let Some(c) = s[i + 1..].chars().next() {
+                    let n = c.len_utf8();
+                    if b.get(i + 1 + n) == Some(&b'\'') {
+                        i += 1 + n;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    panic!("unbalanced test module");
+}
+
+/// Comments cut from the text, so prose does not count as a read.
+fn without_comments(text: &str) -> String {
+    text.lines()
+        .map(|l| match l.find("//") {
+            Some(i) if !l[..i].contains('"') => &l[..i],
+            _ => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Where the check reads: the crates of the check stage and of pass 1.
+const CRATES: &[(&str, &str)] = &[
+    ("sqldiff-core/src", "check"),
+    ("sqldiff-equiv/src", "check"),
+    ("sqldiff-model/src", "check"),
+    ("sqldiff-draft/src", "pass 1"),
+    ("sqldiff-convert/src", "driver"),
+];
+
+/// A kind of door: how the check can reach a catalog.
+const DOORS: &[(&str, &str, &str)] = &[
+    (
+        "catalog accessor",
+        r"\.catalog\(\)",
+        "`CatalogView::catalog` / `Schema::catalog`: the whole-catalog door. Gone after PR 2a (a `RecordingView` has no accessor).",
+    ),
+    (
+        "authoritative",
+        r"\b(tables|routines)_authoritative\b",
+        "`TablesAuthoritative`, `RoutinesAuthoritative(kind)`.",
+    ),
+    (
+        "supplied / origins",
+        r"\.supplied\b|\.origins\b|\.origin\(\)",
+        "`Supplied`, `Origin`. The fields become private in PR 2a.",
+    ),
+    (
+        "view lookups",
+        r"\.(table|routines)\(",
+        "`Table(parts)`, `Routines(parts)` on a view; on a `Schema`, `SchemaTables(name)` (see the sites). Counts include both.",
+    ),
+    (
+        "schema tables",
+        r"\.(tables|table_exact|with_images|with_ddl|with_local)\(",
+        "The equivalence schema's table set: `SchemaTables`, `ColumnNamed`, `ViewFamily`, `HiddenTables` (PR 2b).",
+    ),
+    (
+        "options catalogs",
+        r"\b(facts|catalog)_[ab]\b",
+        "The `Options` door: becomes an opaque `Facts` handle only the engine opens (PR 2a).",
+    ),
+    (
+        "triggers",
+        r"\.triggers\b|\btriggers_named\b",
+        "`TriggersNamed`, `TriggersOn`, `TriggersRunning`.",
+    ),
+    (
+        "view type",
+        r"\bCatalogView\b",
+        "Where a bare `CatalogView` is held. Check crates hold a `RecordingView` or a `LocalView` after PR 2a.",
+    ),
+];
+
+/// One read site: where it is, what it reads, the query it becomes.
+struct Site {
+    id: &'static str,
+    file: &'static str,
+    anchor: &'static str,
+    query: &'static str,
+    note: &'static str,
+}
+
+const SITES: &[Site] = &[
+    Site {
+        id: "B1",
+        file: "sqldiff-core/src/bind/query.rs",
+        anchor: "fn table_ref(",
+        query: "`Table(parts)`, `TablesAuthoritative`, `Origin`",
+        note: "Table lookup with `NoSchema`/`NotFound` outcomes; the reason text formats the origin.",
+    },
+    Site {
+        id: "B2",
+        file: "sqldiff-core/src/bind/query.rs",
+        anchor: "fn unknown_column_in(",
+        query: "`Origin`",
+        note: "Reason text.",
+    },
+    Site {
+        id: "B3",
+        file: "sqldiff-core/src/bind/query.rs",
+        anchor: "fn resolve_call(",
+        query: "`Routines(parts)`, `RoutinesAuthoritative(kind)`, `Origin`",
+        note: "Overloads in catalog order; the file-local routines are a `LocalView`, not a read.",
+    },
+    Site {
+        id: "B4",
+        file: "sqldiff-core/src/bind/query.rs",
+        anchor: "fn unresolved_bare(",
+        query: "`Origin`",
+        note: "Reason text.",
+    },
+    Site {
+        id: "E1",
+        file: "sqldiff-core/src/engine.rs",
+        anchor: "view_a.supplied",
+        query: "`Supplied` per side",
+        note: "A8: field reads. Today the key tells `none` from a catalog; once digests leave the key, `supplied` stays in it.",
+    },
+    Site {
+        id: "A1",
+        file: "sqldiff-equiv/src/equiv/schema.rs",
+        anchor: "pub fn hides_columns(",
+        query: "`HiddenTables` per side, plus `SchemaTables` for each counterpart",
+        note: "Runs for every file (`list_stars_with`, `mirrored`). If this falls back to `WholeCatalog`, the series buys nothing.",
+    },
+    Site {
+        id: "A2",
+        file: "sqldiff-equiv/src/equiv/edit.rs",
+        anchor: "fn typed_class(",
+        query: "`ColumnNamed(name)`",
+        note: "Scans `schema.tables()` (deduplicated set) for a column of that name.",
+    },
+    Site {
+        id: "A3",
+        file: "sqldiff-equiv/src/equiv/schema.rs",
+        anchor: "pub fn table_exact(",
+        query: "`SchemaTables(lower name)`",
+        note: "`Schema::table`, `table_exact`, `with_ddl`, `with_images`: base and temporary tables by `to_lowercase` unqualified name, last one wins, `ambiguous` across schemas. Not `Ident::key`.",
+    },
+    Site {
+        id: "A4",
+        file: "sqldiff-equiv/src/equiv/schema.rs",
+        anchor: "types_from_source && !t.star_outputs",
+        query: "`ViewFamily(name)`",
+        note: "Views typed from a source: every non-view table of the source's name under `eq_ignore_ascii_case`, and their columns; two views of a name give an empty map. A flag digest would be too coarse.",
+    },
+    Site {
+        id: "A5",
+        file: "sqldiff-equiv/src/equiv/schema.rs",
+        anchor: "if d == Dialect::Postgres {",
+        query: "`Spellings(lower name)`",
+        note: "PostgreSQL spellings over schemas, routine schemas and names, table schemas and names, columns, keys and indexes: seven sources.",
+    },
+    Site {
+        id: "A6",
+        file: "sqldiff-equiv/src/equiv/call.rs",
+        anchor: "fn exists(target: &Target, view: &CatalogView",
+        query: "`SchemaKnown(part)`, `Table(parts)`, `Routines(parts)`, and the scan at the end",
+        note: "Comment targets. The `tables.iter().any(..)` scan is a named `Scan` or `WholeCatalog`.",
+    },
+    Site {
+        id: "C1",
+        file: "sqldiff-equiv/src/equiv/call.rs",
+        anchor: "fn switches(",
+        query: "`Table(parts)` on both sides",
+        note: "Versioning declared on the table and its history table on the other side.",
+    },
+    Site {
+        id: "C2",
+        file: "sqldiff-equiv/src/equiv/call.rs",
+        anchor: "fn comments(",
+        query: "`Table(parts)`, `Routines(parts)`",
+        note: "COMMENT ON targets.",
+    },
+    Site {
+        id: "C3",
+        file: "sqldiff-equiv/src/equiv/call.rs",
+        anchor: "fn callee<'v>(",
+        query: "`Routines(parts)`",
+        note: "The routine a CALL names.",
+    },
+    Site {
+        id: "K1",
+        file: "sqldiff-equiv/src/equiv/canon.rs",
+        anchor: "fn user_fn(",
+        query: "`Routines(parts)`",
+        note: "A user function in an expression.",
+    },
+    Site {
+        id: "K2",
+        file: "sqldiff-equiv/src/equiv/canon.rs",
+        anchor: "fn schema_unindexed(",
+        query: "`Table(parts)`",
+        note: "Whether a column set is covered by an index.",
+    },
+    Site {
+        id: "A7",
+        file: "sqldiff-equiv/src/equiv/mod.rs",
+        anchor: "fn trigger_drop(",
+        query: "`TriggersNamed`, `TriggersOn`, `TriggersRunning`",
+        note: "Triggers by name; PostgreSQL triggers with a name on a table; any other trigger that runs the function.",
+    },
+    Site {
+        id: "A8",
+        file: "sqldiff-equiv/src/equiv/schema.rs",
+        anchor: "sources: view.origins.clone()",
+        query: "`Origin`, `Supplied`",
+        note: "`Schema::catalog()` is `None` when nothing was supplied; origins reach witnesses.",
+    },
+    Site {
+        id: "A9",
+        file: "sqldiff-convert/src/check.rs",
+        anchor: "fn check_with_mix(",
+        query: "the union of the reads of every `check_one` inside, the losing variants included",
+        note: "The result is the best of two or three checks. A catalog edit that flips which variant wins must not replay clean. The pass-1 reads inside `rebuild` are covered by rebuilding the mix against the current catalog on reuse.",
+    },
+    Site {
+        id: "P1",
+        file: "sqldiff-draft/src/tsql.rs",
+        anchor: "catalog: Option<&'a sqldiff_equiv::catalog::Catalog>",
+        query: "pass 1 `SourceReads` (sandbox only until Phase B)",
+        note: "`Cx` holds the whole-tree source catalog directly.",
+    },
+    Site {
+        id: "P2",
+        file: "sqldiff-draft/src/tsql.rs",
+        anchor: "local: std::cell::OnceCell<sqldiff_equiv::catalog::Catalog>",
+        query: "none (the file's own DDL)",
+        note: "Not an external input: built from the file's text.",
+    },
+    Site {
+        id: "T1",
+        file: "sqldiff-convert/src/tree.rs",
+        anchor: "opts.facts_a.first().map(|c| c.as_ref())",
+        query: "pass 1 handle",
+        note: "Pass 1 reads the catalog back out of `Options`; it should hold the tree state's own `Arc<Catalog>`.",
+    },
+];
+
+/// `CatalogView` public methods: each is a builder or becomes a query.
+const VIEW_METHODS: &[(&str, &str)] = &[
+    ("new", "builder"),
+    ("catalog", "removed in PR 2a (was the whole-catalog door)"),
+    ("scratch", "builder (a `LocalView`)"),
+    ("put_table", "builder"),
+    ("put_routine", "builder"),
+    ("apply_statement", "builder"),
+    ("tables_authoritative", "TablesAuthoritative"),
+    ("routines_authoritative", "RoutinesAuthoritative"),
+    ("origin", "Origin"),
+    ("table", "Table"),
+    ("routines", "Routines"),
+];
+
+/// `Schema` public methods: each is a builder or reads the catalog.
+const SCHEMA_METHODS: &[(&str, &str)] = &[
+    ("catalog", "the view door (Supplied)"),
+    ("is_empty", "SchemaTables (any)"),
+    ("tables", "SchemaTables / ColumnNamed"),
+    ("table", "SchemaTables"),
+    ("view_column_is_not_char", "ViewFamily"),
+    ("table_exact", "SchemaTables"),
+    ("with_images", "builder over SchemaTables"),
+    ("with_ddl", "builder over SchemaTables"),
+    ("with_local", "builder (the file's own DDL)"),
+    ("case_check", "SchemaTables"),
+    ("load", "builder"),
+    ("hides_columns", "HiddenTables"),
+    ("list_stars_with", "HiddenTables / SchemaTables"),
+    ("from_view", "builder (Spellings, ViewFamily, StarView)"),
+    (
+        "from_shared_view",
+        "builder (Spellings, ViewFamily, StarView)",
+    ),
+];
+
+fn pub_fns_of_impl(file: &str, header: &str) -> Vec<String> {
+    let text = std::fs::read_to_string(crates_dir().join(file)).unwrap();
+    let start = text
+        .find(header)
+        .unwrap_or_else(|| panic!("no `{header}` in {file}"));
+    let body = &text[start + header.len()..];
+    let body = &body[..block_end(body)];
+    let re = Regex::new(r"(?m)^    pub fn (\w+)").unwrap();
+    re.captures_iter(body).map(|c| c[1].to_string()).collect()
+}
+
+#[test]
+fn the_public_methods_of_the_catalog_readers_are_all_classified() {
+    for (file, header, table) in [
+        (
+            "sqldiff-catalog/src/lib.rs",
+            "impl CatalogView {",
+            VIEW_METHODS,
+        ),
+        (
+            "sqldiff-equiv/src/equiv/schema.rs",
+            "impl Schema {",
+            SCHEMA_METHODS,
+        ),
+    ] {
+        let got = pub_fns_of_impl(file, header);
+        let want: Vec<String> = table.iter().map(|(n, _)| n.to_string()).collect();
+        assert_eq!(
+            got, want,
+            "{header} changed: a new public method reads (or builds) a catalog; \
+             give it a query in the table in tests/catalog_sites.rs (and a `Query` variant if it reads)"
+        );
+    }
+}
+
+#[test]
+fn every_site_anchor_exists() {
+    for s in SITES {
+        let text = std::fs::read_to_string(crates_dir().join(s.file))
+            .unwrap_or_else(|e| panic!("{}: {e}", s.file));
+        assert!(
+            text.contains(s.anchor),
+            "site {} ({}): anchor `{}` is gone; update the inventory",
+            s.id,
+            s.file,
+            s.anchor
+        );
+    }
+}
+
+/// Counts per door and file, from the non-test sources.
+fn door_counts() -> BTreeMap<(String, String), usize> {
+    let root = crates_dir();
+    let mut counts = BTreeMap::new();
+    for (dir, _) in CRATES {
+        let mut files = Vec::new();
+        rs_files(&root.join(dir), &mut files);
+        assert!(!files.is_empty(), "no sources under {dir}");
+        for p in files {
+            let rel = p
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text =
+                without_comments(&without_test_modules(&std::fs::read_to_string(&p).unwrap()));
+            for (name, re, _) in DOORS {
+                let n = Regex::new(re).unwrap().find_iter(&text).count();
+                if n > 0 {
+                    counts.insert((name.to_string(), rel.clone()), n);
+                }
+            }
+        }
+    }
+    counts
+}
+
+fn markdown() -> String {
+    let counts = door_counts();
+    let mut out = String::new();
+    out.push_str("# Catalog read sites\n\n");
+    out.push_str(
+        "Generated by `crates/sqldiff-core/tests/catalog_sites.rs`; do not edit by hand:\n\
+         `SQLDIFF_BLESS=1 cargo test -p sqldiff-core --test catalog_sites`.\n\n\
+         Inventory for the recorded-catalog-reads series (performance plan W4.3). It lists where \
+         the check reads a catalog and the query each read becomes. See \
+         `perf-plan/w4-3-recorded-catalog-reads-design.md`.\n\n",
+    );
+    out.push_str("## Sites\n\n| id | file | anchor | becomes | note |\n|---|---|---|---|---|\n");
+    for s in SITES {
+        out.push_str(&format!(
+            "| {} | `{}` | `{}` | {} | {} |\n",
+            s.id,
+            s.file,
+            s.anchor.replace('|', "\\|"),
+            s.query.replace('|', "\\|"),
+            s.note.replace('|', "\\|")
+        ));
+    }
+    out.push_str("\n## Doors\n\nCounts of each kind of door in the non-test sources, comments left out. A change here fails the test: add the new read to the sites above.\n\n");
+    for (name, re, what) in DOORS {
+        out.push_str(&format!("### {name}\n\n`{re}`: {what}\n\n"));
+        out.push_str("| file | stage | count |\n|---|---|---|\n");
+        for ((n, file), c) in &counts {
+            if n == name {
+                let stage = CRATES
+                    .iter()
+                    .find(|(d, _)| file.starts_with(*d))
+                    .map(|(_, s)| *s)
+                    .unwrap_or("");
+                out.push_str(&format!("| `{file}` | {stage} | {c} |\n"));
+            }
+        }
+        out.push('\n');
+    }
+    out.push_str("## `CatalogView` public methods\n\n| method | becomes |\n|---|---|\n");
+    for (m, q) in VIEW_METHODS {
+        out.push_str(&format!("| `{m}` | {q} |\n"));
+    }
+    out.push_str("\n## `Schema` public methods\n\n| method | becomes |\n|---|---|\n");
+    for (m, q) in SCHEMA_METHODS {
+        out.push_str(&format!("| `{m}` | {q} |\n"));
+    }
+    out
+}
+
+#[test]
+fn the_inventory_document_is_generated_from_the_sources() {
+    let path = crates_dir().join("../docs/catalog-read-sites.md");
+    let want = markdown();
+    if std::env::var_os("SQLDIFF_BLESS").is_some() {
+        std::fs::write(&path, &want).unwrap();
+    }
+    // A CRLF checkout (Windows) is the same file.
+    let got = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    assert!(
+        got == want,
+        "{} is stale: a read of a catalog was added, moved or removed. Give it an entry in the \
+         sites table and run SQLDIFF_BLESS=1 cargo test -p sqldiff-core --test catalog_sites",
+        path.display()
+    );
+}

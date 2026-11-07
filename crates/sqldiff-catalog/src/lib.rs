@@ -13,6 +13,7 @@
 
 pub mod builtins;
 pub mod ddl;
+pub mod record;
 pub mod tokens;
 pub mod types;
 
