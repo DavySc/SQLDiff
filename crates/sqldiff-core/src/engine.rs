@@ -107,6 +107,11 @@ pub struct Options {
     /// tests that need a budget to run out. The budgets are counts, never
     /// times, so a result stays a function of the input.
     pub work_budgets: Option<(u64, u64)>,
+    /// Replace the behaviour model's work caps (per unit, per file; see
+    /// `behaviour::unit_work_cap`) by fixed numbers; `None` keeps the
+    /// built-in ones. For tests that need a cap to bite. Counts of metered
+    /// work, never times, so a result stays a function of the input.
+    pub work_caps: Option<(u64, u64)>,
     /// Lower the bound of the exact statement alignment (cells, see
     /// `normalize::DEFAULT_ALIGNMENT_BOUND`); `None` keeps the built-in one.
     /// For tests that need to reach the bound with small inputs. A count,
@@ -131,6 +136,7 @@ impl Default for Options {
             historyless: false,
             skip_witnesses: false,
             work_budgets: None,
+            work_caps: None,
             alignment_bound: None,
         }
     }
@@ -586,7 +592,12 @@ pub fn what_if(
         let eq = compare_sides(&aa, &ab, opts);
         env.identified = Some(std::sync::Arc::new(identified_pairs(&eq)));
     }
-    crate::ir::behaviour::what_if(&aa, &ab, side, line, kind, &env)
+    // One scenario, bounded by the explorer's own caps; the scope makes the
+    // work caps readable here too.
+    sqldiff_model::work::scope("what_if", || {
+        crate::ir::behaviour::what_if(&aa, &ab, side, line, kind, &env)
+    })
+    .0
 }
 
 /// Measurement only (perf plan W6): how many lockstep pair-states the

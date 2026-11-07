@@ -147,6 +147,18 @@ pub fn now() -> Work {
     METER.with(|m| m.borrow().unwrap_or_default())
 }
 
+/// Whether counting is switched off here (inside [`muted`]). A work cap must
+/// not test while muted: that work was counted when it was first done.
+pub fn is_muted() -> bool {
+    MUTED.with(Cell::get) > 0
+}
+
+/// Whether a scope is open on this thread: a cap reads [`now`], which is zero
+/// outside one, so it would never fire.
+pub fn in_scope() -> bool {
+    METER.with(|m| m.borrow().is_some())
+}
+
 /// Counts a recorded amount of work again, per site: what a cache or memo
 /// entry cost when it was made, charged when it is used instead, so that the
 /// total is what the algorithm does and not what its caches happened to save.
