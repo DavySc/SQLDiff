@@ -70,6 +70,11 @@ pub struct Options {
     /// tests that need a budget to run out. The budgets are counts, never
     /// times, so a result stays a function of the input.
     pub work_budgets: Option<(u64, u64)>,
+    /// Lower the bound of the exact statement alignment (cells, see
+    /// `normalize::DEFAULT_ALIGNMENT_BOUND`); `None` keeps the built-in one.
+    /// For tests that need to reach the bound with small inputs. A count,
+    /// never a time, so a result stays a function of the input.
+    pub alignment_bound: Option<usize>,
 }
 
 impl Default for Options {
@@ -89,6 +94,7 @@ impl Default for Options {
             historyless: false,
             skip_witnesses: false,
             work_budgets: None,
+            alignment_bound: None,
         }
     }
 }
@@ -242,7 +248,12 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     let mut receipts = Vec::new();
 
     if same {
-        let mut td = treediff::diff(&aa, &ab);
+        let mut td = treediff::diff(
+            &aa,
+            &ab,
+            opts.alignment_bound
+                .unwrap_or(crate::normalize::DEFAULT_ALIGNMENT_BOUND),
+        );
         // An observer that does not read row counts does not see SET NOCOUNT,
         // unless the code reads them itself: SET resets @@ROWCOUNT (and
         // ROWCOUNT_BIG()) to 0, so an added SET NOCOUNT before
@@ -327,7 +338,13 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
             findings.push(rules::analysis::to_finding(&ab, &h, v));
         }
     } else {
-        findings.extend(pair_writes(&aa, &ab, opts.historyless));
+        findings.extend(pair_writes(
+            &aa,
+            &ab,
+            opts.historyless,
+            opts.alignment_bound
+                .unwrap_or(crate::normalize::DEFAULT_ALIGNMENT_BOUND),
+        ));
         for (side, schema) in [(&aa, &schema_a), (&ab, &schema_b)] {
             for h in lint::all_hits(side) {
                 findings.push(lint::to_finding(side, &h));
@@ -646,13 +663,13 @@ fn in_error_handler(node: &sqldiff_syntax::SyntaxNode) -> bool {
 /// EXCEPTION block that records a failure covers several CATCH blocks that
 /// each record it, so how often and in what order they occur is not compared
 /// here (the behavioural diff compares the error paths themselves).
-fn pair_writes(a: &Analyzed, b: &Analyzed, historyless: bool) -> Vec<Finding> {
+fn pair_writes(a: &Analyzed, b: &Analyzed, historyless: bool, work: usize) -> Vec<Finding> {
     // A T-SQL trigger for several events became one PostgreSQL function per
     // event, each with the trigger's writes: pair them per function.
     if let Some(fns) = crate::equiv::trigger_functions(a, b) {
         let mut out: Vec<Finding> = Vec::new();
         for f in &fns {
-            for x in pair_writes_in(a, b, Some(f), historyless) {
+            for x in pair_writes_in(a, b, Some(f), historyless, work) {
                 if !out.iter().any(|y| y.fingerprint == x.fingerprint) {
                     out.push(x);
                 }
@@ -660,7 +677,7 @@ fn pair_writes(a: &Analyzed, b: &Analyzed, historyless: bool) -> Vec<Finding> {
         }
         return out;
     }
-    pair_writes_in(a, b, None, historyless)
+    pair_writes_in(a, b, None, historyless, work)
 }
 
 /// `pair_writes` with side B's writes limited to those inside `within`.
@@ -669,6 +686,7 @@ fn pair_writes_in(
     b: &Analyzed,
     within: Option<&sqldiff_syntax::SyntaxNode>,
     historyless: bool,
+    work: usize,
 ) -> Vec<Finding> {
     // MERGE and INSERT ... ON CONFLICT are both upserts.
     let key = |w: &facts::Write| {
@@ -746,7 +764,7 @@ fn pair_writes_in(
     };
     const SAME_TABLE: &str = "the same table is written by a different kind of statement";
 
-    let Some(pairs) = crate::normalize::lcs_pairs_exact(&ka, &kb) else {
+    let Some(pairs) = crate::normalize::lcs_pairs_exact(&ka, &kb, work) else {
         // Too many writes to align: none is called unpaired.
         return vec![crate::treediff::alignment_bound_finding(
             &a.object,

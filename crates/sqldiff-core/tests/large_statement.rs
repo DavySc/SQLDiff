@@ -72,13 +72,20 @@ fn long_script() -> (String, String) {
     )
 }
 
-fn script_report() -> sqldiff_core::Report {
+fn script_report_with(alignment_bound: Option<usize>) -> sqldiff_core::Report {
     let (a, b) = long_script();
     diff(
         &Artifact::new("a.sql", Dialect::Tsql, a),
         &Artifact::new("b.sql", Dialect::Tsql, b),
-        &Options::default(),
+        &Options {
+            alignment_bound,
+            ..Options::default()
+        },
     )
+}
+
+fn script_report() -> sqldiff_core::Report {
+    script_report_with(None)
 }
 
 /// A script of thousands of statements with edits at both ends and
@@ -99,7 +106,7 @@ fn a_long_script_with_few_edits_reports_only_those() {
 /// statement made up from a partial alignment.
 #[test]
 fn past_the_alignment_bound_the_script_is_unknown_not_guessed() {
-    let r = sqldiff_core::normalize::with_alignment_bound(1_000_000, script_report);
+    let r = script_report_with(Some(1_000_000));
     let count = |rule: &str| r.findings.iter().filter(|f| f.rule == rule).count();
     assert_eq!(count("stmt.moved"), 0, "{:?}", r.findings);
     assert_eq!(count("stmt.added"), 0);

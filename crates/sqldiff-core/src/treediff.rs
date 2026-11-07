@@ -116,7 +116,7 @@ pub(crate) fn alignment_bound_finding(
     }
 }
 
-pub fn diff(a: &Analyzed, b: &Analyzed) -> TreeDiff {
+pub fn diff(a: &Analyzed, b: &Analyzed, work: usize) -> TreeDiff {
     let ua: Vec<Unit> = ast::structural_children(&a.root)
         .into_iter()
         .map(|n| build_unit(n, a))
@@ -141,6 +141,7 @@ pub fn diff(a: &Analyzed, b: &Analyzed) -> TreeDiff {
         hashes_b: all_hashes(&ub),
         skipped_a: HashSet::new(),
         skipped_b: HashSet::new(),
+        work,
     };
     ctx.diff_lists(&ua, &ub);
     ctx.resolve_unpaired();
@@ -162,6 +163,8 @@ struct Ctx<'x, 'a> {
     /// whose twin is among them may only have moved there.
     skipped_a: HashSet<String>,
     skipped_b: HashSet<String>,
+    /// The exact-alignment bound ([`crate::normalize::lcs_pairs_bounded`]).
+    work: usize,
 }
 
 fn all_hashes(units: &[Unit]) -> HashSet<String> {
@@ -182,7 +185,7 @@ impl Ctx<'_, '_> {
     fn diff_lists(&mut self, a: &[Unit], b: &[Unit]) {
         let ka: Vec<&str> = a.iter().map(|u| u.full.as_str()).collect();
         let kb: Vec<&str> = b.iter().map(|u| u.full.as_str()).collect();
-        let (anchors, exact) = crate::normalize::lcs_pairs_checked(&ka, &kb);
+        let (anchors, exact) = crate::normalize::lcs_pairs_bounded(&ka, &kb, self.work);
         let (mut ai, mut bj) = (0, 0);
         for (i, j) in anchors
             .into_iter()

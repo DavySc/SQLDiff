@@ -393,7 +393,16 @@ pub fn annotate(report: &mut Report, a: Composed, b: Option<Composed>, opts: &Op
     }
     if let (Some(ab), Some(b)) = (&ab, b) {
         if let (Some(ca), Some(cb)) = (a.composition, b.composition) {
-            compare_parts(report, &aa, ca, ab, cb, &object);
+            compare_parts(
+                report,
+                &aa,
+                ca,
+                ab,
+                cb,
+                &object,
+                opts.alignment_bound
+                    .unwrap_or(crate::normalize::DEFAULT_ALIGNMENT_BOUND),
+            );
         }
     }
     *report = crate::engine::finish(report.clone());
@@ -528,10 +537,11 @@ fn compare_parts(
     ab: &Analyzed,
     cb: &Composition,
     object: &str,
+    work: usize,
 ) {
     let na: Vec<&str> = ca.parts.iter().map(|p| p.name.as_str()).collect();
     let nb: Vec<&str> = cb.parts.iter().map(|p| p.name.as_str()).collect();
-    let Some(pairs) = crate::normalize::lcs_pairs_exact(&na, &nb) else {
+    let Some(pairs) = crate::normalize::lcs_pairs_exact(&na, &nb, work) else {
         // Too many parts to align: none is called added or removed.
         if let Some(p) = cb.parts.first() {
             let mut f = part_finding(

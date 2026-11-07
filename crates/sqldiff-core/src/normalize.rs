@@ -273,19 +273,10 @@ const LCS_CELLS: usize = 16_000_000;
 /// in a release build. Past it the middle stays unmatched.
 const LCS_WORK: usize = 4_000_000_000;
 
-thread_local! {
-    static LCS_WORK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(LCS_WORK) };
-}
-
-/// Runs `f` with the exact alignment bound ([`LCS_WORK`]) set to `limit` on
-/// this thread, so a test can reach the inexact path with small inputs.
-#[doc(hidden)]
-pub fn with_alignment_bound<R>(limit: usize, f: impl FnOnce() -> R) -> R {
-    let old = LCS_WORK_LIMIT.with(|c| c.replace(limit));
-    let r = f();
-    LCS_WORK_LIMIT.with(|c| c.set(old));
-    r
-}
+/// The production exact-alignment bound ([`LCS_WORK`]), for callers that
+/// carry the bound as a parameter (tests lower it through
+/// `Options::alignment_bound`).
+pub const DEFAULT_ALIGNMENT_BOUND: usize = LCS_WORK;
 
 /// Index pairs of a longest common subsequence, and whether they are one.
 ///
@@ -297,6 +288,17 @@ pub fn with_alignment_bound<R>(limit: usize, f: impl FnOnce() -> R) -> R {
 /// the flag is false: the pairs are then a common subsequence but not a
 /// longest one. The answer depends only on the inputs.
 pub fn lcs_pairs_checked<T: PartialEq>(a: &[T], b: &[T]) -> (Vec<(usize, usize)>, bool) {
+    lcs_pairs_bounded(a, b, LCS_WORK)
+}
+
+/// [`lcs_pairs_checked`] with the exact-alignment bound (the product of the
+/// lengths once the common start and end are matched) given by the caller.
+/// A lower bound only makes more alignments inexact.
+pub fn lcs_pairs_bounded<T: PartialEq>(
+    a: &[T],
+    b: &[T],
+    work: usize,
+) -> (Vec<(usize, usize)>, bool) {
     let (n, m) = (a.len(), b.len());
     if n.saturating_mul(m) <= LCS_CELLS {
         return (lcs_table(a, b, 0, 0), true);
@@ -314,7 +316,7 @@ pub fn lcs_pairs_checked<T: PartialEq>(a: &[T], b: &[T]) -> (Vec<(usize, usize)>
     let mut exact = true;
     if cells <= LCS_CELLS {
         out.extend(lcs_table(ma, mb, pre, pre));
-    } else if cells <= LCS_WORK_LIMIT.with(|c| c.get()) {
+    } else if cells <= work {
         hirschberg(ma, mb, pre, pre, &mut out);
     } else {
         exact = false;
@@ -332,8 +334,8 @@ pub fn lcs_pairs<T: PartialEq>(a: &[T], b: &[T]) -> Vec<(usize, usize)> {
 /// The pairs of a longest common subsequence, or `None` when the lists are
 /// past the bound and only part of them could be aligned. For callers that
 /// report what is left over as added, removed or moved.
-pub fn lcs_pairs_exact<T: PartialEq>(a: &[T], b: &[T]) -> Option<Vec<(usize, usize)>> {
-    let (p, exact) = lcs_pairs_checked(a, b);
+pub fn lcs_pairs_exact<T: PartialEq>(a: &[T], b: &[T], work: usize) -> Option<Vec<(usize, usize)>> {
+    let (p, exact) = lcs_pairs_bounded(a, b, work);
     exact.then_some(p)
 }
 
