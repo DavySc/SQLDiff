@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 const CRATES: &[&str] = &[
     "sqldiff-syntax",
     "sqldiff-catalog",
+    "sqldiff-model",
     "sqldiff-core",
     "sqldiff-source",
     "sqldiff-convert",

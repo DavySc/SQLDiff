@@ -1,5 +1,5 @@
 {
-  "about": "Unmodified public SQL that runs on its target database. `sqldiff check` must report no `different` finding on any of it: each one would be a false positive a reviewer learns to ignore. Pinned commits keep the gate reproducible; bump them deliberately.",
+  "about": "Unmodified public SQL that runs on its target database. `sqldiff check` must report no `different` finding on any of it: each one would be a false positive a reviewer learns to ignore. Pinned commits keep the gate reproducible; bump them deliberately. Dropped: IBM/ibmi-oss-examples (Apache-2.0, db2i, commit 37f17dc6) - unauthenticated git fetch now fails with a username prompt, so CI could only pass from a cache. Db2 for i real-code coverage now comes from sakila (db2-sakila-db) only; re-add it if the repo becomes cloneable again.",
   "sources": [
     {
       "name": "pg_partman",
@@ -14,13 +14,6 @@
       "commit": "8efb078dbe7afe16c83be72e9fffefbb03ebd9e9",
       "license": "PostgreSQL",
       "paths": [{"path": ".", "dialect": "postgres"}]
-    },
-    {
-      "name": "ibmi-oss-examples",
-      "repo": "https://github.com/IBM/ibmi-oss-examples",
-      "commit": "37f17dc6527e1f28314e055c050bb426f5cfe0f1",
-      "license": "Apache-2.0",
-      "paths": [{"path": ".", "dialect": "db2i"}]
     },
     {
       "name": "sakila",

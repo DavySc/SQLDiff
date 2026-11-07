@@ -23,7 +23,7 @@ re-cuts these phases around a converter whose output needs no re-review, and
 
 ## Trust boundary today
 
-`derive_verdict` (`crates/sqldiff-core/src/session.rs`) returns "equal" when no
+`derive_verdict` (`crates/sqldiff-model/src/session.rs`) returns "equal" when no
 finding is `different` or `unknown` and no unknown reason is recorded. "Equal"
 is therefore the absence of an objection, and every component whose silence
 counts is trusted:
@@ -654,7 +654,7 @@ implementations and the drift controls.
   `crates/sqldiff-syntax/src/dialect.rs`). It is set by `--dialect-version`,
   `[dialect_versions]` in `sqldiff.toml` or a pack, or a `dialect_map` entry.
   On the `verification` branch it is validated against
-  `crates/sqldiff-core/profiles/lifecycle.toml` (`sqldiff_core::target`): a
+  `crates/sqldiff-model/profiles/lifecycle.toml` (`sqldiff_core::target`): a
   T-SQL target is `2019`, `2019/130`, `mi-2022`, `mi-evergreen`, `azure` or
   `fabric` with an optional compatibility level, an unknown version is an
   error, and the CLI prints a note for a `preview`, `legacy` or `retired`

@@ -666,7 +666,7 @@ private def opt? {α : Type} : Value → (Value → Option α) → Option (Optio
 }
 
 /// Runs the gate on a finished diff report.
-pub(crate) fn apply(r: &mut Report, a: &Analyzed, b: &Analyzed, s: &Settings) {
+pub fn apply(r: &mut Report, a: &Analyzed, b: &Analyzed, s: &Settings) {
     if s.mode == Mode::Off {
         return;
     }
