@@ -1306,6 +1306,11 @@ struct Collector<'x, 'a> {
     /// scenario is counted, repeats are not, so the count does not depend on
     /// whether a cache answered.
     charged: RefCell<BTreeSet<String>>,
+    /// Diffs the first computation of each flipped scenario spent (see
+    /// `persists`).
+    flip_spent: RefCell<BTreeMap<String, u64>>,
+    /// While a flipped scenario is recomputed: the diffs it may still make.
+    replay: Cell<Option<u64>>,
     /// `diff` calls spent by this routine pair, and whether a budget ran out.
     spent: Cell<u64>,
     out_of_budget: Cell<bool>,
@@ -1385,6 +1390,8 @@ impl<'x, 'a> Collector<'x, 'a> {
             cut_b: BTreeSet::new(),
             flipped: RefCell::new(HashMap::new()),
             charged: RefCell::new(BTreeSet::new()),
+            flip_spent: RefCell::new(BTreeMap::new()),
+            replay: Cell::new(None),
             spent: Cell::new(0),
             out_of_budget: Cell::new(false),
             cap_hit: Cell::new(None),
@@ -1413,6 +1420,17 @@ impl<'x, 'a> Collector<'x, 'a> {
     /// Spends one `diff` call; false (and the routine marked as cut by its
     /// budget) when the routine's or the file's allowance is used up.
     fn spend(&self) -> bool {
+        // A flipped scenario recomputed (a cache that is off, or was cleared)
+        // gets exactly the diffs its first computation spent, from a local
+        // allowance: the routine's and the file's budget are not touched, so
+        // the budget does not depend on whether a cache answered.
+        if let Some(left) = self.replay.get() {
+            if left == 0 {
+                return false;
+            }
+            self.replay.set(Some(left - 1));
+            return true;
+        }
         let file = self.file_spent.get();
         let (routine_max, file_max) = self.budgets;
         if self.spent.get() >= routine_max || file >= file_max {
@@ -1521,11 +1539,23 @@ impl<'x, 'a> Collector<'x, 'a> {
         let set = match known {
             Some(set) => set,
             None => {
-                let make = || Rc::new(self.divergences_of(sc, scen_a, scen_b));
                 let set = if first {
-                    make()
+                    let before = self.spent.get();
+                    let set = Rc::new(self.divergences_of(sc, scen_a, scen_b));
+                    self.flip_spent
+                        .borrow_mut()
+                        .insert(key.clone(), self.spent.get() - before);
+                    set
                 } else {
-                    sqldiff_model::work::muted(make)
+                    // Same pairs in the same order, the same number of diffs,
+                    // none of them from the budget or the work count.
+                    let allowed = self.flip_spent.borrow().get(&key).copied().unwrap_or(0);
+                    self.replay.set(Some(allowed));
+                    let set = sqldiff_model::work::muted(|| {
+                        Rc::new(self.divergences_of(sc, scen_a, scen_b))
+                    });
+                    self.replay.set(None);
+                    set
                 };
                 if !caches_off() {
                     let mut c = self.flipped.borrow_mut();

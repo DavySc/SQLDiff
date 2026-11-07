@@ -74,6 +74,9 @@ fn thread_count_folder_and_resume_never_change_a_files_work() {
     // Resumed on the first run's store: whatever is checked again (the store
     // answers the rest) counts the same as before.
     let again = totals(&src, &d.join("out-a"), "4", "--overwrite");
+    // The sampled re-check re-checks some files; if the store ever answered
+    // them all this test would compare nothing.
+    assert!(!again.is_empty(), "the resumed run checked nothing");
     for (file, n) in &again {
         assert_eq!(a.get(file), Some(n), "{file}");
     }

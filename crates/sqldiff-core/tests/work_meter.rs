@@ -191,4 +191,46 @@ mod fixed {
         let (_, w) = scope("two", || x.explore(&cfg, &sc));
         assert!(steps(&w) > 0 && steps(&w) < 200, "{w}");
     }
+
+    /// The recompute of a flipped scenario (caches off, or a cache that was
+    /// cleared) spends no routine or file diff budget, so a budget set to
+    /// exactly what the cached run spends gives the same report and the same
+    /// work with the caches on or off. p01-move-stock reaches the flipped
+    /// scenarios (`persists`) with first requests and repeats.
+    #[test]
+    fn a_flipped_scenario_recomputed_spends_no_budget() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../corpus/pairs/p01-move-stock");
+        let read = |f: &str| {
+            std::fs::read_to_string(dir.join(f))
+                .unwrap()
+                .replace("\r\n", "\n")
+        };
+        let (a, b) = (read("tsql.sql"), read("db2i.sql"));
+        let run = |budget: Option<(u64, u64)>| {
+            let opts = Options {
+                work_budgets: budget,
+                ..Options::default()
+            };
+            let (rep, w) = scope("t", || {
+                diff(
+                    &Artifact::new("a.sql", Dialect::Tsql, a.as_str()),
+                    &Artifact::new("b.sql", Dialect::Db2i, b.as_str()),
+                    &opts,
+                )
+            });
+            (serde_json::to_string(&rep).unwrap(), w)
+        };
+        let (base_report, base) = run(None);
+        let spent = base.get(Site::BehaviourDiffs);
+        assert!(spent > 4, "{base}");
+        // Exactly the cached run's spend: nothing is cut with the caches on.
+        let (on_report, on) = run(Some((spent, u64::MAX)));
+        assert_eq!(on_report, base_report);
+        set_caches_off_for_tests(true);
+        let (off_report, off) = run(Some((spent, u64::MAX)));
+        set_caches_off_for_tests(false);
+        assert_eq!(off_report, on_report);
+        assert_eq!(off, on);
+    }
 }
