@@ -34,7 +34,6 @@ KNOWN_OPEN = {
     "a_procs_50x200": "R1: killed at 120 s, 937 MB",
     "a_procs_200x20": "R1: killed at 120 s",
     "a_procs_500x20": "R1: killed at 120 s",
-    "g_tables_5000": "catalog loading is quadratic, killed at 120 s",
     "j_branches_14": "R1: nested IF/ELSE depth 14, 109 s, 1 GB",
     "k_seq_ifs_200": "R1: sequential IF-guarded writes, killed at 120 s",
 }

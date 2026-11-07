@@ -148,6 +148,7 @@ pub(crate) fn convert(
         dynamic_from: Vec::new(),
         scope: None,
         local: std::cell::OnceCell::new(),
+        catalog_types: std::cell::OnceCell::new(),
         own_tables: Vec::new(),
         bit_cols: Vec::new(),
         bit_unhandled: Vec::new(),
@@ -506,6 +507,10 @@ struct Cx<'a> {
     scope: Option<Scope>,
     /// Without a tree catalog: one read from this input, made when needed.
     local: std::cell::OnceCell<sqldiff_equiv::catalog::Catalog>,
+    /// The distinct column types (base name, arguments) of `type_catalog`,
+    /// sorted, made when first needed: asking "is any column a bit" must
+    /// not walk every column of the catalog for every expression.
+    catalog_types: std::cell::OnceCell<Vec<(String, Vec<u32>)>>,
     /// The table variables and `#` tables this routine or script declared
     /// so far, for the types of their columns (names lower case).
     own_tables: Vec<sqldiff_equiv::catalog::Table>,
