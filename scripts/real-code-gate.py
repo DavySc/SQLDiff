@@ -25,6 +25,13 @@ def git(*args, cwd=None, hint=""):
 def vendored(src):
     """A source kept in the repository: no network, bytes checked against sha256."""
     dest = os.path.join(ROOT, src["local"])
+    # Every .sql file the gate will read must be pinned: an added file is a failure.
+    found = sorted(
+        os.path.relpath(os.path.join(dp, f), dest).replace(os.sep, "/")
+        for dp, _, fs in os.walk(dest) for f in fs if f.lower().endswith(".sql")
+    )
+    if found != sorted(src["sha256"]):
+        sys.exit(f"real-code gate: vendored {src['name']} .sql files {found} != pinned {sorted(src['sha256'])}")
     for rel, want in src["sha256"].items():
         got = hashlib.sha256(open(os.path.join(dest, rel), "rb").read()).hexdigest()
         if got != want:
