@@ -696,11 +696,38 @@ impl Schema {
             .filter(|t| t.kind == TableKind::View && t.types_from_source && !t.star_outputs)
         {
             let name = t.name.to_lowercase();
+            // The types were copied when the view was created: they count
+            // only while the one base table of that name still has each
+            // source column with that very type (an ALTER COLUMN, or a
+            // table dropped and created again, leaves the copy stale).
+            let sources: Vec<&crate::catalog::Table> = view
+                .catalog
+                .tables
+                .iter()
+                .filter(|b| {
+                    b.kind != TableKind::View && b.name.eq_ignore_ascii_case(&t.source_table)
+                })
+                .collect();
+            let current = |col: usize| -> bool {
+                let [base] = sources.as_slice() else {
+                    return false;
+                };
+                t.source_columns
+                    .get(col)
+                    .and_then(|x| x.as_ref())
+                    .and_then(|sc| {
+                        base.columns
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(sc))
+                    })
+                    .is_some_and(|c| c.data_type == t.columns[col].data_type)
+            };
             let cols: HashMap<String, Fam> = t
                 .columns
                 .iter()
-                .filter(|c| c.data_type.is_known())
-                .map(|c| (c.name.to_lowercase(), ty_of(&c.data_type, d).fam))
+                .enumerate()
+                .filter(|(i, c)| c.data_type.is_known() && current(*i))
+                .map(|(_, c)| (c.name.to_lowercase(), ty_of(&c.data_type, d).fam))
                 .collect();
             // Two views of one name in different schemas: not trusted.
             match std::sync::Arc::make_mut(&mut s.view_families).entry(name) {
