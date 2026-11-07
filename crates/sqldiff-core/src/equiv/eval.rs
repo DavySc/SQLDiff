@@ -1655,9 +1655,20 @@ impl Ctx<'_> {
     /// parameter or variable declared as one, or a column of the catalog that
     /// is one. A name that resolves to a derived column, a record field or a
     /// variable of unknown type counts as may-be, so the answer errs on
-    /// refusing. Other expressions (function results, concatenations) are
-    /// text, not blank-padded.
+    /// refusing. The whole expression is searched: COALESCE, NULLIF, CASE,
+    /// GREATEST, ISNULL, `+`, CONCAT and a scalar subquery all keep the
+    /// blanks of a `char(n)` value, and no function is known to strip them,
+    /// so any part that may be one makes the whole one.
     fn may_be_char(&self, e: &Expr, scopes: &[Scope]) -> bool {
+        let mut found = false;
+        walk_expr(e, &mut |x| {
+            found = found || self.leaf_may_be_char(x, scopes);
+        });
+        found
+    }
+
+    /// One node of [`Self::may_be_char`].
+    fn leaf_may_be_char(&self, e: &Expr, scopes: &[Scope]) -> bool {
         match e {
             Expr::Cast(_, ty) => Ty::from_type(ty, self.d, true).fam == Fam::Char,
             Expr::Var(v) => self.var_may_be_char(&var_key(v)),
@@ -1690,6 +1701,8 @@ impl Ctx<'_> {
                     })
                 })
             }
+            // A scalar subquery returns whatever its select list is.
+            Expr::Subquery(_) => true,
             _ => false,
         }
     }

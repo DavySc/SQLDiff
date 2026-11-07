@@ -98,3 +98,70 @@ fn a_char_column_written_short_is_still_proven() {
         "{v:?}"
     );
 }
+
+fn query_verdict(d: Dialect, ty: &str, a: &str, b: &str) -> Verdict {
+    let ddl = format!("CREATE TABLE t (id integer PRIMARY KEY, c {ty} NOT NULL);");
+    let opts = Options {
+        catalog_a: vec![Artifact::new("catalog.sql", d, &ddl)],
+        catalog_b: vec![Artifact::new("catalog.sql", d, &ddl)],
+        ..Options::default()
+    };
+    let q = |w: &str| format!("SELECT id FROM t WHERE c = 'abc' AND {w};");
+    diff(
+        &Artifact::new("a.sql", d, &q(a)),
+        &Artifact::new("b.sql", d, &q(b)),
+        &opts,
+    )
+    .verdict()
+}
+
+/// Every wrapper that keeps the type of a `char(n)` value is as unsafe as
+/// the bare column: the verdict must not be Different, while the same
+/// condition on `varchar(6)` is judged (the control).
+#[test]
+fn wrappers_that_keep_the_char_type() {
+    let pg = [
+        "COALESCE(c, 'x') LIKE",
+        "NULLIF(c, 'q') LIKE",
+        "CASE WHEN id > 0 THEN c END LIKE",
+        "(SELECT c FROM t t2 WHERE t2.id = t.id) LIKE",
+        "GREATEST(c, 'a') LIKE",
+    ];
+    let mut bad = Vec::new();
+    for w in pg {
+        let v = query_verdict(
+            Dialect::Postgres,
+            "char(6)",
+            &format!("{w} 'abc'"),
+            &format!("{w} 'zzzzzzz'"),
+        );
+        if matches!(v, Verdict::Different) {
+            bad.push(format!("pg {w}"));
+        }
+    }
+    let ms = [
+        "c + '%'",
+        "COALESCE(c, 'x')",
+        "ISNULL(c, 'x')",
+        "CASE WHEN id > 0 THEN c END",
+        "(SELECT c FROM t t2 WHERE t2.id = t.id)",
+        "CONCAT(c, '')",
+        "c",
+    ];
+    for w in ms {
+        let v = query_verdict(
+            Dialect::Tsql,
+            "char(6)",
+            &format!("'abc' LIKE {w}"),
+            "1 = 0",
+        );
+        if matches!(v, Verdict::Different) {
+            bad.push(format!("tsql {w}"));
+        }
+    }
+    let v = query_verdict(Dialect::Tsql, "char(6)", "c + 'x' LIKE 'abcx'", "1 = 0");
+    if matches!(v, Verdict::Different) {
+        bad.push("tsql c + 'x' LIKE".into());
+    }
+    assert!(bad.is_empty(), "shown Different:\n{}", bad.join("\n"));
+}
