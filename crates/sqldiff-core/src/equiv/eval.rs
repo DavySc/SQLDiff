@@ -864,8 +864,19 @@ impl<'s> Ctx<'s> {
         // Seen values, by their debug text: a statement with thousands of
         // literals must not cost the square of that to list them.
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut nan = 0usize;
         let mut push = |v: V| {
-            if seen.insert(format!("{v:?}")) {
+            // The key follows `PartialEq`: 0.0 and -0.0 are one value, a NaN
+            // equals nothing.
+            let key = match &v {
+                V::Num(f) if f.is_nan() => {
+                    nan += 1;
+                    format!("nan#{nan}")
+                }
+                V::Num(f) => format!("Num({})", if *f == 0.0 { 0.0f64 } else { *f }.to_bits()),
+                v => format!("{v:?}"),
+            };
+            if seen.insert(key) {
                 out.push(v);
             }
         };

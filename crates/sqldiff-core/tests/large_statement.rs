@@ -49,3 +49,37 @@ fn an_in_list_of_thousands_of_numbers_is_compared() {
     });
     assert_eq!(run(a, b), Verdict::Different);
 }
+
+/// A script of thousands of statements with edits at both ends and
+/// transactions in between is aligned exactly: only the real edits are
+/// reported, and no COMMIT is said to have moved. (The alignment table of
+/// such a script is past the size it is built in whole.)
+#[test]
+fn a_long_script_with_few_edits_reports_only_those() {
+    let n = 4_300;
+    let base = |i: usize| format!("UPDATE dbo.t{} SET c = {} WHERE id = {};\n", i % 50, i, i);
+    let stmt = |i: usize, b: bool| -> String {
+        if i % 100 == 0 {
+            "BEGIN TRAN;\n".into()
+        } else if i % 100 == 99 {
+            "COMMIT;\n".into()
+        } else if b && (i == 3 || i == n - 3) {
+            format!("DELETE FROM dbo.x WHERE id = {i};\n")
+        } else if b && i == n / 2 {
+            format!("UPDATE dbo.t9 SET c = 0 WHERE id = {};\n", i + 1_000_000)
+        } else {
+            base(i)
+        }
+    };
+    let a: String = (0..n).map(|i| stmt(i, false)).collect();
+    let b: String = (0..n).map(|i| stmt(i, true)).collect();
+    let r = diff(
+        &Artifact::new("a.sql", Dialect::Tsql, a),
+        &Artifact::new("b.sql", Dialect::Tsql, b),
+        &Options::default(),
+    );
+    let count = |rule: &str| r.findings.iter().filter(|f| f.rule == rule).count();
+    assert_eq!(count("stmt.moved"), 0, "nothing moved");
+    assert_eq!(count("stmt.added"), 2);
+    assert_eq!(count("stmt.removed"), 2);
+}

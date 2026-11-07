@@ -268,13 +268,21 @@ pub fn lcs_len<T: PartialEq>(a: &[T], b: &[T]) -> usize {
 /// 20 000 tokens already needs gigabytes.
 const LCS_CELLS: usize = 16_000_000;
 
+/// The most cells (the product of the lengths, once the common start and end
+/// are matched) `lcs_pairs` works through exactly: about a minute of work in
+/// a release build. Past it the middle stays unmatched.
+const LCS_WORK: usize = 4_000_000_000;
+
 /// Index pairs of a longest common subsequence.
 ///
-/// Exact while the table fits [`LCS_CELLS`]. Past that the common start and
-/// end are matched and the table is built over what lies between them when
-/// that fits; otherwise the middle stays unmatched. The pairs are then still
-/// a common subsequence but not a longest one: a caller shows more of the
-/// two as changed, never less. The answer depends only on the inputs.
+/// Exact at every size up to [`LCS_WORK`]. While the table fits
+/// [`LCS_CELLS`] it is the table walk (so the pairs there are the same as
+/// they always were); past that the common start and end are matched and the
+/// middle is aligned by Hirschberg's method, which needs memory in the order
+/// of the shorter length. Beyond [`LCS_WORK`] the middle stays unmatched: the
+/// pairs are then a common subsequence but not a longest one, so a caller
+/// shows more of the two as changed, never less. The answer depends only on
+/// the inputs.
 pub fn lcs_pairs<T: PartialEq>(a: &[T], b: &[T]) -> Vec<(usize, usize)> {
     let (n, m) = (a.len(), b.len());
     if n.saturating_mul(m) <= LCS_CELLS {
@@ -291,9 +299,61 @@ pub fn lcs_pairs<T: PartialEq>(a: &[T], b: &[T]) -> Vec<(usize, usize)> {
     let mut out: Vec<(usize, usize)> = (0..pre).map(|i| (i, i)).collect();
     if ma.len().saturating_mul(mb.len()) <= LCS_CELLS {
         out.extend(lcs_table(ma, mb, pre, pre));
+    } else if ma.len().saturating_mul(mb.len()) <= LCS_WORK {
+        hirschberg(ma, mb, pre, pre, &mut out);
     }
     out.extend((0..suf).map(|k| (n - suf + k, m - suf + k)));
     out
+}
+
+/// LCS length of `a` against every prefix of `b` (`b.len() + 1` values), read
+/// forward or, with `rev`, over both slices reversed.
+fn lcs_row<T: PartialEq>(a: &[T], b: &[T], rev: bool) -> Vec<u32> {
+    let m = b.len();
+    let mut prev = vec![0u32; m + 1];
+    let mut cur = vec![0u32; m + 1];
+    for i in 0..a.len() {
+        let x = if rev { &a[a.len() - 1 - i] } else { &a[i] };
+        for j in 0..m {
+            let y = if rev { &b[m - 1 - j] } else { &b[j] };
+            cur[j + 1] = if x == y {
+                prev[j] + 1
+            } else {
+                cur[j].max(prev[j + 1])
+            };
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev
+}
+
+/// Appends the pairs of a longest common subsequence of `a` and `b`, offset
+/// by `(oa, ob)`, in order: split `a` in half, find where `b` is best cut
+/// from the scores of both halves, and align each side on its own.
+fn hirschberg<T: PartialEq>(a: &[T], b: &[T], oa: usize, ob: usize, out: &mut Vec<(usize, usize)>) {
+    if a.is_empty() || b.is_empty() {
+        return;
+    }
+    if a.len().saturating_mul(b.len()) <= LCS_CELLS / 16 {
+        out.extend(lcs_table(a, b, oa, ob));
+        return;
+    }
+    let mid = a.len() / 2;
+    let left = lcs_row(&a[..mid], b, false);
+    let right = lcs_row(&a[mid..], b, true);
+    let m = b.len();
+    // The first cut of `b` with the best total; the same on every run.
+    let mut cut = 0;
+    let mut best = 0;
+    for j in 0..=m {
+        let total = left[j] + right[m - j];
+        if total > best {
+            best = total;
+            cut = j;
+        }
+    }
+    hirschberg(&a[..mid], &b[..cut], oa, ob, out);
+    hirschberg(&a[mid..], &b[cut..], oa + mid, ob + cut, out);
 }
 
 /// The table walk of [`lcs_pairs`] over the whole of both slices; the pairs
@@ -388,14 +448,18 @@ mod lcs_tests {
         assert_eq!(p.len(), 19_999);
     }
 
-    /// Long inputs that differ everywhere stay bounded: a common subsequence
-    /// that is not a longest one, the same every time.
+    /// Past the table size the answer is still a longest common subsequence
+    /// (checked against the table on inputs just past it) and the same every
+    /// time.
     #[test]
-    fn long_inputs_that_differ_throughout_stay_bounded() {
-        let a: Vec<u32> = (0..30_000).map(|i| i * 2).collect();
-        let b: Vec<u32> = (0..30_000).map(|i| i * 2 + (i % 2)).collect();
+    fn past_the_table_size_the_alignment_is_still_longest() {
+        // Half of each side's items are shared, in order, with gaps.
+        let a: Vec<u32> = (0..4_200).map(|i| (i * 7) % 1_000).collect();
+        let b: Vec<u32> = (0..4_100).map(|i| (i * 11 + 3) % 1_000).collect();
+        assert!(a.len() * b.len() > LCS_CELLS);
         let p = lcs_pairs(&a, &b);
         assert!(is_common(&a, &b, &p));
+        assert_eq!(p.len(), lcs_len(&a, &b));
         assert_eq!(p, lcs_pairs(&a, &b));
     }
 }
