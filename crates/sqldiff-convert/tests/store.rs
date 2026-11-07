@@ -592,3 +592,22 @@ fn recheck_none_says_so_when_only_the_tree_state_was_reused() {
     assert!(w.tree.report.run.files.iter().all(|r| !r.reused));
     assert!(tree::summary(&w.tree.report).contains("unverified reuse"));
 }
+
+#[test]
+fn a_damaged_stored_draft_fails_cleanly_even_when_nothing_is_rechecked() {
+    // `--recheck none` trusts the store's content, never its ranges: a
+    // damaged draft still fails the run instead of being indexed.
+    let f = Fixture::standard("damagednone");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    let p = states(&f.out("o")).remove(0);
+    let mut st = read_state(&p);
+    st["drafts"][3]["raw"]["text"] = "".into();
+    write_state(&p, &st);
+    let err = convert_into(
+        &with_recheck(f.job("o", true, false), tree::Recheck::None),
+        &Hooks::default(),
+    )
+    .err()
+    .expect("a damaged draft fails the run");
+    assert!(err.contains("stored tree state"), "{err}");
+}
