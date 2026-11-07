@@ -11,6 +11,7 @@ name = "sqldiff-mcp"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc.workspace = true
 sqldiff-core.workspace = true
 sqldiff-source.workspace = true
 sqldiff-review.workspace = true
