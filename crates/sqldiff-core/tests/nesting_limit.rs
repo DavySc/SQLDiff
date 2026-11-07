@@ -66,14 +66,14 @@ fn a_chain_past_the_limit_is_not_proven_and_does_not_crash() {
 
 #[test]
 fn statements_nested_past_the_limit_are_not_proven_and_do_not_crash() {
-    // Past the limit (256); IF used to overflow the engine stack near 3 000.
+    // Past the limit (1000); IF used to overflow the engine stack near 3 000.
     let nest = |n: usize, v: u32| {
         format!(
             "CREATE PROCEDURE dbo.p @x int AS\n{}UPDATE dbo.t SET a = {v};\n",
             "IF @x > 1\n".repeat(n)
         )
     };
-    let r = run(nest(400, 1), nest(400, 2));
+    let r = run(nest(1100, 1), nest(1100, 2));
     assert!(
         not_proven(&r),
         "{:?} {:?} {:?}",
@@ -107,7 +107,7 @@ fn a_deep_routine_does_not_swallow_the_batches_after_it() {
     assert!(not_proven(&r), "{:?}", r.verdict());
     let text = format!("{:?}", r.findings);
     assert!(
-        text.contains("dbo.q") || text.contains("dbo.Q") || text.contains("q"),
+        text.contains("`int` became `bigint`") && text.contains("`1` became `2`"),
         "{text}"
     );
     assert!(
