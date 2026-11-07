@@ -5414,7 +5414,7 @@ impl<'a> Canon<'a> {
     /// the engine cannot name.
     fn visible_star(&self, e: &Expr) -> R<Option<Vec<(String, String)>>> {
         let Expr::Star(q) = e else { return Ok(None) };
-        if !self.schema.list_stars {
+        if !self.schema.lists_stars() {
             return Ok(None);
         }
         let Some(scope) = self.scopes.last() else {

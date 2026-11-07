@@ -3715,14 +3715,10 @@ impl Hints<'_> {
             None => {
                 let Expr::Name(p) = e else { return None };
                 let col = p.last()?.to_lowercase();
-                let mut tys = self
-                    .schema
-                    .tables()
-                    .filter_map(|t| t.column(&col))
-                    .map(|c| c.ty);
-                let first = tys.next()?;
+                let tys = self.schema.column_types(&col);
+                let first = *tys.first()?;
                 let class = |t: &super::schema::Ty| (t.fam, t.len == Some(1));
-                if !tys.all(|t| class(&t) == class(&first)) {
+                if !tys.iter().all(|t| class(t) == class(&first)) {
                     return None;
                 }
                 first
