@@ -152,7 +152,7 @@ jobs:
       # client in their dependency tree, and findings are byte-identical across runs.
       - name: No network clients in the engine crates
         run: |
-          for p in sqldiff-syntax sqldiff-model sqldiff-core sqldiff-corpus; do
+          for p in sqldiff-syntax sqldiff-catalog sqldiff-model sqldiff-core sqldiff-corpus; do
             if cargo tree -p "$p" -e normal --prefix none | grep -E '^(reqwest|hyper|ureq|tokio|isahc|curl|surf) '; then
               echo "$p depends on a network client"; exit 1
             fi

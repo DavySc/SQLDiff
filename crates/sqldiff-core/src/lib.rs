@@ -7,7 +7,7 @@
 pub use sqldiff_model::artifact;
 pub use sqldiff_model::assumptions;
 pub mod bind;
-pub mod catalog;
+pub use sqldiff_catalog as catalog;
 pub mod classify;
 pub mod composition;
 pub mod coverage;
@@ -29,7 +29,7 @@ pub mod rule_proofs;
 pub mod rules;
 pub use sqldiff_model::session;
 pub use sqldiff_model::target;
-pub mod tokens;
+pub use sqldiff_catalog::tokens;
 pub mod treediff;
 
 pub use artifact::Artifact;
