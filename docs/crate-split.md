@@ -265,8 +265,12 @@ This is the behaviour change of the plan.
   again (draft cost only, no check) and compared; a difference is a miss,
   and a recorded mix with no `rebuild` available (a run under a review
   ledger) is a miss too. The sampled re-check also compares the mix.
-  A result stored by an older build has no mix field and key format 3, so it
-  is never found.
+  A result also records whether a mix could be tried when it was made
+  (`mix_tried`): not under a review ledger, where drafts are not built
+  again. A result stored without a try is not taken by a run that can try
+  one (it is checked again), so removing the ledger cannot bring back a
+  result that never had its mix looked at. A result stored by an older
+  build has key format 3 and is never found.
 - Cargo and tests enforce the boundary. `tests/engine_fingerprint.rs`
   asserts that the check set is the converter's closure minus
   `sqldiff-draft`, that the draft crate does not depend on core, convert or
@@ -280,7 +284,10 @@ This is the behaviour change of the plan.
   runs inside `tree.rs` and calls the draft code. A rule edit still rebuilds
   them. Moving that is a later step and needs its own stage list.
 
-Tests: `tests/store.rs` (a stored mix the code no longer builds is a miss;
+Tests: `tree::mix_reuse` (real mixes, through a test-only marker
+`check::FORCE_MIX` because no corpus input builds one: stored, reused,
+missed when the rebuilt draft differs, missed across a review ledger both
+ways, and the re-check failing on a mix that differs), `tests/store.rs` (a stored mix the code no longer builds is a miss;
 a clash lifted by an edit of another file changes the other file's stored
 result and equals a fresh run), `tests/engine_fingerprint.rs`,
 `tests/stage_boundary.rs`.

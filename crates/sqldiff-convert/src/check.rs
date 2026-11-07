@@ -55,6 +55,10 @@ pub(crate) fn score_of<'a>(units: impl Iterator<Item = &'a Unit>) -> (usize, usi
     (differs, open)
 }
 
+/// A marker that makes a test input build a mix (`cfg(test)` only).
+#[cfg(test)]
+pub(crate) const FORCE_MIX: &str = "-- sqldiff-test: force-mix";
+
 /// The mix [`check_with`] built a draft for: the routines (by the source
 /// offset where each starts) written without exception blocks, and the
 /// draft that came out (`Draft::canonical`). Stored with the result whether or
@@ -133,6 +137,11 @@ pub(crate) fn check_with_mix(
         // Only a file where one routine does better with the blocks and
         // another does better without them can beat both whole-file variants.
         let fresh = blocks_better && plain_better;
+        // Tests only: no input of the corpora builds a mix, so an input
+        // naming `FORCE_MIX` has the engine try one (it is still kept only
+        // when it scores better). Compiled out of every other build.
+        #[cfg(test)]
+        let fresh = fresh || input.contains(FORCE_MIX);
         fresh.then(|| {
             let mixed = rebuild(&plain_at);
             built = Some(Mix {

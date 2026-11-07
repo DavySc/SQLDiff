@@ -205,6 +205,11 @@ struct Entry {
     /// is not part of a result's fingerprint, so a reuse builds the mix again
     /// and compares.
     mix: Option<crate::check::Mix>,
+    /// Whether a mix could be tried when the result was made: not in a run
+    /// under a review ledger, where the draft is not built again. A result
+    /// stored without a try says nothing about a mix, so a run that can try
+    /// one does not take it.
+    mix_tried: bool,
 }
 
 /// The body of a result file: the file is the SHA-256 of its body in hex, a
@@ -401,7 +406,7 @@ impl Store {
 
     /// The stored conversion. A file that does not read back whole, or does
     /// not name its own key, is a miss.
-    pub fn get(&self, key: &Key) -> Option<(Conversion, Option<crate::check::Mix>)> {
+    pub fn get(&self, key: &Key) -> Option<(Conversion, Option<crate::check::Mix>, bool)> {
         let path = crate::tree::dest_under(&self.out, &Self::rel(key)).ok()?;
         let raw = std::fs::read(path).ok()?;
         let body = verified_body(&raw)?;
@@ -412,7 +417,7 @@ impl Store {
         expand(&mut e.conversion, &e.pool)?;
         unshare_notes(&mut e.conversion)?;
         let conversion = serde_json::from_value(e.conversion).ok()?;
-        Some((conversion, e.mix))
+        Some((conversion, e.mix, e.mix_tried))
     }
 
     /// Stores a result: written beside its name and renamed into place,
@@ -423,6 +428,7 @@ impl Store {
         key: &Key,
         c: &Conversion,
         mix: Option<&crate::check::Mix>,
+        mix_tried: bool,
     ) -> Result<(), String> {
         let mut value = serde_json::to_value(c).map_err(|e| e.to_string())?;
         share_notes(&mut value);
@@ -432,6 +438,7 @@ impl Store {
             pool,
             conversion,
             mix: mix.cloned(),
+            mix_tried,
         })
         .map_err(|e| e.to_string())?;
         let bytes = framed(&body);
