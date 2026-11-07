@@ -203,6 +203,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_site_list_matches_the_sites() {
+        for (i, s) in SITE_LIST.iter().enumerate() {
+            assert_eq!(*s as usize, i);
+        }
+        assert_eq!(NAMES.len(), SITES);
+    }
+
+    #[test]
     fn counts_in_a_scope_and_nothing_outside() {
         spend(Site::DiffCalls, 5);
         assert!(unmetered() >= 5);

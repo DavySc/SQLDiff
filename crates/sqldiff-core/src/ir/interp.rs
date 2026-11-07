@@ -958,7 +958,11 @@ impl Explorer {
                 outs_end: 0,
                 small,
                 dropped: false,
-                spent: sqldiff_model::work::now().get(sqldiff_model::work::Site::ExplorerSteps),
+                // Relative to the start of this explorer: what ran earlier in
+                // the file is not part of reaching this tick.
+                spent: sqldiff_model::work::now()
+                    .get(sqldiff_model::work::Site::ExplorerSteps)
+                    .saturating_sub(started.get(sqldiff_model::work::Site::ExplorerSteps)),
             });
             it.tick(&mut m);
             // A path dropped by joining ran nothing: a replay must not merge
@@ -1112,15 +1116,16 @@ impl Explorer {
         let Some(mut m) = self.machine_at(cfg, t) else {
             return self.full(cfg, sc);
         };
+        if m.next_node() != Some(fault.node) {
+            return self.full(cfg, sc);
+        }
         // The scenario's own run starts where the fault-free one was at `t`:
-        // what that took is the cost of its prefix.
+        // what that took is the cost of its prefix. (Charged after the check
+        // above, so the fallback to a full run is not charged twice.)
         sqldiff_model::work::spend(
             sqldiff_model::work::Site::ExplorerSteps,
             self.ticks[t].spent,
         );
-        if m.next_node() != Some(fault.node) {
-            return self.full(cfg, sc);
-        }
         // The replay runs every path to its end: what joining dropped from the
         // fault-free run cannot reach the failing statement (it is first
         // reached at tick `t`), so those paths are as in the fault-free run.
@@ -1714,6 +1719,10 @@ impl Interp<'_> {
         if st.steps < e.steps && e.step_cut {
             return false;
         }
+        // `e.cost` is the unjoined cost of the subtree. When the entry's
+        // subtree was cut by the step budget and this path has fewer steps
+        // left, it would have been cut sooner: a slight, deterministic
+        // overcharge.
         let (arrived, cost) = (e.arrived, e.cost);
         j.joined += 1;
         j.last_arrived = arrived;

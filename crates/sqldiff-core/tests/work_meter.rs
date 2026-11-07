@@ -123,4 +123,64 @@ mod logical {
         let (_, again) = scope("replay", || x.explore(&cfg, &sc));
         assert_eq!(w, again);
     }
+
+    /// The charge for a replay does not depend on what the file did before
+    /// the explorer was made (a resumed or stored earlier routine).
+    #[test]
+    fn a_replay_charge_ignores_earlier_work_in_the_file() {
+        let body: String = (0..700)
+            .map(|i| format!("  UPDATE dbo.t SET a = {i};\n"))
+            .collect();
+        let cfg = cfg_of(&body);
+        let keys = KeyUniverse::of(&[&cfg]);
+        let base = Scenario::default();
+        let node = (0..cfg.nodes.len())
+            .filter(|&n| cfg.node(n).stmt().is_some())
+            .nth(100)
+            .expect("a statement");
+        let sc = Scenario {
+            faults: vec![Fault {
+                node,
+                kind: ErrorKind::ALL[0],
+            }],
+            ..base.clone()
+        };
+        let run = |earlier: u64| {
+            scope("file", || {
+                sqldiff_model::work::spend(Site::ExplorerSteps, earlier);
+                let x = Explorer::in_universe(&cfg, &base, &keys);
+                scope("replay", || x.explore(&cfg, &sc)).1
+            })
+            .0
+        };
+        assert_eq!(run(0), run(1_000_000));
+    }
+
+    /// A fault the explorer cannot resume (its node is not the one the
+    /// checkpoint reaches) falls back to a full run: charged once.
+    #[test]
+    fn two_faults_are_charged_as_one_full_run() {
+        let body: String = (0..50)
+            .map(|i| format!("  UPDATE dbo.t SET a = {i};\n"))
+            .collect();
+        let cfg = cfg_of(&body);
+        let keys = KeyUniverse::of(&[&cfg]);
+        let base = Scenario::default();
+        let x = Explorer::in_universe(&cfg, &base, &keys);
+        let nodes: Vec<usize> = (0..cfg.nodes.len())
+            .filter(|&n| cfg.node(n).stmt().is_some())
+            .collect();
+        let sc = Scenario {
+            faults: nodes[..2]
+                .iter()
+                .map(|&node| Fault {
+                    node,
+                    kind: ErrorKind::ALL[0],
+                })
+                .collect(),
+            ..base.clone()
+        };
+        let (_, w) = scope("two", || x.explore(&cfg, &sc));
+        assert!(steps(&w) > 0 && steps(&w) < 200, "{w}");
+    }
 }
