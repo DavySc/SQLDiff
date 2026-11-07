@@ -1107,6 +1107,7 @@ impl Server {
             to,
             jobs: Some(1),
             no_catalog: false,
+            recheck: Default::default(),
             template,
             extensions: Vec::new(),
             helpers: self.config.options().helpers,
@@ -1149,6 +1150,7 @@ impl Server {
         };
         Ok(tree::Args {
             rules: Default::default(),
+            recheck: Default::default(),
             src: src.into(),
             from,
             to: target(args)?,

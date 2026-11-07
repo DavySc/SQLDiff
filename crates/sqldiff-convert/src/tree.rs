@@ -32,6 +32,57 @@ use sqldiff_core::{Dialect, Options};
 use sqldiff_source::compose;
 use sqldiff_syntax::template::Template;
 
+/// How much of what a run takes from the store it builds again and compares
+/// (`--recheck`). A stored result is trusted only because its key says
+/// everything the check reads; the re-check is the proof that the key does.
+/// It never changes a result: a difference empties the store and fails the
+/// run. The sample a run draws is a function of the tree and the store's run
+/// count (`store::seed_of`), never of the clock.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Recheck {
+    /// Reuse stored results as they are. The report says so: nothing reused
+    /// in this run was verified.
+    None,
+    /// One stored file in 50 (at least one) is built again and compared.
+    #[default]
+    Sample,
+    /// Every stored result and draft is built again and compared; the whole
+    /// tree state is built again. Reuse then saves no time but verifies all.
+    All,
+}
+
+impl Recheck {
+    /// The files of `present` (`(index, bytes)`) to build again.
+    pub fn pick(self, present: &[(usize, usize)], seed: u64) -> std::collections::BTreeSet<usize> {
+        match self {
+            Recheck::None => Default::default(),
+            Recheck::Sample => crate::store::pick(present, seed),
+            Recheck::All => present.iter().map(|&(i, _)| i).collect(),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Recheck::None => "none",
+            Recheck::Sample => "sample",
+            Recheck::All => "all",
+        }
+    }
+}
+
+impl std::str::FromStr for Recheck {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "none" => Ok(Recheck::None),
+            "sample" => Ok(Recheck::Sample),
+            "all" => Ok(Recheck::All),
+            _ => Err(format!("`{s}`: expected none, sample or all")),
+        }
+    }
+}
+
 /// How to convert a tree.
 pub struct Args {
     /// The source tree, or one file. Locations in the report are relative to it.
@@ -62,6 +113,8 @@ pub struct Args {
     pub catalogs_b: Vec<PathBuf>,
     /// Choices for the rules (`--temporal-historyless`), all off by default.
     pub rules: crate::RuleOptions,
+    /// How much of what is taken from the store is checked again.
+    pub recheck: Recheck,
 }
 
 /// How templates are read: the placeholder rules of `diff --template`.
@@ -164,6 +217,10 @@ fn is_true(b: &bool) -> bool {
 pub struct RunInfo {
     /// Wall-clock seconds the conversion took.
     pub seconds: f64,
+    /// How much of the stored work this run built again to compare
+    /// (`--recheck`).
+    #[serde(default)]
+    pub recheck: Recheck,
     /// One entry per file, in report order.
     pub files: Vec<RunFile>,
 }
@@ -802,6 +859,7 @@ fn convert_kept(
         files,
         run: RunInfo {
             seconds: (started.elapsed().as_secs_f64() * 100.0).round() / 100.0,
+            recheck: a.recheck,
             files: run_files,
         },
         unreadable,
@@ -962,11 +1020,13 @@ fn tree_key(
     k.finish()
 }
 
-/// The re-check of a stored tree state, as for stored results: every run
-/// builds again the rules' draft of one file in 50 (at least one) from the
-/// stored source catalog and compares it with the stored one, and one run in
-/// ten builds the whole state again and compares all of it, byte for byte as
-/// it serialises. `None` when they agree, else why not.
+/// The re-check of a stored tree state, as for stored results: by default
+/// every run builds again the rules' draft of one file in 50 (at least one)
+/// from the stored source catalog and compares it with the stored one, and
+/// one run in ten builds the whole state again and compares all of it, byte
+/// for byte as it serialises. `--recheck all` builds the whole state every
+/// run; `--recheck none` compares nothing but the shape. `None` when they
+/// agree, else why not.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_tree_state(
     st: &crate::store::TreeState,
@@ -988,7 +1048,10 @@ pub(crate) fn verify_tree_state(
     if st.drafts.len() != inputs.len() || st.source.is_some() == a.no_catalog {
         return wrong("its shape");
     }
-    if seed % 10 == 0 {
+    if a.recheck == Recheck::None {
+        return None;
+    }
+    if seed % 10 == 0 || a.recheck == Recheck::All {
         let Ok(mut fresh) = build_tree_state(a, out, inputs, jobs, ledger, base, None) else {
             return wrong("the whole state");
         };
@@ -1001,7 +1064,7 @@ pub(crate) fn verify_tree_state(
         a.from,
     );
     let all: Vec<(usize, usize)> = (0..inputs.len()).map(|i| (i, 0)).collect();
-    for idx in crate::store::pick(&all, seed) {
+    for idx in a.recheck.pick(&all, seed) {
         let i = &inputs[idx];
         let mut d = crate::rewrite_in_tree(&i.text, a.from, a.to, source, Some(&claims), a.rules);
         if let Some(l) = ledger {
@@ -1094,7 +1157,7 @@ pub(crate) fn build_tree_state(
     // A stored draft is trusted like a stored result: a sample of the ones
     // taken is built again and compared, byte for byte as it prints.
     if let Some(c) = drafts_of {
-        for idx in crate::store::pick(&reused, c.seed) {
+        for idx in a.recheck.pick(&reused, c.seed) {
             if rewrite(&inputs[idx]).canonical() != drafts[idx].canonical() {
                 return Err(format!(
                     "the stored draft of {} differs from one built again from the same \
@@ -1354,7 +1417,7 @@ fn convert_files(
                 .filter(|(_, k)| k.as_ref().is_some_and(|k| c.store.has(k)))
                 .map(|(i, _)| (i, inputs[i].text.len()))
                 .collect();
-            crate::store::pick(&present, seed)
+            a.recheck.pick(&present, seed)
         }
         _ => Default::default(),
     };
@@ -2841,6 +2904,9 @@ fn proof_lines(r: &Report) -> Option<(String, Option<String>)> {
     Some((first, second))
 }
 
+/// The summary line of a run under `--recheck none`.
+const UNVERIFIED_REUSE: &str = "unverified reuse: --recheck none; nothing taken from the store in this run (results, drafts, tree state) was built again to compare";
+
 pub fn summary(r: &Report) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "{} files, {} → {}", r.totals.files, r.from, r.to);
@@ -2860,6 +2926,12 @@ pub fn summary(r: &Report) -> String {
     }
     if !r.unreadable.is_empty() {
         let _ = writeln!(s, "{:<20} {:>6}", "unreadable", r.unreadable.len());
+    }
+    // Whatever the run took from the store (results, drafts, the tree
+    // state) was not built again to compare, so say so on every run in this
+    // mode, whether or not a per-file result happened to be reused.
+    if r.run.recheck == Recheck::None {
+        let _ = writeln!(s, "{UNVERIFIED_REUSE}");
     }
     if let Some(p) = &r.totals.progress {
         let _ = writeln!(
@@ -2961,6 +3033,12 @@ pub fn markdown(r: &Report) -> String {
         s,
         "A file counts as converted only when every unit in it is: no assumption, no decision, nothing found by the engine's diff or by checking the output on its own (binding, leftover source syntax, target limits).\n"
     );
+    if r.run.recheck == Recheck::None {
+        let _ = writeln!(
+            s,
+            "**Unverified reuse (`--recheck none`):** anything this run took from the result store was trusted as stored, not built again to compare.\n"
+        );
+    }
     let _ = writeln!(s, "```\n{}```\n", summary(r));
     if let Some(p) = &r.totals.proof {
         proof_markdown(&mut s, r, p);
@@ -3271,6 +3349,7 @@ mod tree_state_tests {
             to: Dialect::Postgres,
             jobs: Some(1),
             no_catalog: false,
+            recheck: Default::default(),
             template: None,
             extensions: extensions(Vec::new()),
             helpers: Vec::new(),
