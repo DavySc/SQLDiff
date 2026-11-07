@@ -21,7 +21,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use serde::Serialize;
 use sqldiff_convert::tree::Tree;
@@ -33,6 +33,21 @@ const SUFFIX: &str = ".json.gz";
 
 pub struct Stored {
     dir: PathBuf,
+    /// Writes that were announced ([`Stored::pending`]) and not done yet.
+    writing: Mutex<usize>,
+    idle: Condvar,
+}
+
+/// A write to the folder that has been announced and not finished: held
+/// until it is dropped, so that [`Stored::clear`] waits for it.
+pub struct Pending(Arc<Stored>);
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        let mut n = self.0.writing.lock().unwrap_or_else(|e| e.into_inner());
+        *n -= 1;
+        self.0.idle.notify_all();
+    }
 }
 
 /// What the folder holds, as the settings page shows it.
@@ -49,7 +64,18 @@ impl Stored {
     pub fn in_data_dir(data_dir: &Path) -> Stored {
         Stored {
             dir: data_dir.join("gui").join("conversions"),
+            writing: Mutex::new(0),
+            idle: Condvar::new(),
         }
+    }
+
+    /// Announces a write that is about to happen on another thread. Take it
+    /// before the conversion is shown as done, and drop it after `put`:
+    /// [`Stored::clear`] waits for every write announced before it, so a
+    /// file never appears after the folder was cleared.
+    pub fn pending(self: &Arc<Self>) -> Pending {
+        *self.writing.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        Pending(Arc::clone(self))
     }
 
     fn file(&self, key: &str) -> PathBuf {
@@ -147,9 +173,16 @@ impl Stored {
 
     /// Deletes every stored conversion (and nothing else in the folder).
     pub fn clear(&self) -> Usage {
+        // Writes announced so far finish first (they are short, and a
+        // convenience), else one lands after the delete and survives it.
+        let mut n = self.writing.lock().unwrap_or_else(|e| e.into_inner());
+        while *n > 0 {
+            n = self.idle.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
         for (f, _, _) in self.files() {
             let _ = std::fs::remove_file(f);
         }
+        drop(n);
         self.usage()
     }
 }
@@ -222,6 +255,27 @@ mod tests {
         s.trim(size("b") + size("c"));
         assert!(!s.file("a").exists());
         assert!(s.file("b").exists() && s.file("c").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn clear_waits_for_a_write_announced_before_it() {
+        let d = dir("pending");
+        let s = Arc::new(Stored::in_data_dir(&d));
+        let pending = s.pending();
+        let writer = Arc::clone(&s);
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            writer.put("late", b"1");
+            drop(pending);
+        });
+        assert_eq!(s.clear().files, 0);
+        assert_eq!(
+            s.usage().files,
+            0,
+            "the late write did not survive the clear"
+        );
+        t.join().unwrap();
         let _ = std::fs::remove_dir_all(&d);
     }
 }
