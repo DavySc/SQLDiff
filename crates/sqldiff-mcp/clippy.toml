@@ -1,0 +1,8 @@
+# Determinism guard (docs: perf plan W0). A hash container's iteration order
+# is unspecified, so these crates use BTreeMap/BTreeSet. Allow a HashMap only
+# for a hot lookup table, with `#[allow(clippy::disallowed_types)]` and a
+# comment saying why its order can never reach an output.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order is unspecified; use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "iteration order is unspecified; use BTreeSet" },
+]

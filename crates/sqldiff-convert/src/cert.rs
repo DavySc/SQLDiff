@@ -1016,7 +1016,7 @@ pub fn propose_renaming(a: &Routine, b: &Routine) -> Result<Renaming, String> {
         ));
     }
     out.extend(locals.into_iter().zip(decls));
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = std::collections::BTreeSet::new();
     for (_, y) in &out {
         if !seen.insert(y.clone()) {
             return Err(format!("two source names map to `{y}`"));

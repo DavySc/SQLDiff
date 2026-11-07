@@ -359,12 +359,43 @@ impl StandIns {
         out
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.tables.is_empty()
+    }
+
+    /// SHA-256 of the stand-ins as they serialise: part of the key of the
+    /// flags stored for a file ([`crate::store::Store::get_flags`]).
+    pub fn digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let bytes = serde_json::to_vec(self).unwrap_or_default();
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
     /// Flags the units of file `fi` (converted from `text`) that name a
     /// stand-in table, on the innermost unit around each name. It reads the file's output
     /// and units and changes units and counts only.
     pub fn flag_file(&self, fi: usize, text: &str, c: &mut Conversion, from: Dialect, to: Dialect) {
+        let flags = self.flags_of(fi, text, c, from, to);
+        apply_flags(c, &flags);
+    }
+
+    /// What [`Self::flag_file`] adds to the units of `c`, as data: a function
+    /// of the stand-ins, the file index, the text, the output and the
+    /// units' places and notes, so it can be stored with the result.
+    pub fn flags_of(
+        &self,
+        fi: usize,
+        text: &str,
+        c: &Conversion,
+        from: Dialect,
+        to: Dialect,
+    ) -> Vec<UnitFlag> {
+        let mut flags = Vec::new();
         if self.tables.is_empty() {
-            return;
+            return flags;
         }
         // Names in the source and in the output: a name the source
         // holds in a string (sp_addextendedproperty) is a name in the
@@ -394,12 +425,11 @@ impl StandIns {
                 hits[ui].push(si);
             }
         }
-        let mut changed = false;
         for (ui, his) in hits.into_iter().enumerate() {
             if his.is_empty() {
                 continue;
             }
-            let u = &mut c.units[ui];
+            let u = &c.units[ui];
             let within = |t: &[Tok], (a, b): (usize, usize)| -> std::ops::Range<usize> {
                 t.partition_point(|x| x.start < a)..t.partition_point(|x| x.start < b)
             };
@@ -432,37 +462,62 @@ impl StandIns {
                     left.join(" and ")
                 ));
             }
-            u.notes.push(Note {
-                status: Status::Assumptions,
-                rule: STAND_IN.into(),
-                text: format!(
-                    "Uses tables whose CREATE TABLE was not converted, or views over them: {}. The statement holds once the target table is created with the stand-in's columns and types; accept this when it is (a column or alias named like the table also counts).",
-                    parts.join("; ")
-                ).into(),
+            flags.push(UnitFlag {
+                unit: ui,
+                stand_in: Note {
+                    status: Status::Assumptions,
+                    rule: STAND_IN.into(),
+                    text: format!(
+                        "Uses tables whose CREATE TABLE was not converted, or views over them: {}. The statement holds once the target table is created with the stand-in's columns and types; accept this when it is (a column or alias named like the table also counts).",
+                        parts.join("; ")
+                    ).into(),
+                },
+                refused: (!touched.is_empty()).then(|| Note {
+                    status: Status::Unproven,
+                    rule: REFUSED_COLUMN.into(),
+                    text: format!(
+                        "May use a refused column, whose target form is not known, so this is not compared: {}.",
+                        touched.join("; ")
+                    ).into(),
+                }),
             });
-            if !touched.is_empty() {
-                let at = u.notes.partition_point(|n| n.status >= Status::Unproven);
-                u.notes.insert(
-                    at,
-                    Note {
-                        status: Status::Unproven,
-                        rule: REFUSED_COLUMN.into(),
-                        text: format!(
-                            "May use a refused column, whose target form is not known, so this is not compared: {}.",
-                            touched.join("; ")
-                        ).into(),
-                    },
-                );
-                u.status = u.status.max(Status::Unproven);
-            } else {
-                u.status = u.status.max(Status::Assumptions);
-            }
-            changed = true;
         }
-        if changed {
-            crate::recount(c);
+        flags
+    }
+}
+
+/// What flagging adds to one unit: the stand-in note and, when the unit may
+/// touch a refused column, that note (inserted before the first note below
+/// `Unproven`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnitFlag {
+    unit: usize,
+    stand_in: Note,
+    refused: Option<Note>,
+}
+
+/// Adds `flags` to the units of `c` and recounts. `false`, with `c` left as
+/// it was, when a flag names a unit `c` does not have.
+pub fn apply_flags(c: &mut Conversion, flags: &[UnitFlag]) -> bool {
+    if flags.iter().any(|f| f.unit >= c.units.len()) {
+        return false;
+    }
+    for f in flags {
+        let u = &mut c.units[f.unit];
+        u.notes.push(f.stand_in.clone());
+        match &f.refused {
+            Some(n) => {
+                let at = u.notes.partition_point(|n| n.status >= Status::Unproven);
+                u.notes.insert(at, n.clone());
+                u.status = u.status.max(Status::Unproven);
+            }
+            None => u.status = u.status.max(Status::Assumptions),
         }
     }
+    if !flags.is_empty() {
+        crate::recount(c);
+    }
+    true
 }
 
 /// `c` with the columns `cols` left out of `table` and, when it is

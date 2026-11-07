@@ -223,6 +223,7 @@ fn the_clash_check_spans_the_files_of_a_tree() {
         to: Dialect::Postgres,
         jobs: Some(2),
         no_catalog: false,
+        recheck: Default::default(),
         template: None,
         extensions: sqldiff_convert::tree::extensions(Vec::new()),
         helpers: Vec::new(),
