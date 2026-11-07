@@ -5,8 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::profile::ErrorKind;
 use crate::model::Finding;
+use crate::profile::ErrorKind;
 
 /// One step of the path a scenario follows: a condition the interpreter
 /// could not decide and the value this path gives it.

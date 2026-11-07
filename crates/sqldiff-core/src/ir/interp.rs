@@ -1681,6 +1681,11 @@ impl Interp<'_> {
     }
 
     fn row(&self, st: &mut State, id: &str, fact: Option<&str>, status: Status) {
+        // A row already noted has its assumption and untested entries too:
+        // they follow from the row's id, fact and status alone.
+        if st.rows.contains(id) {
+            return;
+        }
         st.rows.insert(id.to_string());
         if status != Status::Confirmed {
             st.assumptions.insert(row_assumption_id(fact, id));
@@ -2042,12 +2047,13 @@ impl Interp<'_> {
             };
             if rejects {
                 let r = &self.prof.transactions.doomed_writes;
-                self.row(
-                    &mut st,
-                    &format!("{}.transactions.doomed_writes", d.id()),
-                    r.fact.as_deref(),
-                    r.status,
-                );
+                let row_id = match d {
+                    Dialect::Tsql => "tsql.transactions.doomed_writes",
+                    Dialect::Postgres => "postgres.transactions.doomed_writes",
+                    Dialect::Db2i => "db2i.transactions.doomed_writes",
+                };
+                debug_assert_eq!(row_id, format!("{}.transactions.doomed_writes", d.id()));
+                self.row(&mut st, row_id, r.fact.as_deref(), r.status);
                 return self.fail(id, ErrorKind::Other, st, None);
             }
         }
@@ -2478,8 +2484,7 @@ impl Interp<'_> {
                     && (r.kinds.is_empty() || r.kinds.contains(&kind))
                     && r.when.matches(&sit)
             }),
-        }
-        .cloned();
+        };
         let first_fault = st.fault_index.is_some() && st.fault_route.is_none();
         if first_fault {
             st.fault_route = Some(

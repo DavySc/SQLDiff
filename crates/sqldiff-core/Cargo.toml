@@ -8,6 +8,8 @@ publish.workspace = true
 
 [dependencies]
 sqldiff-syntax.workspace = true
+sqldiff-model.workspace = true
+sqldiff-equiv.workspace = true
 sqldiff-catalog.workspace = true
 rowan.workspace = true
 serde.workspace = true

@@ -54,7 +54,7 @@ require` makes that the exit code.
 
 ## Where the current code stands against it
 
-From a read of `crates/sqldiff-convert` and `crates/sqldiff-core/src/equiv`
+From a read of `crates/sqldiff-convert` and `crates/sqldiff-equiv/src/equiv`
 on 2026-10-28:
 
 | Fact | Consequence for the target |

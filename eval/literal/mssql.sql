@@ -1,5 +1,5 @@
 -- Literal-conversion probes for equiv::literal, SQL Server 2022 (run 2026-10-26).
--- Results are summarised in crates/sqldiff-core/src/equiv/literal.rs.
+-- Results are summarised in crates/sqldiff-equiv/src/equiv/literal.rs.
 SET NOCOUNT ON;
 CREATE TABLE t (k int, d2 datetime2 NOT NULL, d0 datetime2(0), dt datetime, sdt smalldatetime, dd date, tm time, tm3 time(3), i int, dec2 decimal(10,2), b bit, g uniqueidentifier, dto datetimeoffset, v varchar(30));
 INSERT t VALUES (1,'9999-12-31 23:59:59.9999999','2020-01-01 10:00:00','2020-01-01 10:00:00','2020-01-01 10:01','2020-01-01','10:00:00.1234567','10:00:00.123',5,1.01,1,'6F9619FF-8B86-D011-B42D-00C04FC964FF','2020-01-01 10:00:00 +02:00','abc');
