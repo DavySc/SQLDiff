@@ -516,8 +516,7 @@ impl Schema {
 
     /// Whether the view `key` was defined with a `*` select list.
     pub fn is_star_view(&self, key: &str) -> bool {
-        let ext = self.ext.star_views.contains(key);
-        self.rec(|| Query::StarView(key.to_string()), &ext);
+        let ext = self.ask_star(key);
         (ext && !self.star_cleared)
             || self.flat_star_views.contains(key)
             || self.extra_star_views.contains(key)
@@ -558,14 +557,75 @@ impl Schema {
     /// them to agree, so their order does not matter.
     #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: the consumer needs all types to agree
     pub fn column_types(&self, col: &str) -> Vec<Ty> {
-        self.rec(
-            || Query::ColumnNamed(col.to_string()),
-            &self.sorted_ext(|t| t.column(col).is_some()),
-        );
+        self.ask_columns(col);
         self.tables_by_key()
             .filter_map(|(_, t)| t.column(col))
             .map(|c| c.ty)
             .collect()
+    }
+
+    /// Records the `ColumnNamed` answer for a lower-case column name.
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: sorted
+    fn ask_columns(&self, col: &str) {
+        self.rec(
+            || Query::ColumnNamed(col.to_string()),
+            &self.sorted_ext(|t| t.column(col).is_some()),
+        );
+    }
+
+    /// Records the `HiddenTables` answer.
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: sorted
+    fn ask_hidden(&self) {
+        self.rec(
+            || Query::HiddenTables,
+            &self.sorted_ext(|t| t.columns.iter().any(|c| c.hidden)),
+        );
+    }
+
+    /// Records the `StarView` answer for a lower-case view name.
+    fn ask_star(&self, key: &str) -> bool {
+        let ext = self.ext.star_views.contains(key);
+        self.rec(|| Query::StarView(key.to_string()), &ext);
+        ext
+    }
+
+    /// Records the `ViewFamily` answer for a lower-case unqualified name.
+    #[allow(clippy::disallowed_methods)] // collected into a BTreeMap: ordered
+    fn ask_family(&self, key: &str) {
+        let family = self
+            .ext
+            .view_families
+            .get(key)
+            .map(|m| m.iter().collect::<std::collections::BTreeMap<_, _>>());
+        self.rec(|| Query::ViewFamily(key.to_string()), &family);
+    }
+
+    /// Records the `Spellings` answer for a lower-case name (PostgreSQL only).
+    fn ask_spellings(&self, lower: &str) {
+        if self.ext.pg {
+            self.rec(
+                || Query::Spellings(lower.to_string()),
+                &self.ext.spellings.get(lower),
+            );
+        }
+    }
+
+    /// Replay: asks the external catalog the question `q` as a check did,
+    /// so that the answer is recorded by the very code the check ran.
+    /// `false` when `q` is not a question of the equivalence schema.
+    pub fn ask(&self, q: &Query) -> bool {
+        match q {
+            Query::SchemaTables(k) => self.ask_table(k),
+            Query::ColumnNamed(c) => self.ask_columns(c),
+            Query::HiddenTables => self.ask_hidden(),
+            Query::StarView(k) => {
+                self.ask_star(k);
+            }
+            Query::ViewFamily(k) => self.ask_family(k),
+            Query::Spellings(k) => self.ask_spellings(k),
+            _ => return false,
+        }
+        true
     }
 
     /// The external tables that satisfy `keep`, by name: the canonical form
@@ -606,13 +666,7 @@ impl Schema {
     pub fn view_column_is_not_char(&self, name: &str, col: &str) -> bool {
         let key = name.to_lowercase();
         let key = key.rsplit('.').next().unwrap_or(&key);
-        #[allow(clippy::disallowed_methods)] // collected into a BTreeMap: ordered
-        let family = self
-            .ext
-            .view_families
-            .get(key)
-            .map(|m| m.iter().collect::<std::collections::BTreeMap<_, _>>());
-        self.rec(|| Query::ViewFamily(key.to_string()), &family);
+        self.ask_family(key);
         self.view_families
             .get(key)
             .and_then(|c| c.get(&col.to_lowercase()))
@@ -731,12 +785,7 @@ impl Schema {
     /// be a catalog name.
     pub fn case_check(&self, stored: &str, known: bool) -> Result<(), String> {
         let lower = stored.to_lowercase();
-        if self.ext.pg {
-            self.rec(
-                || Query::Spellings(lower.clone()),
-                &self.ext.spellings.get(&lower),
-            );
-        }
+        self.ask_spellings(&lower);
         let merged;
         let found = match (self.spellings.get(&lower), self.extra_spellings.get(&lower)) {
             (Some(a), Some(b)) => {
@@ -792,10 +841,7 @@ impl Schema {
     /// Whether a table has a HIDDEN column (T-SQL period column).
     #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: `any`
     pub fn hides_columns(&self) -> bool {
-        self.rec(
-            || Query::HiddenTables,
-            &self.sorted_ext(|t| t.columns.iter().any(|c| c.hidden)),
-        );
+        self.ask_hidden();
         self.tables_by_key()
             .any(|(_, t)| t.columns.iter().any(|c| c.hidden))
     }

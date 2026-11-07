@@ -248,6 +248,50 @@ impl<'a> RecordingView<'a> {
         a
     }
 
+    /// Replay: asks the question `q` through the same method a check used,
+    /// so the answer is recorded (to this view's sink) by the very code the
+    /// check ran. `false` for a question this view cannot be asked: a
+    /// replay that meets one rejects the stored result.
+    pub fn ask(&self, q: &Query) -> bool {
+        let idents = |parts: &[Part]| -> Vec<Ident> {
+            parts
+                .iter()
+                .map(|(t, q)| Ident::new(t.as_str(), *q))
+                .collect()
+        };
+        match q {
+            Query::Supplied => {
+                self.supplied();
+            }
+            Query::Origin => {
+                self.origin();
+            }
+            Query::TablesAuthoritative => {
+                self.tables_authoritative();
+            }
+            Query::RoutinesAuthoritative(kind) => {
+                let kind = match kind.as_str() {
+                    "Procedure" => RoutineKind::Procedure,
+                    "Function" => RoutineKind::Function,
+                    "Trigger" => RoutineKind::Trigger,
+                    _ => return false,
+                };
+                self.routines_authoritative(kind);
+            }
+            Query::Table(parts) => {
+                self.table(&idents(parts));
+            }
+            Query::Routines(parts) => {
+                self.routines(&idents(parts));
+            }
+            Query::WholeCatalog => {
+                self.whole();
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// The whole catalog, for a read that has no narrow query yet. Recorded
     /// as `WholeCatalog` with the digest of everything, so a file that calls
     /// it is re-checked on any edit of this side's catalog: sound, and the
