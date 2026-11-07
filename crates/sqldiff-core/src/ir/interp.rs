@@ -219,6 +219,9 @@ struct State {
     last_error: Option<ErrorKind>,
     /// Whether the last statement touched no rows, when a scenario says so.
     no_rows: Option<bool>,
+    /// The statement whose row count `no_rows` / `@@ROWCOUNT` / `FOUND`
+    /// reads now (names the condition of a row-count test in a signature).
+    rows_stmt: Option<NodeId>,
     partial: BTreeSet<String>,
     entry_depth: u32,
     faults_done: BTreeSet<NodeId>,
@@ -268,6 +271,7 @@ impl State {
             caught,
             last_error,
             no_rows,
+            rows_stmt,
             entry_depth,
             loop_seen,
             ret,
@@ -305,6 +309,7 @@ impl State {
             || *caught != b.caught
             || *last_error != b.last_error
             || *no_rows != b.no_rows
+            || *rows_stmt != b.rows_stmt
             || *entry_depth != b.entry_depth
             || *loop_seen != b.loop_seen
             || *ret != b.ret
@@ -1323,6 +1328,7 @@ impl Interp<'_> {
             caught: Vec::new(),
             last_error: None,
             no_rows: None,
+            rows_stmt: None,
             partial: BTreeSet::new(),
             entry_depth: 0,
             faults_done: BTreeSet::new(),
@@ -1514,9 +1520,14 @@ impl Interp<'_> {
                 if let Some(b) = known {
                     return Step::Go(if b { t } else { f }, st);
                 }
-                let text = match test {
-                    Test::Unknown(x) => x.clone(),
-                    _ => String::new(),
+                // A row-count test is named by the statement it reads and
+                // recorded as "no rows from it", so the two sides' tests
+                // (`@@ROWCOUNT = 0`, `NOT FOUND`, `FOUND` on the other
+                // branch) agree on what the value means.
+                let (text, tv) = match test {
+                    Test::Unknown(x) => (x.clone(), true),
+                    Test::NoRows(b) => (self.rows_text(&st), *b),
+                    _ => (String::new(), true),
                 };
                 if *is_loop {
                     let digest = self.digest(&st);
@@ -1533,12 +1544,24 @@ impl Interp<'_> {
                     }
                 }
                 let mut a = st.clone();
-                a.signature.push((text.clone(), true));
-                st.signature.push((text, false));
+                a.signature.push((text.clone(), tv));
+                st.signature.push((text, !tv));
                 Step::Fork(vec![(t, a), (f, st)])
             }
             Op::Stmt(_) => self.exec(id, st),
         }
+    }
+
+    /// "no rows from <statement>": the statement a row-count test reads.
+    fn rows_text(&self, st: &State) -> String {
+        let what = match st.rows_stmt.and_then(|n| self.cfg.node(n).stmt()) {
+            Some(s) => match s.effects.first() {
+                Some(e) => e.key.clone(),
+                None => format!("{:?}", s.kind),
+            },
+            None => "the start".to_string(),
+        };
+        format!("no rows from {what}")
     }
 
     fn digest(&self, st: &State) -> String {
@@ -1562,6 +1585,7 @@ impl Interp<'_> {
         // leave it alone.
         if d != Dialect::Postgres || s.category.is_some() || s.kind == StmtKind::Select {
             st.no_rows = None;
+            st.rows_stmt = Some(id);
         }
         // IMPLICIT_TRANSACTIONS opens the transaction when DML starts, even if
         // it then touches no rows or fails.

@@ -1118,13 +1118,42 @@ fn pairs(pa: &[Outcome], pb: &[Outcome]) -> (Vec<(usize, usize)>, bool) {
             .collect();
         return (v, true);
     }
+    // Not the same set of paths: every pair of outcomes except those no input
+    // can produce (see `feasible`).
     let mut v = Vec::new();
     for i in 0..pa.len() {
         for j in 0..pb.len() {
-            v.push((i, j));
+            if feasible(&siga[i], &sigb[j]) {
+                v.push((i, j));
+            }
         }
     }
     (v, false)
+}
+
+/// Whether one input could take path `a` on side A and path `b` on side B.
+/// The paths decide conditions in order; the same condition (after folding)
+/// decided with two values makes the pair impossible. At the first position
+/// where the two decide different conditions, nothing is known about the
+/// rest (the sides may decide in another order, or a condition may be
+/// another spelling of one the other side decides), so the pair stays. This
+/// only ever removes pairs a real input cannot produce, so every input still
+/// has its pair and a divergence shown by all remaining pairs is shown by
+/// every input.
+fn feasible(a: &[(String, bool)], b: &[(String, bool)]) -> bool {
+    // A condition decided more than once on a path (a loop test, or the same
+    // text at two places) can have different values each time: its values
+    // say nothing about the other side's.
+    let once = |p: &[(String, bool)], c: &str| p.iter().filter(|x| x.0 == c).count() == 1;
+    for (x, y) in a.iter().zip(b) {
+        if x.0 != y.0 || !once(a, &x.0) || !once(b, &x.0) {
+            return true;
+        }
+        if x.1 != y.1 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Behavioural findings, the assumptions they rest on, and a structured
@@ -2140,5 +2169,55 @@ pub fn what_if(
         findings: std::mem::take(&mut c.out.findings),
         witnesses: std::mem::take(&mut c.out.witnesses),
         notes,
+    }
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::feasible;
+
+    fn p(x: &[(&str, bool)]) -> Vec<(String, bool)> {
+        x.iter().map(|(c, v)| (c.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn the_same_condition_with_two_values_is_impossible() {
+        assert!(!feasible(&p(&[("c", true)]), &p(&[("c", false)])));
+        assert!(!feasible(
+            &p(&[("c", true), ("d", true)]),
+            &p(&[("c", true), ("d", false)])
+        ));
+    }
+
+    #[test]
+    fn a_prefix_and_its_extensions_pair() {
+        assert!(feasible(
+            &p(&[("c", true)]),
+            &p(&[("c", true), ("d", false)])
+        ));
+        assert!(feasible(&p(&[]), &p(&[("c", true)])));
+    }
+
+    #[test]
+    fn different_conditions_say_nothing() {
+        // Another order, or another spelling of the same condition.
+        assert!(feasible(&p(&[("c", true)]), &p(&[("d", false)])));
+        assert!(feasible(
+            &p(&[("c", true), ("d", true)]),
+            &p(&[("d", false), ("c", true)])
+        ));
+    }
+
+    #[test]
+    fn a_condition_decided_twice_is_not_compared() {
+        // A loop test has a value per iteration.
+        assert!(feasible(
+            &p(&[("w", true), ("w", false)]),
+            &p(&[("w", true), ("w", true), ("w", false)])
+        ));
+        assert!(feasible(
+            &p(&[("w", true)]),
+            &p(&[("w", false), ("w", true)])
+        ));
     }
 }
