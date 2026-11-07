@@ -14,6 +14,8 @@
 //! reads files and the review store; it writes only when `convert_tree` is
 //! given an output directory, exactly what `sqldiff convert -o` writes.
 
+#![recursion_limit = "512"]
+
 use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
@@ -1141,6 +1143,59 @@ impl Server {
         Ok((text, structured))
     }
 
+    /// The increment `select` names (see `sqldiff convert --next` and
+    /// friends); empty checks the whole tree.
+    fn select_arg(&self, args: &Value) -> Result<sqldiff_convert::plan::Select, String> {
+        let Some(v) = args.get("select").filter(|v| !v.is_null()) else {
+            return Ok(Default::default());
+        };
+        Ok(sqldiff_convert::plan::Select {
+            next: v.get("next").and_then(Value::as_u64).map(|n| n as usize),
+            schemas: list_arg(v, "schemas")?,
+            objects: list_arg(v, "objects")?,
+            paths: list_arg(v, "paths")?,
+            changed: v.get("changed").and_then(Value::as_bool).unwrap_or(false),
+        })
+    }
+
+    /// Converts the tree as `sqldiff convert` does: with an `out`, each
+    /// file's checked result is kept in the store of `out` and reused when
+    /// its key matches, so a second call over an unchanged tree (a queue
+    /// read, a drafted unit) costs a lookup. Without `out` nothing is kept.
+    fn build_tree(
+        &self,
+        args: &Value,
+        a: &tree::Args,
+        inputs: &[tree::Input],
+        unreadable: Vec<String>,
+        out: Option<&std::path::Path>,
+    ) -> Result<tree::Tree, String> {
+        let fresh = args.get("fresh").and_then(Value::as_bool).unwrap_or(false);
+        let select = self.select_arg(args)?;
+        let Some(o) = out else {
+            if !select.is_empty() || fresh {
+                return Err("`select` and `fresh` need `out`: the store lives there".to_string());
+            }
+            return tree::convert(a, inputs, unreadable, None);
+        };
+        let t = tree::convert_increment(
+            a,
+            inputs,
+            unreadable,
+            o,
+            &tree::Hooks::default(),
+            fresh,
+            &select,
+        )?;
+        if !select.is_empty() {
+            sqldiff_convert::job::write_plan(
+                &sqldiff_convert::plan::Plan::build(inputs, a.from),
+                o,
+            )?;
+        }
+        Ok(t)
+    }
+
     /// The tree arguments `convert_tree` and `conversion_queue` share.
     fn tree_args(&self, args: &Value) -> Result<tree::Args, String> {
         let src = str_arg(args, "src").ok_or("`src` is required (a directory or one file)")?;
@@ -1149,8 +1204,17 @@ impl Server {
             None => Dialect::Tsql,
         };
         Ok(tree::Args {
-            rules: Default::default(),
-            recheck: Default::default(),
+            rules: sqldiff_convert::RuleOptions {
+                temporal_historyless: args
+                    .get("temporal_historyless")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                ..Default::default()
+            },
+            recheck: match str_arg(args, "recheck") {
+                Some(r) => r.parse()?,
+                None => Default::default(),
+            },
             src: src.into(),
             from,
             to: target(args)?,
@@ -1196,7 +1260,7 @@ impl Server {
             .unwrap_or(DEFAULT_TREE_LIMIT);
         // Converted again in memory, so decisions recorded since count; nothing is written.
         let (inputs, unreadable) = tree::read(&a)?;
-        let mut t = tree::convert(&a, &inputs, unreadable, Some(&out))?;
+        let mut t = self.build_tree(args, &a, &inputs, unreadable, Some(&out))?;
         tree::review_in(&mut t, &inputs, &out)?;
         let q = queue::build(&t.report, inst.as_ref(), all);
         let listed: Vec<&queue::Item> = q
@@ -1276,7 +1340,7 @@ impl Server {
         tree::prepare_out(&a.src, &out, true)?;
         tree::guard_hand_edits(&out, false)?;
         let (inputs, unreadable) = tree::read(&a)?;
-        let t = tree::convert(&a, &inputs, unreadable.clone(), Some(&out))?;
+        let t = self.build_tree(args, &a, &inputs, unreadable.clone(), Some(&out))?;
         let r = tree::written_record(
             &t,
             &inputs,
@@ -1289,7 +1353,7 @@ impl Server {
             &sqldiff_review::time::now(),
         )?;
         review::append(&out, &r)?;
-        let mut t = tree::convert(&a, &inputs, unreadable, Some(&out))?;
+        let mut t = self.build_tree(args, &a, &inputs, unreadable, Some(&out))?;
         tree::review_in(&mut t, &inputs, &out)?;
         tree::write(&t, &out)?;
         queue::write(&queue::build(&t.report, None, false), &out)?;
@@ -1368,7 +1432,7 @@ impl Server {
                 .unwrap_or(false);
             tree::guard_hand_edits(o, discard)?;
         }
-        let mut t = tree::convert(&a, &inputs, unreadable, out.as_deref())?;
+        let mut t = self.build_tree(args, &a, &inputs, unreadable, out.as_deref())?;
         // Review decisions committed next to the converted tree.
         if let Some(o) = &out {
             tree::review_in(&mut t, &inputs, o)?;
@@ -1893,6 +1957,15 @@ fn tools() -> Value {
                     "parameters": { "type": "array", "items": { "type": "string" }, "description": "With `template`: the only placeholder names, besides the pack's known_parameters" },
                     "extensions": { "type": "array", "items": { "type": "string" }, "description": "File extensions to convert (default [\"sql\"])" },
                     "jobs": { "type": "integer", "minimum": 1, "description": "Parallel jobs (default: available cores)" },
+                    "temporal_historyless": { "type": "boolean", "description": "Rule option `--temporal-historyless` (ASM-TEMPORAL-HISTORYLESS), off by default. Give the same value to `conversion_queue` and `write_unit`" },
+                    "recheck": { "type": "string", "enum": ["none", "sample", "all"], "description": "With `out`: how much of what is taken from the store is built again and compared (default sample). `none` trusts the store and the report says so; `all` verifies every stored result" },
+                    "fresh": { "type": "boolean", "description": "With `out`: reuse no stored result; every file is checked again and stored" },
+                    "select": { "type": "object", "description": "With `out`: check only this increment, as `sqldiff convert --next/--schema/--object/--path/--changed`; a file outside it is taken from the store or counted not converted", "properties": {
+                        "next": { "type": "integer", "minimum": 1 },
+                        "schemas": { "type": "array", "items": { "type": "string" } },
+                        "objects": { "type": "array", "items": { "type": "string" } },
+                        "paths": { "type": "array", "items": { "type": "string" } },
+                        "changed": { "type": "boolean" } } },
                     "statuses": { "type": "array", "items": { "type": "string", "enum": ["converted", "assumptions", "decision", "unproven", "differs", "not_converted"] }, "description": "List only files with one of these statuses (totals always cover the whole tree)" },
                     "folder": { "type": "string", "description": "List only files whose path starts with this" },
                     "limit": { "type": "integer", "minimum": 0, "description": "Cap on files listed (default 25); the rest are counted" },
@@ -1905,7 +1978,7 @@ fn tools() -> Value {
         {
             "name": "conversion_queue",
             "title": "Review queue of a converted tree",
-            "description": "What a person should review in a converted tree, worst first, by tier (never a score): 1 differs, not converted, rejected, a missing object many units fail to bind on (one item), templates whose instances differ; 2 not proven, instances unknown or not woven, templates no instance uses; 3 output an agent wrote that no person approved; 4 open decisions; 5 open assumptions (unverified vendor facts and template premises first); 6 (with `all`) plainly converted units nobody approved. Converts `src` again in memory with the same arguments as `convert_tree` and applies the review-decisions.jsonl in `out`, so decisions recorded since count; writes nothing. Reviewed units are not listed. Verdicts are recorded by people in the GUI or CLI, never by this server; `write_unit` only records an agent's draft.",
+            "description": "What a person should review in a converted tree, worst first, by tier (never a score): 1 differs, not converted, rejected, a missing object many units fail to bind on (one item), templates whose instances differ; 2 not proven, instances unknown or not woven, templates no instance uses; 3 output an agent wrote that no person approved; 4 open decisions; 5 open assumptions (unverified vendor facts and template premises first); 6 (with `all`) plainly converted units nobody approved. Converts `src` again with the same arguments as `convert_tree` (each file's checked result is reused from the store in `out`, so an unchanged tree costs lookups) and applies the review-decisions.jsonl in `out`, so decisions recorded since count; writes nothing but that store. Reviewed units are not listed. Verdicts are recorded by people in the GUI or CLI, never by this server; `write_unit` only records an agent's draft.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1916,6 +1989,8 @@ fn tools() -> Value {
                     "no_catalog": { "type": "boolean" },
                     "catalogs": { "type": "array", "items": { "type": "string" }, "description": "As given to `convert_tree`" },
                     "catalogs_b": { "type": "array", "items": { "type": "string" }, "description": "As given to `convert_tree`" },
+                    "temporal_historyless": { "type": "boolean", "description": "As given to `convert_tree`" },
+                    "recheck": { "type": "string", "enum": ["none", "sample", "all"], "description": "As given to `convert_tree`" },
                     "template": { "type": "boolean" },
                     "parameters": { "type": "array", "items": { "type": "string" } },
                     "extensions": { "type": "array", "items": { "type": "string" } },
@@ -1942,6 +2017,8 @@ fn tools() -> Value {
                     "no_catalog": { "type": "boolean" },
                     "catalogs": { "type": "array", "items": { "type": "string" }, "description": "As given to `convert_tree`" },
                     "catalogs_b": { "type": "array", "items": { "type": "string" }, "description": "As given to `convert_tree`" },
+                    "temporal_historyless": { "type": "boolean", "description": "As given to `convert_tree`" },
+                    "recheck": { "type": "string", "enum": ["none", "sample", "all"], "description": "As given to `convert_tree`" },
                     "template": { "type": "boolean" },
                     "parameters": { "type": "array", "items": { "type": "string" } },
                     "extensions": { "type": "array", "items": { "type": "string" } },
