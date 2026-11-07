@@ -390,7 +390,7 @@ pub fn rewrite_template_with(
         Some((pre, neutral, post)) if from == Dialect::Tsql => {
             let marker = format!("/*{}hb*/", stand.stem);
             // A fragment's statements are the template's, not a whole routine's: no error continuation.
-            let base = crate::tsql::without_continuation(|| {
+            let base = sqldiff_draft::tsql::without_continuation(|| {
                 rewrite_in(&format!("{pre}{neutral}{post}"), from, to, source)
             });
             let base = base.output();
@@ -428,7 +428,8 @@ pub fn rewrite_template_with(
         }
         _ => None,
     };
-    let draft = crate::tsql::without_continuation(|| rewrite_in(&frag.text, from, to, source));
+    let draft =
+        sqldiff_draft::tsql::without_continuation(|| rewrite_in(&frag.text, from, to, source));
     TemplateDraft {
         frag,
         draft,

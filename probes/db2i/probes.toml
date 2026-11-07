@@ -2526,7 +2526,7 @@ role = "decisive"
 procedure = "V27_INT"
 args = ["'SELECT SUM(K) FROM (SELECT K FROM (VALUES (1), (2), (3)) AS Q (K) ORDER BY K DESC FETCH FIRST 2 ROWS ONLY) AS S'"]
 question = "A derived table with ORDER BY ... DESC FETCH FIRST 2 ROWS ONLY over 1, 2, 3: is it accepted, and does it keep 3 and 2 (sum 5)?"
-source = "SQLDiff converts T-SQL TOP inside a query to FETCH FIRST there (crates/sqldiff-convert/src/tsql/paging.rs); the IBM i fetch-clause page could not be read."
+source = "SQLDiff converts T-SQL TOP inside a query to FETCH FIRST there (crates/sqldiff-draft/src/tsql/paging.rs); the IBM i fetch-clause page could not be read."
 outcome = [
   { label = "limited", when = { create = "00000", state = "00000", n1 = "=5" }, verdict = "consistent", meaning = "Accepted, and the limit applies to that query after its own ORDER BY." },
   { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Accepted with another result (in N1): the limit or the order is not applied there." },
@@ -2540,7 +2540,7 @@ role = "decisive"
 procedure = "V27_INT"
 args = ["'SELECT SUM(K) FROM (VALUES (1), (2), (3)) AS Q (K) WHERE K IN (SELECT R FROM (VALUES (1), (2), (3)) AS P (R) ORDER BY R FETCH FIRST 2 ROWS ONLY)'"]
 question = "An IN subquery with ORDER BY FETCH FIRST 2 ROWS ONLY: does it keep 1 and 2 (sum 3)?"
-source = "SQLDiff converts T-SQL TOP inside a query to FETCH FIRST there (crates/sqldiff-convert/src/tsql/paging.rs); the IBM i fetch-clause page could not be read."
+source = "SQLDiff converts T-SQL TOP inside a query to FETCH FIRST there (crates/sqldiff-draft/src/tsql/paging.rs); the IBM i fetch-clause page could not be read."
 outcome = [
   { label = "limited", when = { create = "00000", state = "00000", n1 = "=3" }, verdict = "consistent", meaning = "Accepted, and the limit applies to that query after its own ORDER BY." },
   { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Accepted with another result (in N1): the limit or the order is not applied there." },
@@ -2554,7 +2554,7 @@ role = "decisive"
 procedure = "V27_INT"
 args = ["'SELECT (SELECT K FROM (VALUES (1), (2), (3)) AS Q (K) ORDER BY K DESC FETCH FIRST 1 ROWS ONLY) FROM SYSIBM.SYSDUMMY1'"]
 question = "A scalar subquery with ORDER BY ... DESC FETCH FIRST 1 ROWS ONLY: is it accepted and 3?"
-source = "SQLDiff converts T-SQL TOP inside a query to FETCH FIRST there (crates/sqldiff-convert/src/tsql/paging.rs); the IBM i fetch-clause page could not be read."
+source = "SQLDiff converts T-SQL TOP inside a query to FETCH FIRST there (crates/sqldiff-draft/src/tsql/paging.rs); the IBM i fetch-clause page could not be read."
 outcome = [
   { label = "limited", when = { create = "00000", state = "00000", n1 = "=3" }, verdict = "consistent", meaning = "Accepted, and the limit applies to that query after its own ORDER BY." },
   { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Accepted with another result (in N1): the limit or the order is not applied there." },
@@ -2568,7 +2568,7 @@ role = "decisive"
 procedure = "V27_INT"
 args = ["'WITH C AS (SELECT K FROM (VALUES (1), (2), (3)) AS Q (K) ORDER BY K DESC FETCH FIRST 2 ROWS ONLY) SELECT SUM(K) FROM C'"]
 question = "A common table expression with ORDER BY ... DESC FETCH FIRST 2 ROWS ONLY: does it keep 3 and 2 (sum 5)?"
-source = "SQLDiff converts T-SQL TOP inside a query to FETCH FIRST there (crates/sqldiff-convert/src/tsql/paging.rs); the IBM i fetch-clause page could not be read."
+source = "SQLDiff converts T-SQL TOP inside a query to FETCH FIRST there (crates/sqldiff-draft/src/tsql/paging.rs); the IBM i fetch-clause page could not be read."
 outcome = [
   { label = "limited", when = { create = "00000", state = "00000", n1 = "=5" }, verdict = "consistent", meaning = "Accepted, and the limit applies to that query after its own ORDER BY." },
   { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Accepted with another result (in N1): the limit or the order is not applied there." },
@@ -2582,7 +2582,7 @@ role = "decisive"
 procedure = "V27_INT"
 args = ["'SELECT SUM(K) FROM (SELECT K FROM (VALUES (1), (2), (3)) AS Q (K) ORDER BY K) AS S'"]
 question = "A derived table with ORDER BY and no FETCH FIRST (what TOP 100 PERCENT ... ORDER BY leaves): is it accepted (sum 6)?"
-source = "SQLDiff converts T-SQL TOP inside a query to FETCH FIRST there (crates/sqldiff-convert/src/tsql/paging.rs); the IBM i fetch-clause page could not be read."
+source = "SQLDiff converts T-SQL TOP inside a query to FETCH FIRST there (crates/sqldiff-draft/src/tsql/paging.rs); the IBM i fetch-clause page could not be read."
 outcome = [
   { label = "accepted", when = { create = "00000", state = "00000", n1 = "=6" }, verdict = "consistent", meaning = "Accepted, and the limit applies to that query after its own ORDER BY." },
   { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Accepted with another result (in N1): the limit or the order is not applied there." },
@@ -2606,7 +2606,7 @@ outcome = [
 
 # ---------------------------------------------------------------- V33 date and timestamp strings
 # The converter writes a T-SQL date or datetime2 literal assigned to a variable
-# in the ISO form (crates/sqldiff-convert/src/tsql.rs date_store), and the
+# in the ISO form (crates/sqldiff-draft/src/tsql.rs date_store), and the
 # engine reads it as the CAST the IBM i "Timestamp strings" and "Date strings"
 # pages describe (crates/sqldiff-equiv/src/equiv/literal.rs). Each probe assigns
 # a string to a TIMESTAMP(7) or DATE variable: N1 is year * 10000 + month * 100
@@ -2783,7 +2783,7 @@ role = "decisive"
 procedure = "V29_DDL"
 args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT NOT NULL PRIMARY KEY, S VARCHAR(10))'", "'CREATE SEQUENCE SQLDFPROBE.SQ AS BIGINT START WITH 10 INCREMENT BY 1 MINVALUE 1 MAXVALUE 1000 NO CYCLE NO CACHE'", "'CREATE TRIGGER SQLDFPROBE.UXSEQ NO CASCADE BEFORE INSERT ON SQLDFPROBE.UX REFERENCING NEW AS N FOR EACH ROW MODE DB2SQL WHEN (N.K IS NULL) SET N.K = NEXT VALUE FOR SQLDFPROBE.SQ'", "'INSERT INTO SQLDFPROBE.UX (S) VALUES (''a'')'", "'INSERT INTO SQLDFPROBE.UX (S) VALUES (''b'')'", "''"]
 question = "Two INSERTs that leave the NOT NULL column K out (it has no default): does the trigger fill it before the NOT NULL check, giving 10 and 11?"
-source = "The converter writes a T-SQL `DEFAULT (NEXT VALUE FOR seq)` on a NOT NULL column as this trigger (crates/sqldiff-convert/src/tsql.rs, sequence_default_triggers); the IBM i CREATE TRIGGER page could not be read (IBM Documentation refused the fetch)."
+source = "The converter writes a T-SQL `DEFAULT (NEXT VALUE FOR seq)` on a NOT NULL column as this trigger (crates/sqldiff-draft/src/tsql.rs, sequence_default_triggers); the IBM i CREATE TRIGGER page could not be read (IBM Documentation refused the fetch)."
 outcome = [
   { label = "filled", when = { text = "YYYYY-", n1 = "=2", n2 = "=10" }, verdict = "consistent", meaning = "The trigger fills the column, as T-SQL's default does." },
   { label = "refused", when = { text = "YYYN*" }, verdict = "contradicts", meaning = "The INSERT is refused before the trigger can set the column (the NOT NULL check comes first, or the trigger was not created): the conversion needs another form." },
@@ -2797,7 +2797,7 @@ role = "decisive"
 procedure = "V29_DDL"
 args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT NOT NULL PRIMARY KEY, S VARCHAR(10))'", "'CREATE SEQUENCE SQLDFPROBE.SQ AS BIGINT START WITH 10 INCREMENT BY 1 MINVALUE 1 MAXVALUE 1000 NO CYCLE NO CACHE'", "'CREATE TRIGGER SQLDFPROBE.UXSEQ NO CASCADE BEFORE INSERT ON SQLDFPROBE.UX REFERENCING NEW AS N FOR EACH ROW MODE DB2SQL WHEN (N.K IS NULL) SET N.K = NEXT VALUE FOR SQLDFPROBE.SQ'", "'INSERT INTO SQLDFPROBE.UX (S) VALUES (''a''), (''b''), (''c'')'", "'INSERT INTO SQLDFPROBE.UX (S) SELECT ''d'' FROM SYSIBM.SYSDUMMY1'", "''"]
 question = "A multi-row INSERT and an INSERT ... SELECT that leave K out: one new value per row (4 rows, the primary key holds, smallest 10)?"
-source = "The converter writes a T-SQL `DEFAULT (NEXT VALUE FOR seq)` on a NOT NULL column as this trigger (crates/sqldiff-convert/src/tsql.rs, sequence_default_triggers); the IBM i CREATE TRIGGER page could not be read (IBM Documentation refused the fetch)."
+source = "The converter writes a T-SQL `DEFAULT (NEXT VALUE FOR seq)` on a NOT NULL column as this trigger (crates/sqldiff-draft/src/tsql.rs, sequence_default_triggers); the IBM i CREATE TRIGGER page could not be read (IBM Documentation refused the fetch)."
 outcome = [
   { label = "per row", when = { text = "YYYYY-", n1 = "=4", n2 = "=10" }, verdict = "consistent", meaning = "One value per row, as T-SQL's default." },
   { label = "other", when = { text = "*" }, verdict = "contradicts", meaning = "Something else (see O_TEXT, N1, N2 and the SQLSTATE): the converted sequence default does not behave as T-SQL's." },
@@ -2810,7 +2810,7 @@ role = "decisive"
 procedure = "V29_DDL"
 args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT NOT NULL PRIMARY KEY, S VARCHAR(10))'", "'CREATE SEQUENCE SQLDFPROBE.SQ AS BIGINT START WITH 10 INCREMENT BY 1 MINVALUE 1 MAXVALUE 1000 NO CYCLE NO CACHE'", "'CREATE TRIGGER SQLDFPROBE.UXSEQ NO CASCADE BEFORE INSERT ON SQLDFPROBE.UX REFERENCING NEW AS N FOR EACH ROW MODE DB2SQL WHEN (N.K IS NULL) SET N.K = NEXT VALUE FOR SQLDFPROBE.SQ'", "'INSERT INTO SQLDFPROBE.UX (K, S) VALUES (100, ''a'')'", "'INSERT INTO SQLDFPROBE.UX (S) VALUES (''b'')'", "''"]
 question = "An INSERT that gives K takes no sequence value (WHEN fails): the next INSERT that leaves K out still gets 10 (N2 = 10, not 11)?"
-source = "The converter writes a T-SQL `DEFAULT (NEXT VALUE FOR seq)` on a NOT NULL column as this trigger (crates/sqldiff-convert/src/tsql.rs, sequence_default_triggers); the IBM i CREATE TRIGGER page could not be read (IBM Documentation refused the fetch)."
+source = "The converter writes a T-SQL `DEFAULT (NEXT VALUE FOR seq)` on a NOT NULL column as this trigger (crates/sqldiff-draft/src/tsql.rs, sequence_default_triggers); the IBM i CREATE TRIGGER page could not be read (IBM Documentation refused the fetch)."
 outcome = [
   { label = "not taken", when = { text = "YYYYY-", n1 = "=2", n2 = "=10" }, verdict = "consistent", meaning = "No value taken for a given K, as T-SQL's default." },
   { label = "other", when = { text = "*" }, verdict = "contradicts", meaning = "Something else (see O_TEXT, N1, N2 and the SQLSTATE): the converted sequence default does not behave as T-SQL's." },
@@ -2823,7 +2823,7 @@ role = "decisive"
 procedure = "V29_DDL"
 args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT NOT NULL PRIMARY KEY, S VARCHAR(10))'", "'CREATE SEQUENCE SQLDFPROBE.SQ AS BIGINT START WITH 10 INCREMENT BY 1 MINVALUE 1 MAXVALUE 1000 NO CYCLE NO CACHE'", "'CREATE TRIGGER SQLDFPROBE.UXSEQ NO CASCADE BEFORE INSERT ON SQLDFPROBE.UX REFERENCING NEW AS N FOR EACH ROW MODE DB2SQL WHEN (N.K IS NULL) SET N.K = NEXT VALUE FOR SQLDFPROBE.SQ'", "'MERGE INTO SQLDFPROBE.UX AS T USING (VALUES (''a'')) AS M (S) ON 1 = 0 WHEN NOT MATCHED THEN INSERT (S) VALUES (M.S)'", "''", "''"]
 question = "MERGE ... WHEN NOT MATCHED THEN INSERT leaving K out: does the BEFORE INSERT trigger fire and fill K (N2 = 10)?"
-source = "The converter writes a T-SQL `DEFAULT (NEXT VALUE FOR seq)` on a NOT NULL column as this trigger (crates/sqldiff-convert/src/tsql.rs, sequence_default_triggers); the IBM i CREATE TRIGGER page could not be read (IBM Documentation refused the fetch)."
+source = "The converter writes a T-SQL `DEFAULT (NEXT VALUE FOR seq)` on a NOT NULL column as this trigger (crates/sqldiff-draft/src/tsql.rs, sequence_default_triggers); the IBM i CREATE TRIGGER page could not be read (IBM Documentation refused the fetch)."
 outcome = [
   { label = "filled", when = { text = "YYYY--", n1 = "=1", n2 = "=10" }, verdict = "consistent", meaning = "The trigger fires for MERGE's INSERT." },
   { label = "other", when = { text = "*" }, verdict = "contradicts", meaning = "Something else (see O_TEXT, N1, N2 and the SQLSTATE): the converted sequence default does not behave as T-SQL's." },
@@ -2836,7 +2836,7 @@ role = "info"
 procedure = "V29_DDL"
 args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT NOT NULL PRIMARY KEY, S VARCHAR(10))'", "'CREATE SEQUENCE SQLDFPROBE.SQ AS BIGINT START WITH 10 INCREMENT BY 1 MINVALUE 1 MAXVALUE 1000 NO CYCLE NO CACHE'", "'CREATE TRIGGER SQLDFPROBE.UXSEQ NO CASCADE BEFORE INSERT ON SQLDFPROBE.UX REFERENCING NEW AS N FOR EACH ROW MODE DB2SQL WHEN (N.K IS NULL) SET N.K = NEXT VALUE FOR SQLDFPROBE.SQ'", "'INSERT INTO SQLDFPROBE.UX (K, S) VALUES (NULL, ''a'')'", "''", "''"]
 question = "An INSERT that writes NULL into K: T-SQL refuses it (NOT NULL); the trigger sees NULL and fills in 10 (ASM-SEQUENCE-DEFAULT-TRIGGER states this difference). Which happens?"
-source = "The converter writes a T-SQL `DEFAULT (NEXT VALUE FOR seq)` on a NOT NULL column as this trigger (crates/sqldiff-convert/src/tsql.rs, sequence_default_triggers); the IBM i CREATE TRIGGER page could not be read (IBM Documentation refused the fetch)."
+source = "The converter writes a T-SQL `DEFAULT (NEXT VALUE FOR seq)` on a NOT NULL column as this trigger (crates/sqldiff-draft/src/tsql.rs, sequence_default_triggers); the IBM i CREATE TRIGGER page could not be read (IBM Documentation refused the fetch)."
 outcome = [
   { label = "filled", when = { text = "YYYY--", n1 = "=1", n2 = "=10" }, verdict = "consistent", meaning = "Filled with the next value: the difference ASM-SEQUENCE-DEFAULT-TRIGGER states." },
   { label = "refused", when = { text = "YYYN--" }, verdict = "refines", meaning = "Refused, as T-SQL: the stated difference does not exist." },
@@ -2850,7 +2850,7 @@ role = "info"
 procedure = "V29_DDL"
 args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT NOT NULL PRIMARY KEY, S VARCHAR(10))'", "'CREATE SEQUENCE SQLDFPROBE.SQ AS BIGINT START WITH 10 INCREMENT BY 1 MINVALUE 1 MAXVALUE 1000 NO CYCLE NO CACHE'", "'CREATE TRIGGER SQLDFPROBE.UXSEQ NO CASCADE BEFORE INSERT ON SQLDFPROBE.UX REFERENCING NEW AS N FOR EACH ROW MODE DB2SQL WHEN (N.K IS NULL) SET N.K = NEXT VALUE FOR SQLDFPROBE.SQ'", "'INSERT INTO SQLDFPROBE.UX (K, S) VALUES (DEFAULT, ''a'')'", "''", "''"]
 question = "An INSERT that writes DEFAULT into K (no default declared): T-SQL takes the next sequence value. Does Db2 for i refuse it, or hand the trigger NULL so it is filled (N2 = 10)?"
-source = "The converter writes a T-SQL `DEFAULT (NEXT VALUE FOR seq)` on a NOT NULL column as this trigger (crates/sqldiff-convert/src/tsql.rs, sequence_default_triggers); the IBM i CREATE TRIGGER page could not be read (IBM Documentation refused the fetch)."
+source = "The converter writes a T-SQL `DEFAULT (NEXT VALUE FOR seq)` on a NOT NULL column as this trigger (crates/sqldiff-draft/src/tsql.rs, sequence_default_triggers); the IBM i CREATE TRIGGER page could not be read (IBM Documentation refused the fetch)."
 outcome = [
   { label = "filled", when = { text = "YYYY--", n1 = "=1", n2 = "=10" }, verdict = "open", meaning = "Filled, as T-SQL." },
   { label = "refused", when = { text = "YYYN--" }, verdict = "open", meaning = "Refused: INSERTs writing DEFAULT into the column need it left out instead." },

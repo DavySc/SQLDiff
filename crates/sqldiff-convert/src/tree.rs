@@ -1118,7 +1118,7 @@ pub(crate) fn verify_tree_state(
         return (!st.same_as(&fresh)).then(|| mismatch("the whole state"));
     }
     let source = st.source.as_ref();
-    let claims = crate::table_vars::Claims::of(
+    let claims = sqldiff_draft::table_vars::Claims::of(
         inputs.iter().map(|i| (i.rel.as_str(), i.text.as_str())),
         a.from,
     );
@@ -1176,7 +1176,7 @@ pub(crate) fn build_tree_state(
     });
     // The temporary table names the whole tree's table variables claim, so
     // no two routines that may be active in one session share one.
-    let claims = crate::table_vars::Claims::of(
+    let claims = sqldiff_draft::table_vars::Claims::of(
         inputs.iter().map(|i| (i.rel.as_str(), i.text.as_str())),
         a.from,
     );
@@ -1490,7 +1490,7 @@ fn convert_files(
     // messages are sorted before they are reported, so the error does not
     // depend on which thread finished when.
     let mismatch: std::sync::Mutex<Vec<String>> = Default::default();
-    let claims: std::sync::OnceLock<crate::table_vars::Claims> = std::sync::OnceLock::new();
+    let claims: std::sync::OnceLock<sqldiff_draft::table_vars::Claims> = std::sync::OnceLock::new();
     let work = slots(inputs.iter().zip(drafts).zip(keys.iter()).enumerate());
     let progress = Progress::new(work.len(), hooks);
     let done = parallel(jobs, &work, |w| {
@@ -1572,7 +1572,7 @@ fn convert_files(
         let t = Instant::now();
         let rebuild = |plain_at: &[usize]| {
             let claims = claims.get_or_init(|| {
-                crate::table_vars::Claims::of(
+                sqldiff_draft::table_vars::Claims::of(
                     inputs.iter().map(|i| (i.rel.as_str(), i.text.as_str())),
                     a.from,
                 )

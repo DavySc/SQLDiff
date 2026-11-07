@@ -3,14 +3,14 @@
 //! `INSERT t (…, Location) VALUES (…, 0xE6100000010C…)` stores SQL Server's
 //! binary form of a geography, which PostGIS rejects ("Invalid endian flag
 //! value encountered"). A point both keep as it is (SRID 4326, finite,
-//! within ±180 / ±90; `sqldiff_core::equiv::geography`) becomes its EWKB,
+//! within ±180 / ±90; `sqldiff_equiv::equiv::geography`) becomes its EWKB,
 //! `'0101000020E6100000…'::geography`, the same doubles with longitude
 //! first; Z and M are kept. Anything else stays a bytea, which the check
 //! does not show equal.
 
 use super::bits::{opening, operand_start, BitEdits};
 use super::*;
-use sqldiff_core::equiv::geography as geo;
+use sqldiff_equiv::equiv::geography as geo;
 
 impl Cx<'_> {
     /// Point constants stored in geography columns by `VALUES` rows.
@@ -48,7 +48,7 @@ impl Cx<'_> {
             named: true,
         };
         let geog: Vec<bool> = {
-            use sqldiff_core::catalog::Ident;
+            use sqldiff_equiv::catalog::Ident;
             let Some(table) = self.entry_table(&entry) else {
                 return;
             };
@@ -109,7 +109,7 @@ impl Cx<'_> {
     ///   the longitude first).
     ///
     /// The conversion is exact only for a constant both engines read alike
-    /// (`sqldiff_core::equiv::geography`): SQL Server raises on a latitude
+    /// (`sqldiff_equiv::equiv::geography`): SQL Server raises on a latitude
     /// beyond ±90, NaN or trailing bytes where PostGIS moves the value into
     /// range or accepts it, so the engine shows these equal only for such
     /// constants and every other call stays unproven. Every other static
