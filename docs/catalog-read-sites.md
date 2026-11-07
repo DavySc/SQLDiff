@@ -16,8 +16,8 @@ Inventory for the recorded-catalog-reads series (performance plan W4.3). It list
 | B5 | `sqldiff-core/src/bind/query.rs` | `fn pseudo_sources(` | `Table(parts)` | The table a trigger fires on, for `inserted` and `deleted`. |
 | B6 | `sqldiff-core/src/bind/query.rs` | `fn lookup_table_silent(` | `Table(parts)` | `self.input.view.table`: the same lookup as `table_ref`, without the reason text. |
 | B7 | `sqldiff-core/src/bind/mod.rs` | `fn lookup_table_quiet(` | `Table(parts)` | `view.table(parts)` for a caller outside the query binder. |
-| S1 | `sqldiff-equiv/src/equiv/canon.rs` | `fn visible_star(` | `StarView(lower name)`, `HiddenTables` (the `list_stars` flag) | Reads the public fields `Schema::star_views` and `Schema::list_stars`. |
-| E1 | `sqldiff-core/src/engine.rs` | `view_a.supplied()` | `Supplied` per side | A8: field reads. Today the key tells `none` from a catalog; once digests leave the key, `supplied` stays in it. |
+| S1 | `sqldiff-equiv/src/equiv/canon.rs` | `fn visible_star(` | `StarView(lower name)`, `HiddenTables` (the `list_stars` flag) | Reads through `Schema::is_star_view` and `Schema::lists_stars`; the fields are private. |
+| E1 | `sqldiff-core/src/engine.rs` | `read_a.supplied()` | `Supplied` per side | A8: field reads. Today the key tells `none` from a catalog; once digests leave the key, `supplied` stays in it. |
 | A1 | `sqldiff-equiv/src/equiv/schema.rs` | `pub fn hides_columns(` | `HiddenTables` per side, plus `SchemaTables` for each counterpart | Runs for every file (`list_stars_with`, `mirrored`). If this falls back to `WholeCatalog`, the series buys nothing. |
 | A2 | `sqldiff-equiv/src/equiv/edit.rs` | `fn typed_class(` | `ColumnNamed(name)` | Scans `schema.tables()` (deduplicated set) for a column of that name. |
 | A3 | `sqldiff-equiv/src/equiv/schema.rs` | `pub fn table_exact(` | `SchemaTables(lower name)` | `Schema::table`, `table_exact`, `with_ddl`, `with_images`: base and temporary tables by `to_lowercase` unqualified name, last one wins, `ambiguous` across schemas. Not `Ident::key`. |
@@ -62,7 +62,7 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 
 ### unrecorded catalog
 
-`\.unrecorded_catalog\(\)`: `CatalogView::unrecorded_catalog`: engine-side only. `Schema::build` reads whole tables through it until PR 2b makes the overlay lazy; the scan below fails on any other file.
+`\.unrecorded_catalog\(\)`: `CatalogView::unrecorded_catalog`: engine-side only. `Schema::build` and the static `include_str!` schemas use it (no sink); the scan below fails on any other file.
 
 | file | stage | count |
 |---|---|---|
@@ -124,9 +124,8 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 | `sqldiff-draft/src/tsql/bits.rs` | pass 1 | 1 |
 | `sqldiff-draft/src/tsql/temporal.rs` | pass 1 | 1 |
 | `sqldiff-equiv/src/equiv/canon.rs` | check | 3 |
-| `sqldiff-equiv/src/equiv/edit.rs` | check | 1 |
 | `sqldiff-equiv/src/equiv/mod.rs` | check | 9 |
-| `sqldiff-equiv/src/equiv/schema.rs` | check | 2 |
+| `sqldiff-equiv/src/equiv/schema.rs` | check | 1 |
 | `sqldiff-equiv/src/equiv/trigger.rs` | check | 2 |
 
 ### options catalogs
@@ -155,12 +154,12 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 
 ### schema fields
 
-`\.(star_views|list_stars|is_star_view)\b`: `StarView(lower name)`. `Schema::star_views` and `list_stars` are public fields: a read of either is a read of the catalog.
+`\.(star_views|list_stars|is_star_view)\b`: `StarView(lower name)`. `Schema::star_views` and `list_stars` are private; a read is a read of the catalog.
 
 | file | stage | count |
 |---|---|---|
-| `sqldiff-equiv/src/equiv/canon.rs` | check | 2 |
-| `sqldiff-equiv/src/equiv/schema.rs` | check | 8 |
+| `sqldiff-equiv/src/equiv/canon.rs` | check | 1 |
+| `sqldiff-equiv/src/equiv/schema.rs` | check | 7 |
 
 ### pass 1 catalog
 
@@ -205,17 +204,19 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 
 | method | becomes |
 |---|---|
+| `for_check` | per-check handle (side + sink) |
 | `catalog` | the view door (Supplied) |
-| `is_empty` | SchemaTables (any) |
+| `sources` | Supplied / Origin (the recorded source list) |
+| `lists_stars` | HiddenTables (the `list_stars` flag) |
 | `is_star_view` | StarView |
-| `tables` | SchemaTables / ColumnNamed |
+| `column_types` | ColumnNamed / SchemaTables |
 | `table` | SchemaTables |
 | `view_column_is_not_char` | ViewFamily |
 | `table_exact` | SchemaTables |
 | `with_images` | builder over SchemaTables |
 | `with_ddl` | builder over SchemaTables |
 | `with_local` | builder (the file's own DDL) |
-| `case_check` | SchemaTables |
+| `case_check` | Spellings |
 | `load` | builder |
 | `hides_columns` | HiddenTables |
 | `list_stars_with` | HiddenTables / SchemaTables |

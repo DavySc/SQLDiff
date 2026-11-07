@@ -57,18 +57,22 @@ pub enum Query {
     Routines(Vec<Part>),
     /// Whether a schema is known: system, created, or named by an object.
     SchemaKnown(Part),
-    /// `Schema` tables by lower-case unqualified name: every base or
-    /// temporary table of that name in catalog order, and whether two
-    /// schemas share it (the equivalence schema's view, not `CatalogView`'s).
+    /// `Schema` tables by lower-case unqualified name: the derived table the
+    /// last base or temporary table of that name in catalog order yields
+    /// (last wins), plus the sticky `ambiguous` flag (two schemas held the
+    /// name). The answer is the equivalence schema's view, not `CatalogView`'s.
     SchemaTables(String),
     /// Every table (as the equivalence schema has them) with a column of
     /// this lower-case name, with that column's type (`typed_class`).
     ColumnNamed(String),
-    /// Every table that has a HIDDEN column, with its counterpart on the
-    /// other side (`hides_columns`, `mirrored`).
+    /// Every derived table of this one side that has a HIDDEN column, in
+    /// full (all columns), sorted by name. One side only: the counterpart on
+    /// the other side is a separate `SchemaTables` read (`hides_columns`,
+    /// `mirrored`).
     HiddenTables,
-    /// The family a view typed from its source belongs to: the view and
-    /// every non-view table its `source_table` names, with their columns.
+    /// The computed family map of a view typed from its source: only views
+    /// with `kind == View && types_from_source && !star_outputs` count, and
+    /// the map is empty when two such views carry the name.
     ViewFamily(String),
     /// Whether a lower-case view name is a view whose `*` is read through
     /// (`Schema::star_views`, with `list_stars`: `visible_star`).

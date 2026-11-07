@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::artifact::{exact_hash, Analyzed, Artifact};
 use crate::bind::{self, BindInput, Bindings};
 use crate::catalog::builtins::Helper;
-use crate::catalog::record::{RecordingView, Side as ReadSide};
+use crate::catalog::record::{NoSink, ReadSink, RecordingView, Side as ReadSide};
 use crate::catalog::{ddl, Catalog, CatalogView};
 use crate::classify::pairing_key;
 use crate::equiv;
@@ -185,8 +185,17 @@ fn ddl_catalog(dialect: sqldiff_syntax::Dialect, ddl: &[Artifact]) -> Arc<Catalo
 /// A side's view as a check reads it. Nothing is recorded until the series'
 /// PR 3 passes each check's sink here; this is where a side's `CatalogView`
 /// is turned into the only thing the check crates can hold.
-fn reading(view: &CatalogView, side: ReadSide) -> RecordingView<'_> {
-    RecordingView::new(view, side, &sqldiff_catalog::record::NO_SINK)
+fn reading<'a>(
+    view: &'a CatalogView,
+    side: ReadSide,
+    sink: &'a (dyn ReadSink + Send),
+) -> RecordingView<'a> {
+    RecordingView::new(view, side, sink)
+}
+
+/// A sink that keeps nothing: every run that is not a recorded check.
+fn unrecorded() -> Arc<dyn ReadSink + Send> {
+    Arc::new(NoSink)
 }
 
 struct BoundSide {
@@ -270,12 +279,30 @@ pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Compare two artifacts. Same dialect: version review (UC2). Different
 /// dialects: drift and conversion review (UC1, UC3).
 pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
-    // Counts the work of this comparison (see `sqldiff_model::work`); inside
-    // a file's check it shares the file's meter.
-    sqldiff_model::work::scope("diff", || diff_inner(a, b, opts)).0
+    diff_recorded(a, b, opts, unrecorded())
 }
 
-fn diff_inner(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
+/// [`diff`] with every read of a catalog going to `sink`: side A's catalog is
+/// filed as `Side::Source`, side B's as `Side::Target`. The roles are the
+/// caller's to name, because the cached side serves whichever role a check
+/// gives it (performance plan W4.3).
+pub fn diff_recorded(
+    a: &Artifact,
+    b: &Artifact,
+    opts: &Options,
+    sink: Arc<dyn ReadSink + Send>,
+) -> Report {
+    // Counts the work of this comparison (see `sqldiff_model::work`); inside
+    // a file's check it shares the file's meter.
+    sqldiff_model::work::scope("diff", || diff_inner(a, b, opts, sink)).0
+}
+
+fn diff_inner(
+    a: &Artifact,
+    b: &Artifact,
+    opts: &Options,
+    sink: Arc<dyn ReadSink + Send>,
+) -> Report {
     let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
     let ab = Analyzed::new(b, Side::B, opts.excerpt_lines);
     let same = a.dialect == b.dialect;
@@ -293,9 +320,13 @@ fn diff_inner(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     let side_a = side(a.dialect, &opts.catalog_a, &opts.facts_a);
     let side_b = side(b.dialect, &opts.catalog_b, &opts.facts_b);
     let (view_a, view_b) = (&side_a.view, &side_b.view);
-    let mut schema_a = side_a.schema.clone();
-    let mut schema_b = side_b.schema.clone();
+    let mut schema_a = side_a.schema.for_check(ReadSide::Source, sink.clone());
+    let mut schema_b = side_b.schema.for_check(ReadSide::Target, sink.clone());
     schema_a.list_stars_with(&mut schema_b);
+    let (read_a, read_b) = (
+        reading(view_a, ReadSide::Source, &*sink),
+        reading(view_b, ReadSide::Target, &*sink),
+    );
     let mut eq = equiv::Outcome::default();
     let mut txn_unknown = Vec::new();
     // What the same-dialect comparison vouches for (`coverage::unreceipted`).
@@ -447,20 +478,20 @@ fn diff_inner(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     let bound_a = bind::bind(
         &aa,
         &BindInput {
-            view: reading(view_a, ReadSide::Source),
+            view: read_a,
             helpers: &opts.helpers,
         },
     );
     let bound_b = bind::bind(
         &ab,
         &BindInput {
-            view: reading(view_b, ReadSide::Target),
+            view: read_b,
             helpers: &opts.helpers,
         },
     );
     let (bindf, binda) = bind::binding_findings(&Bindings {
-        a: (&aa, &bound_a, view_a.supplied()),
-        b: Some((&ab, &bound_b, view_b.supplied())),
+        a: (&aa, &bound_a, read_a.supplied()),
+        b: Some((&ab, &bound_b, read_b.supplied())),
     });
     absorb_residue(&mut findings, &bindf);
     findings.extend(bindf);
@@ -469,7 +500,7 @@ fn diff_inner(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
             assumptions.push(x);
         }
     }
-    if view_a.supplied() || view_b.supplied() {
+    if read_a.supplied() || read_b.supplied() {
         normalizations.push("names bound against the catalog".to_string());
     }
 
@@ -549,8 +580,8 @@ fn diff_inner(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
 fn compare_sides(aa: &Analyzed, ab: &Analyzed, opts: &Options) -> equiv::Outcome {
     let side_a = side(aa.artifact.dialect, &opts.catalog_a, &opts.facts_a);
     let side_b = side(ab.artifact.dialect, &opts.catalog_b, &opts.facts_b);
-    let mut schema_a = side_a.schema.clone();
-    let mut schema_b = side_b.schema.clone();
+    let mut schema_a = side_a.schema.for_check(ReadSide::Source, unrecorded());
+    let mut schema_b = side_b.schema.for_check(ReadSide::Target, unrecorded());
     schema_a.list_stars_with(&mut schema_b);
     equiv::compare(aa, ab, &schema_a, &schema_b, &opts.anchors)
 }
@@ -612,8 +643,8 @@ pub fn identity(a: &Artifact, b: &Artifact, opts: &Options) -> Vec<equiv::identi
     let ab = Analyzed::new(b, Side::B, opts.excerpt_lines);
     let side_a = side(a.dialect, &opts.catalog_a, &opts.facts_a);
     let side_b = side(b.dialect, &opts.catalog_b, &opts.facts_b);
-    let mut schema_a = side_a.schema.clone();
-    let mut schema_b = side_b.schema.clone();
+    let mut schema_a = side_a.schema.for_check(ReadSide::Source, unrecorded());
+    let mut schema_b = side_b.schema.for_check(ReadSide::Target, unrecorded());
     schema_a.list_stars_with(&mut schema_b);
     equiv::compare(&aa, &ab, &schema_a, &schema_b, &[]).identity
 }
@@ -639,9 +670,23 @@ pub fn overlay(a: &Artifact, b: &Artifact) -> crate::ir::overlay::Overlay {
 
 /// Lint one artifact on its own.
 pub fn check(a: &Artifact, opts: &Options) -> Report {
+    check_recorded(a, opts, ReadSide::Source, unrecorded())
+}
+
+/// [`check`] with the catalog of `opts.catalog_a` / `opts.facts_a` filed as
+/// `side` (the role it plays in the caller's check) and every read going to
+/// `sink`.
+pub fn check_recorded(
+    a: &Artifact,
+    opts: &Options,
+    side_role: ReadSide,
+    sink: Arc<dyn ReadSink + Send>,
+) -> Report {
     let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
     let side_a = side(a.dialect, &opts.catalog_a, &opts.facts_a);
-    let (view, schema) = (&side_a.view, side_a.schema.clone());
+    let view = &side_a.view;
+    let read = reading(view, side_role, &*sink);
+    let schema = side_a.schema.for_check(side_role, sink.clone());
     let mut findings: Vec<Finding> = lint::all_hits(&aa)
         .iter()
         .map(|h| lint::to_finding(&aa, h))
@@ -652,12 +697,12 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
     let bound = bind::bind(
         &aa,
         &BindInput {
-            view: reading(view, ReadSide::Source),
+            view: read,
             helpers: &opts.helpers,
         },
     );
     let (bindf, assumptions) = bind::binding_findings(&Bindings {
-        a: (&aa, &bound, view.supplied()),
+        a: (&aa, &bound, read.supplied()),
         b: None,
     });
     absorb_residue(&mut findings, &bindf);

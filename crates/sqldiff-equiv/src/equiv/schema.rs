@@ -11,7 +11,7 @@ use sqldiff_syntax::{parse, Dialect};
 use super::ast::Type;
 use super::literal::Target;
 use crate::artifact::Artifact;
-use crate::catalog::record::RecordingView;
+use crate::catalog::record::{Query, ReadSink, RecordingView, Side as ReadSide, NO_SINK};
 use crate::catalog::{ddl, Catalog, CatalogView, DataType, TableKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,7 +329,7 @@ impl Table {
 #[derive(Debug, Clone, Default)]
 pub struct Schema {
     tables: std::sync::Arc<HashMap<String, Table>>,
-    pub sources: Vec<String>,
+    sources: Vec<String>,
     /// PostgreSQL: the system catalogs are known too.
     pg_system: bool,
     /// T-SQL: the `sys` catalog views are known too.
@@ -342,7 +342,7 @@ pub struct Schema {
     /// Lower-cased unqualified names of views defined with a `*` select
     /// list (`catalog::Table::star_outputs`): which columns of their sources
     /// they return is not modelled.
-    pub star_views: std::sync::Arc<std::collections::HashSet<String>>,
+    star_views: std::sync::Arc<std::collections::HashSet<String>>,
     /// Views that read one table or view directly
     /// (`catalog::Table::types_from_source`): lower-cased view name, then
     /// lower-cased column name, to the column's type family when known.
@@ -357,7 +357,22 @@ pub struct Schema {
     /// schema's tables (hidden ones left out), not as one term: set on both
     /// sides of a comparison when either has a table with HIDDEN columns
     /// (`Schema::list_stars_with`).
-    pub list_stars: bool,
+    list_stars: bool,
+    /// The external answers as built, never edited afterwards: the base maps
+    /// above are copied on write by `with_images` / `with_local` (and
+    /// `flatten`), so what a read asks of the external catalog is answered
+    /// from here and recorded as such (performance plan W4.3, PR 2b).
+    ext: Ext,
+    /// The role and the sink of the check this schema serves; `None` for a
+    /// schema outside a recorded check (nothing is recorded).
+    probe: Option<Probe>,
+    /// `list_stars_with` found every table with HIDDEN columns mirrored on
+    /// both sides: the external star views are then plain views. The file's
+    /// own star views (layers) stay star views.
+    star_cleared: bool,
+    /// Star views of layers flattened into the base by `with_images` /
+    /// `with_local`; never cleared.
+    flat_star_views: std::sync::Arc<std::collections::HashSet<String>>,
     /// Tables added on top of `tables` by `with_ddl` (they replace tables of
     /// the same name). Adding one table must not copy every table of the
     /// catalog, so the added names live in these small layers; readers go
@@ -367,6 +382,31 @@ pub struct Schema {
     extra_ambiguous: std::sync::Arc<std::collections::HashSet<String>>,
     extra_star_views: std::sync::Arc<std::collections::HashSet<String>>,
     extra_spellings: std::sync::Arc<HashMap<String, std::collections::BTreeSet<String>>>,
+}
+
+/// What the external catalog says, fixed at build.
+#[derive(Debug, Clone, Default)]
+struct Ext {
+    tables: std::sync::Arc<HashMap<String, Table>>,
+    ambiguous: std::sync::Arc<std::collections::HashSet<String>>,
+    star_views: std::sync::Arc<std::collections::HashSet<String>>,
+    view_families: std::sync::Arc<HashMap<String, HashMap<String, Fam>>>,
+    spellings: std::sync::Arc<HashMap<String, std::collections::BTreeSet<String>>>,
+    /// PostgreSQL: spellings are asked.
+    pg: bool,
+}
+
+/// The role and the sink of the check a schema serves.
+#[derive(Clone)]
+struct Probe {
+    side: ReadSide,
+    sink: std::sync::Arc<dyn ReadSink + Send>,
+}
+
+impl std::fmt::Debug for Probe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Probe({:?})", self.side)
+    }
 }
 
 /// The SQL Server catalog views in `sys_catalog.sql`.
@@ -404,21 +444,54 @@ fn pg_system() -> &'static Schema {
 }
 
 impl Schema {
+    /// The same schema serving one check: its reads are filed under `side`
+    /// (the role of this catalog in the check, which only the caller knows)
+    /// and go to `sink`. The cached schema of a side carries neither, so it
+    /// cannot file a read under the wrong role.
+    pub fn for_check(&self, side: ReadSide, sink: std::sync::Arc<dyn ReadSink + Send>) -> Schema {
+        let mut s = self.clone();
+        s.probe = Some(Probe { side, sink });
+        s
+    }
+
+    fn rec<T: std::fmt::Debug + ?Sized>(&self, q: impl FnOnce() -> Query, answer: &T) {
+        if let Some(p) = &self.probe {
+            if p.sink.active() {
+                p.sink
+                    .record(p.side, &q(), crate::catalog::record::Outcome::of(answer));
+            }
+        }
+    }
+
+    /// Asks the external catalog for the user table under `key` (lower-cased
+    /// unqualified name): the table as built and whether the name is in
+    /// more than one schema. Asked on every read of a name, whatever a layer
+    /// says, because `ambiguous` is computed across both.
+    fn ask_table(&self, key: &str) {
+        self.rec(
+            || Query::SchemaTables(key.to_string()),
+            &(self.ext.tables.get(key), self.ext.ambiguous.contains(key)),
+        );
+    }
+
     /// The catalog of this side, as a check may read it: every question
-    /// goes through a [`RecordingView`]. Under no sink until PR 3 hands each
-    /// check's sink and side down; nothing is recorded yet.
+    /// goes through a [`RecordingView`] under this check's role and sink.
     pub fn catalog(&self) -> Option<RecordingView<'_>> {
-        self.view.as_deref().map(|v| {
-            RecordingView::new(
-                v,
-                crate::catalog::record::Side::Source,
-                &crate::catalog::record::NO_SINK,
-            )
+        self.view.as_deref().map(|v| match &self.probe {
+            Some(p) => RecordingView::new(v, p.side, &*p.sink),
+            None => RecordingView::new(v, ReadSide::Source, &NO_SINK),
         })
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.tables.is_empty() && self.extra_tables.is_empty()
+    /// The origins of the catalogs the schema was read from.
+    pub fn sources(&self) -> &[String] {
+        &self.sources
+    }
+
+    /// Whether the check lists stars (set by `list_stars_with` from the
+    /// recorded reads of both sides).
+    pub fn lists_stars(&self) -> bool {
+        self.list_stars
     }
 
     /// A user table by its lower-cased unqualified name, the layer added by
@@ -443,7 +516,11 @@ impl Schema {
 
     /// Whether the view `key` was defined with a `*` select list.
     pub fn is_star_view(&self, key: &str) -> bool {
-        self.star_views.contains(key) || self.extra_star_views.contains(key)
+        let ext = self.ext.star_views.contains(key);
+        self.rec(|| Query::StarView(key.to_string()), &ext);
+        (ext && !self.star_cleared)
+            || self.flat_star_views.contains(key)
+            || self.extra_star_views.contains(key)
     }
 
     /// Copies the added layer into the base maps, for the edits that change
@@ -466,7 +543,7 @@ impl Schema {
         std::sync::Arc::make_mut(&mut self.tables)
             .extend(t.iter().map(|(k, v)| (k.clone(), v.clone())));
         std::sync::Arc::make_mut(&mut self.ambiguous).extend(a.iter().cloned());
-        std::sync::Arc::make_mut(&mut self.star_views).extend(v.iter().cloned());
+        std::sync::Arc::make_mut(&mut self.flat_star_views).extend(v.iter().cloned());
         let spellings = std::sync::Arc::make_mut(&mut self.spellings);
         for (k, v) in sp.iter() {
             spellings
@@ -476,10 +553,29 @@ impl Schema {
         }
     }
 
-    /// The tables of the catalog (system catalogs left out).
-    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: its consumer needs all tables to agree
-    pub fn tables(&self) -> impl Iterator<Item = &Table> {
-        self.tables_by_key().map(|(_, t)| t)
+    /// The types of the columns named `col` (lower case) in the catalog's
+    /// tables (system catalogs left out), one per table. The caller needs
+    /// them to agree, so their order does not matter.
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: the consumer needs all types to agree
+    pub fn column_types(&self, col: &str) -> Vec<Ty> {
+        self.rec(
+            || Query::ColumnNamed(col.to_string()),
+            &self.sorted_ext(|t| t.column(col).is_some()),
+        );
+        self.tables_by_key()
+            .filter_map(|(_, t)| t.column(col))
+            .map(|c| c.ty)
+            .collect()
+    }
+
+    /// The external tables that satisfy `keep`, by name: the canonical form
+    /// of an answer about many tables.
+    #[allow(clippy::disallowed_methods)] // sorted before it leaves
+    fn sorted_ext(&self, keep: impl Fn(&Table) -> bool) -> Vec<(&String, &Table)> {
+        let mut v: Vec<(&String, &Table)> =
+            self.ext.tables.iter().filter(|(_, t)| keep(t)).collect();
+        v.sort_by(|a, b| a.0.cmp(b.0));
+        v
     }
 
     /// A table by name, qualified or not; user tables are found by their
@@ -495,6 +591,7 @@ impl Schema {
                 .then(|| tsql_system().tables.get(last))
                 .flatten();
         }
+        self.ask_table(last);
         self.table_by_key(last).or_else(|| {
             // pg_catalog comes first on every search path.
             (self.pg_system && last.starts_with("pg_"))
@@ -509,6 +606,13 @@ impl Schema {
     pub fn view_column_is_not_char(&self, name: &str, col: &str) -> bool {
         let key = name.to_lowercase();
         let key = key.rsplit('.').next().unwrap_or(&key);
+        #[allow(clippy::disallowed_methods)] // collected into a BTreeMap: ordered
+        let family = self
+            .ext
+            .view_families
+            .get(key)
+            .map(|m| m.iter().collect::<std::collections::BTreeMap<_, _>>());
+        self.rec(|| Query::ViewFamily(key.to_string()), &family);
         self.view_families
             .get(key)
             .and_then(|c| c.get(&col.to_lowercase()))
@@ -519,6 +623,7 @@ impl Schema {
     /// no other schema has a table of that name.
     pub fn table_exact(&self, schema: Option<&str>, name: &str) -> Option<&Table> {
         let name = name.to_lowercase();
+        self.ask_table(&name);
         if self.is_ambiguous(&name) {
             return None;
         }
@@ -563,6 +668,7 @@ impl Schema {
         let mut s = self.clone();
         let mut ambiguous = (*s.extra_ambiguous).clone();
         for n in extra.tables.keys() {
+            self.ask_table(n);
             if self
                 .table_by_key(n)
                 .is_some_and(|t| t.schema != extra.tables[n].schema)
@@ -625,6 +731,12 @@ impl Schema {
     /// be a catalog name.
     pub fn case_check(&self, stored: &str, known: bool) -> Result<(), String> {
         let lower = stored.to_lowercase();
+        if self.ext.pg {
+            self.rec(
+                || Query::Spellings(lower.clone()),
+                &self.ext.spellings.get(&lower),
+            );
+        }
         let merged;
         let found = match (self.spellings.get(&lower), self.extra_spellings.get(&lower)) {
             (Some(a), Some(b)) => {
@@ -680,7 +792,12 @@ impl Schema {
     /// Whether a table has a HIDDEN column (T-SQL period column).
     #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: `any`
     pub fn hides_columns(&self) -> bool {
-        self.tables().any(|t| t.columns.iter().any(|c| c.hidden))
+        self.rec(
+            || Query::HiddenTables,
+            &self.sorted_ext(|t| t.columns.iter().any(|c| c.hidden)),
+        );
+        self.tables_by_key()
+            .any(|(_, t)| t.columns.iter().any(|c| c.hidden))
     }
 
     /// Both sides of a comparison list their stars when either side has a
@@ -689,7 +806,11 @@ impl Schema {
     /// when the columns they return are.
     #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: `all`
     pub fn list_stars_with(&mut self, other: &mut Schema) {
-        if self.hides_columns() || other.hides_columns() {
+        // Both sides are asked, never `||`: a short circuit would leave the
+        // other side's `HiddenTables` read unrecorded although the mirrored
+        // decision below uses it.
+        let (hides_a, hides_b) = (self.hides_columns(), other.hides_columns());
+        if hides_a || hides_b {
             self.list_stars = true;
             other.list_stars = true;
             // A view defined with `*` returns what its sources do, so it is
@@ -697,10 +818,16 @@ impl Schema {
             // columns has a counterpart on the other side that keeps exactly
             // its visible columns (the historyless conversion). Otherwise a
             // star over such a view is refused (`Canon::visible_star`).
+            // Read from the external answers of both sides only (never the
+            // layers), each read recorded: the hidden tables of `a` are in
+            // its `HiddenTables` answer, their counterparts are
+            // `SchemaTables` reads of `b`.
             let mirrored = |a: &Schema, b: &Schema| {
-                a.tables_by_key().all(|(n, t)| {
-                    !t.columns.iter().any(|c| c.hidden)
-                        || b.table_by_key(n).is_some_and(|o| {
+                a.sorted_ext(|t| t.columns.iter().any(|c| c.hidden))
+                    .into_iter()
+                    .all(|(n, t)| {
+                        b.ask_table(n);
+                        b.ext.tables.get(n).is_some_and(|o| {
                             o.complete
                                 && o.columns.iter().map(|c| &c.name).eq(t
                                     .columns
@@ -708,13 +835,11 @@ impl Schema {
                                     .filter(|c| !c.hidden)
                                     .map(|c| &c.name))
                         })
-                })
+                    })
             };
             if mirrored(self, other) && mirrored(other, self) {
-                self.star_views = Default::default();
-                other.star_views = Default::default();
-                self.extra_star_views = Default::default();
-                other.extra_star_views = Default::default();
+                self.star_cleared = true;
+                other.star_cleared = true;
             }
         }
     }
@@ -877,6 +1002,14 @@ impl Schema {
                 },
             );
         }
+        s.ext = Ext {
+            tables: s.tables.clone(),
+            ambiguous: s.ambiguous.clone(),
+            star_views: s.star_views.clone(),
+            view_families: s.view_families.clone(),
+            spellings: s.spellings.clone(),
+            pg: d == Dialect::Postgres,
+        };
         s
     }
 }
@@ -902,6 +1035,275 @@ pub(super) fn ty_of(t: &DataType, d: Dialect) -> Ty {
 mod tests {
     use super::*;
 
+    /// The recorded digest of an answer is the `Debug` text of derived
+    /// `Table`, `Column` and `Ty` values: every field must be in it, and a new
+    /// field breaks this build (each type is destructured without `..`) until
+    /// it has a line here that changes the text.
+    fn digest<T: std::fmt::Debug>(v: &T) -> crate::catalog::record::Outcome {
+        crate::catalog::record::Outcome::of(v)
+    }
+
+    #[test]
+    fn every_field_of_the_derived_types_is_digested() {
+        let ty = Ty {
+            fam: Fam::Int,
+            len: Some(4),
+            scale: None,
+        };
+        let Ty {
+            fam: _,
+            len: _,
+            scale: _,
+        } = ty;
+        for (name, m) in [
+            (
+                "fam",
+                Ty {
+                    fam: Fam::Char,
+                    ..ty
+                },
+            ),
+            ("len", Ty { len: Some(8), ..ty }),
+            (
+                "scale",
+                Ty {
+                    scale: Some(2),
+                    ..ty
+                },
+            ),
+        ] {
+            assert_ne!(digest(&ty), digest(&m), "Ty.{name}");
+        }
+        let col = Column {
+            name: "a".into(),
+            ty,
+            not_null: false,
+            identity: false,
+            generated: false,
+            period: false,
+            hidden: false,
+            target: None,
+            collation: None,
+        };
+        let Column {
+            name: _,
+            ty: _,
+            not_null: _,
+            identity: _,
+            generated: _,
+            period: _,
+            hidden: _,
+            target: _,
+            collation: _,
+        } = &col;
+        #[allow(clippy::type_complexity)]
+        let muts: Vec<(&str, Box<dyn Fn(&mut Column)>)> = vec![
+            ("name", Box::new(|c| c.name = "b".into())),
+            ("ty", Box::new(|c| c.ty.len = Some(9))),
+            ("not_null", Box::new(|c| c.not_null = true)),
+            ("identity", Box::new(|c| c.identity = true)),
+            ("generated", Box::new(|c| c.generated = true)),
+            ("period", Box::new(|c| c.period = true)),
+            ("hidden", Box::new(|c| c.hidden = true)),
+            ("target", Box::new(|c| c.target = Some(Target::Bit))),
+            ("collation", Box::new(|c| c.collation = Some("x".into()))),
+        ];
+        for (name, m) in muts {
+            let mut c = col.clone();
+            m(&mut c);
+            assert_ne!(digest(&col), digest(&c), "Column.{name}");
+        }
+        let tab = Table {
+            schema: None,
+            name: "t".into(),
+            columns: vec![col],
+            keys: vec![],
+            complete: false,
+        };
+        let Table {
+            schema: _,
+            name: _,
+            columns: _,
+            keys: _,
+            complete: _,
+        } = &tab;
+        #[allow(clippy::type_complexity)]
+        let muts: Vec<(&str, Box<dyn Fn(&mut Table)>)> = vec![
+            ("schema", Box::new(|t| t.schema = Some("s".into()))),
+            ("name", Box::new(|t| t.name = "u".into())),
+            ("columns", Box::new(|t| t.columns.clear())),
+            ("keys", Box::new(|t| t.keys.push(vec!["a".into()]))),
+            ("complete", Box::new(|t| t.complete = true)),
+        ];
+        for (name, m) in muts {
+            let mut t = tab.clone();
+            m(&mut t);
+            assert_ne!(digest(&tab), digest(&t), "Table.{name}");
+        }
+    }
+
+    /// A naive model of the layer algebra of the performance plan's 2b note
+    /// (R3): tables replace by key; `with_ddl` sets `ambiguous` when the
+    /// table currently held under the name has another schema; `with_local`
+    /// and `with_images` clear it for the keys they replace.
+    #[derive(Clone, Default)]
+    struct Model {
+        tables: std::collections::BTreeMap<String, (Option<String>, Vec<String>)>,
+        ambiguous: std::collections::BTreeSet<String>,
+    }
+
+    fn norm(schema: &str) -> Option<String> {
+        let s = schema.to_lowercase();
+        (s != "dbo" && s != "public").then_some(s)
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    const SCHEMAS: [&str; 4] = ["dbo", "s1", "S2", "public"];
+    const NAMES: [&str; 5] = ["a", "b", "C", "A", "d"];
+    const COLS: [&str; 3] = ["c1", "c2", "c3"];
+
+    #[allow(clippy::type_complexity)]
+    fn ddl_of(r: &mut Rng, n: usize) -> (String, Vec<(String, Option<String>, Vec<String>)>) {
+        let mut text = String::new();
+        let mut made = Vec::new();
+        for _ in 0..n {
+            let (sc, nm) = (SCHEMAS[r.next(4)], NAMES[r.next(5)]);
+            let cols: Vec<&str> = COLS.iter().copied().filter(|_| r.next(2) == 0).collect();
+            let list: String = std::iter::once("id INT NOT NULL".to_string())
+                .chain(cols.iter().map(|c| format!("{c} INT NULL")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            text.push_str(&format!("CREATE TABLE {sc}.{nm} ({list});\n"));
+            let mut names = vec!["id".to_string()];
+            names.extend(cols.iter().map(|c| c.to_string()));
+            made.push((nm.to_lowercase(), norm(sc), names));
+        }
+        (text, made)
+    }
+
+    fn model_layer(m: &mut Model, made: &[(String, Option<String>, Vec<String>)]) {
+        // The layer folds on its own first.
+        let mut layer: std::collections::BTreeMap<String, (Option<String>, Vec<String>)> =
+            Default::default();
+        let mut layer_amb = std::collections::BTreeSet::new();
+        for (k, sc, cols) in made {
+            if layer.get(k).is_some_and(|o| &o.0 != sc) {
+                layer_amb.insert(k.clone());
+            }
+            layer.insert(k.clone(), (sc.clone(), cols.clone()));
+        }
+        for (k, v) in &layer {
+            if m.tables.get(k).is_some_and(|o| o.0 != v.0) {
+                m.ambiguous.insert(k.clone());
+            }
+            m.tables.insert(k.clone(), v.clone());
+        }
+        m.ambiguous.extend(layer_amb);
+    }
+
+    fn base_schema(r: &mut Rng) -> (Schema, Model) {
+        let (text, made) = ddl_of(r, 4);
+        let mut cat = Catalog::default();
+        ddl::load_tree(
+            &mut cat,
+            &parse(&text, Dialect::Tsql).syntax(),
+            Dialect::Tsql,
+        );
+        let mut m = Model::default();
+        model_layer(&mut m, &made);
+        (
+            Schema::from_view(&CatalogView::new(Dialect::Tsql, &[&cat])),
+            m,
+        )
+    }
+
+    fn agree(s: &Schema, m: &Model, what: &str) {
+        for nm in NAMES.iter().chain(&["inserted", "deleted", "temp:a", "zz"]) {
+            let k = nm.to_lowercase();
+            let want = m.tables.get(&k);
+            let got = s.table(nm).map(|t| {
+                (
+                    t.schema.clone(),
+                    t.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                )
+            });
+            assert_eq!(got.as_ref(), want, "{what}: table({nm})");
+            for sc in [None, Some("s1"), Some("s2")] {
+                let want = want
+                    .filter(|_| !m.ambiguous.contains(&k))
+                    .filter(|t| t.0.as_deref() == sc)
+                    .map(|t| &t.1);
+                let got = s
+                    .table_exact(sc, nm)
+                    .map(|t| t.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>());
+                assert_eq!(got.as_ref(), want, "{what}: table_exact({sc:?}, {nm})");
+            }
+        }
+        for c in COLS {
+            let want = m
+                .tables
+                .values()
+                .filter(|t| t.1.iter().any(|x| x == c))
+                .count();
+            assert_eq!(s.column_types(c).len(), want, "{what}: column_types({c})");
+        }
+    }
+
+    #[test]
+    fn layers_stack_like_the_model_in_any_order() {
+        for seed in 1..=60u64 {
+            let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let (mut s, mut m) = base_schema(&mut r);
+            agree(&s, &m, &format!("seed {seed} base"));
+            for step in 0..6 {
+                match r.next(3) {
+                    0 => {
+                        let n = 1 + r.next(2);
+                        let (text, made) = ddl_of(&mut r, n);
+                        s = s.with_ddl(&text, Dialect::Tsql);
+                        model_layer(&mut m, &made);
+                    }
+                    1 => {
+                        let (sc, nm) = (SCHEMAS[r.next(4)], NAMES[r.next(5)]);
+                        let text =
+                            format!("CREATE TABLE {sc}.{nm} (id INT NOT NULL, c1 INT NULL);");
+                        if let Some(n) =
+                            s.with_local(&text, Dialect::Tsql, |_, n| format!("temp:{n}"))
+                        {
+                            s = n;
+                            let k = format!("temp:{}", nm.to_lowercase());
+                            m.tables
+                                .insert(k.clone(), (norm(sc), vec!["id".into(), "c1".into()]));
+                            m.ambiguous.remove(&k);
+                        }
+                    }
+                    _ => {
+                        let nm = NAMES[r.next(5)];
+                        if let Some(n) = s.with_images(&[nm.to_string()], &["inserted", "deleted"])
+                        {
+                            let src = m.tables[&nm.to_lowercase()].clone();
+                            s = n;
+                            for img in ["inserted", "deleted"] {
+                                m.tables.insert(img.into(), (None, src.1.clone()));
+                                m.ambiguous.remove(img);
+                            }
+                        }
+                    }
+                }
+                agree(&s, &m, &format!("seed {seed} step {step}"));
+            }
+        }
+    }
+
     /// `with_ddl` adds tables in a layer; every reader must see them as if
     /// they had been in the catalog all along, and the base stays unchanged.
     #[test]
@@ -919,11 +1321,11 @@ mod tests {
         assert!(more.table("t3").is_some() && base.table("t3").is_none());
         assert!(more.table("t2").is_some());
         // Each table once.
-        assert_eq!(more.tables().count(), 3);
-        assert_eq!(base.tables().count(), 2);
+        assert_eq!(more.tables_by_key().count(), 3);
+        assert_eq!(base.tables_by_key().count(), 2);
         // A layered schema is layered again.
         let again = more.with_ddl("CREATE TABLE t4 (w int);", d);
-        assert_eq!(again.tables().count(), 4);
+        assert_eq!(again.tables_by_key().count(), 4);
         assert!(again.table("t3").is_some() && again.table("t4").is_some());
         // Names of the layer take part in the letter-case check.
         assert!(base.case_check("mixed", false).is_err());
