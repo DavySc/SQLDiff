@@ -1381,6 +1381,8 @@ struct Collector<'x, 'a> {
     flip_spent: RefCell<BTreeMap<String, u64>>,
     /// While a flipped scenario is recomputed: the diffs it may still make.
     replay: Cell<Option<u64>>,
+    /// Keeps the unit open for the statement-level phase check.
+    _phase: sqldiff_model::work::UnitPhase,
     /// `diff` calls spent by this routine pair, and whether a budget ran out.
     spent: Cell<u64>,
     out_of_budget: Cell<bool>,
@@ -1512,6 +1514,7 @@ impl<'x, 'a> Collector<'x, 'a> {
             charged: RefCell::new(BTreeSet::new()),
             flip_spent: RefCell::new(BTreeMap::new()),
             replay: Cell::new(None),
+            _phase: sqldiff_model::work::UnitPhase::open(),
             spent: Cell::new(0),
             out_of_budget: Cell::new(false),
             cap_hit: RefCell::new(None),

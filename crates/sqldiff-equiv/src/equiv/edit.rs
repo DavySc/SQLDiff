@@ -32,6 +32,7 @@ use crate::artifact::Analyzed;
 use crate::classify::{stmt_kind, StmtKind};
 use crate::model::{fingerprint, Assumption, ChangeClass, Finding, FingerprintInput, Verdict};
 use crate::normalize;
+use sqldiff_model::work::Allowance;
 
 const RULE: &str = "equiv.edit";
 
@@ -49,7 +50,41 @@ pub fn local_values() -> Assumption {
     )
 }
 
+/// The witness text of a candidate the statement-level allowance did not let
+/// the checker examine. The finding stays Unknown (nothing here turns an
+/// unexamined edit into anything weaker), and the text says why.
+fn not_examined(allowance: &Allowance) -> String {
+    format!(
+        "not examined: past the statement-level work budget ({} of {} units of work)",
+        allowance.spent(),
+        allowance.cap().unwrap_or(0)
+    )
+}
+
+fn note_budget(f: &mut Finding, allowance: &Allowance) {
+    f.witness = format!("{} ({})", f.witness, not_examined(allowance));
+}
+
+/// A candidate whose witness search ran out of allowance: it was examined,
+/// but not to the end, so "no witness" is not the answer.
+fn note_search_stopped(f: &mut Finding, allowance: &Allowance) {
+    f.witness = format!(
+        "{} (witness search stopped at the statement-level work budget ({} of {} units of work))",
+        f.witness,
+        allowance.spent(),
+        allowance.cap().unwrap_or(0)
+    );
+}
+
 /// Re-examines "modified" statements and headers that are still unknown.
+///
+/// Under a statement-level allowance (`Options::statement_work_cap`) the
+/// checker stops at two coarse points, before it builds its sweeps and before
+/// each `examine`; every candidate not examined keeps its Unknown verdict and
+/// says so. What it spends is the metered work of the sweeps and of each
+/// `examine` (reach, closure, witness tries), taken from the allowance after
+/// it ran, so the overshoot is one sweep build or one `examine`. An allowance
+/// that is off changes nothing.
 pub fn decide(
     a: &Analyzed,
     b: &Analyzed,
@@ -57,10 +92,18 @@ pub fn decide(
     sb: &Schema,
     findings: &mut [Finding],
     out: &mut Outcome,
+    allowance: &Allowance,
 ) {
     if !findings.iter().any(candidate) {
         return;
     }
+    if allowance.exhausted() {
+        for f in findings.iter_mut().filter(|f| candidate(f)) {
+            note_budget(f, allowance);
+        }
+        return;
+    }
+    let before = sqldiff_model::work::now().total();
     let ra = Routine::new(a);
     let rb = Routine::new(b);
     // What every finding marks as changed, on each side.
@@ -80,6 +123,7 @@ pub fn decide(
         SideEdits::new(&ra, findings, &spans, true, oracle),
         SideEdits::new(&rb, findings, &spans, false, oracle),
     );
+    allowance.take(sqldiff_model::work::now().total().saturating_sub(before));
     if std::env::var_os("SQLDIFF_EDIT_STATS").is_some() {
         eprintln!(
             "edit checker: {} of {} candidate edits on A, {} of {} on B take the shared sweep",
@@ -108,10 +152,29 @@ pub fn decide(
         let (Some(na), Some(nb)) = (ra.node_at(la.byte_start), rb.node_at(lb.byte_start)) else {
             continue;
         };
+        if allowance.exhausted() {
+            note_budget(f, allowance);
+            continue;
+        }
         if std::env::var_os("SQLDIFF_DEBUG_EDIT").is_some() {
             eprintln!("edit: {} at A line {}", f.rule, la.start_line);
         }
-        let r = examine(&ra, &rb, &na, &nb, sa, sb, (&sides.0, &sides.1), i);
+        let before = sqldiff_model::work::now().total();
+        let r = examine(
+            &ra,
+            &rb,
+            &na,
+            &nb,
+            sa,
+            sb,
+            (&sides.0, &sides.1),
+            i,
+            allowance.left(),
+        );
+        allowance.take(sqldiff_model::work::now().total().saturating_sub(before));
+        if matches!(&r, Err(e) if e == BUDGET_ERR) {
+            note_search_stopped(f, allowance);
+        }
         if std::env::var_os("SQLDIFF_DEBUG_EDIT").is_some() {
             match &r {
                 Ok(g) => eprintln!("  => different: {}", g.witness),
@@ -147,6 +210,10 @@ pub fn decide(
         }
     }
 }
+
+/// The error of an `examine` whose witness search stopped at the
+/// statement-level allowance; `decide` shows it on the candidate.
+const BUDGET_ERR: &str = "witness search stopped at the statement-level work budget";
 
 fn candidate(f: &Finding) -> bool {
     matches!(f.rule.as_str(), "stmt.modified" | "header.modified") && f.verdict == Verdict::Unknown
@@ -2618,6 +2685,8 @@ impl<'r, 'x, 'a> TaintSweep<'r, 'x, 'a> {
     }
 
     fn offer(&mut self, u: usize) {
+        // Counting only: one unit visited.
+        sqldiff_model::work::spend(sqldiff_model::work::Site::EditClosure, 1);
         self.offered[u] = true;
         self.offered_list.push(u as u32);
         let unit = &self.units[u];
@@ -2660,6 +2729,7 @@ impl<'r, 'x, 'a> TaintSweep<'r, 'x, 'a> {
             if was_empty {
                 wake.extend(self.any_readers.iter().copied());
             }
+            sqldiff_model::work::spend(sqldiff_model::work::Site::EditClosure, wake.len() as u64);
             for u in wake {
                 let u = u as usize;
                 if self.offered[u]
@@ -2689,6 +2759,11 @@ impl<'r, 'x, 'a> TaintSweep<'r, 'x, 'a> {
                     needed.extend(self.units[u].reads.iter().copied());
                 }
             }
+            // Counting only: the span lookups and the names they read.
+            sqldiff_model::work::spend(
+                sqldiff_model::work::Site::EditClosure,
+                (spans.len() + needed.len()) as u64,
+            );
             needed.sort_unstable();
             needed.dedup();
             if self.taint.meets(&needed) {
@@ -3974,6 +4049,7 @@ fn examine(
     sb: &Schema,
     sides: (&SideEdits, &SideEdits),
     idx: usize,
+    tries: Option<u64>,
 ) -> Result<Decided, String> {
     let d = ra.d;
     if na.kind() != nb.kind() {
@@ -4049,7 +4125,7 @@ fn examine(
         c.focus = focus.clone();
         c
     };
-    let found = match eval::search(&make, &xa.probe, &xb.probe) {
+    let found = match eval::search_within(&make, &xa.probe, &xb.probe, tries) {
         Ok(f) => f,
         Err(m) => {
             // One version fails whenever it runs the statement.
@@ -4059,6 +4135,7 @@ fn examine(
             return Err(match m {
                 Miss::Unsupported(w) => format!("not evaluated: {w}"),
                 Miss::NoWitness => "no witness found".to_string(),
+                Miss::Budget => BUDGET_ERR.to_string(),
             });
         }
     };
@@ -4327,6 +4404,7 @@ fn table_change(
         let found = eval::search(&make, &pa, &pb).map_err(|m| match m {
             Miss::Unsupported(w) => format!("not evaluated: {w}"),
             Miss::NoWitness => "no witness found".to_string(),
+            Miss::Budget => BUDGET_ERR.to_string(),
         })?;
         let first = |o: &Obs| match o {
             Obs::Rows(r, _) => r.first().and_then(|r| r.first()).cloned(),
