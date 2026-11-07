@@ -10,9 +10,9 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use sqldiff_syntax::Dialect;
 
-const TSQL: &str = include_str!("../../profiles/semantics/tsql.toml");
-const POSTGRES: &str = include_str!("../../profiles/semantics/postgres.toml");
-const DB2I: &str = include_str!("../../profiles/semantics/db2i.toml");
+const TSQL: &str = include_str!("../profiles/semantics/tsql.toml");
+const POSTGRES: &str = include_str!("../profiles/semantics/postgres.toml");
+const DB2I: &str = include_str!("../profiles/semantics/db2i.toml");
 
 /// The abstract error kinds of design §3 Layer 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

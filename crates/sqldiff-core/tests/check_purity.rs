@@ -68,31 +68,34 @@ const ALLOWED: &[(&str, &[&str])] = &[
         "sqldiff-convert/src/tsql.rs",
         &["OnceCell", "thread_local!"],
     ),
-    ("sqldiff-core/src/assumptions.rs", &["OnceLock"]),
+    ("sqldiff-model/src/assumptions.rs", &["OnceLock"]),
     ("sqldiff-syntax/src/abstract_syntax.rs", &["thread_local!"]),
     ("sqldiff-catalog/src/builtins.rs", &["OnceLock"]),
     ("sqldiff-catalog/src/ddl.rs", &["fs::"]),
     ("sqldiff-core/src/engine.rs", &["Mutex", "OnceLock"]),
     (
-        "sqldiff-core/src/equiv/canon.rs",
+        "sqldiff-equiv/src/equiv/canon.rs",
         &["Mutex", "OnceLock", "thread_local!"],
     ),
-    ("sqldiff-core/src/equiv/compare.rs", &["thread_local!"]),
+    ("sqldiff-equiv/src/equiv/compare.rs", &["thread_local!"]),
     (
-        "sqldiff-core/src/equiv/edit.rs",
+        "sqldiff-equiv/src/equiv/edit.rs",
         &["OnceCell", "env::var", "thread_local!"],
     ),
-    ("sqldiff-core/src/equiv/eval.rs", &["env::var"]),
-    ("sqldiff-core/src/equiv/geography.rs", &["env::var", "fs::"]),
-    ("sqldiff-core/src/equiv/mod.rs", &["OnceCell", "env::var"]),
-    ("sqldiff-core/src/equiv/schema.rs", &["OnceLock", "fs::"]),
+    ("sqldiff-equiv/src/equiv/eval.rs", &["env::var"]),
+    (
+        "sqldiff-equiv/src/equiv/geography.rs",
+        &["env::var", "fs::"],
+    ),
+    ("sqldiff-equiv/src/equiv/mod.rs", &["OnceCell", "env::var"]),
+    ("sqldiff-equiv/src/equiv/schema.rs", &["OnceLock", "fs::"]),
     ("sqldiff-core/src/format/tests.rs", &["fs::"]),
     ("sqldiff-core/src/ir/behaviour.rs", &["OnceCell"]),
-    ("sqldiff-core/src/ir/profile.rs", &["OnceLock"]),
+    ("sqldiff-model/src/profile.rs", &["OnceLock"]),
     ("sqldiff-core/src/lint.rs", &["OnceLock"]),
     ("sqldiff-core/src/rule_proofs.rs", &["OnceLock"]),
     ("sqldiff-core/src/rules/rule.rs", &["OnceLock"]),
-    ("sqldiff-core/src/target.rs", &["Mutex", "OnceLock"]),
+    ("sqldiff-model/src/target.rs", &["Mutex", "OnceLock"]),
 ];
 
 fn scan(dir: &Path, root: &Path, out: &mut BTreeMap<String, BTreeSet<&'static str>>) {
@@ -129,7 +132,9 @@ fn the_check_reads_nothing_outside_its_arguments() {
         "sqldiff-core",
         "sqldiff-convert",
         "sqldiff-syntax",
+        "sqldiff-model",
         "sqldiff-catalog",
+        "sqldiff-equiv",
     ] {
         scan(&root.join(krate).join("src"), &root, &mut found);
     }

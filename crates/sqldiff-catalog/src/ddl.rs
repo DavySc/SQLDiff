@@ -6,8 +6,8 @@
 use sqldiff_syntax::{parse, Dialect, SyntaxKind, SyntaxNode};
 
 use super::{
-    Catalog, Column, DataType, Ident, Index, Key, Param, ParamMode, Routine, RoutineKind, Table,
-    TableKind, Trigger, Versioning,
+    Catalog, Column, DataType, Ident, Index, Key, NameIndex, Param, ParamMode, Routine,
+    RoutineKind, Table, TableKind, Trigger, Versioning,
 };
 use crate::tokens::{self, close_paren, find_kw, qualified, split_commas, Tok};
 
@@ -24,6 +24,7 @@ pub fn load(text: &str, dialect: Dialect, origin: &str) -> Catalog {
 
 /// Adds the definitions found at the top level of a parsed tree.
 pub fn load_tree(cat: &mut Catalog, root: &SyntaxNode, dialect: Dialect) {
+    let mut ix = NameIndex::new(dialect, cat);
     // Top-level nodes are children of the file or of a batch (the parser
     // opens a batch only at the top), so no other subtree is entered: a
     // routine's body is not walked.
@@ -43,7 +44,7 @@ pub fn load_tree(cat: &mut Catalog, root: &SyntaxNode, dialect: Dialect) {
             continue;
         }
         match node.kind() {
-            SyntaxKind::STATEMENT => apply_statement(cat, &tokens::of_node(&node), dialect),
+            SyntaxKind::STATEMENT => apply_indexed(cat, &mut ix, &tokens::of_node(&node), dialect),
             SyntaxKind::ROUTINE => {
                 if let Some(h) = routine_header(&node, dialect) {
                     match h.view {
@@ -53,8 +54,8 @@ pub fn load_tree(cat: &mut Catalog, root: &SyntaxNode, dialect: Dialect) {
                                 .filter(|c| c.kind() == SyntaxKind::ROUTINE_BODY)
                                 .flat_map(|b| tokens::of_node(&b))
                                 .collect();
-                            let t = view_table(cat, dialect, h.name.clone(), cols, &body);
-                            cat.put_table(dialect, t);
+                            let t = view_table(cat, &ix, dialect, h.name.clone(), cols, &body);
+                            ix.put_table(dialect, cat, t);
                         }
                         None => {
                             if h.routine.kind == RoutineKind::Trigger && dialect == Dialect::Tsql {
@@ -62,7 +63,7 @@ pub fn load_tree(cat: &mut Catalog, root: &SyntaxNode, dialect: Dialect) {
                                     cat.put_trigger(t);
                                 }
                             }
-                            cat.put_routine(dialect, h.routine)
+                            ix.put_routine(dialect, cat, h.routine)
                         }
                     }
                 }
@@ -84,6 +85,13 @@ const TABLE_PREFIXES: &[&str] = &[
 
 /// Applies one top-level statement.
 pub fn apply_statement(cat: &mut Catalog, t: &[Tok], dialect: Dialect) {
+    let mut ix = NameIndex::new(dialect, cat);
+    apply_indexed(cat, &mut ix, t, dialect);
+}
+
+/// [`apply_statement`] with the catalog's index, which it keeps current: a
+/// load of many statements finds and replaces tables without scanning.
+fn apply_indexed(cat: &mut Catalog, ix: &mut NameIndex, t: &[Tok], dialect: Dialect) {
     let Some(first) = t.first() else { return };
     if first.is_kw("CREATE") {
         let mut i = 1;
@@ -93,11 +101,11 @@ pub fn apply_statement(cat: &mut Catalog, t: &[Tok], dialect: Dialect) {
         match t.get(i).map(Tok::upper).as_deref() {
             Some("TABLE") => {
                 if let Some(tb) = create_table(t, dialect) {
-                    cat.put_table(dialect, tb);
+                    ix.put_table(dialect, cat, tb);
                 }
             }
             Some("UNIQUE" | "INDEX" | "CLUSTERED" | "NONCLUSTERED") => {
-                create_index(cat, t, i, dialect)
+                create_index(cat, ix, t, i, dialect)
             }
             Some("VIEW") => {
                 let (name, j) = qualified(t, i + 1);
@@ -114,8 +122,8 @@ pub fn apply_statement(cat: &mut Catalog, t: &[Tok], dialect: Dialect) {
                     j = c + 1;
                 }
                 if let Some(as_at) = find_kw(t, j, "AS") {
-                    let tb = view_table(cat, dialect, name, cols, &t[as_at + 1..]);
-                    cat.put_table(dialect, tb);
+                    let tb = view_table(cat, ix, dialect, name, cols, &t[as_at + 1..]);
+                    ix.put_table(dialect, cat, tb);
                 }
             }
             Some("SCHEMA") => {
@@ -132,10 +140,10 @@ pub fn apply_statement(cat: &mut Catalog, t: &[Tok], dialect: Dialect) {
         }
     } else if first.is_kw("DECLARE") && t.get(1).is_some_and(|x| x.is_kw("GLOBAL")) {
         if let Some(tb) = create_table(t, dialect) {
-            cat.put_table(dialect, tb);
+            ix.put_table(dialect, cat, tb);
         }
     } else if first.is_kw("ALTER") && t.get(1).is_some_and(|x| x.is_kw("TABLE")) {
-        alter_table(cat, t, dialect);
+        alter_table(cat, ix, t, dialect);
     }
 }
 
@@ -619,7 +627,7 @@ fn table_constraint(tb: &mut Table, el: &[Tok], dialect: Dialect) {
 }
 
 /// `CREATE [UNIQUE] [CLUSTERED|NONCLUSTERED] INDEX name ON table (cols)`.
-fn create_index(cat: &mut Catalog, t: &[Tok], from: usize, dialect: Dialect) {
+fn create_index(cat: &mut Catalog, names: &NameIndex, t: &[Tok], from: usize, dialect: Dialect) {
     let unique = t[from..].iter().take(3).any(|x| x.is_kw("UNIQUE"));
     let Some(ix) = t.iter().position(|x| x.is_kw("INDEX")) else {
         return;
@@ -659,7 +667,7 @@ fn create_index(cat: &mut Catalog, t: &[Tok], from: usize, dialect: Dialect) {
         }) && !t[close..].iter().any(|x| x.is_kw("WHERE"))
     };
     let unique = unique && plain && !cols.is_empty();
-    if let Some(i) = super::table_position(dialect, cat, &parts) {
+    if let Some(i) = names.table_position(dialect, cat, &parts) {
         cat.tables[i].indexes.push(Index {
             name,
             unique,
@@ -669,7 +677,7 @@ fn create_index(cat: &mut Catalog, t: &[Tok], from: usize, dialect: Dialect) {
 }
 
 /// `ALTER TABLE t ADD [COLUMN] c type ...`, `DROP [COLUMN] c`.
-fn alter_table(cat: &mut Catalog, t: &[Tok], dialect: Dialect) {
+fn alter_table(cat: &mut Catalog, ix: &NameIndex, t: &[Tok], dialect: Dialect) {
     let mut i = 2;
     if t.get(i).is_some_and(|x| x.is_kw("IF")) {
         i += 2;
@@ -678,7 +686,7 @@ fn alter_table(cat: &mut Catalog, t: &[Tok], dialect: Dialect) {
         i += 1;
     }
     let (parts, j) = qualified(t, i);
-    let Some(i) = super::table_position(dialect, cat, &parts) else {
+    let Some(i) = ix.table_position(dialect, cat, &parts) else {
         return;
     };
     let tb = &mut cat.tables[i];
@@ -954,6 +962,7 @@ pub fn select_outputs(t: &[Tok]) -> Option<Vec<OutputCol>> {
 /// references to tables already in the catalog.
 fn view_table(
     cat: &Catalog,
+    ix: &NameIndex,
     dialect: Dialect,
     name: Vec<Ident>,
     cols: Option<Vec<Ident>>,
@@ -973,7 +982,10 @@ fn view_table(
             .unwrap_or(query.len());
         for item in split_commas(&query[f + 1..end]) {
             let (parts, after) = qualified(item, 0);
-            if let Some(t) = super::table_position(dialect, cat, &parts).map(|i| &cat.tables[i]) {
+            if let Some(t) = ix
+                .table_position(dialect, cat, &parts)
+                .map(|i| &cat.tables[i])
+            {
                 let alias = item
                     .get(after)
                     .filter(|x| x.is_kw("AS"))
