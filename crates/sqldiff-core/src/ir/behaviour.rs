@@ -1110,8 +1110,6 @@ pub(crate) fn norm_cond(c: &str) -> String {
     out.join(" ")
 }
 
-/// T-SQL compared against PostgreSQL or Db2 for i: the other side's
-/// temporary tables, which a table variable may have been converted to.
 /// Statements of a unit: the larger count of the two sides' statement nodes.
 fn statements_of(sa: &SideIr, sb: &SideIr) -> u64 {
     let n = |s: &SideIr| s.cfg.nodes.iter().filter(|n| n.stmt().is_some()).count() as u64;
@@ -1133,6 +1131,8 @@ fn pair_statements(
     n(a, b, ra).max(n(b, a, rb))
 }
 
+/// T-SQL compared against PostgreSQL or Db2 for i: the other side's
+/// temporary tables, which a table variable may have been converted to.
 fn other_temps(x: &Analyzed, other: &Analyzed) -> HashSet<String> {
     if x.dialect() == Dialect::Tsql && other.dialect() != Dialect::Tsql {
         crate::classify::temp_table_names(&other.root)
@@ -1543,7 +1543,7 @@ impl<'x, 'a> Collector<'x, 'a> {
             )
         } else if file_total >= self.file_cap() {
             format!(
-                "file work budget ({file_total} of {} units of work, statement checks included)",
+                "file work budget ({file_total} of {} units of work, behaviour analysis only)",
                 self.file_cap()
             )
         } else if self.spent.get() >= self.budgets.0 {
