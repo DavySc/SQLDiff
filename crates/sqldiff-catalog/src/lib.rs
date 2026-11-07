@@ -157,6 +157,21 @@ pub struct Table {
     /// of its sources they stand for is not.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub star_outputs: bool,
+    /// A view whose column types are those of a single base table or view
+    /// read directly (no join, set operation, CTE or derived table), so
+    /// that a column listed with a known type has that type. Only such
+    /// types may be relied on; any other view's column types are a guess.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub types_from_source: bool,
+    /// With `types_from_source`: the stored name of the base table read, and
+    /// per column the source column its type was copied from (`None` for an
+    /// expression or an unresolved one). Lets a consumer check the types
+    /// against the table as it is *now*: a later ALTER COLUMN or a dropped
+    /// and re-created table leaves the view's copy stale.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_table: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_columns: Vec<Option<String>>,
     #[serde(default)]
     pub keys: Vec<Key>,
     #[serde(default)]
@@ -190,6 +205,9 @@ impl Table {
             columns: Vec::new(),
             columns_known: true,
             star_outputs: false,
+            types_from_source: false,
+            source_table: String::new(),
+            source_columns: Vec::new(),
             keys: Vec::new(),
             indexes: Vec::new(),
             triggers: Vec::new(),

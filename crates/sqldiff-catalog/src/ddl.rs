@@ -763,8 +763,70 @@ fn alter_table(cat: &mut Catalog, ix: &NameIndex, t: &[Tok], dialect: Dialect) {
                     tb.columns.retain(|x| super::key(dialect, &x.name) != ck);
                 }
             }
-            Verb::Other => {}
+            Verb::Other => {
+                if verb.is_kw("ALTER") {
+                    alter_column_type(tb, &action[1..], dialect);
+                }
+            }
         }
+    }
+}
+
+/// `ALTER COLUMN c type [NULL | NOT NULL]` (T-SQL) and `ALTER [COLUMN] c
+/// [SET DATA] TYPE type [USING ...]` (PostgreSQL): the column takes the new
+/// type, so what the catalog says about it is current. Other `ALTER COLUMN`
+/// forms (defaults, nullability alone, identity) leave the type alone.
+fn alter_column_type(tb: &mut Table, a: &[Tok], dialect: Dialect) {
+    let mut k = 0;
+    if a.get(k).is_some_and(|x| x.is_kw("COLUMN")) {
+        k += 1;
+    }
+    let Some(name) = a.get(k).filter(|x| x.is_name()) else {
+        return;
+    };
+    k += 1;
+    let mut rest = &a[k.min(a.len())..];
+    if dialect != Dialect::Tsql {
+        // PostgreSQL / Db2: `[SET DATA] TYPE type`.
+        if rest.first().is_some_and(|x| x.is_kw("SET"))
+            && rest.get(1).is_some_and(|x| x.is_kw("DATA"))
+        {
+            rest = &rest[2..];
+        }
+        if !rest.first().is_some_and(|x| x.is_kw("TYPE")) {
+            return;
+        }
+        rest = &rest[1..];
+        let end = rest
+            .iter()
+            .position(|x| x.is_any_kw(&["USING", "COLLATE"]))
+            .unwrap_or(rest.len());
+        rest = &rest[..end];
+    } else if rest
+        .first()
+        .map_or(true, |x| x.is_any_kw(&["ADD", "DROP", "SET"]))
+    {
+        return;
+    }
+    // Parse `name type ...` as a column definition on a scratch table.
+    let mut scratch = Table::new(None, String::new(), TableKind::Table);
+    let mut item = vec![name.clone()];
+    item.extend(rest.iter().cloned());
+    column_defs(&mut scratch, &item, dialect);
+    let Some(new) = scratch.columns.into_iter().next() else {
+        return;
+    };
+    let ck = name.ident().key(dialect);
+    if let Some(c) = tb
+        .columns
+        .iter_mut()
+        .find(|x| super::key(dialect, &x.name) == ck)
+    {
+        c.data_type = new.data_type;
+        if dialect == Dialect::Tsql {
+            c.nullable = new.nullable;
+        }
+        c.collation = new.collation;
     }
 }
 
@@ -954,6 +1016,37 @@ fn view_table(
             "GROUPING",
         ])
     });
+    // The column types are those of the one table or view read: no join,
+    // comma list, set operation, CTE or derived table, which could put
+    // another source's column under a name the one table also has.
+    // Only a base table counts: a view's own column types are a guess.
+    tb.types_from_source = from_tables.len() == 1
+        && from_tables[0].1.kind == TableKind::Table
+        && !query.iter().any(|x| {
+            x.is_any_kw(&[
+                "JOIN",
+                "APPLY",
+                "UNION",
+                "EXCEPT",
+                "INTERSECT",
+                "MINUS",
+                "WITH",
+                "PIVOT",
+                "UNPIVOT",
+            ])
+        })
+        && find_kw(query, 0, "FROM").is_some_and(|f| {
+            let end = ["WHERE", "GROUP", "HAVING", "ORDER"]
+                .iter()
+                .filter_map(|k| find_kw(query, f, k))
+                .min()
+                .unwrap_or(query.len());
+            split_commas(&query[f + 1..end]).len() == 1
+                && !query[f + 1..end].iter().any(|x| x.is(SyntaxKind::L_PAREN))
+        });
+    if tb.types_from_source {
+        tb.source_table = from_tables[0].1.name.clone();
+    }
     match (outputs, cols) {
         (Some(outs), explicit) => {
             for (k, o) in outs.iter().enumerate() {
@@ -980,6 +1073,9 @@ fn view_table(
                         })
                         .find_map(|(_, t)| t.column(dialect, col))
                 });
+                if tb.types_from_source {
+                    tb.source_columns.push(src.map(|c| c.name.clone()));
+                }
                 tb.columns.push(Column {
                     name: n.stored(dialect),
                     data_type: src
@@ -1568,6 +1664,38 @@ mod tests {
             panic!("{t} missing")
         };
         t.columns.iter().map(|c| c.name.clone()).collect()
+    }
+
+    /// ALTER COLUMN ... type changes what the catalog says about the column.
+    #[test]
+    fn alter_column_type_updates_the_catalog() {
+        let ty = |d: Dialect, sql: &str| load(sql, d, "t").tables[0].columns[1].data_type.clone();
+        let base = "CREATE TABLE t (id int, s varchar(10) NOT NULL);";
+        for (d, alter) in [
+            (
+                Dialect::Tsql,
+                "ALTER TABLE t ALTER COLUMN s char(10) NOT NULL;",
+            ),
+            (
+                Dialect::Postgres,
+                "ALTER TABLE t ALTER COLUMN s TYPE char(10);",
+            ),
+            (
+                Dialect::Postgres,
+                "ALTER TABLE t ALTER s SET DATA TYPE char(10) USING s::char(10);",
+            ),
+        ] {
+            let before = ty(d, base);
+            let after = ty(d, &format!("{base} {alter}"));
+            assert_ne!(before, after, "{d:?} {alter}");
+            assert_eq!(after.base.to_uppercase(), "CHAR", "{d:?} {alter}");
+        }
+        // A form that does not retype leaves the type alone.
+        let kept = ty(
+            Dialect::Postgres,
+            &format!("{base} ALTER TABLE t ALTER COLUMN s SET NOT NULL;"),
+        );
+        assert_eq!(kept, ty(Dialect::Postgres, base));
     }
 
     #[test]
