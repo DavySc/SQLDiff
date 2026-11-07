@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 use sqldiff_syntax::Dialect;
 
-const DATA: &str = include_str!("../../profiles/builtins.toml");
+const DATA: &str = include_str!("../profiles/builtins.toml");
 
 #[derive(Debug, Deserialize)]
 struct File {

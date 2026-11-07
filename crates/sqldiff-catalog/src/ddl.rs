@@ -1448,7 +1448,7 @@ fn trigger_info(t: &[Tok], from: usize) -> TriggerInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{CatalogView, Lookup};
+    use crate::{CatalogView, Lookup};
 
     fn corpus(name: &str) -> String {
         let p = concat!(env!("CARGO_MANIFEST_DIR"), "/../../corpus/catalog/");
