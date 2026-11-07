@@ -398,26 +398,39 @@ fn continues(o: &Outcome) -> bool {
 /// arrays: an outcome that merged into the fault-free run shares that
 /// run's array, so comparing two of them starts from this and costs the
 /// slots they changed.
+///
+/// One cache serves a whole routine pair. It is keyed by the arrays'
+/// identity (a pair of `Rc` addresses) and keeps the arrays alive, so an
+/// address is never reused while its entry exists. Eviction clears
+/// everything once the arrays held reach `BYTES`; it only costs time, the
+/// differences are a pure function of the two arrays.
 #[derive(Default)]
 struct DiffCache {
     #[allow(clippy::type_complexity)]
-    pairs: RefCell<Vec<(Rc<Vec<u8>>, Rc<Vec<u8>>, Rc<Vec<u32>>)>>,
+    pairs: RefCell<(
+        HashMap<(usize, usize), (Rc<Vec<u8>>, Rc<Vec<u8>>, Rc<Vec<u32>>)>,
+        usize,
+    )>,
 }
 
 impl DiffCache {
+    /// Bytes of fate arrays the cache may keep alive before it starts over.
+    const BYTES: usize = 64 << 20;
+
     fn of(&self, a: &Rc<Vec<u8>>, b: &Rc<Vec<u8>>) -> Rc<Vec<u32>> {
         let mut c = self.pairs.borrow_mut();
-        if let Some((_, _, d)) = c
-            .iter()
-            .find(|(x, y, _)| Rc::ptr_eq(x, a) && Rc::ptr_eq(y, b))
-        {
+        let key = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
+        if let Some((_, _, d)) = c.0.get(&key) {
             return d.clone();
         }
         let d = Rc::new(scan_differing(a, b));
-        if c.len() >= 64 {
-            c.clear();
+        let cost = a.len() + b.len() + 4 * d.len() + 64;
+        if c.1 + cost > Self::BYTES {
+            c.0.clear();
+            c.1 = 0;
         }
-        c.push((a.clone(), b.clone(), d.clone()));
+        c.1 += cost;
+        c.0.insert(key, (a.clone(), b.clone(), d.clone()));
         d
     }
 }
@@ -1176,7 +1189,16 @@ struct Collector<'x, 'a> {
     /// side (see `Outcome::cut`).
     cut_a: BTreeSet<NodeId>,
     cut_b: BTreeSet<NodeId>,
+    /// The divergences of a scenario with a default flipped (`persists`),
+    /// by scenario.
+    flipped: RefCell<HashMap<String, Rc<Divergences>>>,
 }
+
+/// The (rule, anchor) of divergences found.
+type Divergences = BTreeSet<(&'static str, String)>;
+
+/// Flipped scenarios kept before the cache starts over (time only).
+const FLIPPED_MAX: usize = 4096;
 
 impl<'x, 'a> Collector<'x, 'a> {
     fn new(
@@ -1206,6 +1228,7 @@ impl<'x, 'a> Collector<'x, 'a> {
             salt: String::new(),
             cut_a: BTreeSet::new(),
             cut_b: BTreeSet::new(),
+            flipped: RefCell::new(HashMap::new()),
         };
         c.splits = splits(&c.sa, &c.sb, true);
         c.splits.extend(splits(&c.sb, &c.sa, false));
@@ -1264,14 +1287,39 @@ impl<'x, 'a> Collector<'x, 'a> {
 
     /// Whether a divergence still shows with a default setting flipped; if
     /// so, the finding does not rest on the assumption behind that default.
+    ///
+    /// The divergences of the flipped scenario are worked out once for all
+    /// findings that flip it (`flipped`): a scenario with many findings used
+    /// to explore and compare every outcome pair again for each of them.
     fn persists(&self, sc: &Kind, scen_a: &Scenario, scen_b: &Scenario, d: &Div) -> bool {
+        let key = format!("{sc:?}|{scen_a:?}|{scen_b:?}");
+        let known = self.flipped.borrow().get(&key).cloned();
+        let set = match known {
+            Some(set) => set,
+            None => {
+                let set = Rc::new(self.divergences_of(sc, scen_a, scen_b));
+                let mut c = self.flipped.borrow_mut();
+                if c.len() >= FLIPPED_MAX {
+                    c.clear();
+                }
+                c.insert(key, set.clone());
+                set
+            }
+        };
+        set.contains(&(d.rule, d.anchor.clone()))
+    }
+
+    /// The (rule, anchor) of every divergence between any pair of outcomes
+    /// of the two sides under the scenarios.
+    fn divergences_of(&self, sc: &Kind, scen_a: &Scenario, scen_b: &Scenario) -> Divergences {
         let (pa, pb) = self.outcomes(sc, scen_a, scen_b);
         let (ps, _) = pairs(&pa, &pb);
         let ra: Vec<Reads> = pa.iter().map(|o| reads(&self.sa, o)).collect();
         let rb: Vec<Reads> = pb.iter().map(|o| reads(&self.sb, o)).collect();
-        ps.iter().any(|&(i, j)| {
+        let mut out = BTreeSet::new();
+        for &(i, j) in &ps {
             let (a, b) = ((&pa[i], &ra[i]), (&pb[j], &rb[j]));
-            diff(
+            for x in diff(
                 &self.sa,
                 &self.sb,
                 &self.splits,
@@ -1280,10 +1328,11 @@ impl<'x, 'a> Collector<'x, 'a> {
                 b,
                 &|_, _| false,
                 &self.al,
-            )
-            .iter()
-            .any(|x| x.rule == d.rule && x.anchor == d.anchor)
-        })
+            ) {
+                out.insert((x.rule, x.anchor));
+            }
+        }
+        out
     }
 
     fn run(
