@@ -157,6 +157,16 @@ jobs:
               echo "$p depends on a network client"; exit 1
             fi
           done
+      - name: The draft crate does not depend on the engine above it
+        run: |
+          # The fingerprint of a draft is that of its crate closure
+          # (docs/crate-split.md): it must never reach the check, the IR or the
+          # engine, which are fingerprinted with the results.
+          for p in sqldiff-draft sqldiff-units; do
+            if cargo tree -p "$p" -e normal --prefix none | grep -E '^sqldiff-(core|convert|source|review) '; then
+              echo "$p depends on code above the draft stage"; exit 1
+            fi
+          done
       - name: Byte-identical corpus results
         run: |
           cargo run -q -p sqldiff-corpus --bin corpus-report -- --json > run1.json

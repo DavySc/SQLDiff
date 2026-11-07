@@ -10,8 +10,8 @@
 //! This changes no status. A unit with an impossible feature is still
 //! `not converted`: its original stays as a comment, it never counts as
 //! converted, it still keeps its file from counting as converted, and the
-//! engine never compared it. [`Counts::impossible`](crate::Counts) and
-//! [`Totals::impossible`](crate::tree::Totals) count such units as a part of
+//! engine never compared it. `sqldiff_convert::Counts::impossible` and
+//! `sqldiff_convert::tree::Totals::impossible` count such units as a part of
 //! the not converted ones, never instead of them.
 //!
 //! The marker is the reason's text: [`reason`] builds
