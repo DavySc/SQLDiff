@@ -7,7 +7,7 @@
 //! read and write side), jumps, and between 5 and 45 percent of the statements
 //! edited, in both directions and for both dialects.
 
-use sqldiff_core::equiv::edit::shared_answer_counts;
+use sqldiff_core::equiv::edit::{loop_answer_counts, shared_answer_counts};
 use sqldiff_core::{diff, Artifact, Dialect, Options};
 use std::sync::Mutex;
 
@@ -367,4 +367,241 @@ fn status_only_one_sided_and_non_candidate_findings_agree_with_the_exact_scan() 
     }
     assert!(answered > 0);
     expect_answers(before, 80, 50);
+}
+
+// ---- edits inside loops -------------------------------------------------------------------
+
+const LOOPY_T: &[&str] = &[
+    "SET @v1 = @p + {};",
+    "SET @v2 = @v1 * {};",
+    "SET @w1 = @w2 + {};",
+    "SET @w2 = @w3 - {};",
+    "SET @w3 = @v1 + {};",
+    "INSERT INTO #t (a) VALUES (@w1 + {});",
+    "UPDATE #t SET a = a + {} WHERE a > @v2;",
+    "SELECT a FROM #t WHERE a = @w3 + {};",
+    "EXEC(@sql);",
+    "SELECT @w1 + {};",
+];
+
+const LOOPY_P: &[&str] = &[
+    "v1 := p + {};",
+    "v2 := v1 * {};",
+    "w1 := w2 + {};",
+    "w2 := w3 - {};",
+    "w3 := v1 + {};",
+    "INSERT INTO t1 (a) VALUES (w1 + {});",
+    "UPDATE t1 SET a = a + {} WHERE a > v2;",
+    "PERFORM a FROM t1 WHERE a = w3 + {};",
+    "EXECUTE sql;",
+    "PERFORM w1 + {};",
+];
+
+/// Routines that live inside loops: nested WHILE bodies, conditions, jumps
+/// (BREAK / EXIT, RETURN) and reverse dependency chains.
+fn gen_loopy(rng: &mut Rng, depth: u32, next_id: &mut usize, tsql: bool, n: u64) -> Vec<Node> {
+    let leaves = if tsql { LOOPY_T } else { LOOPY_P };
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let id = *next_id;
+        *next_id += 1;
+        let pick = rng.below(10);
+        let k = rng.below(5);
+        let node = if depth < 3 && pick < 2 {
+            let body_n = 1 + rng.below(4);
+            let body = gen_loopy(rng, depth + 1, next_id, tsql, body_n);
+            if tsql {
+                Node {
+                    head: "WHILE @v2 < {} BEGIN",
+                    k,
+                    body,
+                    tail: "SET @v2 = @v2 + 1; END",
+                    id,
+                }
+            } else {
+                Node {
+                    head: "WHILE v2 < {} LOOP",
+                    k,
+                    body,
+                    tail: "v2 := v2 + 1; END LOOP;",
+                    id,
+                }
+            }
+        } else if depth < 3 && pick == 2 {
+            let body_n = 1 + rng.below(3);
+            let body = gen_loopy(rng, depth + 1, next_id, tsql, body_n);
+            if tsql {
+                Node {
+                    head: "IF @w1 > {} BEGIN",
+                    k,
+                    body,
+                    tail: "END",
+                    id,
+                }
+            } else {
+                Node {
+                    head: "IF w1 > {} THEN",
+                    k,
+                    body,
+                    tail: "END IF;",
+                    id,
+                }
+            }
+        } else if pick == 3 {
+            Node {
+                head: if tsql {
+                    "IF @w2 = {} BREAK;"
+                } else {
+                    "IF w2 = {} THEN EXIT; END IF;"
+                },
+                k,
+                body: vec![],
+                tail: "",
+                id,
+            }
+        } else if pick == 4 && depth > 0 {
+            Node {
+                head: if tsql {
+                    "IF @v1 = {} RETURN;"
+                } else {
+                    "IF v1 = {} THEN RETURN; END IF;"
+                },
+                k,
+                body: vec![],
+                tail: "",
+                id,
+            }
+        } else {
+            Node {
+                head: leaves[rng.below(leaves.len() as u64) as usize],
+                k: rng.below(9),
+                body: vec![],
+                tail: "",
+                id,
+            }
+        };
+        out.push(node);
+    }
+    out
+}
+
+fn routine_loopy(nodes: &[Node], edited: &[bool], b: bool, tsql: bool, outer: bool) -> String {
+    let mut body = String::new();
+    render(nodes, edited, b, &mut body);
+    // The whole body in one loop, or the loops only where generated.
+    let (open, close) = match (outer, tsql) {
+        (true, true) => ("WHILE @v2 < 100 BEGIN\n", "SET @v2 = @v2 + 1;\nEND\n"),
+        (true, false) => ("WHILE v2 < 100 LOOP\n", "v2 := v2 + 1;\nEND LOOP;\n"),
+        _ => ("", ""),
+    };
+    if tsql {
+        format!(
+            "CREATE PROCEDURE dbo.r @p int AS\nBEGIN\nDECLARE @v1 int = 0, @v2 int = 0, @w1 int = 0, @w2 int = 0, @w3 int = 0, @sql nvarchar(100) = N'';\nCREATE TABLE #t (a int);\n{open}{body}{close}SELECT a FROM #t;\nEND\n"
+        )
+    } else {
+        format!(
+            "CREATE FUNCTION r(p int) RETURNS void LANGUAGE plpgsql AS $$\nDECLARE v1 int := 0; v2 int := 0; w1 int := 0; w2 int := 0; w3 int := 0; sql text := '';\nBEGIN\n{open}{body}{close}END $$;\n"
+        )
+    }
+}
+
+/// Edits inside loops take the exact path (the shared sweeps skip them), now
+/// a worklist; under the oracle every such answer is compared with the
+/// original pass-loop scan.
+#[test]
+fn edits_in_loops_agree_with_the_pass_loop_reference() {
+    std::env::set_var("SQLDIFF_EDIT_ORACLE", "1");
+    let _guard = serial();
+    let before = loop_answer_counts();
+    let mut rng = Rng(0x100b5);
+    let mut compared = 0usize;
+    for case in 0..60 {
+        let tsql = case % 2 == 0;
+        let d = if tsql {
+            Dialect::Tsql
+        } else {
+            Dialect::Postgres
+        };
+        let n = 4 + rng.below(16);
+        let mut ids = 0;
+        let nodes = gen_loopy(&mut rng, 0, &mut ids, tsql, n);
+        let pct = 5 + rng.below(46);
+        let edited: Vec<bool> = (0..ids).map(|_| rng.below(100) < pct).collect();
+        let outer = case % 4 < 2;
+        let (a, b) = (
+            routine_loopy(&nodes, &edited, false, tsql, outer),
+            routine_loopy(&nodes, &edited, true, tsql, outer),
+        );
+        let ddl = if tsql {
+            "CREATE TABLE dbo.t1 (a int);"
+        } else {
+            "CREATE TABLE t1 (a int);"
+        };
+        let opts = Options {
+            catalog_a: vec![Artifact::new("catalog.sql", d, ddl)],
+            catalog_b: vec![Artifact::new("catalog.sql", d, ddl)],
+            ..Options::default()
+        };
+        for (x, y) in [(&a, &b), (&b, &a)] {
+            let r = diff(
+                &Artifact::new("a.sql", d, x.as_str()),
+                &Artifact::new("b.sql", d, y.as_str()),
+                &opts,
+            );
+            compared += r.findings.len();
+        }
+    }
+    assert!(compared > 200, "the generated cases produce findings");
+    let (answers, visits) = {
+        let after = loop_answer_counts();
+        (after.0 - before.0, after.1 - before.1)
+    };
+    assert!(
+        answers >= 300 && visits >= 1000,
+        "the oracle compared {answers} loop answers ({visits} closure wake-ups), expected at least 300 (1000)"
+    );
+}
+
+/// Fixed loop shapes for the worklist's wake-ups, which the generator reaches
+/// only by chance. A unit that reads only through the any-name (a quoted
+/// identifier `*`) must fire as soon as the set is non-empty, and a unit
+/// that writes the any-name (a call) must wake every unit that reads
+/// something. Each is the one thing a missed wake changes in the answer: a
+/// later edit then reads `@q`, or the edit's result reaches the changed code
+/// through `@q`.
+#[test]
+fn loop_wake_ups_agree_with_the_pass_loop_reference() {
+    std::env::set_var("SQLDIFF_EDIT_ORACLE", "1");
+    let _guard = serial();
+    let before = loop_answer_counts();
+    let d = Dialect::Tsql;
+    let opts = Options::default();
+    let any_reader = |k1: u32, k2: u32| {
+        format!(
+            "CREATE PROCEDURE dbo.r @p int, @q int, @lim int AS\nBEGIN\nDECLARE @v2 int = 0;\nWHILE @lim < 10 BEGIN\nSET @q = (SELECT @p AS [*]);\nSET @v2 = @p + {k1};\nSELECT @q + {k2};\nSET @lim = @lim + 1;\nEND\nEND\n"
+        )
+    };
+    let any_writer = |k1: u32, k2: u32| {
+        format!(
+            "CREATE PROCEDURE dbo.r @p int, @q int AS\nBEGIN\nDECLARE @v2 int = 0;\nWHILE @v2 < 10 BEGIN\nEXEC dbo.f @p, {k1};\nSET @q = @p + 1;\nSELECT @q + {k2};\nSET @v2 = @v2 + 1;\nEND\nEND\n"
+        )
+    };
+    for make in [&any_reader as &dyn Fn(u32, u32) -> String, &any_writer] {
+        // Both edits, then each alone.
+        for (a, b) in [((1, 1), (2, 2)), ((1, 1), (2, 1)), ((1, 1), (1, 2))] {
+            for (x, y) in [(a, b), (b, a)] {
+                let _ = diff(
+                    &Artifact::new("a.sql", d, make(x.0, x.1).as_str()),
+                    &Artifact::new("b.sql", d, make(y.0, y.1).as_str()),
+                    &opts,
+                );
+            }
+        }
+    }
+    let after = loop_answer_counts();
+    assert!(
+        after.0 - before.0 >= 6,
+        "the oracle compared {} loop answers, expected at least 6",
+        after.0 - before.0
+    );
 }

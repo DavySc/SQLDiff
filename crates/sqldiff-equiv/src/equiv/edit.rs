@@ -328,7 +328,7 @@ impl<'x, 'a> Routine<'x, 'a> {
                             {
                                 self.records.insert(name.clone());
                             }
-                            self.site(&name, &c, None, false, false);
+                            self.site(&name, &c, &t, None, false, false);
                         }
                     }
                 }
@@ -338,16 +338,20 @@ impl<'x, 'a> Routine<'x, 'a> {
         }
     }
 
+    /// Records an assignment site of `name` at `node`; `t` are the tokens of
+    /// `node`, scanned once by the caller (a statement that sets many names,
+    /// as one `DECLARE` of a thousand variables does, was scanned again for
+    /// each).
     fn site(
         &mut self,
         name: &str,
         node: &SyntaxNode,
+        t: &[Tok],
         constant: Option<Expr>,
         count: bool,
         declare: bool,
     ) {
         let (start, end) = cst::sig_range(node);
-        let t = tokens(node);
         let random = t.windows(2).any(|w| {
             w[0].kind == K::Word
                 && matches!(w[0].up.as_str(), "RAND" | "RANDOM")
@@ -414,7 +418,7 @@ impl<'x, 'a> Routine<'x, 'a> {
                 Some(Expr::Null)
             };
             if init || c.is_some() {
-                self.site(&name, n, c, false, true);
+                self.site(&name, n, &t, c, false, true);
             }
             return;
         }
@@ -465,7 +469,7 @@ impl<'x, 'a> Routine<'x, 'a> {
                         t.get(s).is_some_and(|x| x.kind == K::LParen)
                             && is_count(&t[(s + 1).min(t.len())..])
                     });
-                    self.site(&name, n, c, count, true);
+                    self.site(&name, n, &t, c, count, true);
                     i = k + 1;
                 }
             }
@@ -473,7 +477,7 @@ impl<'x, 'a> Routine<'x, 'a> {
                 let name = t[1].text.trim_start_matches('@').to_lowercase();
                 let plain = t[2].text == "=";
                 let c = if plain { constant(&t[3..]) } else { None };
-                self.site(&name, n, c, false, false);
+                self.site(&name, n, &t, c, false, false);
             }
             "SELECT" if d == Dialect::Tsql => {
                 // SELECT [ALL | DISTINCT] [TOP n | TOP (n) [PERCENT] [WITH TIES]] @a = x, @b = y FROM ...
@@ -520,7 +524,7 @@ impl<'x, 'a> Routine<'x, 'a> {
                             if prev_ok {
                                 let name = x.text.trim_start_matches('@').to_lowercase();
                                 let count = is_count(&t[i + 2..]);
-                                self.site(&name, n, None, count, false);
+                                self.site(&name, n, &t, None, count, false);
                             }
                         }
                         K::Word if depth == 0 && x.up == "FROM" => break,
@@ -534,7 +538,7 @@ impl<'x, 'a> Routine<'x, 'a> {
                     if i >= 1 {
                         let name = t[i - 1].text.to_lowercase();
                         let count = t.get(i + 1).is_some_and(|x| x.up == "ROW_COUNT");
-                        self.site(&name, n, None, count, false);
+                        self.site(&name, n, &t, None, count, false);
                     }
                 }
             }
@@ -547,7 +551,7 @@ impl<'x, 'a> Routine<'x, 'a> {
             && (t[1].text == ":=" || (t[1].text == "=" && !matches!(first, "SET" | "UPDATE")))
         {
             let name = t[0].text.to_lowercase();
-            self.site(&name, n, constant(&t[2..]), false, false);
+            self.site(&name, n, &t, constant(&t[2..]), false, false);
         }
         if d != Dialect::Tsql && t.len() >= 4 && t[1].kind == K::LParen {
             // `arr[0] := e` style targets are not traced.
@@ -570,7 +574,7 @@ impl<'x, 'a> Routine<'x, 'a> {
                             break;
                         }
                         let name = x.text.trim_start_matches('@').to_lowercase();
-                        self.site(&name, n, None, count, false);
+                        self.site(&name, n, &t, None, count, false);
                         j += 1;
                         if t.get(j).is_some_and(|x| x.kind == K::Comma) {
                             j += 1;
@@ -593,7 +597,7 @@ impl<'x, 'a> Routine<'x, 'a> {
                         .is_some_and(|y| y.up == "OUTPUT" || y.up == "OUT")
                 {
                     let name = x.text.trim_start_matches('@').to_lowercase();
-                    self.site(&name, n, None, false, false);
+                    self.site(&name, n, &t, None, false, false);
                 }
             }
         }
@@ -1856,7 +1860,17 @@ impl<'x, 'a> Routine<'x, 'a> {
         reach: &Reach,
     ) -> Option<String> {
         let Some(fast) = side.fast.get(&i) else {
-            return self.interacts_exact(n, &side.without(i), reach);
+            let got = self.interacts_exact(n, &side.without(i), reach);
+            if side.oracle {
+                let want = self.interacts_reference(n, &side.without(i), reach);
+                assert_eq!(
+                    got,
+                    want,
+                    "edit checker: the worklist scan differs from the pass-loop reference (line {})",
+                    self.line(n)
+                );
+            }
+            return got;
         };
         SHARED_ANSWERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if fast.reach.is_some() {
@@ -1864,7 +1878,7 @@ impl<'x, 'a> Routine<'x, 'a> {
         }
         let got = self.interacts_shared(n, side, fast, reach);
         if side.oracle {
-            let want = self.interacts_exact(n, &side.without(i), reach);
+            let want = self.interacts_reference(n, &side.without(i), reach);
             assert_eq!(
                 got,
                 want,
@@ -1952,9 +1966,9 @@ impl<'x, 'a> Routine<'x, 'a> {
         if outer.is_some() {
             LOOP_ANSWERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        let in_loop_with_n =
-            |u: &Unit| outer.is_some_and(|(ls, le)| ls <= u.start && u.end <= le);
-        let before = |u: &Unit| !overlaps((u.start, u.end), here) && (u.end <= here.0 || in_loop_with_n(u));
+        let in_loop_with_n = |u: &Unit| outer.is_some_and(|(ls, le)| ls <= u.start && u.end <= le);
+        let before =
+            |u: &Unit| !overlaps((u.start, u.end), here) && (u.end <= here.0 || in_loop_with_n(u));
         let line = |off: usize| self.side.lines.line_col(off).0;
 
         // Values at `n` that changed code may have set.
@@ -2069,8 +2083,7 @@ impl<'x, 'a> Routine<'x, 'a> {
         let outer = self.outer_loop(here);
         let after = |u: &Unit| {
             !overlaps((u.start, u.end), here)
-                && (u.start >= here.1
-                    || outer.is_some_and(|(ls, le)| ls <= u.start && u.end <= le))
+                && (u.start >= here.1 || outer.is_some_and(|(ls, le)| ls <= u.start && u.end <= le))
         };
         let names = self.unit_names();
         // Status names are never carried along.
@@ -2089,10 +2102,7 @@ impl<'x, 'a> Routine<'x, 'a> {
         if pending.is_empty() {
             return None;
         }
-        let window: Vec<bool> = units
-            .iter()
-            .map(|u| after(u) && !changed_unit(u))
-            .collect();
+        let window: Vec<bool> = units.iter().map(|u| after(u) && !changed_unit(u)).collect();
         close_over(
             units,
             self.readers(),
@@ -2101,6 +2111,180 @@ impl<'x, 'a> Routine<'x, 'a> {
             pending,
             Some(&names.status),
         );
+        units
+            .iter()
+            .filter(|u| after(u) && changed_unit(u))
+            .find(|u| u.jumps || reached.meets(&u.touches))
+            .map(|u| self.side.lines.line_col(u.start).0)
+    }
+
+    /// The reference the worklist scans are checked against under the oracle
+    /// (`SQLDIFF_EDIT_ORACLE`): the original full-pass closures over every
+    /// unit, kept as they were. Same answer as [`Self::interacts_exact`];
+    /// only the oracle runs it.
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: set union; sorted before it reaches a witness; set union
+    fn interacts_reference(
+        &self,
+        n: &SyntaxNode,
+        changed: &[Span],
+        reach: &Reach,
+    ) -> Option<String> {
+        if changed.is_empty() {
+            return None;
+        }
+        let here = cst::sig_range(n);
+        let units = self.units();
+        let changed_set = SpanSet::new(changed);
+        let changed_unit = |u: &Unit| changed_set.overlaps((u.start, u.end));
+        let in_loop_with_n = |u: &Unit| {
+            self.loops
+                .iter()
+                .any(|(ls, le)| *ls <= u.start && u.end <= *le && *ls <= here.0 && here.1 <= *le)
+        };
+        let others: Vec<&Unit> = units
+            .iter()
+            .filter(|u| !overlaps((u.start, u.end), here))
+            .collect();
+        let before = |u: &Unit| u.end <= here.0 || in_loop_with_n(u);
+        let line = |off: usize| self.side.lines.line_col(off).0;
+
+        // Values at `n` that changed code may have set.
+        let names = self.unit_names();
+        let mut tainted = Taint::new(names.names.len());
+        let mut first_change: Option<usize> = None;
+        for u in others.iter().filter(|u| before(u) && changed_unit(u)) {
+            tainted.add_all(&u.writes);
+            first_change = Some(first_change.map_or(u.start, |f| f.min(u.start)));
+            // A changed jump on the way that is not evaluated as a guard.
+            if u.jumps && !reach.untraced.is_empty() {
+                return Some(format!(
+                    "the changed jump at line {} may decide whether it runs",
+                    line(u.start)
+                ));
+            }
+        }
+        if let Some(first) = first_change {
+            // The closure does not depend on the order the units are met,
+            // only on which of them are unchanged and before `n`.
+            let prior: Vec<&Unit> = others
+                .iter()
+                .copied()
+                .filter(|u| before(u) && !changed_unit(u))
+                .collect();
+            loop {
+                let mut grew = false;
+                for u in &prior {
+                    if tainted.meets(&u.reads) {
+                        grew |= tainted.add_all(&u.writes);
+                    }
+                }
+                if !grew {
+                    break;
+                }
+            }
+            let deciding = self.deciding_conditions(n);
+            let mut needed: Vec<u32> = units
+                .iter()
+                .filter(|u| {
+                    overlaps((u.start, u.end), here)
+                        || deciding.iter().any(|c| overlaps(*c, (u.start, u.end)))
+                })
+                .flat_map(|u| u.reads.iter().copied())
+                .collect();
+            needed.sort_unstable();
+            needed.dedup();
+            if tainted.meets(&needed) {
+                let mut shared: Vec<&String> = needed
+                    .iter()
+                    .filter(|&&i| i != ANY_ID && tainted.has(i))
+                    .map(|&i| &names.names[i as usize])
+                    .collect();
+                shared.sort();
+                return Some(match shared.first() {
+                    Some(x) => format!(
+                        "{} may hold a value set by the changed code at line {}",
+                        spell(x),
+                        line(first)
+                    ),
+                    None => format!(
+                        "it reads what the changed code at line {} may write",
+                        line(first)
+                    ),
+                });
+            }
+        }
+
+        // What `n` writes that changed code later reads or overwrites.
+        let seed: HashSet<String> = units
+            .iter()
+            .filter(|u| overlaps((u.start, u.end), here))
+            .flat_map(|u| u.writes.iter().map(|&i| names.names[i as usize].clone()))
+            .collect();
+        self.reaches_change_reference(seed, here, units, &changed_set)
+            .map(|l| format!("its result reaches the changed code at line {l}"))
+    }
+
+    /// The pass-loop reference of [`Self::reaches_change`]. The line of the first changed unit after `here` (or in a loop with
+    /// it) that reads or overwrites one of `seed`, directly or through
+    /// unchanged units in between.
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: the seed only decides which names are reached; order never matters
+    fn reaches_change_reference(
+        &self,
+        seed: HashSet<String>,
+        here: Span,
+        units: &[Unit],
+        changed_set: &SpanSet,
+    ) -> Option<usize> {
+        let changed_unit = |u: &Unit| changed_set.overlaps((u.start, u.end));
+        let after = |u: &Unit| {
+            !overlaps((u.start, u.end), here)
+                && (u.start >= here.1
+                    || self.loops.iter().any(|(ls, le)| {
+                        *ls <= u.start && u.end <= *le && *ls <= here.0 && here.1 <= *le
+                    }))
+        };
+        let names = self.unit_names();
+        // A name no unit mentions can never be met again, but it still
+        // makes the set non-empty.
+        let seed: Vec<&String> = seed
+            .iter()
+            .filter(|x| !STATUS.contains(&x.as_str()))
+            .collect();
+        if seed.is_empty() {
+            return None;
+        }
+        let mut reached = Taint::new(names.names.len() + seed.len());
+        let mut unknown = names.names.len();
+        for x in seed {
+            match names.ids.get(x.as_str()) {
+                Some(&i) => {
+                    reached.add(i);
+                }
+                None => {
+                    reached.add(unknown as u32);
+                    unknown += 1;
+                }
+            }
+        }
+        let later: Vec<&Unit> = units
+            .iter()
+            .filter(|u| after(u) && !changed_unit(u))
+            .collect();
+        loop {
+            let mut grew = false;
+            for u in &later {
+                if reached.meets(&u.reads) {
+                    for &w in &u.writes {
+                        if !names.status[w as usize] {
+                            grew |= reached.add(w);
+                        }
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
         units
             .iter()
             .filter(|u| after(u) && changed_unit(u))
