@@ -3767,17 +3767,31 @@ impl<'a> Canon<'a> {
             }
         }
         if op == "AND" || op == "OR" {
+            // A chain `a OR b OR c ...` is a left-leaning tree of one
+            // operator. Its operands are lowered left to right (the order
+            // the recursive reading used) and gathered into one list that is
+            // sorted once, instead of re-gathering and re-sorting the
+            // operands of every level (quadratic, and as deep as the chain).
+            let head = op.to_lowercase();
             let mut parts = Vec::new();
-            for side in [l, r] {
+            let mut todo: Vec<&Expr> = vec![r, l];
+            while let Some(side) = todo.pop() {
+                if let Expr::Bin(o, sl, sr) = side {
+                    if o == op {
+                        todo.push(sr);
+                        todo.push(sl);
+                        continue;
+                    }
+                }
                 let (t, _) = self.cond(side)?;
-                if t.is(&op.to_lowercase()) {
+                if t.is(&head) {
                     parts.extend(t.kids().iter().cloned());
                 } else {
                     parts.push(t);
                 }
             }
             parts.sort();
-            return Ok((n(&op.to_lowercase(), parts), Some(Ty::of(Fam::Bool))));
+            return Ok((n(&head, parts), Some(Ty::of(Fam::Bool))));
         }
         let (mut lt, mut lty) = self.expr(l)?;
         let (mut rt, mut rty) = self.expr(r)?;

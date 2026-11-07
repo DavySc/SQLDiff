@@ -431,6 +431,48 @@ fn the_re_check_seed_is_not_the_clock() {
 }
 
 #[test]
+fn hand_edits_are_found_with_or_without_the_recorded_hashes() {
+    let f = Fixture::new("handedits");
+    let case = Case {
+        to: Dialect::Postgres,
+        catalogs: &[],
+    };
+    run(&f, &case, "a", 2, Select::default(), true);
+    let out = f.out("a");
+    assert!(tree::hand_edits(&out).unwrap().is_empty());
+    let sidecar = out.join(tree::OUTPUT_HASHES);
+    assert!(sidecar.is_file(), "the hashes are recorded with the report");
+    // One file edited by hand.
+    let edited = out.join("funcs/f.sql");
+    let mut text = std::fs::read_to_string(&edited).unwrap();
+    text.push_str("-- by hand\n");
+    std::fs::write(&edited, text).unwrap();
+    let with = tree::hand_edits(&out).unwrap();
+    assert_eq!(with, vec!["funcs/f.sql".to_string()]);
+    // Without the file, with a broken one: the report is read, same answer.
+    let saved = std::fs::read(&sidecar).unwrap();
+    std::fs::remove_file(&sidecar).unwrap();
+    assert_eq!(tree::hand_edits(&out).unwrap(), with);
+    std::fs::write(&sidecar, b"not json").unwrap();
+    assert_eq!(tree::hand_edits(&out).unwrap(), with);
+    // Recorded for another report (the report changed since): not trusted.
+    // Here the report records the edited file's current hash, the sidecar
+    // still the old one; the report decides.
+    std::fs::write(&sidecar, &saved).unwrap();
+    let report = out.join("conversion-report.json");
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    let now = std::fs::read_to_string(&edited).unwrap();
+    for file in v["files"].as_array_mut().unwrap() {
+        if file["path"] == "funcs/f.sql" {
+            file["output_hash"] = sqldiff_convert::review::file_hash(&now).into();
+        }
+    }
+    std::fs::write(&report, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    assert!(tree::hand_edits(&out).unwrap().is_empty());
+}
+
+#[test]
 fn stand_in_flags_come_from_the_store_without_changing_the_output() {
     let f = Fixture::new("flags");
     let c = Case {
