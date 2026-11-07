@@ -113,6 +113,10 @@ struct Dense {
     base: Rc<Vec<u8>>,
     /// (index, code), by index, differing from `base`.
     over: Vec<(u32, u8)>,
+    /// `base` is the all-zero array shared by every such value, so the
+    /// nonzero codes are exactly those in `over` and a state that ran a few
+    /// effects costs the few, not one slot per key of the routine.
+    zero_base: bool,
 }
 
 impl Dense {
@@ -139,12 +143,21 @@ impl Dense {
                 .into_iter()
                 .filter(|(i, c)| self.base[*i as usize] != *c)
                 .collect(),
+            zero_base: self.zero_base,
         }
     }
 
-    fn live(&self) -> impl Iterator<Item = (usize, u8)> + '_ {
+    fn live(&self) -> Box<dyn Iterator<Item = (usize, u8)> + '_> {
+        if self.zero_base {
+            return Box::new(
+                self.over
+                    .iter()
+                    .filter(|(_, c)| *c != 0)
+                    .map(|&(i, c)| (i as usize, c)),
+            );
+        }
         let mut over = self.over.iter().peekable();
-        (0..self.base.len()).filter_map(move |i| {
+        Box::new((0..self.base.len()).filter_map(move |i| {
             let c = match over.peek() {
                 Some(&&(j, c)) if j as usize == i => {
                     over.next();
@@ -153,7 +166,7 @@ impl Dense {
                 _ => self.base[i],
             };
             (c != 0).then_some((i, c))
-        })
+        }))
     }
 }
 
@@ -169,6 +182,22 @@ impl Effects {
             names,
             base: Rc::new(fates),
             over: Vec::new(),
+            zero_base: false,
+        })
+    }
+
+    /// The fates `fates` (by key index, ascending, none zero) over the
+    /// all-zero array `zeros` (one slot per key).
+    pub(super) fn sparse(
+        names: Rc<Vec<Rc<str>>>,
+        zeros: Rc<Vec<u8>>,
+        fates: Vec<(u32, u8)>,
+    ) -> Effects {
+        Effects(Dense {
+            names,
+            base: zeros,
+            over: fates,
+            zero_base: true,
         })
     }
 
@@ -305,6 +334,18 @@ impl KeySet {
             names,
             base: Rc::new(flags),
             over: Vec::new(),
+            zero_base: false,
+        })
+    }
+
+    /// The keys `flags` (by key index, ascending) over the all-zero array
+    /// `zeros` (one slot per key).
+    pub(super) fn sparse(names: Rc<Vec<Rc<str>>>, zeros: Rc<Vec<u8>>, flags: Vec<u32>) -> KeySet {
+        KeySet(Dense {
+            names,
+            base: zeros,
+            over: flags.into_iter().map(|i| (i, 1)).collect(),
+            zero_base: true,
         })
     }
 
@@ -353,13 +394,13 @@ impl fmt::Debug for KeySet {
 /// the scenario that came from it.
 #[derive(Clone, Default)]
 pub struct BeforeFault {
-    /// Key names in key order and, aligned with them, whether each had run.
+    /// Key names in key order and the indices (ascending) of those that had run.
     names: Rc<Vec<Rc<str>>>,
-    ran: Rc<Vec<bool>>,
+    ran: Rc<Vec<u32>>,
 }
 
 impl BeforeFault {
-    pub(super) fn new(names: Rc<Vec<Rc<str>>>, ran: Vec<bool>) -> BeforeFault {
+    pub(super) fn new(names: Rc<Vec<Rc<str>>>, ran: Vec<u32>) -> BeforeFault {
         BeforeFault {
             names,
             ran: Rc::new(ran),
@@ -369,20 +410,16 @@ impl BeforeFault {
     pub fn contains(&self, k: &str) -> bool {
         self.names
             .binary_search_by(|n| (**n).cmp(k))
-            .is_ok_and(|i| self.ran[i])
+            .is_ok_and(|i| self.ran.binary_search(&(i as u32)).is_ok())
     }
 
     pub fn is_empty(&self) -> bool {
-        !self.ran.iter().any(|r| *r)
+        self.ran.is_empty()
     }
 
     /// In key order.
     pub fn iter(&self) -> impl Iterator<Item = &Rc<str>> {
-        self.names
-            .iter()
-            .zip(self.ran.iter())
-            .filter(|(_, r)| **r)
-            .map(|(n, _)| n)
+        self.ran.iter().map(|&i| &self.names[i as usize])
     }
 }
 

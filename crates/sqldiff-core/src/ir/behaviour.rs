@@ -1685,16 +1685,19 @@ impl<'x, 'a> Collector<'x, 'a> {
         scen_b: &Scenario,
     ) -> (Vec<Outcome>, Vec<Outcome>) {
         let (ca, cb) = (&self.sa.cfg, &self.sb.cfg);
+        // Only paths that reach the failing statement belong to a fault
+        // scenario.
+        let reached = |o: &Outcome| match sc {
+            Kind::Fault { key, .. } => o.fault_hit || o.effects.contains_key(key.as_str()),
+            _ => true,
+        };
         let mut pa = Self::explorer(&self.xa, &self.charged, "a", ca, cb, scen_a, &self.keys)
-            .explore(ca, scen_a);
+            .explore_where(ca, scen_a, &reached);
         let mut pb = Self::explorer(&self.xb, &self.charged, "b", cb, ca, scen_b, &self.keys)
-            .explore(cb, scen_b);
-        if let Kind::Fault { key, .. } = sc {
-            // Only paths that reach the failing statement belong to the scenario.
-            let reached = |o: &Outcome| o.fault_hit || o.effects.contains_key(key.as_str());
-            pa.retain(reached);
-            pb.retain(reached);
-        }
+            .explore_where(cb, scen_b, &reached);
+        // The replayed and full runs are filtered here; the others were.
+        pa.retain(reached);
+        pb.retain(reached);
         (pa, pb)
     }
 
