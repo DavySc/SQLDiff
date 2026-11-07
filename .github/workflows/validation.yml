@@ -152,9 +152,19 @@ jobs:
       # client in their dependency tree, and findings are byte-identical across runs.
       - name: No network clients in the engine crates
         run: |
-          for p in sqldiff-syntax sqldiff-catalog sqldiff-model sqldiff-equiv sqldiff-units sqldiff-core sqldiff-corpus; do
+          for p in sqldiff-syntax sqldiff-catalog sqldiff-model sqldiff-equiv sqldiff-units sqldiff-draft sqldiff-core sqldiff-corpus; do
             if cargo tree -p "$p" -e normal --prefix none | grep -E '^(reqwest|hyper|ureq|tokio|isahc|curl|surf) '; then
               echo "$p depends on a network client"; exit 1
+            fi
+          done
+      - name: The draft crate does not depend on the engine above it
+        run: |
+          # The fingerprint of a draft is that of its crate closure
+          # (docs/crate-split.md): it must never reach the check, the IR or the
+          # engine, which are fingerprinted with the results.
+          for p in sqldiff-draft sqldiff-units; do
+            if cargo tree -p "$p" -e normal --prefix none | grep -E '^sqldiff-(core|convert|source|review) '; then
+              echo "$p depends on code above the draft stage"; exit 1
             fi
           done
       - name: Byte-identical corpus results

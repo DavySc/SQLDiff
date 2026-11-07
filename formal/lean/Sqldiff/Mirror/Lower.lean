@@ -930,7 +930,7 @@ bigint, smallint, and tinyint (Transact-SQL)"; PostgreSQL 8.1.1, Table
   PostgreSQL `timestamp`: `.123333` against `.123456`).
 
 **`bit` against `boolean`** (`bitType`). The converter maps T-SQL `bit`
-to `boolean` (crates/sqldiff-convert/src/tsql/bits.rs). A `bit` holds
+to `boolean` (crates/sqldiff-draft/src/tsql/bits.rs). A `bit` holds
 0, 1 or NULL; a `boolean` FALSE, TRUE or NULL; the correspondence is
 0 to FALSE and 1 to TRUE (`Sqldiff.Core.Val.bool`, the same value a
 comparison gives). "bit (Transact-SQL)": "The string values TRUE and
@@ -2107,7 +2107,7 @@ the rules rest on.
 **String column types** (`CatCol.str`). T-SQL `varchar(n)` or
 `nvarchar(n)`, `1 ≤ n ≤ 4000`, against PostgreSQL `varchar(n)` with the
 same `n` (the converter writes `varchar(n)` for both,
-crates/sqldiff-convert/src/tsql.rs, `ty_pg`): the C2b types ("The C2b
+crates/sqldiff-draft/src/tsql.rs, `ty_pg`): the C2b types ("The C2b
 slice: strings", with its citations: `n` bytes for `varchar`, byte-pairs
 for `nvarchar`, characters for PostgreSQL). `max`, `char(n)`,
 `nchar(n)`, `text` and every other type stay outside (the Rust side does
@@ -4168,7 +4168,7 @@ other. Corresponding types (`tyCorr`), as the converter writes them:
   PostgreSQL one (`varchar(m)`, `character varying(m)`, `char
   varying(m)`, `varchar`, `text`), the C2b types (`strTypeT`,
   `strTypeP`); the converter writes `varchar(n)` for both T-SQL types
-  (crates/sqldiff-convert/src/tsql.rs, `ty_pg`). The lengths need not
+  (crates/sqldiff-draft/src/tsql.rs, `ty_pg`). The lengths need not
   agree: PostgreSQL drops the length of a parameter and of a function
   result (below), so `varchar(m)`, `varchar` and `text` there all take
   and give any string; what a body stores in either is held to that
