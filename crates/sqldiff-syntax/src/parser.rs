@@ -41,6 +41,7 @@ pub fn parse(text: &str, dialect: Dialect) -> Parse {
         diags: lexed.diagnostics,
         mode: Mode::Sql,
         stops: Vec::new(),
+        nest: 0,
     };
     p.parse_file();
     Parse {
@@ -125,7 +126,17 @@ struct Parser<'a> {
     diags: Vec<Diagnostic>,
     mode: Mode,
     stops: Vec<&'static [&'static str]>,
+    /// Statements being read inside one another (blocks, IF, loops).
+    nest: usize,
 }
+
+/// The deepest nesting of statements the parser reads (BEGIN inside IF
+/// inside WHILE ...). The passes after it recurse once per level, with large
+/// frames: on the engine's stack a nest of `IF` overflows near 3 000 levels in
+/// a debug build. Real code nests a few dozen at most. Past this the rest of
+/// the file is one error node and the parse reports it, so the unit is
+/// refused instead of the process crashing.
+pub const MAX_STATEMENT_NESTING: usize = 256;
 
 impl<'a> Parser<'a> {
     // ---- token access ----------------------------------------------------
@@ -328,6 +339,24 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_statement(&mut self) {
+        if self.nest >= MAX_STATEMENT_NESTING {
+            self.bump_trivia();
+            self.diag_here(format!(
+                "statements nested deeper than {MAX_STATEMENT_NESTING}: nesting too deep"
+            ));
+            self.start(ERROR);
+            while self.sig_index(0).is_some() {
+                self.bump();
+            }
+            self.finish();
+            return;
+        }
+        self.nest += 1;
+        self.parse_statement_at();
+        self.nest -= 1;
+    }
+
+    fn parse_statement_at(&mut self) {
         self.bump_trivia();
         let cp = self.builder.checkpoint();
         if self.try_label() && self.dialect == Dialect::Tsql {
@@ -1421,6 +1450,31 @@ mod tests {
         assert!(root
             .descendants()
             .any(|n| n.kind() == STATEMENT && ast::first_words(&n, 1) == ["UPDATE"]));
+    }
+
+    #[test]
+    fn statements_nested_too_deep_are_one_error_and_the_text_stays_whole() {
+        let nest = |k: usize| format!("{}SELECT 1;\n{}", "BEGIN\n".repeat(k), "END\n".repeat(k));
+        let deep = nest(MAX_STATEMENT_NESTING + 50);
+        let ok = nest(MAX_STATEMENT_NESTING - 10);
+        {
+            let d = Dialect::Tsql;
+            let (bad, good) = (parse(&deep, d), parse(&ok, d));
+            assert!(
+                bad.diagnostics
+                    .iter()
+                    .any(|x| x.message.contains("nesting too deep")),
+                "{d:?}"
+            );
+            assert_eq!(bad.syntax().text().to_string(), deep, "{d:?}: lossless");
+            assert!(
+                !good
+                    .diagnostics
+                    .iter()
+                    .any(|x| x.message.contains("nesting too deep")),
+                "{d:?}"
+            );
+        }
     }
 
     #[test]

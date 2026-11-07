@@ -473,9 +473,37 @@ pub struct Parser<'a> {
     /// them ([`parse_stmt_output`]).
     pub keep_output: bool,
     pub output: Option<Output>,
+    /// How deep the tree being read already is: the enclosing nesting and
+    /// the links of the chains it hangs from. Bounded by [`MAX_EXPR_HEIGHT`].
+    depth: usize,
 }
 
+/// The error of an expression or query nested (or chained: `a OR b OR ...`)
+/// deeper than [`MAX_EXPR_HEIGHT`].
+pub const TOO_DEEP: &str = "nesting too deep";
+
+/// The tallest expression tree the parser reads, counting nesting (brackets,
+/// subqueries, CASE, calls) and chain links together. Every later pass walks
+/// the tree recursively, one frame per level; on the engine's stack the
+/// deepest of them (debug build, the full diff of a chain of `+`) overflows
+/// near 9 700 levels and a nest of brackets near 6 000 to 20 000, so this
+/// leaves a wide margin. Real code stays far below it. A longer chain or a
+/// deeper nest is refused with [`TOO_DEEP`] instead of crashing the process.
+pub const MAX_EXPR_HEIGHT: usize = 2000;
+
 impl<'a> Parser<'a> {
+    /// Runs `f` with the tree `extra` levels deeper than it is now, or fails
+    /// with [`TOO_DEEP`] when that passes [`MAX_EXPR_HEIGHT`].
+    fn deeper<T>(&mut self, extra: usize, f: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+        if self.depth.saturating_add(extra) > MAX_EXPR_HEIGHT {
+            return Err(TOO_DEEP.into());
+        }
+        self.depth += extra;
+        let r = f(self);
+        self.depth -= extra;
+        r
+    }
+
     pub fn new(t: &'a [Tok], d: Dialect) -> Self {
         Parser {
             t,
@@ -486,6 +514,7 @@ impl<'a> Parser<'a> {
             lowered: false,
             keep_output: false,
             output: None,
+            depth: 0,
         }
     }
 
@@ -507,6 +536,7 @@ impl<'a> Parser<'a> {
             lowered: true,
             keep_output: false,
             output: None,
+            depth: 0,
         }
     }
 
@@ -799,13 +829,15 @@ impl<'a> Parser<'a> {
     // ---- expressions ---------------------------------------------------
 
     pub fn expr(&mut self) -> PResult<Expr> {
-        self.or_expr()
+        self.deeper(1, |p| p.or_expr())
     }
 
     fn or_expr(&mut self) -> PResult<Expr> {
         let mut l = self.and_expr()?;
+        let mut links = 0;
         while self.eat_kw("OR") {
-            let r = self.and_expr()?;
+            links += 1;
+            let r = self.deeper(links, |p| p.and_expr())?;
             l = Expr::Bin("OR".into(), Box::new(l), Box::new(r));
         }
         Ok(l)
@@ -813,8 +845,10 @@ impl<'a> Parser<'a> {
 
     fn and_expr(&mut self) -> PResult<Expr> {
         let mut l = self.not_expr()?;
+        let mut links = 0;
         while self.eat_kw("AND") {
-            let r = self.not_expr()?;
+            links += 1;
+            let r = self.deeper(links, |p| p.not_expr())?;
             l = Expr::Bin("AND".into(), Box::new(l), Box::new(r));
         }
         Ok(l)
@@ -823,7 +857,7 @@ impl<'a> Parser<'a> {
     fn not_expr(&mut self) -> PResult<Expr> {
         if self.is_kw("NOT") && !self.is_kw_at(1, "EXISTS") {
             self.i += 1;
-            let e = self.not_expr()?;
+            let e = self.deeper(1, |p| p.not_expr())?;
             return Ok(Expr::Unary("NOT".into(), Box::new(e)));
         }
         self.pred()
@@ -916,12 +950,14 @@ impl<'a> Parser<'a> {
             return Ok(l);
         }
         // The jsonb operators `->`, `->>`, `#>` and `#>>` share the rank.
+        let mut links = 0;
         while let Some(op) = ["||", "->>", "->", "#>>", "#>"]
             .into_iter()
             .find(|op| self.is_op(op))
         {
             self.i += 1;
-            let r = self.add()?;
+            links += 1;
+            let r = self.deeper(links, |p| p.add())?;
             l = Expr::Bin(op.into(), Box::new(l), Box::new(r));
         }
         Ok(l)
@@ -929,6 +965,7 @@ impl<'a> Parser<'a> {
 
     fn add(&mut self) -> PResult<Expr> {
         let mut l = self.add_operand()?;
+        let mut links = 0;
         loop {
             let op = match self.peek() {
                 Some(t)
@@ -942,10 +979,11 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
             self.i += 1;
+            links += 1;
             let r = match self.labeled_duration() {
                 Some(d) => d,
                 None => {
-                    let operand = self.add_operand()?;
+                    let operand = self.deeper(links, |p| p.add_operand())?;
                     self.duration_of(operand)
                 }
             };
@@ -1015,6 +1053,7 @@ impl<'a> Parser<'a> {
 
     fn mul(&mut self) -> PResult<Expr> {
         let mut l = self.unary()?;
+        let mut links = 0;
         loop {
             let op = match self.peek() {
                 Some(t) if t.kind == K::Op && matches!(t.text.as_str(), "*" | "/" | "%") => {
@@ -1023,7 +1062,8 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
             self.i += 1;
-            let r = self.unary()?;
+            links += 1;
+            let r = self.deeper(links, |p| p.unary())?;
             l = Expr::Bin(op, Box::new(l), Box::new(r));
         }
         Ok(l)
@@ -1033,7 +1073,7 @@ impl<'a> Parser<'a> {
         if self.is_op("-") || self.is_op("+") {
             let op = self.peek().unwrap().text.clone();
             self.i += 1;
-            let e = self.unary()?;
+            let e = self.deeper(1, |p| p.unary())?;
             if op == "-" {
                 if let Expr::Num(n) = &e {
                     return Ok(Expr::Num(format!("-{n}")));
@@ -1449,6 +1489,10 @@ impl<'a> Parser<'a> {
     // ---- queries -------------------------------------------------------
 
     pub fn select(&mut self) -> PResult<Select> {
+        self.deeper(1, |p| p.select_inner())
+    }
+
+    fn select_inner(&mut self) -> PResult<Select> {
         if self.is_kw("WITH") && self.lowered && !self.ext {
             let ctes = self.with_list()?;
             let mut s = self.select()?;
@@ -3023,6 +3067,51 @@ pub fn parse_stmt_lowered(toks: &[Tok], d: Dialect) -> PResult<Stmt> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Parses `SELECT <src>`'s expression on a big stack: the parser and the
+    /// drop of a tall tree recurse, and these inputs are meant to be tall.
+    fn expr_on_big_stack(src: String) -> PResult<()> {
+        std::thread::Builder::new()
+            .stack_size(256 << 20)
+            .spawn(move || {
+                let toks = tokens(&crate::parse(&format!("SELECT {src}"), Dialect::Tsql).syntax());
+                let mut p = Parser::new(&toks[1..], Dialect::Tsql);
+                p.expr().map(|_| ())
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_tree_taller_than_the_limit_is_refused_not_overflowed() {
+        let n = MAX_EXPR_HEIGHT;
+        // A chain of links, nesting of brackets, a prefix chain and a chain
+        // inside brackets: just under the limit reads, past it is refused.
+        let chain =
+            |op: &str, k: usize| (0..k).map(|i| format!("c{i}")).collect::<Vec<_>>().join(op);
+        for op in [" + ", " * ", " OR ", " AND "] {
+            assert_eq!(expr_on_big_stack(chain(op, n - 100)), Ok(()), "{op}");
+            assert_eq!(
+                expr_on_big_stack(chain(op, n + 100)),
+                Err(TOO_DEEP.to_string()),
+                "{op}"
+            );
+        }
+        let nest = |k: usize| format!("{}1{}", "(".repeat(k), ")".repeat(k));
+        assert_eq!(expr_on_big_stack(nest(n / 2)), Ok(()));
+        assert_eq!(expr_on_big_stack(nest(n + 100)), Err(TOO_DEEP.to_string()));
+        assert_eq!(
+            expr_on_big_stack(format!("{}c", "NOT ".repeat(n + 100))),
+            Err(TOO_DEEP.to_string())
+        );
+        // The height adds up: a chain in the last operand of another chain.
+        let half = n * 3 / 4;
+        assert_eq!(
+            expr_on_big_stack(format!("{} + ({})", chain(" + ", half), chain(" + ", half))),
+            Err(TOO_DEEP.to_string())
+        );
+    }
     use super::*;
 
     fn toks(sql: &str, d: Dialect) -> Vec<Tok> {
