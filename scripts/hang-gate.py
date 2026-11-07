@@ -40,7 +40,6 @@ KNOWN_OPEN = {
         2048,
     ),
     "a_procs_500x20": "R1: 246 s (0.5 s per routine)",
-    "g_tables_5000": "catalog loading is quadratic, killed at 120 s",
     "n_h04_nested_while": "R2: 4000 nested WHILE, killed at 120 s, 2.3 GB (audit h04)",
 }
 

@@ -818,13 +818,31 @@ impl Cx<'_> {
                     .iter()
                     .any(|c| self.dt_cat(&c.data_type.base, &c.data_type.args) == Dt::Bit)
             })
-            || self.type_catalog().is_some_and(|c| {
-                c.tables().iter().any(|t| {
-                    t.columns
+            || self
+                .catalog_types()
+                .iter()
+                .any(|(b, a)| self.dt_cat(b, a) == Dt::Bit)
+    }
+
+    /// The distinct column types of the catalog, sorted. `dt_cat` of a type
+    /// depends only on the type and the alias types so far, so asking it of
+    /// each distinct type answers for every column.
+    fn catalog_types(&self) -> &[(String, Vec<u32>)] {
+        self.catalog_types.get_or_init(|| {
+            let mut v: Vec<(String, Vec<u32>)> = self
+                .type_catalog()
+                .map(|c| {
+                    c.tables()
                         .iter()
-                        .any(|c| self.dt_cat(&c.data_type.base, &c.data_type.args) == Dt::Bit)
+                        .flat_map(|t| t.columns.iter())
+                        .map(|c| (c.data_type.base.clone(), c.data_type.args.clone()))
+                        .collect()
                 })
-            })
+                .unwrap_or_default();
+            v.sort();
+            v.dedup();
+            v
+        })
     }
 
     fn bit_cmp(&mut self, ts: &[T], i: usize, e: &mut BitEdits) {

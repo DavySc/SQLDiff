@@ -193,7 +193,7 @@ const DOORS: &[(&str, &str, &str)] = &[
     ),
     (
         "schema fields",
-        r"\.(star_views|list_stars)\b",
+        r"\.(star_views|list_stars|is_star_view)\b",
         "`StarView(lower name)`. `Schema::star_views` and `list_stars` are public fields: a read of either is a read of the catalog.",
     ),
     (
@@ -502,6 +502,7 @@ const VIEW_METHODS: &[(&str, &str)] = &[
 const SCHEMA_METHODS: &[(&str, &str)] = &[
     ("catalog", "the view door (Supplied)"),
     ("is_empty", "SchemaTables (any)"),
+    ("is_star_view", "StarView"),
     ("tables", "SchemaTables / ColumnNamed"),
     ("table", "SchemaTables"),
     ("view_column_is_not_char", "ViewFamily"),
