@@ -19,7 +19,7 @@
 //! `concurrency.split-statement`. [`what_if`] answers one scenario on demand,
 //! and [`Env`] re-runs the analysis under flipped scenario assumptions.
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
@@ -285,6 +285,8 @@ pub struct Env {
     pub commit_level: Option<String>,
     /// Build no witnesses (`Options::skip_witnesses`).
     pub skip_witnesses: bool,
+    /// Budgets lowered by `Options::work_budgets` (routine, file).
+    pub work_budgets: Option<(u64, u64)>,
 }
 
 /// Assumptions whose flip changes the scenarios (and so is re-run, not relabelled).
@@ -298,6 +300,7 @@ impl Env {
             xact_abort: flips.get("ASM-TSQL-CALLER-XACT-ABORT-OFF") == Some(&false),
             commit_level: None,
             skip_witnesses: false,
+            work_budgets: None,
         }
     }
 
@@ -309,6 +312,7 @@ impl Env {
                 .get("ASM-DB2-COMMIT-LEVEL")
                 .and_then(|t| crate::ledger::declared_commit_level(t)),
             skip_witnesses: opts.skip_witnesses,
+            work_budgets: opts.work_budgets,
             ..Env::from_flips(&opts.flips)
         }
     }
@@ -1193,6 +1197,13 @@ struct Collector<'x, 'a> {
     /// The divergences of a scenario with a default flipped (`persists`),
     /// by scenario.
     flipped: RefCell<HashMap<String, Rc<Divergences>>>,
+    /// `diff` calls spent by this routine pair, and whether a budget ran out.
+    spent: Cell<u64>,
+    out_of_budget: Cell<bool>,
+    /// `diff` calls spent by the whole file so far (shared by its routine
+    /// pairs), and the budgets in force (routine, file).
+    file_spent: Rc<Cell<u64>>,
+    budgets: (u64, u64),
 }
 
 /// The (rule, anchor) of divergences found.
@@ -1201,6 +1212,14 @@ type Divergences = BTreeSet<(&'static str, String)>;
 /// Flipped scenarios kept before the cache starts over (time only).
 const FLIPPED_MAX: usize = 4096;
 
+/// How many outcome-pair comparisons (`diff` calls) one routine pair may
+/// spend, and one file's check in all. A count, never a time: the same
+/// input stops at the same place on every machine. Past either, the pairs
+/// not compared are reported as "not proven: work budget" on every
+/// statement of the routine (`budget_findings`).
+const ROUTINE_DIFFS: u64 = 1 << 21;
+const FILE_DIFFS: u64 = 1 << 23;
+
 impl<'x, 'a> Collector<'x, 'a> {
     fn new(
         a: &'x Analyzed<'a>,
@@ -1208,7 +1227,9 @@ impl<'x, 'a> Collector<'x, 'a> {
         env: Env,
         ra: Option<SyntaxNode>,
         rb: Option<SyntaxNode>,
+        file_spent: Rc<Cell<u64>>,
     ) -> Self {
+        let env_budgets = env.work_budgets.unwrap_or((ROUTINE_DIFFS, FILE_DIFFS));
         let (sa, sb) = (SideIr::new(a, b, ra), SideIr::new(b, a, rb));
         let keys = KeyUniverse::of(&[&sa.cfg, &sb.cfg]);
         let al = Align::new(&keys, &sa, &sb);
@@ -1230,10 +1251,28 @@ impl<'x, 'a> Collector<'x, 'a> {
             cut_a: BTreeSet::new(),
             cut_b: BTreeSet::new(),
             flipped: RefCell::new(HashMap::new()),
+            spent: Cell::new(0),
+            out_of_budget: Cell::new(false),
+            file_spent,
+            budgets: env_budgets,
         };
         c.splits = splits(&c.sa, &c.sb, true);
         c.splits.extend(splits(&c.sb, &c.sa, false));
         c
+    }
+
+    /// Spends one `diff` call; false (and the routine marked as cut by its
+    /// budget) when the routine's or the file's allowance is used up.
+    fn spend(&self) -> bool {
+        let file = self.file_spent.get();
+        let (routine_max, file_max) = self.budgets;
+        if self.spent.get() >= routine_max || file >= file_max {
+            self.out_of_budget.set(true);
+            return false;
+        }
+        self.spent.set(self.spent.get() + 1);
+        self.file_spent.set(file + 1);
+        true
     }
 
     fn fault_scenario(&self, n: NodeId, r: &[ErrorKind], kind: ErrorKind) -> Scenario {
@@ -1319,6 +1358,9 @@ impl<'x, 'a> Collector<'x, 'a> {
         let rb: Vec<Reads> = pb.iter().map(|o| reads(&self.sb, o)).collect();
         let mut out = BTreeSet::new();
         for &(i, j) in &ps {
+            if !self.spend() {
+                break;
+            }
             let (a, b) = ((&pa[i], &ra[i]), (&pb[j], &rb[j]));
             for x in diff(
                 &self.sa,
@@ -1342,6 +1384,13 @@ impl<'x, 'a> Collector<'x, 'a> {
         scen_a: Scenario,
         scen_b: Scenario,
     ) -> (Vec<Outcome>, Vec<Outcome>) {
+        // Nothing left to spend: the scenario is not even explored (that is
+        // the other cost of a branchy routine), and the routine is reported
+        // as not proven.
+        if self.spent.get() >= self.budgets.0 || self.file_spent.get() >= self.budgets.1 {
+            self.out_of_budget.set(true);
+            return (Vec::new(), Vec::new());
+        }
         let (pa, pb) = self.outcomes(&sc, &scen_a, &scen_b);
         self.cut_a
             .extend(pa.iter().flat_map(|o| o.cut.iter().copied()));
@@ -1361,7 +1410,12 @@ impl<'x, 'a> Collector<'x, 'a> {
         let ra: Vec<Reads> = pa.iter().map(|o| reads(&self.sa, o)).collect();
         let rb: Vec<Reads> = pb.iter().map(|o| reads(&self.sb, o)).collect();
         let mut found: Vec<(Div, &Outcome, &Outcome, usize)> = Vec::new();
+        let mut compared = 0;
         for &(i, j) in &ps {
+            if !self.spend() {
+                break;
+            }
+            compared += 1;
             let (oa, ob) = (&pa[i], &pb[j]);
             // Each divergence counts once per outcome pair.
             let mut here: Vec<(&str, String)> = Vec::new();
@@ -1395,7 +1449,8 @@ impl<'x, 'a> Collector<'x, 'a> {
                 d,
                 oa,
                 ob,
-                exact || hits == combos,
+                // Pairs left out may disagree: all agreeing is not known.
+                compared == combos && (exact || hits == combos),
                 Some((&scen_a, &scen_b)),
             );
         }
@@ -1640,7 +1695,7 @@ impl<'x, 'a> Collector<'x, 'a> {
                     class: ChangeClass::Transactional,
                     severity: Severity::Medium,
                     verdict: Verdict::Unknown,
-                    witness: "Not proven: the behaviour model stopped at its step or path budget before it ran this statement in at least one scenario, so what happens when it fails and how its transaction goes are not compared.".to_string(),
+                    witness: "Not proven: the behaviour model stopped at its step, path or work budget before it ran or compared this statement in at least one scenario, so what happens when it fails and how its transaction goes are not compared.".to_string(),
                     a: on_a.then(|| loc.clone()),
                     b: (!on_a).then_some(loc),
                     assumptions: Vec::new(),
@@ -1901,6 +1956,8 @@ fn meet(a: &Analyzed, b: &Analyzed) -> Option<Meeting> {
 /// budgets. A routine that meets none is not analysed, and a transaction
 /// statement inside it stays unproven.
 pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
+    // The `diff` calls all routine pairs of this file share.
+    let file_spent = Rc::new(Cell::new(0));
     let Some(m) = meet(a, b) else {
         // At most one routine on each side: `routines_of` picks it, so a
         // setup `DO` block beside it is not mistaken for it.
@@ -1913,6 +1970,7 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
             rb.first().cloned(),
             "",
             &HashSet::new(),
+            &file_spent,
         );
         // Transaction statements are compared only inside a routine both
         // sides hold exactly once.
@@ -1949,6 +2007,7 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
             Some(y.clone()),
             &format!("{name}|"),
             &prior,
+            &file_spent,
         );
         prior.extend(r.findings.iter().map(|f| f.fingerprint.clone()));
         all_compared &= r.txn_compared;
@@ -1978,6 +2037,7 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
 
 /// The analysis of one pair of routines (or, with `None`, of the statements
 /// outside any routine).
+#[allow(clippy::too_many_arguments)]
 fn analyze_pair(
     a: &Analyzed,
     b: &Analyzed,
@@ -1986,8 +2046,9 @@ fn analyze_pair(
     rb: Option<SyntaxNode>,
     salt: &str,
     prior: &HashSet<String>,
+    file_spent: &Rc<Cell<u64>>,
 ) -> Behaviour {
-    let mut c = Collector::new(a, b, env.clone(), ra, rb);
+    let mut c = Collector::new(a, b, env.clone(), ra, rb, file_spent.clone());
     c.salt = salt.to_string();
     c.prior = prior.clone();
     c.faults();
@@ -1999,6 +2060,13 @@ fn analyze_pair(
             ..env.scenario()
         };
         c.run(Kind::CallerTxn, caller.clone(), caller);
+    }
+    if c.out_of_budget.get() {
+        // Some pairs of outcomes were never compared: every statement of
+        // the routine is unproven, and nothing here is exact.
+        c.cut_a.insert(c.sa.cfg.entry);
+        c.cut_b.insert(c.sb.cfg.entry);
+        c.incomplete = true;
     }
     c.budget_findings();
     // A replaced routine-wide finding may have brought assumptions that no
@@ -2093,7 +2161,7 @@ pub fn what_if(
             }
         }
     };
-    let mut c = Collector::new(a, b, env.clone(), ra, rb);
+    let mut c = Collector::new(a, b, env.clone(), ra, rb, Rc::new(Cell::new(0)));
     let (this, other) = if on_a { (&c.sa, &c.sb) } else { (&c.sb, &c.sa) };
     let mut notes = Vec::new();
     let empty = |notes: Vec<String>, text: String| WhatIf {

@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::artifact::{content_hash, Analyzed, Artifact};
+use crate::artifact::{exact_hash, Analyzed, Artifact};
 use crate::bind::{self, BindInput, Bindings};
 use crate::catalog::builtins::Helper;
 use crate::catalog::{ddl, Catalog, CatalogView};
@@ -66,6 +66,11 @@ pub struct Options {
     /// per finding is quadratic on a script with thousands of writes. For
     /// callers that never read them (`sqldiff_convert`).
     pub skip_witnesses: bool,
+    /// Lower the behaviour model's counted work budgets to (per routine
+    /// pair, per file) `diff` calls; `None` keeps the built-in ones. For
+    /// tests that need a budget to run out. The budgets are counts, never
+    /// times, so a result stays a function of the input.
+    pub work_budgets: Option<(u64, u64)>,
 }
 
 impl Default for Options {
@@ -84,6 +89,7 @@ impl Default for Options {
             anchors: Vec::new(),
             historyless: false,
             skip_witnesses: false,
+            work_budgets: None,
         }
     }
 }
@@ -103,7 +109,7 @@ fn ddl_catalog(dialect: sqldiff_syntax::Dialect, ddl: &[Artifact]) -> Arc<Catalo
         key.push('\0');
         key.push_str(a.dialect.id());
         key.push('\0');
-        key.push_str(&content_hash(&a.text));
+        key.push_str(&exact_hash(&a.text));
     }
     let cache = CACHE.get_or_init(Default::default);
     if let Some(c) = cache.lock().ok().and_then(|m| m.get(&key).cloned()) {
@@ -171,7 +177,7 @@ fn side(
         ddl_key.push('\0');
         ddl_key.push_str(a.dialect.id());
         ddl_key.push('\0');
-        ddl_key.push_str(&content_hash(&a.text));
+        ddl_key.push_str(&exact_hash(&a.text));
         ddl_key.push('\0');
     }
     let cache = CACHE.get_or_init(Default::default);
