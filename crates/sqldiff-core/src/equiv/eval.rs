@@ -3091,6 +3091,7 @@ fn or3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
 /// - a trailing space in the text or the pattern: whether it counts depends
 ///   on the type (a padded `char(n)` against a `varchar`) and the dialect, and
 ///   the evaluator does not know the declared type of a string value.
+///
 /// Both are refused rather than guessed.
 fn like(s: &str, p: &str, ci: bool) -> Option<bool> {
     if p.contains('[') || p.contains('\\') || !s.is_ascii() || !p.is_ascii() {
