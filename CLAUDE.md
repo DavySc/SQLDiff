@@ -54,7 +54,7 @@ coordinate through GitHub, which every session can read:
   trade correctness for speed or coverage without the owner's explicit OK.
 - **No new assumption without the owner's OK.** A new `ASM-*` id, or a wider
   reading of an existing one, needs the owner's explicit approval before it
-  merges. Register it in `crates/sqldiff-core/profiles/assumptions.toml` and
+  merges. Register it in `crates/sqldiff-model/profiles/assumptions.toml` and
   regenerate `docs/assumptions.md` with
   `SQLDIFF_BLESS=1 cargo test -p sqldiff-core --test assumptions`. An
   assumption the owner withdrew is not proposed again without new evidence.

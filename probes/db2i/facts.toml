@@ -75,7 +75,7 @@ review = ["docs/convert-mode.md"]
 [[fact]]
 id = "V31"
 title = "Casts and literal types: decimal and float to integer, scale, float text, constant types, timestamp precision"
-review = ["crates/sqldiff-core/src/equiv/canon.rs", "eval/casts/README.md"]
+review = ["crates/sqldiff-equiv/src/equiv/canon.rs", "eval/casts/README.md"]
 
 [[fact]]
 id = "V32"
@@ -125,13 +125,13 @@ hedge = "were not checked, fact V15"
 
 [[link]]
 facts = ["V19"]
-file = "crates/sqldiff-core/src/equiv/canon.rs"
+file = "crates/sqldiff-equiv/src/equiv/canon.rs"
 anchor = "(fact V19"
 hedge = "Db2 for i part not checked on a real system"
 
 [[link]]
 facts = ["V25"]
-file = "crates/sqldiff-core/src/equiv/canon.rs"
+file = "crates/sqldiff-equiv/src/equiv/canon.rs"
 anchor = "\"ASM-DB2-USRPRF-USER\","
 hedge = "fact V25, not checked on a real system"
 
@@ -162,12 +162,12 @@ hedge = "fact V27, not checked on a real system"
 [[fact]]
 id = "V29"
 title = "UNIQUE indexes (NULLs, case, trailing blanks), index names and sequence defaults"
-review = ["crates/sqldiff-core/src/equiv/ddl.rs", "docs/cross-dialect-proofs.md"]
+review = ["crates/sqldiff-equiv/src/equiv/ddl.rs", "docs/cross-dialect-proofs.md"]
 
 [[fact]]
 id = "V30"
 title = "Procedure calls and COMMENT ON: open questions for comparing Db2 for i calls"
-review = ["crates/sqldiff-core/src/equiv/call.rs", "docs/cross-dialect-proofs.md"]
+review = ["crates/sqldiff-equiv/src/equiv/call.rs", "docs/cross-dialect-proofs.md"]
 
 [[fact]]
 id = "V34"
@@ -195,11 +195,11 @@ hedge = "not checked on a real system"
 [[fact]]
 id = "V33"
 title = "Date and timestamp strings: ISO and IBM SQL forms read on assignment as in a CAST; T-SQL's compact yyyymmdd rejected"
-review = ["crates/sqldiff-core/src/equiv/literal.rs", "crates/sqldiff-convert/src/tsql.rs", "docs/vendor-facts-verification.md"]
+review = ["crates/sqldiff-equiv/src/equiv/literal.rs", "crates/sqldiff-convert/src/tsql.rs", "docs/vendor-facts-verification.md"]
 
 [[link]]
 facts = ["V33"]
-file = "crates/sqldiff-core/src/equiv/literal.rs"
+file = "crates/sqldiff-equiv/src/equiv/literal.rs"
 anchor = "\"ASM-FACT-V33\","
 hedge = "not checked on a real system"
 
