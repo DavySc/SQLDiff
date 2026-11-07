@@ -3084,9 +3084,19 @@ fn or3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
 }
 
 /// LIKE with `%` and `_` (no character classes); None when the answer could
-/// depend on the collation.
+/// depend on the collation or on the dialect:
+/// - a backslash in the pattern: PostgreSQL reads it as the default escape
+///   character (`'a%' LIKE 'a\%'` is true), SQL Server and Db2 for i as an
+///   ordinary character;
+/// - a trailing space in the text or the pattern: whether it counts depends
+///   on the type (a padded `char(n)` against a `varchar`) and the dialect, and
+///   the evaluator does not know the declared type of a string value.
+/// Both are refused rather than guessed.
 fn like(s: &str, p: &str, ci: bool) -> Option<bool> {
-    if p.contains('[') || !s.is_ascii() || !p.is_ascii() {
+    if p.contains('[') || p.contains('\\') || !s.is_ascii() || !p.is_ascii() {
+        return None;
+    }
+    if s.ends_with(' ') || p.ends_with(' ') {
         return None;
     }
     let (s, p): (Vec<char>, Vec<char>) = if ci {
@@ -5110,6 +5120,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn like_refuses_what_depends_on_the_dialect_or_the_type() {
+        // PostgreSQL's default escape is the backslash; the others read it
+        // as a character.
+        assert_eq!(like("a%", "a\\%", true), None);
+        assert_eq!(like("a\\b", "a\\b", false), None);
+        // Trailing blanks of the text or the pattern.
+        assert_eq!(like("abc ", "abc", true), None);
+        assert_eq!(like("abc", "abc ", true), None);
+        assert_eq!(like("abc ", "abc%", true), None);
+        // Blanks inside or in front are ordinary characters.
+        assert_eq!(like(" abc", " a%", true), Some(true));
+        assert_eq!(like("a bc", "a_bc", true), Some(true));
     }
 
     #[test]
