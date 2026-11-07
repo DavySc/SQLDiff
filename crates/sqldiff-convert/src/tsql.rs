@@ -71,6 +71,27 @@ pub(crate) fn without_continuation<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+thread_local! {
+    /// Sorted source offsets of the routines converted without exception
+    /// blocks whatever they hold (see [`with_plain_routines`]).
+    static PLAIN_AT: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` with the routines starting at the source offsets `at` (sorted)
+/// converted without the exception blocks of [`continuation_points`], the
+/// others as they would be: a variant chosen for each routine on its own.
+pub(crate) fn with_plain_routines<T>(at: &[usize], f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PLAIN_AT.with(|p| p.borrow_mut().clear());
+        }
+    }
+    PLAIN_AT.with(|p| *p.borrow_mut() = at.to_vec());
+    let _reset = Reset;
+    f()
+}
+
 pub(crate) fn convert(
     root: &SyntaxNode,
     src: &str,
@@ -835,6 +856,14 @@ impl<'a> Cx<'a> {
     /// stops the procedure, where T-SQL goes on.
     fn routine(&mut self, out: &mut Out, r: &SyntaxNode) {
         let (text, units) = (out.text.len(), out.units.len());
+        let start = usize::from(r.text_range().start());
+        if PLAIN_AT.with(|p| p.borrow().binary_search(&start).is_ok()) {
+            let keep = self.no_cont;
+            self.no_cont = true;
+            self.routine_once(out, r);
+            self.no_cont = keep;
+            return;
+        }
         self.cont_used = false;
         self.refusals = 0;
         self.routine_once(out, r);

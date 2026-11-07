@@ -1359,6 +1359,7 @@ fn convert_files(
         _ => Default::default(),
     };
     let mismatch: std::sync::Mutex<Option<String>> = Default::default();
+    let claims: std::sync::OnceLock<crate::table_vars::Claims> = std::sync::OnceLock::new();
     let work = slots(inputs.iter().zip(drafts).zip(keys.iter()).enumerate());
     let progress = Progress::new(work.len(), hooks);
     let done = parallel(jobs, &work, |w| {
@@ -1397,7 +1398,26 @@ fn convert_files(
             }
         }
         let t = Instant::now();
-        let mut c = crate::check(&input.text, draft, &opts);
+        let rebuild = |plain_at: &[usize]| {
+            let claims = claims.get_or_init(|| {
+                crate::table_vars::Claims::of(
+                    inputs.iter().map(|i| (i.rel.as_str(), i.text.as_str())),
+                    a.from,
+                )
+            });
+            crate::rewrite_in_tree_plain(
+                &input.text,
+                a.from,
+                a.to,
+                opts.facts_a.first().map(|c| c.as_ref()),
+                Some(claims),
+                a.rules,
+                plain_at,
+            )
+        };
+        // Hand-written output replaces the rules' draft: not built again.
+        let rebuild: Option<crate::Rebuild> = ledger.is_none().then_some(&rebuild);
+        let mut c = crate::check_with(&input.text, draft, &opts, rebuild);
         finish.apply(&mut c);
         let secs = t.elapsed().as_secs_f64();
         if let Some((cc, k, old)) = &stored {
