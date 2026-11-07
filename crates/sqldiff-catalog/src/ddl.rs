@@ -380,8 +380,9 @@ pub fn column_defs(tb: &mut Table, inner: &[Tok], dialect: Dialect) {
                 }
                 "DEFAULT" => col.has_default = true,
                 "COLLATE" => {
-                    col.collation = opts.get(k + 1).map(|x| x.ident().text);
-                    k += 1;
+                    let (name, used) = collation_name(&opts[k + 1..]);
+                    col.collation = name;
+                    k += used;
                 }
                 "AS" if k == 0 => {
                     // T-SQL computed column: `c AS (expr)`.
@@ -830,6 +831,27 @@ fn alter_column_type(tb: &mut Table, a: &[Tok], dialect: Dialect) {
         }
         c.collation = new.collation;
     }
+}
+
+/// The collation named at the start of `toks` (after `COLLATE`) and how many
+/// tokens it took. A schema-qualified name keeps its qualifier (`s.c`), except
+/// `pg_catalog`: PostgreSQL searches it first, so `pg_catalog."C"` and `"C"`
+/// are the same collation and must be recorded alike.
+fn collation_name(toks: &[Tok]) -> (Option<String>, usize) {
+    let Some(first) = toks.first() else {
+        return (None, 0);
+    };
+    let mut parts = vec![first.ident().text];
+    let mut used = 1;
+    while toks.get(used).is_some_and(|x| x.kind == SyntaxKind::DOT) && toks.get(used + 1).is_some()
+    {
+        parts.push(toks[used + 1].ident().text);
+        used += 2;
+    }
+    if parts.len() > 1 && parts[0].eq_ignore_ascii_case("pg_catalog") {
+        parts.remove(0);
+    }
+    (Some(parts.join(".")), used)
 }
 
 /// One output column of a query's select list.
@@ -1696,6 +1718,21 @@ mod tests {
         // collation when it has none (PostgreSQL, T-SQL). USING is not part of
         // the column.
         let coll = |d: Dialect, sql: &str| load(sql, d, "t").tables[0].columns[1].collation.clone();
+        // A schema-qualified collation is read whole; `pg_catalog.` is the
+        // implicit schema and does not count.
+        let q = |sql: &str| coll(Dialect::Postgres, sql);
+        assert_eq!(
+            q("CREATE TABLE t (id int, s text COLLATE pg_catalog.\"C\" NOT NULL);"),
+            q("CREATE TABLE t (id int, s text COLLATE \"C\" NOT NULL);")
+        );
+        assert!(q("CREATE TABLE t (id int, s text COLLATE pg_catalog.\"C\");").is_some());
+        let other = q("CREATE TABLE t (id int, s text COLLATE app.\"C\");");
+        assert_ne!(other, q("CREATE TABLE t (id int, s text COLLATE \"C\");"));
+        assert_eq!(other.as_deref(), Some("app.C"));
+        assert_eq!(
+            q("CREATE TABLE t (id int, s text); ALTER TABLE t ALTER COLUMN s TYPE text COLLATE pg_catalog.\"C\";"),
+            q("CREATE TABLE t (id int, s text COLLATE \"C\");")
+        );
         let base_c = "CREATE TABLE t (id int, s varchar(10) COLLATE \"C\");";
         assert_eq!(
             coll(
