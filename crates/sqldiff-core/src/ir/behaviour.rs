@@ -1121,9 +1121,9 @@ fn pairs(pa: &[Outcome], pb: &[Outcome]) -> (Vec<(usize, usize)>, bool) {
     // Not the same set of paths: every pair of outcomes except those no input
     // can produce (see `feasible`).
     let mut v = Vec::new();
-    for i in 0..pa.len() {
-        for j in 0..pb.len() {
-            if feasible(&siga[i], &sigb[j]) {
+    for (i, x) in siga.iter().enumerate() {
+        for (j, y) in sigb.iter().enumerate() {
+            if feasible(x, y) {
                 v.push((i, j));
             }
         }
