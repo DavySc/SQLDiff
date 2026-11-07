@@ -73,6 +73,55 @@ pub fn tokens(node: &SyntaxNode) -> Vec<Tok> {
         .collect()
 }
 
+/// The most tokens of one node that [`tokens_shared`] keeps.
+const SHARED_NODE_MAX: usize = 20_000;
+/// The most tokens [`tokens_shared`] keeps in all, per thread; when one more
+/// node would pass it, the cache is emptied first.
+const SHARED_TOTAL_MAX: usize = 100_000;
+
+#[derive(Default)]
+struct Shared {
+    /// Keyed by node: the cache holds the node, so its tree is alive and the
+    /// key cannot be taken by another tree. Only looked up, never iterated.
+    by_node: std::collections::HashMap<SyntaxNode, std::rc::Rc<[Tok]>>,
+    total: usize,
+}
+
+thread_local! {
+    static SHARED: std::cell::RefCell<Shared> = std::cell::RefCell::new(Shared::default());
+}
+
+/// The same tokens as [`tokens`], computed once per node on this thread and
+/// shared: the converter and the check ask for the tokens of one statement
+/// from a dozen places. It is a cache of a pure function of the node, so what
+/// it returns never depends on what was asked before; it is bounded by
+/// [`SHARED_NODE_MAX`] and [`SHARED_TOTAL_MAX`] tokens and is emptied, not
+/// trimmed, when full.
+pub fn tokens_shared(node: &SyntaxNode) -> std::rc::Rc<[Tok]> {
+    if let Some(t) = SHARED.with(|c| c.borrow().by_node.get(node).cloned()) {
+        return t;
+    }
+    let toks: std::rc::Rc<[Tok]> = tokens(node).into();
+    if toks.len() <= SHARED_NODE_MAX {
+        SHARED.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.total + toks.len() > SHARED_TOTAL_MAX {
+                c.by_node.clear();
+                c.total = 0;
+            }
+            c.total += toks.len();
+            c.by_node.insert(node.clone(), toks.clone());
+        });
+    }
+    toks
+}
+
+/// Drops what [`tokens_shared`] holds on this thread (and the trees it
+/// keeps alive).
+pub fn clear_shared_tokens() {
+    SHARED.with(|c| *c.borrow_mut() = Shared::default());
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     /// Column or unresolved name: qualified parts as written.

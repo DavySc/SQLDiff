@@ -22,6 +22,8 @@
 //!   result store and seeds the sampled re-check, none of which the check sees; timings are kept out of the
 //!   bytes a stored result is compared by; `tree.rs` also memoises the tree
 //!   claims (derived from the inputs) in a `OnceLock` for the per-routine rebuild.
+//! - `abstract_syntax.rs` (`sqldiff-syntax`) keeps a bounded per-thread cache of the
+//!   tokens of a node (`tokens_shared`), a pure function of the node.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -67,6 +69,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
         &["OnceCell", "thread_local!"],
     ),
     ("sqldiff-core/src/assumptions.rs", &["OnceLock"]),
+    ("sqldiff-syntax/src/abstract_syntax.rs", &["thread_local!"]),
     ("sqldiff-core/src/catalog/builtins.rs", &["OnceLock"]),
     ("sqldiff-core/src/catalog/ddl.rs", &["fs::"]),
     ("sqldiff-core/src/engine.rs", &["Mutex", "OnceLock"]),

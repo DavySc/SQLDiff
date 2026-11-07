@@ -19,7 +19,7 @@
 
 use sqldiff_syntax::{ast as cst, Dialect, SyntaxKind, SyntaxNode};
 
-use super::ast::{tokens, Expr, Stmt, Tok, Type, K};
+use super::ast::{tokens_shared as tokens, Expr, Stmt, Tok, Type, K};
 use super::canon::asm;
 use super::literal::{self, Target};
 use super::lower::{self, Local, Segment, Unit};
