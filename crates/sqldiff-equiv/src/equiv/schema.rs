@@ -342,6 +342,12 @@ pub struct Schema {
     /// list (`catalog::Table::star_outputs`): which columns of their sources
     /// they return is not modelled.
     pub star_views: std::sync::Arc<std::collections::HashSet<String>>,
+    /// Views that read one table or view directly
+    /// (`catalog::Table::types_from_source`): lower-cased view name, then
+    /// lower-cased column name, to the column's type family when known.
+    /// Used only to tell that a column cannot be `char(n)`; nothing else
+    /// about a view column (nullability, values) is relied on.
+    view_families: std::sync::Arc<HashMap<String, HashMap<String, Fam>>>,
     /// PostgreSQL: the stored spellings of every catalog name (schemas,
     /// tables and views, columns, keys, indexes, routines), by lower case.
     /// Two spellings under one key are names that differ only in letter case.
@@ -422,6 +428,18 @@ impl Schema {
                 .then(|| pg_system().tables.get(last))
                 .flatten()
         })
+    }
+
+    /// Whether column `col` of the view `name` is known not to be a
+    /// character type: the view reads one table directly and its definition
+    /// gives the column a known type of another family.
+    pub fn view_column_is_not_char(&self, name: &str, col: &str) -> bool {
+        let key = name.to_lowercase();
+        let key = key.rsplit('.').next().unwrap_or(&key);
+        self.view_families
+            .get(key)
+            .and_then(|c| c.get(&col.to_lowercase()))
+            .is_some_and(|f| *f != Fam::Char)
     }
 
     /// A user table by schema (`None` for the default one) and name, when
@@ -640,7 +658,7 @@ impl Schema {
             ..Schema::default()
         };
         if d == Dialect::Postgres {
-            let c = &view.catalog;
+            let c = &view.catalog();
             let names = c
                 .schemas
                 .iter()
@@ -665,16 +683,66 @@ impl Schema {
             }
         }
         std::sync::Arc::make_mut(&mut s.star_views).extend(
-            view.catalog
+            view.catalog()
                 .tables
                 .iter()
                 .filter(|t| t.kind == TableKind::View && t.star_outputs)
                 .map(|t| t.name.to_lowercase()),
         );
+        for t in view
+            .catalog
+            .tables
+            .iter()
+            .filter(|t| t.kind == TableKind::View && t.types_from_source && !t.star_outputs)
+        {
+            let name = t.name.to_lowercase();
+            // The types were copied when the view was created: they count
+            // only while the one base table of that name still has each
+            // source column with that very type (an ALTER COLUMN, or a
+            // table dropped and created again, leaves the copy stale).
+            let sources: Vec<&crate::catalog::Table> = view
+                .catalog
+                .tables
+                .iter()
+                .filter(|b| {
+                    b.kind != TableKind::View && b.name.eq_ignore_ascii_case(&t.source_table)
+                })
+                .collect();
+            let current = |col: usize| -> bool {
+                let [base] = sources.as_slice() else {
+                    return false;
+                };
+                t.source_columns
+                    .get(col)
+                    .and_then(|x| x.as_ref())
+                    .and_then(|sc| {
+                        base.columns
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(sc))
+                    })
+                    .is_some_and(|c| c.data_type == t.columns[col].data_type)
+            };
+            let cols: HashMap<String, Fam> = t
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| c.data_type.is_known() && current(*i))
+                .map(|(_, c)| (c.name.to_lowercase(), ty_of(&c.data_type, d).fam))
+                .collect();
+            // Two views of one name in different schemas: not trusted.
+            match std::sync::Arc::make_mut(&mut s.view_families).entry(name) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    e.insert(HashMap::new());
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(cols);
+                }
+            }
+        }
         // Base and temporary tables only: view columns are derived, and their
         // types and nullability are not facts equivalence may rely on.
         for t in view
-            .catalog
+            .catalog()
             .tables
             .iter()
             .filter(|t| matches!(t.kind, TableKind::Table | TableKind::Temporary))

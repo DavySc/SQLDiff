@@ -1722,8 +1722,9 @@ impl Ctx<'_> {
         }
         let base = table.split(' ').next().unwrap_or(table);
         match self.schema.table(base) {
-            // Unknown to the catalog (a view, say): may be anything.
-            None => true,
+            // Unknown to the catalog (a view, say): may be anything, unless
+            // the view reads one table directly and types the column.
+            None => !self.schema.view_column_is_not_char(base, col),
             // Known: only a column it has can be this one. A table without
             // the column is another table of a join.
             Some(t) => t.column(col).is_some_and(|c| c.ty.fam == Fam::Char),

@@ -34,7 +34,7 @@ id = "ASM-APPLOCK-CHECK-RAISES"
 statement = "The `IF @rc < 0` branch after sp_getapplock only rolls back and raises."
 discharge = "nothing"
 fact = "A reading of the branch in the source routine (the rule does not match its body)."
-sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+sites = ["sqldiff-equiv/profiles/rules/idioms.rules"]
 
 [[assumption]]
 id = "ASM-ARGUMENT-LENGTHS"
@@ -499,7 +499,7 @@ statement = "Objects in T-SQL schema dbo are found in the target's default schem
 discharge = "deployment"
 fact = "The target's default schema holds the converted objects."
 fact_key = "default_schema"
-sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/instances.rs", "sqldiff-convert/src/lib.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-convert/src/tsql/trigger.rs", "sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/instances.rs", "sqldiff-convert/src/lib.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-convert/src/tsql/trigger.rs", "sqldiff-equiv/profiles/rules/tsql-pg.rules"]
 
 [[assumption]]
 id = "ASM-DEFAULT-SCHEMA"
@@ -620,14 +620,14 @@ id = "ASM-ISNULL-TYPE"
 statement = "The ISNULL fallback fits the type of the first argument (ISNULL converts to it, COALESCE takes the wider type)."
 discharge = "catalog"
 fact = "The types of both arguments."
-sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-equiv/profiles/rules/tsql-pg.rules"]
 
 [[assumption]]
 id = "ASM-LASTVAL-SAME-INSERT"
 statement = "No trigger on the target table inserts into another table with a sequence, so lastval() is the key of this INSERT."
 discharge = "catalog"
 fact = "The triggers on the table in the catalog."
-sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+sites = ["sqldiff-equiv/profiles/rules/idioms.rules"]
 
 [[assumption]]
 id = "ASM-LISTAGG"
@@ -1056,7 +1056,7 @@ id = "ASM-EXACTLY-ONE-ROW"
 statement = "The query returns exactly one row: with none, T-SQL keeps the variable and PostgreSQL sets it to NULL."
 discharge = "deployment"
 fact = "The data: a row always exists for the predicate (a unique key alone gives at most one)."
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules"]
 
 [[assumption]]
 id = "ASM-SMALLDATETIME"
@@ -1295,7 +1295,7 @@ id = "ASM-TSQL-LEN-BMP"
 statement = "Strings a T-SQL LEN counts, or a LIKE _ steps over, have no character outside the Basic Multilingual Plane, or the collation is supplementary-character aware (_SC): LEN counts the characters PostgreSQL length counts."
 discharge = "deployment"
 fact = "The data the routines see, or the collation."
-sites = ["sqldiff-convert/src/cert.rs", "sqldiff-core/profiles/rules/tsql-pg.rules", "sqldiff-equiv/src/equiv/canon.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-equiv/profiles/rules/tsql-pg.rules", "sqldiff-equiv/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-STRING-ARGS"
@@ -1367,7 +1367,7 @@ statement = "T-SQL compares strings, identifiers and variables case-insensitivel
 discharge = "catalog"
 fact = "The T-SQL database's and columns' collations."
 fact_key = "collation"
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules", "sqldiff-equiv/src/equiv/canon.rs"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules", "sqldiff-equiv/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-CODE-PAGE"
@@ -1418,21 +1418,21 @@ id = "ASM-TSQL-PLUS-IS-CONCAT"
 statement = "Operands of T-SQL `+` next to a string literal are character strings, so `+` concatenates."
 discharge = "catalog"
 fact = "The operands' types."
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules", "sqldiff-equiv/src/equiv/canon.rs"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules", "sqldiff-equiv/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-STRING-AGG-8000"
 statement = "The aggregated list stays under 8000 bytes (T-SQL STRING_AGG of a non-MAX input errors past that)."
 discharge = "deployment"
 fact = "The data never aggregates a longer list."
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules", "sqldiff-equiv/src/equiv/canon.rs"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules", "sqldiff-equiv/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-SYSDATETIME-PER-STATEMENT"
 statement = "SYSDATETIME() is evaluated once per statement (observed SQL Server behaviour, not documented; fact V20)."
 discharge = "nothing"
 fact = "Vendor fact V20 documented or checked."
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules", "sqldiff-equiv/src/equiv/canon.rs"]
+sites = ["sqldiff-equiv/profiles/rules/tsql-pg.rules", "sqldiff-equiv/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-UDF-CALL-CONTEXT"
@@ -1488,7 +1488,7 @@ id = "ASM-UPSERT-UNIQUE-INDEX"
 statement = "A unique index or constraint covers the upsert's key columns, as ON CONFLICT requires."
 discharge = "catalog"
 fact = "A unique index or constraint on the key columns."
-sites = ["sqldiff-core/profiles/rules/idioms.rules"]
+sites = ["sqldiff-equiv/profiles/rules/idioms.rules"]
 
 [[assumption]]
 id = "ASM-USER-TYPE"

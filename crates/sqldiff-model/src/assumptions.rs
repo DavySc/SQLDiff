@@ -200,7 +200,7 @@ pub fn markdown() -> String {
     let _ = writeln!(s);
     let _ = writeln!(
         s,
-        "Generated from `crates/sqldiff-core/profiles/assumptions.toml`; do not edit. \
+        "Generated from `crates/sqldiff-model/profiles/assumptions.toml`; do not edit. \
          After changing the registry run \
          `SQLDIFF_BLESS=1 cargo test -p sqldiff-core --test assumptions`."
     );

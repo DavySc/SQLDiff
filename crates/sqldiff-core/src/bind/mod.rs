@@ -19,7 +19,7 @@ use sqldiff_syntax::{ast, Dialect, SyntaxKind, SyntaxNode};
 use crate::artifact::Analyzed;
 use crate::catalog::builtins::{self, Helper};
 use crate::catalog::ddl::{self, OutputCol};
-use crate::catalog::{Catalog, CatalogView, DataType, Ident, RoutineKind, TableKind};
+use crate::catalog::{CatalogView, DataType, Ident, RoutineKind, TableKind};
 use crate::model::{Assumption, ChangeClass, Severity};
 use crate::tokens::{self, close_paren, split_commas, Tok};
 
@@ -201,7 +201,7 @@ pub(crate) struct Binder<'a> {
     scopes: Vec<Scope>,
     next_scope: usize,
     /// Objects the artifact creates: temp tables, table variables, routines.
-    local: Catalog,
+    local: CatalogView,
     ordinals: HashMap<String, usize>,
     trigger: Option<TriggerCtx>,
     /// `#variable_conflict use_column` in a PL/pgSQL body: a name that is
@@ -213,7 +213,7 @@ pub(crate) struct Binder<'a> {
     /// Every routine the artifact creates, wherever it is: a call inside a
     /// routine body is resolved when the body runs, possibly after a routine
     /// defined further down was created.
-    later: Catalog,
+    later: CatalogView,
 }
 
 /// Binds one parsed artifact.
@@ -227,7 +227,7 @@ pub fn bind(a: &Analyzed, input: &BindInput) -> Bound {
         out: Bound::default(),
         scopes: Vec::new(),
         next_scope: 0,
-        local: Catalog::default(),
+        local: CatalogView::scratch(a.dialect()),
         ordinals: HashMap::new(),
         trigger: None,
         pg_conflict_directive: a
@@ -238,7 +238,7 @@ pub fn bind(a: &Analyzed, input: &BindInput) -> Bound {
             .skip(1)
             .any(|r| r.trim_start().starts_with("use_column")),
         goto_labels: Vec::new(),
-        later: Catalog::default(),
+        later: CatalogView::scratch(a.dialect()),
     };
     for r in a
         .root
@@ -247,7 +247,7 @@ pub fn bind(a: &Analyzed, input: &BindInput) -> Bound {
     {
         if let Some(h) = ddl::routine_header(&r, b.d) {
             if h.view.is_none() && h.routine.kind != RoutineKind::Trigger {
-                b.later.put_routine(b.d, h.routine);
+                b.later.put_routine(h.routine);
             }
         }
     }
@@ -635,7 +635,7 @@ impl<'a> Binder<'a> {
                     }
                 }
                 if h.routine.kind != RoutineKind::Trigger {
-                    self.local.put_routine(self.d, h.routine.clone());
+                    self.local.put_routine(h.routine.clone());
                 }
             }
             if let Some(t) = &h.trigger {
@@ -722,7 +722,7 @@ impl<'a> Binder<'a> {
                     {
                         tb.schema = Some("SESSION".to_string());
                     }
-                    self.local.put_table(self.d, tb);
+                    self.local.put_table(tb);
                 }
             }
         }
@@ -1037,7 +1037,7 @@ impl<'a> Binder<'a> {
             // persistent tables come from the catalog, which reflects the ALTER already.
             (_, "ALTER") => {
                 if second == "TABLE" {
-                    ddl::apply_statement(&mut self.local, &t, self.d);
+                    self.local.apply_statement(&t);
                 }
             }
             (_, "DROP" | "GRANT" | "REVOKE" | "COMMENT" | "USE" | "DENY") => {}
@@ -1245,13 +1245,13 @@ impl<'a> Binder<'a> {
                     let (from, to) = q;
                     self.analyze(&t[from..to], stmt);
                 }
-                self.local.put_table(self.d, tb);
+                self.local.put_table(tb);
             }
         } else if let Some(v) = view_at {
             if let Some(as_at) = tokens::find_kw(t, v + 1, "AS") {
                 self.analyze(&t[as_at + 1..], stmt);
             }
-            ddl::apply_statement(&mut self.local, t, self.d);
+            self.local.apply_statement(t);
         }
     }
 
@@ -1311,7 +1311,7 @@ impl<'a> Binder<'a> {
                     let c = close_paren(item, open);
                     ddl::column_defs(&mut tb, &item[open + 1..c], self.d);
                 }
-                self.local.put_table(self.d, tb);
+                self.local.put_table(tb);
                 self.declare(
                     DeclKind::Variable,
                     &v.text,
@@ -1353,7 +1353,7 @@ impl<'a> Binder<'a> {
                 if tb.schema.is_none() {
                     tb.schema = Some("SESSION".to_string());
                 }
-                self.local.put_table(self.d, tb);
+                self.local.put_table(tb);
             }
             // `AS (fullselect) WITH DATA`: the query is the one after a
             // top-level AS, not `START WITH` in a column or `WITH REPLACE`.
@@ -1598,7 +1598,7 @@ impl<'a> Binder<'a> {
     }
 
     fn lookup_table_quiet(&self, parts: &[Ident], view: &CatalogView) -> Option<Vec<OutputCol>> {
-        let local = CatalogView::new(self.d, &[&self.local]);
+        let local = &self.local;
         let found = match local.table(parts) {
             crate::catalog::Lookup::Found(t) => Some(t.clone()),
             _ => match view.table(parts) {
