@@ -6,7 +6,8 @@
 //! It covers the sources and data of the workspace crates the converter
 //! depends on, every file they include at compile time (also outside the
 //! crate), `Cargo.lock`, the compiler's version, the target, the profile and
-//! the enabled features.
+//! the enabled features, the workspace manifest and cargo configuration of
+//! the checkout, and the compiler flags and `CARGO_CFG_*` the target sets.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -56,6 +57,11 @@ fn includes(file: &Path, text: &str, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// `bytes` without carriage returns: a Windows checkout is the same engine.
+fn lf(bytes: Vec<u8>) -> Vec<u8> {
+    bytes.into_iter().filter(|b| *b != b'\r').collect()
+}
+
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let crates_dir = manifest.parent().unwrap().to_path_buf();
@@ -92,14 +98,34 @@ fn main() {
             .strip_prefix(&root)
             .map(|r| r.to_string_lossy().replace('\\', "/"))
             .unwrap_or_else(|_| p.to_string_lossy().replace('\\', "/"));
-        // Line ends do not count: a Windows checkout is the same engine.
-        let bytes = std::fs::read(p).unwrap_or_default();
-        let bytes: Vec<u8> = bytes.iter().copied().filter(|b| *b != b'\r').collect();
-        put(&rel, &bytes);
+        put(&rel, &lf(std::fs::read(p).unwrap_or_default()));
     }
     let lock = root.join("Cargo.lock");
     println!("cargo:rerun-if-changed={}", lock.display());
-    put("Cargo.lock", &std::fs::read(&lock).unwrap_or_default());
+    put("Cargo.lock", &lf(std::fs::read(&lock).unwrap_or_default()));
+    // The workspace manifest (profiles, patches, shared dependency versions
+    // and features) and the cargo configuration of the checkout (flags,
+    // target settings) change the code that is generated.
+    for rel in [
+        "Cargo.toml",
+        ".cargo/config.toml",
+        ".cargo/config",
+        "rust-toolchain.toml",
+        "rust-toolchain",
+    ] {
+        let p = root.join(rel);
+        println!("cargo:rerun-if-changed={}", p.display());
+        // Absent files are hashed as absent, so adding one changes the key.
+        match std::fs::read(&p) {
+            Ok(b) => put(rel, &lf(b)),
+            Err(_) => put(&format!("absent {rel}"), b""),
+        }
+    }
+    // A new or removed file in a crate is not seen through the files that
+    // exist: watch the folders too.
+    for c in CRATES {
+        println!("cargo:rerun-if-changed={}", crates_dir.join(c).display());
+    }
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let version = std::process::Command::new(rustc)
         .arg("-vV")
@@ -115,6 +141,25 @@ fn main() {
         "CARGO_CFG_TARGET_FEATURE",
     ] {
         put(key, std::env::var(key).unwrap_or_default().as_bytes());
+    }
+    // The flags the compiler gets (RUSTFLAGS, `build.rustflags`, target
+    // flags, already merged by cargo), every `CARGO_CFG_*` the target sets,
+    // and profile overrides from the environment: a result is never reused
+    // across different code generation.
+    for key in [
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_BUILD_RUSTFLAGS",
+    ] {
+        println!("cargo:rerun-if-env-changed={key}");
+        put(key, std::env::var(key).unwrap_or_default().as_bytes());
+    }
+    let mut env: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("CARGO_CFG_") || k.starts_with("CARGO_PROFILE_"))
+        .collect();
+    env.sort();
+    for (k, v) in env {
+        put(&k, v.as_bytes());
     }
     let mut features: Vec<String> = std::env::vars()
         .filter(|(k, _)| k.starts_with("CARGO_FEATURE_"))

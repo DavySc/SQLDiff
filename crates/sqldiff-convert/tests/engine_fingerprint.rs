@@ -20,12 +20,19 @@ fn closure(name: &str, seen: &mut BTreeSet<String>) {
     }
     let text = std::fs::read_to_string(crates_dir().join(name).join("Cargo.toml")).unwrap();
     let doc: toml::Table = text.parse().unwrap();
-    for section in ["dependencies", "build-dependencies"] {
-        let Some(deps) = doc.get(section).and_then(|d| d.as_table()) else {
-            continue;
-        };
-        for dep in deps.keys().filter(|k| k.starts_with("sqldiff-")) {
-            closure(dep, seen);
+    // Plain tables and the same tables under `[target.<cfg>.…]`.
+    let mut tables: Vec<&toml::Table> = vec![&doc];
+    if let Some(t) = doc.get("target").and_then(|t| t.as_table()) {
+        tables.extend(t.values().filter_map(|v| v.as_table()));
+    }
+    for table in tables {
+        for section in ["dependencies", "build-dependencies"] {
+            let Some(deps) = table.get(section).and_then(|d| d.as_table()) else {
+                continue;
+            };
+            for dep in deps.keys().filter(|k| k.starts_with("sqldiff-")) {
+                closure(dep, seen);
+            }
         }
     }
 }
