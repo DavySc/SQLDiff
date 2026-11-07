@@ -335,8 +335,12 @@ pub fn compare(
 /// yet compared are each named as not compared (an explicit Unknown reason),
 /// never left silent, because in a cross-dialect comparison silence means
 /// equal. What each unit's comparison spent (the meter's delta) is taken
-/// from the allowance after it ran, so the overshoot is one unit's setup
-/// or one statement pair. An allowance that is off is `compare`.
+/// from the allowance after it ran, and each statement pair costs one unit
+/// besides. The overshoot is one unit's setup plus the pre-pass over its
+/// pairs (`pair_items` compares every pair once to count the unequal ones
+/// before the first check), then at most one pair. Outside a meter scope the
+/// meter reads zero, so only the one unit per pair counts; that is
+/// deterministic too. An allowance that is off is `compare`.
 pub fn compare_within(
     a: &Analyzed,
     b: &Analyzed,
@@ -534,20 +538,59 @@ fn compare_units_within(
     out: &mut Outcome,
 ) {
     if allowance.exhausted() {
-        // A unit not compared at all: each of its statements is named, on
-        // both sides, and so is the unit (its header and signature).
+        // A unit not compared at all. Everything `compare_units` would have
+        // reported for it is named on both sides, on its own line: the
+        // header and signature, the statements, and the tables, DDL, calls,
+        // dynamic SQL, table variables, transaction statements and
+        // uncovered constructs it carries. One line-less reason besides
+        // keeps the whole file from counting as converted, whatever a line
+        // maps to.
         let why = budget_reason(allowance);
+        out.unknown_reasons.push(format!(
+            "a routine or script segment is {why}: it and everything in it is not proven"
+        ));
         for (side, u) in [(a, ua), (b, ub)] {
             let name = side_name(side);
-            out.unknown_reasons.push(format!(
-                "{name} line {}: the routine or script segment is {why}",
-                u.stmts.first().map_or(0, |s| side.line_of(&s.node))
-            ));
-            for s in &u.stmts {
-                out.unknown_reasons.push(format!(
-                    "{name} line {}: statement is {why}",
-                    side.line_of(&s.node)
-                ));
+            let (hs, he) = u.header_at;
+            let mut lines: Vec<(usize, &str)> = vec![(
+                side.location(hs, he).start_line,
+                "the routine header and signature",
+            )];
+            lines.extend(u.stmts.iter().map(|s| (side.line_of(&s.node), "statement")));
+            lines.extend(u.tables.iter().map(|(n, _)| (side.line_of(n), "table")));
+            lines.extend(
+                u.ddl
+                    .iter()
+                    .map(|(n, _)| (side.line_of(n), "DDL statement")),
+            );
+            lines.extend(u.calls.iter().map(|(n, _)| (side.line_of(n), "call")));
+            lines.extend(
+                u.dynamic
+                    .iter()
+                    .map(|(n, _)| (side.line_of(n), "dynamic SQL")),
+            );
+            lines.extend(
+                u.table_vars
+                    .iter()
+                    .chain(&u.temp_drops)
+                    .map(|(n, _)| (side.line_of(n), "temporary table statement")),
+            );
+            lines.extend(
+                u.txn_stmts
+                    .iter()
+                    .map(|(n, _)| (side.line_of(n), "transaction statement")),
+            );
+            lines.extend(
+                u.uncovered
+                    .iter()
+                    .map(|(n, _)| (side.line_of(n), "construct")),
+            );
+            let mut seen = std::collections::BTreeSet::new();
+            for (l, what) in lines {
+                if seen.insert((l, what)) {
+                    out.unknown_reasons
+                        .push(format!("{name} line {l}: {what} is {why}"));
+                }
             }
         }
         return;
