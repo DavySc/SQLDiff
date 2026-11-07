@@ -7,19 +7,19 @@ usage: real-code-gate.py [--sqldiff PATH] [--work DIR] [--only NAME]
 Sources and pinned commits: corpus/real-code/sources.json. Files that are not
 UTF-8 (UTF-16 exports) are skipped and counted.
 """
-import argparse, collections, json, os, subprocess, sys
+import argparse, collections, json, os, shutil, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def git(*args, cwd=None):
+def git(*args, cwd=None, hint=""):
     # Never prompt: a source that has gone private or been removed must fail
     # with a clear message, not wait for credentials (and none are ever added).
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     try:
         subprocess.run(["git", *args], cwd=cwd, check=True, stdout=subprocess.DEVNULL, env=env)
     except subprocess.CalledProcessError:
-        sys.exit(f"real-code gate: `git {' '.join(args)}` failed; the pinned source may be gone or private. Drop or re-pin it in corpus/real-code/sources.json.")
+        sys.exit(f"real-code gate: `git {' '.join(args)}` failed.{hint}")
 
 
 def fetch(src, work):
@@ -29,13 +29,17 @@ def fetch(src, work):
         cur = subprocess.run(["git", "rev-parse", "HEAD"], cwd=dest, capture_output=True, text=True).stdout.strip()
         if cur == src["commit"]:
             return dest
+    # Start from an empty directory: a restored cache can leave a stale tree
+    # that a fresh checkout would refuse to overwrite.
+    shutil.rmtree(dest, ignore_errors=True)
     os.makedirs(dest, exist_ok=True)
     git("init", "-q", cwd=dest)
     subprocess.run(["git", "remote", "remove", "origin"], cwd=dest, capture_output=True)
     git("remote", "add", "origin", src["repo"], cwd=dest)
     if src.get("sparse"):
         git("sparse-checkout", "set", src["sparse"], cwd=dest)
-    git("fetch", "-q", "--depth", "1", "--filter=blob:none", "origin", src["commit"], cwd=dest)
+    git("fetch", "-q", "--depth", "1", "--filter=blob:none", "origin", src["commit"], cwd=dest,
+        hint=" The pinned source may be gone or private; drop or re-pin it in corpus/real-code/sources.json.")
     git("checkout", "-q", "FETCH_HEAD", cwd=dest)
     return dest
 
