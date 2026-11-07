@@ -11631,7 +11631,9 @@ const PROCID_NAME: &str = "OBJECT_NAME(@@PROCID) / OBJECT_SCHEMA_NAME(@@PROCID) 
 /// @@PROCID) = 1` (or `uses_quoted_identifier`) at `ts[i]`, the opening
 /// parenthesis: the setting and the index after the `1`.
 fn module_setting_test(ts: &[T], i: usize) -> Option<(&'static str, usize)> {
-    let s: Vec<usize> = sig(&ts[i..]).into_iter().map(|k| k + i).take(14).collect();
+    // Only the first 14 significant tokens matter: not the whole rest of the
+    // slice for every parenthesis.
+    let s: Vec<usize> = (i..ts.len()).filter(|&k| ts[k].sig()).take(14).collect();
     let w = |k: usize| s.get(k).map(|&j| &ts[j]);
     let word = |k: usize, x: &str| {
         w(k).is_some_and(|t| {
