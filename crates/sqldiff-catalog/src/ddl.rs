@@ -797,9 +797,11 @@ fn alter_column_type(tb: &mut Table, a: &[Tok], dialect: Dialect) {
             return;
         }
         rest = &rest[1..];
+        // `TYPE type [COLLATE c] [USING expr]`: the collation is part of the
+        // new column definition, the USING expression is not.
         let end = rest
             .iter()
-            .position(|x| x.is_any_kw(&["USING", "COLLATE"]))
+            .position(|x| x.is_kw("USING"))
             .unwrap_or(rest.len());
         rest = &rest[..end];
     } else if rest
@@ -1690,6 +1692,31 @@ mod tests {
             assert_ne!(before, after, "{d:?} {alter}");
             assert_eq!(after.base.to_uppercase(), "CHAR", "{d:?} {alter}");
         }
+        // The new column takes the COLLATE clause of the ALTER, and the default
+        // collation when it has none (PostgreSQL, T-SQL). USING is not part of
+        // the column.
+        let coll = |d: Dialect, sql: &str| load(sql, d, "t").tables[0].columns[1].collation.clone();
+        let base_c = "CREATE TABLE t (id int, s varchar(10) COLLATE \"C\");";
+        assert_eq!(
+            coll(
+                Dialect::Postgres,
+                &format!("{base_c} ALTER TABLE t ALTER COLUMN s TYPE text COLLATE \"POSIX\" USING s::text;"),
+            )
+            .map(|c| c.to_lowercase()),
+            Some("posix".to_string())
+        );
+        assert_eq!(
+            coll(
+                Dialect::Postgres,
+                &format!("{base_c} ALTER TABLE t ALTER COLUMN s TYPE text;"),
+            ),
+            None
+        );
+        assert!(coll(
+            Dialect::Tsql,
+            "CREATE TABLE t (id int, s varchar(10)); ALTER TABLE t ALTER COLUMN s varchar(10) COLLATE Latin1_General_BIN2 NOT NULL;",
+        )
+        .is_some());
         // A form that does not retype leaves the type alone.
         let kept = ty(
             Dialect::Postgres,
