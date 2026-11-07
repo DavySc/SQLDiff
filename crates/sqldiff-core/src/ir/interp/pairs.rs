@@ -117,7 +117,7 @@ impl Interp<'_> {
                     st = s;
                 }
                 Step::Done(o) => return Side::Done(o),
-                Step::Fork(_) => unreachable!("only a decision forks"),
+                Step::Fork(_) | Step::Pruned(..) => unreachable!("only a decision forks"),
             }
         }
     }
@@ -150,6 +150,7 @@ impl Interp<'_> {
             }
             Step::Go(n, s) => Err(self.to_decision(n, s, ticks)),
             Step::Done(o) => Err(Side::Done(o)),
+            Step::Pruned(..) => unreachable!("`step` always has room"),
         }
     }
 

@@ -4805,15 +4805,7 @@ fn traced(
         }
     }
     // Pairs out of order with another pair are not kept.
-    let crossing: Vec<bool> = out
-        .pairs
-        .iter()
-        .map(|&(i, j)| {
-            out.pairs
-                .iter()
-                .any(|&(x, y)| (x < i && y > j) || (x > i && y < j))
-        })
-        .collect();
+    let crossing = crossing_pairs(&out.pairs);
     let mut kept = Vec::new();
     for (p, c) in out.pairs.iter().zip(crossing) {
         if c {
@@ -4829,14 +4821,20 @@ fn traced(
     // its counterpart is in that gap.
     for (is_a, at) in [(true, &at_a), (false, &at_b)] {
         let other = if is_a { &gaps[1] } else { &gaps[0] };
+        let mut paired = vec![false; at.len()];
+        for p in &out.pairs {
+            if let Some(x) = paired.get_mut(if is_a { p.0 } else { p.1 }) {
+                *x = true;
+            }
+        }
+        let mut moved = vec![false; at.len()];
+        for m in out.moved.iter().filter(|m| m.0 == is_a) {
+            if let Some(x) = moved.get_mut(m.1) {
+                *x = true;
+            }
+        }
         for (i, ks) in at.iter().enumerate() {
-            if ks.is_empty()
-                || out
-                    .pairs
-                    .iter()
-                    .any(|p| if is_a { p.0 == i } else { p.1 == i })
-                || out.moved.contains(&(is_a, i))
-            {
+            if ks.is_empty() || paired[i] || moved[i] {
                 continue;
             }
             let near: Vec<usize> = (0..other.len())
@@ -4857,6 +4855,49 @@ fn traced(
         }
     }
     out
+}
+
+/// For each pair: whether another pair is out of order with it (one index
+/// smaller and the other larger). Same answer as comparing every two pairs,
+/// from prefix maxima and suffix minima over the first index.
+fn crossing_pairs(pairs: &[(usize, usize)]) -> Vec<bool> {
+    let mut order: Vec<usize> = (0..pairs.len()).collect();
+    order.sort_by_key(|&k| pairs[k].0);
+    // Greatest second index among pairs with a smaller first index, and
+    // least among those with a larger one.
+    let mut below = vec![None::<usize>; pairs.len()];
+    let mut above = vec![None::<usize>; pairs.len()];
+    let mut best: Option<usize> = None;
+    let mut g = 0;
+    while g < order.len() {
+        let mut e = g;
+        while e < order.len() && pairs[order[e]].0 == pairs[order[g]].0 {
+            below[order[e]] = best;
+            e += 1;
+        }
+        for &k in &order[g..e] {
+            best = Some(best.map_or(pairs[k].1, |b| b.max(pairs[k].1)));
+        }
+        g = e;
+    }
+    let mut best: Option<usize> = None;
+    let mut e = order.len();
+    while e > 0 {
+        let mut g = e;
+        while g > 0 && pairs[order[g - 1]].0 == pairs[order[e - 1]].0 {
+            g -= 1;
+            above[order[g]] = best;
+        }
+        for &k in &order[g..e] {
+            best = Some(best.map_or(pairs[k].1, |b| b.min(pairs[k].1)));
+        }
+        e = g;
+    }
+    (0..pairs.len())
+        .map(|k| {
+            below[k].is_some_and(|m| m > pairs[k].1) || above[k].is_some_and(|m| m < pairs[k].1)
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4896,7 +4937,13 @@ fn pair_items(
     let (pairs, elsewhere) = same_branches(ia, ib, pairs);
     let (na, nb) = (side_name(a), side_name(b));
     for (side, items, name, is_a) in [(a, ia, &na, true), (b, ib, &nb, false)] {
-        let is_paired = |i: usize| pairs.iter().any(|p| if is_a { p.0 == i } else { p.1 == i });
+        let mut paired = vec![false; items.len()];
+        for p in &pairs {
+            if let Some(x) = paired.get_mut(if is_a { p.0 } else { p.1 }) {
+                *x = true;
+            }
+        }
+        let is_paired = |i: usize| paired.get(i).copied().unwrap_or(false);
         let frames = branches(items);
         for (i, it) in items.iter().enumerate() {
             if is_paired(i) {
@@ -4991,7 +5038,11 @@ fn pair_items(
         .count();
     let wit = wit.filter(|_| all_paired && unequal == 1);
     for &(i, j) in &pairs {
-        let (oa, ob) = (other_terms(ia, i), other_terms(ib, j));
+        // The other statements are only read for a witness search.
+        let (oa, ob) = match wit {
+            Some(_) => (other_terms(ia, i), other_terms(ib, j)),
+            None => (Vec::new(), Vec::new()),
+        };
         compare_pair(
             a,
             b,
@@ -5660,6 +5711,41 @@ pub fn refine_modified(
         }
     }
     *findings = keep;
+}
+
+#[cfg(test)]
+mod crossing_tests {
+    use super::crossing_pairs;
+
+    /// Compares every two pairs, as the code did before `crossing_pairs`.
+    fn brute(pairs: &[(usize, usize)]) -> Vec<bool> {
+        pairs
+            .iter()
+            .map(|&(i, j)| {
+                pairs
+                    .iter()
+                    .any(|&(x, y)| (x < i && y > j) || (x > i && y < j))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn crossing_pairs_agree_with_comparing_every_two() {
+        // A small deterministic generator of pair lists with repeated
+        // indexes on either side.
+        let mut seed = 12345u64;
+        let mut next = |m: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) % m) as usize
+        };
+        for _ in 0..500 {
+            let n = next(12);
+            let pairs: Vec<(usize, usize)> = (0..n).map(|_| (next(6), next(6))).collect();
+            assert_eq!(crossing_pairs(&pairs), brute(&pairs), "{pairs:?}");
+        }
+    }
 }
 
 #[cfg(test)]

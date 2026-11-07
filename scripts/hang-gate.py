@@ -30,13 +30,10 @@ OVERRIDES = {}
 # would only spend CI minutes being killed); `--known-open` runs only them and
 # fails when one now passes, so the entry is removed in the PR that fixes it.
 KNOWN_OPEN = {
-    "a_procs_50x20": "R1: IF-guarded writes per routine, 53 s",
-    "a_procs_50x200": "R1: killed at 120 s, 937 MB",
-    "a_procs_200x20": "R1: killed at 120 s",
-    "a_procs_500x20": "R1: killed at 120 s",
+    "a_procs_50x200": "R1: 50 routines of 200 IF-guarded writes, killed at 300 s",
+    "a_procs_200x20": "R1: 118 s (0.6 s per routine of 20 IF-guarded writes), too close to the limit",
+    "a_procs_500x20": "R1: 246 s (0.5 s per routine)",
     "g_tables_5000": "catalog loading is quadratic, killed at 120 s",
-    "j_branches_14": "R1: nested IF/ELSE depth 14, 109 s, 1 GB",
-    "k_seq_ifs_200": "R1: sequential IF-guarded writes, killed at 120 s",
 }
 
 
