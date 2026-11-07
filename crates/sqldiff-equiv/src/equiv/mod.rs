@@ -4800,6 +4800,7 @@ fn traced(
                 let g = align_certain(&sa, &sb);
                 out.pairs.extend(g.pairs);
                 out.ambiguous.extend(g.ambiguous);
+                out.over_bound |= g.over_bound;
             }
         }
     }
@@ -5168,6 +5169,7 @@ fn level(
     };
     out.beside.extend(al.beside);
     out.ambiguous.extend(al.ambiguous);
+    out.over_bound |= al.over_bound;
     let entry = |seq: &'_ [Entry], i: usize| -> Option<usize> {
         seq.iter().position(|e| match e {
             Entry::Leaf(x) => *x == i,
