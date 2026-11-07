@@ -403,7 +403,13 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         normalizations.push("names bound against the catalog".to_string());
     }
 
-    let env = crate::ir::behaviour::Env::from_options(opts);
+    let mut env = crate::ir::behaviour::Env::from_options(opts);
+    // Cross-dialect: a condition text matches across the sides only where
+    // the identity analysis proved it the same fact (W6c, E2). Same-dialect
+    // diffs do not run that analysis and keep matching by text.
+    if !same {
+        env.identified = Some(std::sync::Arc::new(identified_pairs(&eq)));
+    }
     let beh = crate::ir::behaviour::analyze(&aa, &ab, &env);
     // A transaction statement between data statements is compared when the
     // behaviour model compared the routine that holds it, on its side.
@@ -468,6 +474,28 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     report
 }
 
+/// The statement-equivalence comparison of two analysed artifacts, as `diff`
+/// runs it for different dialects.
+fn compare_sides(aa: &Analyzed, ab: &Analyzed, opts: &Options) -> equiv::Outcome {
+    let side_a = side(aa.artifact.dialect, &opts.catalog_a, &opts.facts_a);
+    let side_b = side(ab.artifact.dialect, &opts.catalog_b, &opts.facts_b);
+    let mut schema_a = side_a.schema.clone();
+    let mut schema_b = side_b.schema.clone();
+    schema_a.list_stars_with(&mut schema_b);
+    equiv::compare(aa, ab, &schema_a, &schema_b, &opts.anchors)
+}
+
+/// The condition pairs (start offsets) the identity analysis proved to be
+/// the same fact about the input.
+fn identified_pairs(eq: &equiv::Outcome) -> std::collections::BTreeSet<(usize, usize)> {
+    eq.identity
+        .iter()
+        .flat_map(|r| &r.rows)
+        .filter(|c| c.class.identified())
+        .map(|c| (c.a_start, c.b_start))
+        .collect()
+}
+
 /// "What if this statement fails?" (design §6.1 `what_if`): the statement
 /// on or before `line` of side `side`, failing with `kind`, under the
 /// environment `opts.flips` and `opts.declared` describe.
@@ -481,7 +509,13 @@ pub fn what_if(
 ) -> crate::ir::witness::WhatIf {
     let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
     let ab = Analyzed::new(b, Side::B, opts.excerpt_lines);
-    let env = crate::ir::behaviour::Env::from_options(opts);
+    let mut env = crate::ir::behaviour::Env::from_options(opts);
+    // The same condition matching as `diff` (see there), so the failure it
+    // replays is one `diff` explored.
+    if a.dialect != b.dialect {
+        let eq = compare_sides(&aa, &ab, opts);
+        env.identified = Some(std::sync::Arc::new(identified_pairs(&eq)));
+    }
     crate::ir::behaviour::what_if(&aa, &ab, side, line, kind, &env)
 }
 

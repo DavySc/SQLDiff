@@ -1449,6 +1449,11 @@ pub fn walk_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     }
 }
 
+/// Whether a value may be a string.
+fn stringy(v: &V) -> bool {
+    matches!(v, V::Str(_) | V::Opq(_) | V::Gen(_) | V::Ne(_))
+}
+
 fn num_of(v: &V) -> Option<f64> {
     match v {
         V::Int(i) => Some(*i as f64),
@@ -1856,6 +1861,15 @@ impl Ctx<'_> {
             }
             Expr::Cast(x, ty) => {
                 let v = self.expr(x, scopes, g)?;
+                // A `char(n)` value cast to another string type keeps its
+                // blanks on SQL Server and loses them on PostgreSQL; the
+                // evaluator holds it unpadded, so it cannot tell.
+                if stringy(&v)
+                    && Ty::from_type(ty, self.d, true).fam != Fam::Char
+                    && self.may_be_char(x, scopes)
+                {
+                    return rej();
+                }
                 self.cast(v, ty)
             }
             Expr::Case(op, whens, els) => {
@@ -1964,6 +1978,14 @@ impl Ctx<'_> {
             "+" | "-" | "*" | "/" | "%" | "||" => {
                 let a = self.expr(l, scopes, g)?;
                 let b = self.expr(r, scopes, g)?;
+                // `+` and `||` join strings, and a `char(n)` operand is
+                // blank-padded in the database but not here.
+                if matches!(op, "+" | "||")
+                    && (stringy(&a) || stringy(&b))
+                    && (self.may_be_char(l, scopes) || self.may_be_char(r, scopes))
+                {
+                    return rej();
+                }
                 self.arith(op, a, b, l, r)
             }
             _ => unsupported(format!("operator {op}")),
@@ -2379,6 +2401,42 @@ impl Ctx<'_> {
                 return unsupported("aggregate outside a grouped query");
             };
             return self.aggregate(c, &name, scopes, g);
+        }
+        // A function of a possible `char(n)` value (LEN, DATALENGTH, CONCAT,
+        // SUBSTRING, UPPER, ...) depends on the blank padding the evaluator
+        // does not keep. Exempt are the ones that hand a value on unchanged,
+        // and the numeric and date functions: they convert their argument to
+        // a number or a date, trailing blanks are ignored by that conversion
+        // in both dialects, and the result holds none of the argument's text.
+        // (The date part of DATEADD, DATEPART, ... is a name, not a value.)
+        if !matches!(
+            name.as_str(),
+            "COALESCE"
+                | "ISNULL"
+                | "NULLIF"
+                | "IIF"
+                | "GREATEST"
+                | "LEAST"
+                | "ABS"
+                | "CEILING"
+                | "CEIL"
+                | "FLOOR"
+                | "ROUND"
+                | "SIGN"
+                | "SQRT"
+                | "POWER"
+                | "EXP"
+                | "YEAR"
+                | "MONTH"
+                | "DAY"
+                | "DATEADD"
+                | "DATEDIFF"
+                | "DATEDIFF_BIG"
+                | "DATEPART"
+                | "EOMONTH"
+        ) && c.args.iter().any(|x| self.may_be_char(x, scopes))
+        {
+            return rej();
         }
         if CLOCK.contains(&name.as_str()) {
             // Both versions run at the same moment: the time is an input.
