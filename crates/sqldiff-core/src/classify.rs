@@ -147,6 +147,12 @@ fn dml_index(toks: &[SyntaxToken]) -> Option<usize> {
     None
 }
 
+/// The statement word of the data-changing statement a `WITH` leads to.
+fn with_dml(node: &SyntaxNode) -> Option<String> {
+    let toks: Vec<SyntaxToken> = ast::sig_tokens(node).collect();
+    dml_index(&toks).map(|i| toks.get(i).and_then(word).unwrap_or_default())
+}
+
 pub fn stmt_kind(node: &SyntaxNode, dialect: Dialect) -> StmtKind {
     match node.kind() {
         SyntaxKind::BLOCK => return StmtKind::Block,
@@ -163,7 +169,10 @@ pub fn stmt_kind(node: &SyntaxNode, dialect: Dialect) -> StmtKind {
         SyntaxKind::STATEMENT => {}
         _ => return StmtKind::Container,
     }
-    let toks: Vec<SyntaxToken> = ast::sig_tokens(node).collect();
+    // The kind is read from the first three significant tokens; the two
+    // rarer shapes that look further (`WITH` and `SET OPTION`) walk the
+    // statement themselves.
+    let toks: Vec<SyntaxToken> = ast::sig_tokens(node).take(3).collect();
     let w = |i: usize| toks.get(i).and_then(word).unwrap_or_default();
     let w0 = w(0);
     let w1 = w(1);
@@ -172,7 +181,7 @@ pub fn stmt_kind(node: &SyntaxNode, dialect: Dialect) -> StmtKind {
     }
     match w0.as_str() {
         "SELECT" | "VALUES" => StmtKind::Select,
-        "WITH" => match dml_index(&toks).map(w).as_deref() {
+        "WITH" => match with_dml(node).as_deref() {
             Some("INSERT") => StmtKind::Insert,
             Some("UPDATE") => StmtKind::Update,
             Some("DELETE") => StmtKind::Delete,
@@ -185,7 +194,7 @@ pub fn stmt_kind(node: &SyntaxNode, dialect: Dialect) -> StmtKind {
         "MERGE" => StmtKind::Merge,
         "SET" => match w1.as_str() {
             "XACT_ABORT" | "IMPLICIT_TRANSACTIONS" | "TRANSACTION" => StmtKind::TxnSetting,
-            "OPTION" if toks.iter().any(|t| t.text().eq_ignore_ascii_case("COMMIT")) => {
+            "OPTION" if ast::sig_tokens(node).any(|t| t.text().eq_ignore_ascii_case("COMMIT")) => {
                 StmtKind::TxnSetting
             }
             _ if dialect == Dialect::Tsql
@@ -603,4 +612,59 @@ pub fn pairing_key(parts: &[String]) -> String {
         .last()
         .map(|p| p.to_uppercase().replace('_', ""))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqldiff_syntax::parse;
+
+    /// The kind of the first statement of `sql`.
+    fn kind(sql: &str, d: Dialect) -> StmtKind {
+        let root = parse(sql, d).syntax();
+        let stmt = root
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::STATEMENT)
+            .expect("a statement");
+        stmt_kind(&stmt, d)
+    }
+
+    /// `stmt_kind` reads the first three tokens, and walks further only for
+    /// `WITH` and `SET OPTION`: the kinds that depend on later tokens.
+    #[test]
+    fn the_kind_that_depends_on_later_tokens_is_still_found() {
+        let t = Dialect::Tsql;
+        assert_eq!(
+            kind("WITH c AS (SELECT 1) SELECT * FROM c", t),
+            StmtKind::Select
+        );
+        assert_eq!(
+            kind("WITH c AS (SELECT 1 AS a) INSERT INTO x SELECT a FROM c", t),
+            StmtKind::Insert
+        );
+        assert_eq!(
+            kind("WITH c AS (SELECT 1 AS a) UPDATE x SET a = 1", t),
+            StmtKind::Update
+        );
+        assert_eq!(
+            kind("WITH c AS (SELECT 1 AS a) DELETE FROM x", t),
+            StmtKind::Delete
+        );
+        assert_eq!(
+            kind("SET OPTION COMMIT = 1; SELECT 1", Dialect::Db2i),
+            StmtKind::TxnSetting
+        );
+        assert_eq!(
+            kind("SET OPTION NAMING = *SQL", Dialect::Db2i),
+            StmtKind::Assign
+        );
+        assert_eq!(kind("SET XACT_ABORT ON", t), StmtKind::TxnSetting);
+        assert_eq!(kind("SET @x = 1", t), StmtKind::Assign);
+        assert_eq!(kind("a := 1", Dialect::Postgres), StmtKind::Assign);
+        assert_eq!(
+            kind("RETURN QUERY INSERT INTO t VALUES (1)", Dialect::Postgres),
+            StmtKind::Insert
+        );
+        assert_eq!(kind("RAISE NOTICE 'x'", Dialect::Postgres), StmtKind::Other);
+    }
 }
