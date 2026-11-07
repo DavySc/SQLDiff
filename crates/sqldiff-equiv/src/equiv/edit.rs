@@ -75,6 +75,20 @@ pub fn decide(
             (span(&f.a), span(&f.b))
         })
         .collect();
+    let oracle = std::env::var_os("SQLDIFF_EDIT_ORACLE").is_some();
+    let sides = (
+        SideEdits::new(&ra, findings, &spans, true, oracle),
+        SideEdits::new(&rb, findings, &spans, false, oracle),
+    );
+    if std::env::var_os("SQLDIFF_EDIT_STATS").is_some() {
+        eprintln!(
+            "edit checker: {} of {} candidate edits on A, {} of {} on B take the shared sweep",
+            sides.0.fast.len(),
+            sides.0.candidates,
+            sides.1.fast.len(),
+            sides.1.candidates
+        );
+    }
     for (i, f) in findings.iter_mut().enumerate() {
         if !candidate(f) {
             continue;
@@ -88,12 +102,7 @@ pub fn decide(
         if std::env::var_os("SQLDIFF_DEBUG_EDIT").is_some() {
             eprintln!("edit: {} at A line {}", f.rule, la.start_line);
         }
-        let others = spans.iter().enumerate().filter(|(j, _)| *j != i);
-        let changed = (
-            others.clone().filter_map(|(_, s)| s.0).collect(),
-            others.filter_map(|(_, s)| s.1).collect(),
-        );
-        let r = examine(&ra, &rb, &na, &nb, sa, sb, &changed);
+        let r = examine(&ra, &rb, &na, &nb, sa, sb, (&sides.0, &sides.1), i);
         if std::env::var_os("SQLDIFF_DEBUG_EDIT").is_some() {
             match &r {
                 Ok(g) => eprintln!("  => different: {}", g.witness),
@@ -181,6 +190,8 @@ struct Routine<'x, 'a> {
     sql_set_result: bool,
     /// Statements and conditions with what they read and write, built on first use.
     units: std::cell::OnceCell<Vec<Unit>>,
+    /// The names of `units`, set with them.
+    names: std::cell::OnceCell<Names>,
     /// The first unit or statement (in tree order) that starts at each byte
     /// offset, built on first use: a file of thousands of routines is asked
     /// once per edit, and a scan of the whole tree each time was quadratic.
@@ -190,6 +201,12 @@ struct Routine<'x, 'a> {
     spelling: std::cell::OnceCell<std::rc::Rc<HashMap<String, String>>>,
     /// Opening and closing parentheses of the whole routine (see `validity`).
     parens: std::cell::OnceCell<(usize, usize)>,
+    /// Sorted start offsets of every statement whose first word can make it
+    /// jump (see `jump`) and of every label, built on first use: a subtree
+    /// with none of them cannot hold a jump.
+    jump_marks: std::cell::OnceCell<Vec<usize>>,
+    /// Interval index over `units`, when they are in start order.
+    unit_index: std::cell::OnceCell<Option<UnitIndex>>,
 }
 
 impl<'x, 'a> Routine<'x, 'a> {
@@ -254,9 +271,12 @@ impl<'x, 'a> Routine<'x, 'a> {
                     && matches!(u.kind, lower::UnitKind::Proc | lower::UnitKind::Script),
             sql_set_result,
             units: std::cell::OnceCell::new(),
+            names: std::cell::OnceCell::new(),
             starts: std::cell::OnceCell::new(),
             spelling: std::cell::OnceCell::new(),
             parens: std::cell::OnceCell::new(),
+            jump_marks: std::cell::OnceCell::new(),
+            unit_index: std::cell::OnceCell::new(),
         };
         r.scan();
         r
@@ -847,6 +867,22 @@ enum Scan {
     Untouched,
 }
 
+/// The first words of a statement that `Routine::jump` may call a jump.
+const JUMP_WORDS: &[&str] = &[
+    "RETURN",
+    "GOTO",
+    "SIGNAL",
+    "RESIGNAL",
+    "THROW",
+    "RAISE",
+    "RAISERROR",
+    "BREAK",
+    "CONTINUE",
+    "EXIT",
+    "LEAVE",
+    "ITERATE",
+];
+
 impl<'x, 'a> Routine<'x, 'a> {
     fn line(&self, n: &SyntaxNode) -> usize {
         self.side.line_of(n)
@@ -889,8 +925,76 @@ impl<'x, 'a> Routine<'x, 'a> {
         }
     }
 
+    /// Sorted start offsets of every statement whose first word can make it
+    /// jump, and of every label.
+    fn jump_marks(&self) -> &[usize] {
+        self.jump_marks.get_or_init(|| {
+            let mut v: Vec<usize> = self
+                .side
+                .root
+                .descendants()
+                .filter(|x| match x.kind() {
+                    SyntaxKind::LABEL => true,
+                    SyntaxKind::STATEMENT => cst::first_words(x, 1)
+                        .first()
+                        .is_some_and(|w| JUMP_WORDS.contains(&w.as_str())),
+                    _ => false,
+                })
+                .map(|x| usize::from(x.text_range().start()))
+                .collect();
+            v.sort_unstable();
+            v
+        })
+    }
+
+    /// The siblings before `cur` that hold a jump mark, nearest first: a
+    /// superset of the earlier siblings for which `has_jump` can be true,
+    /// found from the mark list instead of by walking every earlier sibling
+    /// (a flat procedure has thousands).
+    fn earlier_siblings_with_marks(&self, cur: &SyntaxNode) -> Vec<SyntaxNode> {
+        let Some(p) = cur.parent() else {
+            return Vec::new();
+        };
+        let lo = usize::from(p.text_range().start());
+        let hi = usize::from(cur.text_range().start());
+        let marks = self.jump_marks();
+        let from = marks.partition_point(|&m| m < lo);
+        let to = marks.partition_point(|&m| m < hi);
+        let mut out: Vec<SyntaxNode> = Vec::new();
+        for &m in marks[from..to].iter().rev() {
+            let Some(tok) = self
+                .side
+                .root
+                .token_at_offset(rowan::TextSize::from(m as u32))
+                .right_biased()
+            else {
+                continue;
+            };
+            let Some(sib) = tok
+                .parent_ancestors()
+                .find(|a| a.parent().as_ref() == Some(&p))
+            else {
+                continue;
+            };
+            if sib != *cur && out.last() != Some(&sib) {
+                out.push(sib);
+            }
+        }
+        out
+    }
+
     /// Whether some statement inside `u` may jump out of the sequence that holds `target`.
     fn has_jump(&self, u: &SyntaxNode, target: &SyntaxNode) -> bool {
+        // `jump` is `Some` only for a statement whose first word is one of
+        // `JUMP_WORDS`, and a label always counts: a subtree holding no such
+        // mark has no jump, which skips the walk for the common leaf.
+        let marks = self.jump_marks();
+        let range = u.text_range();
+        let (lo, hi) = (usize::from(range.start()), usize::from(range.end()));
+        let k = marks.partition_point(|&m| m < lo);
+        if marks.get(k).map_or(true, |&m| m >= hi) {
+            return false;
+        }
         u.descendants_with_tokens().any(|e| {
             e.as_node().is_some_and(|x| {
                 x.kind() == SyntaxKind::STATEMENT && self.jump(x, target).is_some()
@@ -935,8 +1039,8 @@ impl<'x, 'a> Routine<'x, 'a> {
             let earlier: Vec<SyntaxNode> = if handler {
                 Vec::new()
             } else {
-                cur.siblings(rowan::Direction::Prev)
-                    .skip(1)
+                self.earlier_siblings_with_marks(&cur)
+                    .into_iter()
                     .filter(|s| s.kind().is_unit())
                     .collect()
             };
@@ -1411,9 +1515,22 @@ const ANY: &str = "*";
 struct Unit {
     start: usize,
     end: usize,
+    /// Ids (see `Names`) of the names it reads, sorted.
+    reads: Vec<u32>,
+    /// Ids of the names it writes, sorted.
+    writes: Vec<u32>,
+    /// Ids of the names it reads or writes, sorted.
+    touches: Vec<u32>,
+    /// It may leave the sequence it is in (RETURN, BREAK, THROW, ...).
+    jumps: bool,
+}
+
+/// A unit as scanned, before its names are numbered.
+struct RawUnit {
+    start: usize,
+    end: usize,
     reads: HashSet<String>,
     writes: HashSet<String>,
-    /// It may leave the sequence it is in (RETURN, BREAK, THROW, ...).
     jumps: bool,
 }
 
@@ -1460,8 +1577,88 @@ impl SpanSet {
     }
 }
 
-fn meets(a: &HashSet<String>, b: &HashSet<String>) -> bool {
-    !a.is_empty() && !b.is_empty() && (a.contains(ANY) || b.contains(ANY) || !a.is_disjoint(b))
+/// The names of a routine's units as small numbers, so that the closure
+/// over many units compares integers, not strings. Numbered in name order;
+/// `ANY` is always 0.
+struct Names {
+    ids: std::collections::BTreeMap<String, u32>,
+    names: Vec<String>,
+    /// Whether the name is one of `STATUS`.
+    status: Vec<bool>,
+}
+
+const ANY_ID: u32 = 0;
+
+impl Names {
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: the names are sorted before they are numbered
+    fn of(all: &HashSet<String>) -> Names {
+        let mut sorted: Vec<&String> = all.iter().filter(|x| x.as_str() != ANY).collect();
+        sorted.sort();
+        let mut names = vec![ANY.to_string()];
+        names.extend(sorted.into_iter().cloned());
+        let ids = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i as u32))
+            .collect();
+        let status = names.iter().map(|n| STATUS.contains(&n.as_str())).collect();
+        Names { ids, names, status }
+    }
+
+    /// The sorted ids of `set`; a name no unit mentions has none.
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: the ids are sorted
+    fn ids_of(&self, set: &HashSet<String>) -> Vec<u32> {
+        let mut v: Vec<u32> = set
+            .iter()
+            .filter_map(|x| self.ids.get(x).copied())
+            .collect();
+        v.sort_unstable();
+        v
+    }
+}
+
+/// A growing set of names, answering the closure's "does this unit read
+/// something in it" (the old `meets` over string sets).
+struct Taint {
+    on: Vec<bool>,
+    count: usize,
+}
+
+impl Taint {
+    fn new(size: usize) -> Taint {
+        Taint {
+            on: vec![false; size],
+            count: 0,
+        }
+    }
+
+    /// Adds a name; whether it was new.
+    fn add(&mut self, id: u32) -> bool {
+        let at = &mut self.on[id as usize];
+        let new = !*at;
+        *at = true;
+        self.count += usize::from(new);
+        new
+    }
+
+    fn add_all(&mut self, ids: &[u32]) -> bool {
+        let mut grew = false;
+        for &i in ids {
+            grew |= self.add(i);
+        }
+        grew
+    }
+
+    fn has(&self, id: u32) -> bool {
+        self.on[id as usize]
+    }
+
+    /// Both sets are non-empty and either holds `ANY` or they share a name.
+    fn meets(&self, ids: &[u32]) -> bool {
+        !ids.is_empty()
+            && self.count > 0
+            && (self.has(ANY_ID) || ids.iter().any(|&i| i == ANY_ID || self.has(i)))
+    }
 }
 
 impl<'x, 'a> Routine<'x, 'a> {
@@ -1519,8 +1716,9 @@ impl<'x, 'a> Routine<'x, 'a> {
         self.units.get_or_init(|| self.build_units())
     }
 
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: the names are collected into a set and numbered in sorted order
     fn build_units(&self) -> Vec<Unit> {
-        let mut out = Vec::new();
+        let mut out: Vec<RawUnit> = Vec::new();
         for n in self.side.root.descendants() {
             match n.kind() {
                 SyntaxKind::STATEMENT => {
@@ -1533,7 +1731,7 @@ impl<'x, 'a> Routine<'x, 'a> {
                         | "BREAK" | "CONTINUE" | "EXIT" | "LEAVE" | "ITERATE" => true,
                         _ => false,
                     };
-                    out.push(Unit {
+                    out.push(RawUnit {
                         start,
                         end,
                         reads: tokens(&n).iter().filter_map(unit_name).collect(),
@@ -1559,7 +1757,7 @@ impl<'x, 'a> Routine<'x, 'a> {
                             }
                         }
                     }
-                    out.push(Unit {
+                    out.push(RawUnit {
                         start,
                         end,
                         reads: tokens(&n).iter().filter_map(unit_name).collect(),
@@ -1570,7 +1768,37 @@ impl<'x, 'a> Routine<'x, 'a> {
                 _ => {}
             }
         }
-        out
+        let all: HashSet<String> = out
+            .iter()
+            .flat_map(|u| u.reads.iter().chain(&u.writes))
+            .cloned()
+            .collect();
+        let names = Names::of(&all);
+        let units = out
+            .into_iter()
+            .map(|u| {
+                let (reads, writes) = (names.ids_of(&u.reads), names.ids_of(&u.writes));
+                let mut touches: Vec<u32> = reads.iter().chain(&writes).copied().collect();
+                touches.sort_unstable();
+                touches.dedup();
+                Unit {
+                    start: u.start,
+                    end: u.end,
+                    reads,
+                    writes,
+                    touches,
+                    jumps: u.jumps,
+                }
+            })
+            .collect();
+        let _ = self.names.set(names);
+        units
+    }
+
+    /// The names of [`Self::units`].
+    fn unit_names(&self) -> &Names {
+        self.units();
+        self.names.get().expect("set with the units")
     }
 
     /// Conditions that decide whether `n` runs: those of the IF and WHILE
@@ -1579,9 +1807,9 @@ impl<'x, 'a> Routine<'x, 'a> {
         let mut out = Vec::new();
         let mut cur = n.clone();
         while let Some(p) = cur.parent() {
-            for s in cur
-                .siblings(rowan::Direction::Prev)
-                .skip(1)
+            for s in self
+                .earlier_siblings_with_marks(&cur)
+                .into_iter()
                 .filter(|s| s.kind().is_unit() && self.has_jump(s, n))
             {
                 for c in s
@@ -1599,6 +1827,91 @@ impl<'x, 'a> Routine<'x, 'a> {
         out
     }
 
+    /// The unit overlap index, when the units are in start order.
+    fn unit_index(&self) -> Option<&UnitIndex> {
+        self.unit_index
+            .get_or_init(|| UnitIndex::new(self.units()))
+            .as_ref()
+    }
+
+    /// [`Self::interacts_exact`] for edit number `i` of a side, answered
+    /// from the shared sweep when it covers the edit.
+    fn interacts(
+        &self,
+        n: &SyntaxNode,
+        side: &SideEdits,
+        i: usize,
+        reach: &Reach,
+    ) -> Option<String> {
+        let Some(fast) = side.fast.get(&i) else {
+            return self.interacts_exact(n, &side.without(i), reach);
+        };
+        let got = self.interacts_shared(n, side, fast, reach);
+        if side.oracle {
+            let want = self.interacts_exact(n, &side.without(i), reach);
+            assert_eq!(
+                got,
+                want,
+                "edit checker: the shared interaction state differs from the exact scan (line {})",
+                self.line(n)
+            );
+        }
+        got
+    }
+
+    /// The same answer as [`Self::interacts_exact`], from what the sweep
+    /// found: the jump test, then the taint test, then what the edit writes.
+    fn interacts_shared(
+        &self,
+        n: &SyntaxNode,
+        side: &SideEdits,
+        fast: &FastTaint,
+        reach: &Reach,
+    ) -> Option<String> {
+        // The edit's own span is one of the side's: no other change.
+        if side.spans.len() <= 1 {
+            return None;
+        }
+        let here = cst::sig_range(n);
+        let units = self.units();
+        let names = self.unit_names();
+        let line = |off: usize| self.side.lines.line_col(off).0;
+        if let Some(start) = fast.jump {
+            if !reach.untraced.is_empty() {
+                return Some(format!(
+                    "the changed jump at line {} may decide whether it runs",
+                    line(start)
+                ));
+            }
+        }
+        if let (Some(first), Some(shared)) = (fast.first_change, fast.hit) {
+            return Some(match shared {
+                Some(id) => format!(
+                    "{} may hold a value set by the changed code at line {}",
+                    spell(&names.names[id as usize]),
+                    line(first)
+                ),
+                None => format!(
+                    "it reads what the changed code at line {} may write",
+                    line(first)
+                ),
+            });
+        }
+        let index = self.unit_index().expect("the sweep needs the index");
+        let seed: HashSet<String> = index
+            .overlapping(here)
+            .into_iter()
+            .flat_map(|u| {
+                units[u]
+                    .writes
+                    .iter()
+                    .map(|&i| names.names[i as usize].clone())
+            })
+            .collect();
+        self.reaches_change(seed, here, units, &side.set)
+            .map(|l| format!("its result reaches the changed code at line {l}"))
+    }
+
     /// Why a witness for `n` alone cannot be trusted when the code at
     /// `changed` differs between the versions too: a value `n` reads, or a
     /// condition on the way to it, may come from changed code, or what `n`
@@ -1606,7 +1919,7 @@ impl<'x, 'a> Routine<'x, 'a> {
     /// inputs at `n` and runs the same code after it, so two edits that
     /// make up for each other would look like two differences.
     #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: set union; sorted before it reaches a witness; set union
-    fn interacts(&self, n: &SyntaxNode, changed: &[Span], reach: &Reach) -> Option<String> {
+    fn interacts_exact(&self, n: &SyntaxNode, changed: &[Span], reach: &Reach) -> Option<String> {
         if changed.is_empty() {
             return None;
         }
@@ -1627,10 +1940,11 @@ impl<'x, 'a> Routine<'x, 'a> {
         let line = |off: usize| self.side.lines.line_col(off).0;
 
         // Values at `n` that changed code may have set.
-        let mut tainted: HashSet<String> = HashSet::new();
+        let names = self.unit_names();
+        let mut tainted = Taint::new(names.names.len());
         let mut first_change: Option<usize> = None;
         for u in others.iter().filter(|u| before(u) && changed_unit(u)) {
-            tainted.extend(u.writes.iter().cloned());
+            tainted.add_all(&u.writes);
             first_change = Some(first_change.map_or(u.start, |f| f.min(u.start)));
             // A changed jump on the way that is not evaluated as a guard.
             if u.jumps && !reach.untraced.is_empty() {
@@ -1641,12 +1955,18 @@ impl<'x, 'a> Routine<'x, 'a> {
             }
         }
         if let Some(first) = first_change {
+            // The closure does not depend on the order the units are met,
+            // only on which of them are unchanged and before `n`.
+            let prior: Vec<&Unit> = others
+                .iter()
+                .copied()
+                .filter(|u| before(u) && !changed_unit(u))
+                .collect();
             loop {
                 let mut grew = false;
-                for u in others.iter().filter(|u| before(u) && !changed_unit(u)) {
-                    if meets(&u.reads, &tainted) && !u.writes.is_subset(&tainted) {
-                        tainted.extend(u.writes.iter().cloned());
-                        grew = true;
+                for u in &prior {
+                    if tainted.meets(&u.reads) {
+                        grew |= tainted.add_all(&u.writes);
                     }
                 }
                 if !grew {
@@ -1654,21 +1974,24 @@ impl<'x, 'a> Routine<'x, 'a> {
                 }
             }
             let deciding = self.deciding_conditions(n);
-            let needed: HashSet<String> = units
+            let mut needed: Vec<u32> = units
                 .iter()
                 .filter(|u| {
                     overlaps((u.start, u.end), here)
                         || deciding.iter().any(|c| overlaps(*c, (u.start, u.end)))
                 })
-                .flat_map(|u| u.reads.iter().cloned())
+                .flat_map(|u| u.reads.iter().copied())
                 .collect();
-            if meets(&needed, &tainted) {
-                let mut names: Vec<&String> = needed
-                    .intersection(&tainted)
-                    .filter(|x| x.as_str() != ANY)
+            needed.sort_unstable();
+            needed.dedup();
+            if tainted.meets(&needed) {
+                let mut shared: Vec<&String> = needed
+                    .iter()
+                    .filter(|&&i| i != ANY_ID && tainted.has(i))
+                    .map(|&i| &names.names[i as usize])
                     .collect();
-                names.sort();
-                return Some(match names.first() {
+                shared.sort();
+                return Some(match shared.first() {
                     Some(x) => format!(
                         "{} may hold a value set by the changed code at line {}",
                         spell(x),
@@ -1686,23 +2009,23 @@ impl<'x, 'a> Routine<'x, 'a> {
         let seed: HashSet<String> = units
             .iter()
             .filter(|u| overlaps((u.start, u.end), here))
-            .flat_map(|u| u.writes.iter().cloned())
+            .flat_map(|u| u.writes.iter().map(|&i| names.names[i as usize].clone()))
             .collect();
-        self.reaches_change(seed, here, units, changed)
+        self.reaches_change(seed, here, units, &changed_set)
             .map(|l| format!("its result reaches the changed code at line {l}"))
     }
 
     /// The line of the first changed unit after `here` (or in a loop with
     /// it) that reads or overwrites one of `seed`, directly or through
     /// unchanged units in between.
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: the seed only decides which names are reached; order never matters
     fn reaches_change(
         &self,
         seed: HashSet<String>,
         here: Span,
         units: &[Unit],
-        changed: &[Span],
+        changed_set: &SpanSet,
     ) -> Option<usize> {
-        let changed_set = SpanSet::new(changed);
         let changed_unit = |u: &Unit| changed_set.overlaps((u.start, u.end));
         let after = |u: &Unit| {
             !overlaps((u.start, u.end), here)
@@ -1711,20 +2034,40 @@ impl<'x, 'a> Routine<'x, 'a> {
                         *ls <= u.start && u.end <= *le && *ls <= here.0 && here.1 <= *le
                     }))
         };
-        let mut reached: HashSet<String> = seed
-            .into_iter()
+        let names = self.unit_names();
+        // A name no unit mentions can never be met again, but it still
+        // makes the set non-empty.
+        let seed: Vec<&String> = seed
+            .iter()
             .filter(|x| !STATUS.contains(&x.as_str()))
             .collect();
-        if reached.is_empty() {
+        if seed.is_empty() {
             return None;
         }
+        let mut reached = Taint::new(names.names.len() + seed.len());
+        let mut unknown = names.names.len();
+        for x in seed {
+            match names.ids.get(x.as_str()) {
+                Some(&i) => {
+                    reached.add(i);
+                }
+                None => {
+                    reached.add(unknown as u32);
+                    unknown += 1;
+                }
+            }
+        }
+        let later: Vec<&Unit> = units
+            .iter()
+            .filter(|u| after(u) && !changed_unit(u))
+            .collect();
         loop {
             let mut grew = false;
-            for u in units.iter().filter(|u| after(u) && !changed_unit(u)) {
-                if meets(&u.reads, &reached) {
-                    for w in &u.writes {
-                        if !STATUS.contains(&w.as_str()) && reached.insert(w.clone()) {
-                            grew = true;
+            for u in &later {
+                if reached.meets(&u.reads) {
+                    for &w in &u.writes {
+                        if !names.status[w as usize] {
+                            grew |= reached.add(w);
                         }
                     }
                 }
@@ -1736,11 +2079,333 @@ impl<'x, 'a> Routine<'x, 'a> {
         units
             .iter()
             .filter(|u| after(u) && changed_unit(u))
-            .find(|u| {
-                let touched: HashSet<String> = u.reads.union(&u.writes).cloned().collect();
-                u.jumps || meets(&touched, &reached)
-            })
+            .find(|u| u.jumps || reached.meets(&u.touches))
             .map(|u| self.side.lines.line_col(u.start).0)
+    }
+}
+
+// ---- shared interaction state ---------------------------------------------------------
+
+/// Answers "which units overlap this span" without scanning them all. The
+/// units are in tree order, so their starts do not decrease; the ones that
+/// can overlap a span `(a, b)` are those starting before `b` whose end is
+/// past `a`, which a tree of the largest end in each range enumerates in
+/// time proportional to the answer.
+struct UnitIndex {
+    starts: Vec<usize>,
+    /// Segment tree of the largest end, leaves at `size..`.
+    tree: Vec<usize>,
+    size: usize,
+}
+
+impl UnitIndex {
+    /// `None` when the units are not in start order (the exact scans then
+    /// serve every edit).
+    fn new(units: &[Unit]) -> Option<UnitIndex> {
+        if !units.windows(2).all(|w| w[0].start <= w[1].start) {
+            return None;
+        }
+        let size = units.len().max(1).next_power_of_two();
+        let mut tree = vec![0usize; 2 * size];
+        for (i, u) in units.iter().enumerate() {
+            tree[size + i] = u.end;
+        }
+        for i in (1..size).rev() {
+            tree[i] = tree[2 * i].max(tree[2 * i + 1]);
+        }
+        Some(UnitIndex {
+            starts: units.iter().map(|u| u.start).collect(),
+            tree,
+            size,
+        })
+    }
+
+    /// The numbers of the units that overlap `b` (as [`overlaps`] says), in
+    /// unit order.
+    fn overlapping(&self, b: Span) -> Vec<usize> {
+        let k = self.starts.partition_point(|&s| s < b.1);
+        let mut out = Vec::new();
+        self.collect(1, 0, self.size, k, b.0, &mut out);
+        out
+    }
+
+    fn collect(&self, node: usize, lo: usize, hi: usize, k: usize, a: usize, out: &mut Vec<usize>) {
+        if lo >= k || self.tree[node] <= a {
+            return;
+        }
+        if hi - lo == 1 {
+            out.push(lo);
+            return;
+        }
+        let mid = (lo + hi) / 2;
+        self.collect(2 * node, lo, mid, k, a, out);
+        self.collect(2 * node + 1, mid, hi, k, a, out);
+    }
+}
+
+/// What the taint sweep found for one edit, from the units before it.
+struct FastTaint {
+    /// Start of the first (in unit order) changed unit before the edit that
+    /// may jump.
+    jump: Option<usize>,
+    /// Start of the earliest changed unit before the edit.
+    first_change: Option<usize>,
+    /// The names the edit reads meet the taint: `Some(first shared name)`
+    /// (`None` inside: only the any-name is shared).
+    hit: Option<Option<u32>>,
+}
+
+/// One side's edits, prepared once per `decide`.
+struct SideEdits {
+    /// Every non-Equal finding's span on this side, with the finding's number.
+    spans: Vec<(usize, Span)>,
+    /// The spans as a set.
+    set: SpanSet,
+    /// Results for the edits the shared sweep covers (by finding number).
+    fast: std::collections::BTreeMap<usize, FastTaint>,
+    /// Compare every shared answer with the exact scan (tests).
+    oracle: bool,
+    /// Candidate edits on this side.
+    candidates: usize,
+}
+
+impl SideEdits {
+    /// The spans of the other findings: what the exact scans take.
+    fn without(&self, i: usize) -> Vec<Span> {
+        self.spans
+            .iter()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, s)| *s)
+            .collect()
+    }
+
+    fn new(
+        r: &Routine,
+        findings: &[Finding],
+        spans: &[(Option<Span>, Option<Span>)],
+        is_a: bool,
+        oracle: bool,
+    ) -> SideEdits {
+        let spans: Vec<(usize, Span)> = spans
+            .iter()
+            .enumerate()
+            .filter_map(|(j, s)| (if is_a { s.0 } else { s.1 }).map(|x| (j, x)))
+            .collect();
+        let set = SpanSet::new(&spans.iter().map(|x| x.1).collect::<Vec<_>>());
+        let mut me = SideEdits {
+            spans,
+            set,
+            fast: std::collections::BTreeMap::new(),
+            oracle,
+            candidates: 0,
+        };
+        // The edits the shared sweep can answer: not inside a loop (the
+        // code's own test), and the finding's span lies inside the
+        // statement's range, so that every unit overlapping the finding's
+        // own span also overlaps the statement and is left out of the scans
+        // either way: the other findings' changed units are then the same
+        // for every edit.
+        let mut eligible: Vec<(usize, usize, SyntaxNode, Span)> = Vec::new();
+        if r.unit_index().is_some() {
+            for (j, f) in findings.iter().enumerate() {
+                if !candidate(f) {
+                    continue;
+                }
+                let loc = if is_a { &f.a } else { &f.b };
+                let Some(loc) = loc else { continue };
+                me.candidates += 1;
+                let Some(node) = r.node_at(loc.byte_start) else {
+                    continue;
+                };
+                let here = cst::sig_range(&node);
+                // `spans` is in finding order.
+                let Ok(at) = me.spans.binary_search_by_key(&j, |x| x.0) else {
+                    continue;
+                };
+                let own = me.spans[at].1;
+                let in_loop = r
+                    .loops
+                    .iter()
+                    .any(|(ls, le)| *ls <= here.0 && here.1 <= *le);
+                if own.0 >= here.0 && own.1 <= here.1 && !in_loop {
+                    eligible.push((here.0, j, node, here));
+                }
+            }
+        }
+        eligible.sort_by_key(|e| (e.0, e.1));
+        if !eligible.is_empty() {
+            let mut sweep = TaintSweep::new(r, &me.set);
+            for (at, j, node, here) in &eligible {
+                sweep.advance(*at);
+                let fast = sweep.answer(node, *here);
+                me.fast.insert(*j, fast);
+            }
+        }
+        me
+    }
+}
+
+/// The taint closure of `interacts`, kept as the edits are visited from the
+/// start of the routine to its end. For an edit outside every loop the units
+/// "before" it are those ending at or before its start: more of them for each
+/// later edit, so the tainted names only grow and each unit needs offering
+/// once. A unit fires (taints what it writes) when it is unchanged and reads
+/// something tainted; the closure is the same whatever order units are
+/// offered in.
+struct TaintSweep<'r, 'x, 'a> {
+    r: &'r Routine<'x, 'a>,
+    units: &'r [Unit],
+    /// Unit numbers by end (then number).
+    by_end: Vec<usize>,
+    next: usize,
+    changed: Vec<bool>,
+    /// For each name: the units that read it.
+    readers: Vec<Vec<u32>>,
+    /// Units that read the any-name.
+    any_readers: Vec<u32>,
+    offered: Vec<bool>,
+    fired: Vec<bool>,
+    offered_list: Vec<u32>,
+    taint: Taint,
+    first_change: Option<usize>,
+    first_jump: Option<usize>,
+}
+
+impl<'r, 'x, 'a> TaintSweep<'r, 'x, 'a> {
+    fn new(r: &'r Routine<'x, 'a>, set: &SpanSet) -> Self {
+        let units = r.units();
+        let names = r.unit_names();
+        let mut by_end: Vec<usize> = (0..units.len()).collect();
+        by_end.sort_by_key(|&i| (units[i].end, i));
+        let mut readers = vec![Vec::new(); names.names.len()];
+        let mut any_readers = Vec::new();
+        for (i, u) in units.iter().enumerate() {
+            for &id in &u.reads {
+                readers[id as usize].push(i as u32);
+            }
+            if u.reads.contains(&ANY_ID) {
+                any_readers.push(i as u32);
+            }
+        }
+        TaintSweep {
+            r,
+            units,
+            by_end,
+            next: 0,
+            changed: units
+                .iter()
+                .map(|u| set.overlaps((u.start, u.end)))
+                .collect(),
+            readers,
+            any_readers,
+            offered: vec![false; units.len()],
+            fired: vec![false; units.len()],
+            offered_list: Vec::new(),
+            taint: Taint::new(names.names.len()),
+            first_change: None,
+            first_jump: None,
+        }
+    }
+
+    /// Offers every unit that ends at or before `p`.
+    fn advance(&mut self, p: usize) {
+        while let Some(&u) = self.by_end.get(self.next) {
+            if self.units[u].end > p {
+                break;
+            }
+            self.next += 1;
+            self.offer(u);
+        }
+    }
+
+    fn offer(&mut self, u: usize) {
+        self.offered[u] = true;
+        self.offered_list.push(u as u32);
+        let unit = &self.units[u];
+        if self.changed[u] {
+            self.first_change = Some(self.first_change.map_or(unit.start, |f| f.min(unit.start)));
+            if unit.jumps {
+                self.first_jump = Some(self.first_jump.map_or(u, |f| f.min(u)));
+            }
+            let writes = unit.writes.clone();
+            self.taint_all(writes);
+        } else if self.taint.meets(&unit.reads) {
+            self.fire(u);
+        }
+    }
+
+    fn fire(&mut self, u: usize) {
+        if self.fired[u] {
+            return;
+        }
+        self.fired[u] = true;
+        let writes = self.units[u].writes.clone();
+        self.taint_all(writes);
+    }
+
+    /// Taints names and everything that follows from them.
+    fn taint_all(&mut self, names: Vec<u32>) {
+        let mut stack = names;
+        while let Some(x) = stack.pop() {
+            let was_empty = self.taint.count == 0;
+            if !self.taint.add(x) {
+                continue;
+            }
+            let mut wake: Vec<u32> = Vec::new();
+            if x == ANY_ID {
+                // Every offered unit that reads anything now fires.
+                wake.extend(self.offered_list.iter().copied());
+            } else {
+                wake.extend(self.readers[x as usize].iter().copied());
+            }
+            if was_empty {
+                wake.extend(self.any_readers.iter().copied());
+            }
+            for u in wake {
+                let u = u as usize;
+                if self.offered[u]
+                    && !self.changed[u]
+                    && !self.fired[u]
+                    && self.taint.meets(&self.units[u].reads)
+                {
+                    self.fired[u] = true;
+                    stack.extend(self.units[u].writes.iter().copied());
+                }
+            }
+        }
+    }
+
+    /// The answer for the edit `n` (range `here`), after [`Self::advance`]
+    /// to its start.
+    fn answer(&self, n: &SyntaxNode, here: Span) -> FastTaint {
+        let jump = self.first_jump.map(|u| self.units[u].start);
+        let mut hit = None;
+        if self.first_change.is_some() {
+            let index = self.r.unit_index().expect("a sweep needs the index");
+            let mut spans = self.r.deciding_conditions(n);
+            spans.push(here);
+            let mut needed: Vec<u32> = Vec::new();
+            for sp in &spans {
+                for u in index.overlapping(*sp) {
+                    needed.extend(self.units[u].reads.iter().copied());
+                }
+            }
+            needed.sort_unstable();
+            needed.dedup();
+            if self.taint.meets(&needed) {
+                hit = Some(
+                    needed
+                        .iter()
+                        .copied()
+                        .find(|&i| i != ANY_ID && self.taint.has(i)),
+                );
+            }
+        }
+        FastTaint {
+            jump,
+            first_change: self.first_change,
+            hit,
+        }
     }
 }
 
@@ -2777,7 +3442,7 @@ impl Hints<'_> {
 
 // ---- examination ------------------------------------------------------------------
 
-#[allow(clippy::disallowed_methods)] // hash order cannot reach an output: records are only tested with `contains`
+#[allow(clippy::disallowed_methods, clippy::too_many_arguments)] // hash order cannot reach an output: records are only tested with `contains`
 fn examine(
     ra: &Routine,
     rb: &Routine,
@@ -2785,7 +3450,8 @@ fn examine(
     nb: &SyntaxNode,
     sa: &Schema,
     sb: &Schema,
-    changed: &(Vec<Span>, Vec<Span>),
+    sides: (&SideEdits, &SideEdits),
+    idx: usize,
 ) -> Result<Decided, String> {
     let d = ra.d;
     if na.kind() != nb.kind() {
@@ -2796,7 +3462,13 @@ fn examine(
         return Ok(dec);
     }
     if na.kind() == SyntaxKind::ROUTINE {
-        return header_change(ra, rb, na, nb, changed);
+        return header_change(
+            ra,
+            rb,
+            na,
+            nb,
+            &(sides.0.without(idx), sides.1.without(idx)),
+        );
     }
     if let (Some(ta), Some(tb)) = (table_elements(na), table_elements(nb)) {
         return table_change(ra, rb, na, &ta, &tb, sa);
@@ -2825,11 +3497,8 @@ fn examine(
     let reach_b = rb.reach(nb)?;
     // The witness runs this statement alone: other changes must not feed it
     // or consume what it writes.
-    for (r, n, ch, reach) in [
-        (ra, na, &changed.0, &reach_a),
-        (rb, nb, &changed.1, &reach_b),
-    ] {
-        if let Some(why) = r.interacts(n, ch, reach) {
+    for (r, n, side, reach) in [(ra, na, sides.0, &reach_a), (rb, nb, sides.1, &reach_b)] {
+        if let Some(why) = r.interacts(n, side, idx, reach) {
             return Err(format!("another change interacts with it: {why}"));
         }
     }
@@ -3537,7 +4206,8 @@ fn header_change(
             .find(|b| b.kind() == SyntaxKind::ROUTINE_BODY)
             .map_or((0, 0), |b| cst::sig_range(&b));
         let seed = HashSet::from([x.name.trim_start_matches('@').to_lowercase()]);
-        if let Some(l) = r.reaches_change(seed, (body.0, body.0), r.units(), ch) {
+        let set = SpanSet::new(ch);
+        if let Some(l) = r.reaches_change(seed, (body.0, body.0), r.units(), &set) {
             return Err(format!(
                 "another change interacts with it: {shown} reaches the changed code at line {l}"
             ));
@@ -4559,6 +5229,27 @@ mod tests {
         );
         assert_eq!(eval::date_neighbour("99991231", 1), None);
         assert_eq!(eval::date_neighbour("hello", 1), None);
+    }
+
+    /// The integer name sets meet as the string sets did: both non-empty,
+    /// and either holds the any-name or they share one.
+    #[test]
+    fn taint_meets_like_the_string_sets() {
+        let all: HashSet<String> = ["a", "b", "c"].iter().map(|x| x.to_string()).collect();
+        let names = Names::of(&all);
+        let id = |x: &str| names.ids[x];
+        let mut t = Taint::new(names.names.len());
+        assert!(!t.meets(&[id("a")]), "empty taint meets nothing");
+        t.add(id("a"));
+        assert!(t.meets(&[id("a"), id("b")]));
+        assert!(!t.meets(&[id("b"), id("c")]));
+        assert!(!t.meets(&[]), "an empty read set meets nothing");
+        assert!(
+            t.meets(&[ANY_ID]),
+            "a read of any name meets a non-empty taint"
+        );
+        t.add(ANY_ID);
+        assert!(t.meets(&[id("c")]), "a taint of any name meets every read");
     }
 
     /// The span set answers as a scan with `overlaps` does, for spans that

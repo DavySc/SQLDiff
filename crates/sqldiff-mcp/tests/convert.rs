@@ -20,6 +20,12 @@ fn write(p: &Path, text: &str) {
 
 /// Send each request and collect its response.
 fn session(messages: &[Value]) -> Vec<Value> {
+    session_paced(messages, 0)
+}
+
+/// [`session`] waiting `pause_ms` before each request after the second, so
+/// a background run has time to work between polls.
+fn session_paced(messages: &[Value], pause_ms: u64) -> Vec<Value> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_sqldiff-mcp"))
         .arg("--isolated")
         .env(
@@ -33,7 +39,10 @@ fn session(messages: &[Value]) -> Vec<Value> {
     let mut stdin = child.stdin.take().unwrap();
     let mut out = BufReader::new(child.stdout.take().unwrap());
     let mut responses = Vec::new();
-    for m in messages {
+    for (i, m) in messages.iter().enumerate() {
+        if i > 2 {
+            std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+        }
         writeln!(stdin, "{m}").unwrap();
         stdin.flush().unwrap();
         let mut line = String::new();
@@ -554,5 +563,192 @@ fn convert_tree_binds_against_base_catalogs_as_the_cli_does() {
     let report = std::fs::read_to_string(mcp_out.join("conversion-report.json")).unwrap();
     assert!(report.contains("\"base_catalogs\""), "{report}");
     assert!(!mcp_out.join("orders.sql").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn convert_tree_keeps_and_reuses_the_result_store() {
+    let d = scratch("store");
+    let src = d.join("src");
+    write(&src.join("a.sql"), "CREATE TABLE t (id int NOT NULL);\n");
+    write(&src.join("b.sql"), "SELECT id FROM t;\n");
+    let out = d.join("out");
+    let r = session(&[
+        call(
+            1,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": out }),
+        ),
+        // The same tree again: reused from the store, then verified in full.
+        call(
+            2,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": out, "overwrite": true, "recheck": "all" }),
+        ),
+        call(
+            3,
+            "conversion_queue",
+            json!({ "src": src, "to": "postgres", "out": out, "recheck": "none" }),
+        ),
+        call(
+            4,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "recheck": "sometimes" }),
+        ),
+        call(
+            5,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "select": { "paths": ["a.sql"] } }),
+        ),
+        call(
+            6,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": d.join("out2"), "select": { "paths": ["a.sql"] } }),
+        ),
+    ]);
+    let first = result(&r[0]);
+    let second = result(&r[1]);
+    assert!(out.join(".sqldiff").exists());
+    assert_eq!(first["files"], second["files"]);
+    result(&r[2]);
+    assert_eq!(r[3]["result"]["isError"], true, "{}", r[3]);
+    assert_eq!(r[4]["result"]["isError"], true, "{}", r[4]);
+    // An increment is planned: the plan is written beside the store.
+    result(&r[5]);
+    assert!(d.join("out2").join(".sqldiff/plan.json").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_background_run_reports_like_the_foreground_call_and_can_be_stopped() {
+    let d = scratch("background");
+    let src = d.join("src");
+    write(&src.join("a.sql"), "CREATE TABLE t (id int NOT NULL);\n");
+    write(&src.join("b.sql"), "SELECT id FROM t;\n");
+    let polls: Vec<Value> = (10..70)
+        .map(|i| call(i, "run_status", json!({ "run": "run-1" })))
+        .collect();
+    let mut msgs = vec![
+        call(
+            1,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": d.join("fg") }),
+        ),
+        call(
+            2,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": d.join("bg"), "background": true }),
+        ),
+        // Nothing else converts while it works; either refused or it was fast.
+        call(
+            3,
+            "conversion_queue",
+            json!({ "src": src, "to": "postgres", "out": d.join("bg") }),
+        ),
+    ];
+    msgs.extend(polls);
+    let r = session_paced(&msgs, 50);
+    let fg = result(&r[0]);
+    assert_eq!(result(&r[1])["state"], "running");
+    let fin = r[3..]
+        .iter()
+        .map(result)
+        .find(|v| v["state"] != "running" && v["state"] != "stopping")
+        .expect("the run finishes");
+    assert_eq!(fin["state"], "finished", "{fin}");
+    assert_eq!(fin["files"], fg["files"]);
+    assert_eq!(fin["run"], "run-1");
+
+    // Stopped at once: either cancelled with no output tree, or finished first.
+    let r = session(&[
+        call(
+            1,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": d.join("c"), "background": true }),
+        ),
+        call(2, "cancel_run", json!({ "run": "run-1" })),
+        call(3, "run_status", json!({ "run": "run-9" })),
+    ]);
+    result(&r[1]);
+    assert_eq!(r[2]["result"]["isError"], true);
+    let r = session(&[
+        call(
+            1,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": d.join("c2"), "background": true }),
+        ),
+        call(2, "cancel_run", json!({ "run": "run-1" })),
+        call(3, "run_status", json!({ "run": "run-1" })),
+    ]);
+    let s = result(&r[2]);
+    match s["state"].as_str().unwrap() {
+        "cancelled" => assert!(!d.join("c2/conversion-report.json").exists()),
+        "finished" | "running" | "stopping" => {}
+        other => panic!("{other}: {s}"),
+    }
+    // Argument checks.
+    let r = session(&[
+        call(
+            1,
+            "conversion_queue",
+            json!({ "src": src, "to": "postgres", "out": d.join("fg"), "select": { "paths": ["a.sql"] } }),
+        ),
+        call(
+            2,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": d.join("n"), "select": { "next": "two" } }),
+        ),
+    ]);
+    assert_eq!(r[0]["result"]["isError"], true);
+    assert_eq!(r[1]["result"]["isError"], true);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn the_server_waits_for_a_background_run_when_its_input_ends() {
+    let d = scratch("eof");
+    let src = d.join("src");
+    for i in 0..40 {
+        write(
+            &src.join(format!("f{i}.sql")),
+            &format!("CREATE TABLE t{i} (id int NOT NULL);\nSELECT id FROM t{i};\n"),
+        );
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sqldiff-mcp"))
+        .arg("--isolated")
+        .env(
+            "SQLDIFF_DATA_DIR",
+            std::env::temp_dir().join(format!("sqldiff-mcp-data-{}", std::process::id())),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let m = call(
+        1,
+        "convert_tree",
+        json!({ "src": src, "to": "postgres", "out": d.join("o"), "background": true }),
+    );
+    writeln!(stdin, "{m}").unwrap();
+    stdin.flush().unwrap();
+    let mut line = String::new();
+    out.read_line(&mut line).unwrap();
+    // The client goes away while the run works.
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    // Stopped before writing, or written whole: never a cut-off report.
+    let report = d.join("o/conversion-report.json");
+    if report.exists() {
+        let text = std::fs::read_to_string(&report).unwrap();
+        serde_json::from_str::<Value>(&text).expect("a whole report");
+    }
+    let r = session(&[call(
+        1,
+        "convert_tree",
+        json!({ "src": src, "to": "postgres", "out": d.join("o"), "overwrite": true }),
+    )]);
+    result(&r[0]);
     let _ = std::fs::remove_dir_all(&d);
 }

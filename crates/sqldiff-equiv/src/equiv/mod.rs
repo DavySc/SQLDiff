@@ -2351,7 +2351,7 @@ fn trigger_drop(
     let cat_t = t.1.catalog().ok_or("no catalog for the T-SQL side")?;
     let def_t = one(
         cat_t
-            .catalog
+            .catalog()
             .triggers_named(Dialect::Tsql, ts_schema, &ts_name.text),
         side_name(t.0).as_str(),
     )?;
@@ -2378,7 +2378,7 @@ fn trigger_drop(
     };
     let def_p = one(
         cat_p
-            .catalog
+            .catalog()
             .triggers
             .iter()
             .filter(|d| d.name == pname)
@@ -2410,7 +2410,7 @@ fn trigger_drop(
             func.join(".")
         ));
     }
-    if cat_p.catalog.triggers.iter().any(|d| {
+    if cat_p.catalog().triggers.iter().any(|d| {
         *d != def_p && d.function.as_ref().map(|f| fkey(&names(f, true))) == Some(fkey(dropped))
     }) {
         return Err("another PostgreSQL trigger runs the same function".into());
@@ -4800,6 +4800,7 @@ fn traced(
                 let g = align_certain(&sa, &sb);
                 out.pairs.extend(g.pairs);
                 out.ambiguous.extend(g.ambiguous);
+                out.over_bound |= g.over_bound;
             }
         }
     }
@@ -5168,6 +5169,7 @@ fn level(
     };
     out.beside.extend(al.beside);
     out.ambiguous.extend(al.ambiguous);
+    out.over_bound |= al.over_bound;
     let entry = |seq: &'_ [Entry], i: usize| -> Option<usize> {
         seq.iter().position(|e| match e {
             Entry::Leaf(x) => *x == i,
@@ -5559,21 +5561,31 @@ pub fn refine_modified(
     let ub = lower::lower_against(b, a.dialect());
     let ia = items(&ua, sa, true, ub.dialect);
     let ib = items(&ub, sb, true, ua.dialect);
-    let find = |items: &[Item], side: Side, f: &Finding| -> Option<usize> {
+    // The first item (not a marker) one of whose nodes starts at each byte
+    // offset: a finding names its statement by that offset, and a scan of
+    // all items per finding was quadratic in a long script.
+    let by_start = |items: &[Item]| -> BTreeMap<usize, usize> {
+        let mut m = BTreeMap::new();
+        for (i, it) in items.iter().enumerate() {
+            // IF and loop markers are not statements: an END or ELSE marker
+            // starts where its whole IF does, which a finding on the IF names.
+            if is_ctl(it) {
+                continue;
+            }
+            for n in &it.nodes {
+                m.entry(cst::sig_range(n).0).or_insert(i);
+            }
+        }
+        m
+    };
+    let (starts_a, starts_b) = (by_start(&ia), by_start(&ib));
+    let find = |starts: &BTreeMap<usize, usize>, side: Side, f: &Finding| -> Option<usize> {
         let loc = if side == Side::A {
             f.a.as_ref()?
         } else {
             f.b.as_ref()?
         };
-        // IF and loop markers are not statements: an END or ELSE marker
-        // starts where its whole IF does, which a finding on the IF names.
-        items.iter().position(|it| {
-            !is_ctl(it)
-                && it
-                    .nodes
-                    .iter()
-                    .any(|n| cst::sig_range(n).0 == loc.byte_start)
-        })
+        starts.get(&loc.byte_start).copied()
     };
     let mut keep = Vec::new();
     for f in findings.drain(..) {
@@ -5581,7 +5593,8 @@ pub fn refine_modified(
             keep.push(f);
             continue;
         }
-        let (Some(i), Some(j)) = (find(&ia, Side::A, &f), find(&ib, Side::B, &f)) else {
+        let (Some(i), Some(j)) = (find(&starts_a, Side::A, &f), find(&starts_b, Side::B, &f))
+        else {
             keep.push(f);
             continue;
         };

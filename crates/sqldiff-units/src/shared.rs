@@ -10,8 +10,6 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::Conversion;
-
 /// A string that equal copies share once pooled.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Shared(Arc<str>);
@@ -144,16 +142,6 @@ impl Pool {
             Some(kept) => s.0 = Arc::clone(kept),
             None => {
                 set.insert(Arc::clone(&s.0));
-            }
-        }
-    }
-
-    /// Every note of `c`'s units, shared.
-    pub fn share_notes(&self, c: &mut Conversion) {
-        for u in &mut c.units {
-            for n in &mut u.notes {
-                self.share(&mut n.rule);
-                self.share(&mut n.text);
             }
         }
     }

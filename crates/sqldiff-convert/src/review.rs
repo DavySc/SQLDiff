@@ -32,17 +32,13 @@ use sha2::{Digest, Sha256};
 use sqldiff_core::model::hex;
 
 use crate::{Conversion, Status, Unit};
+pub use sqldiff_units::ids::ids_of;
+use sqldiff_units::ids::lf;
 
 /// The ledger's file name, at the root of the converted tree.
 pub const LEDGER_FILE: &str = "review-decisions.jsonl";
 
-/// Who made a decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum By {
-    Human,
-    Agent,
-}
+pub use sqldiff_units::By;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -250,15 +246,6 @@ pub fn file_hash(text: &str) -> String {
     hex(&Sha256::digest(lf(text).as_bytes()))
 }
 
-/// `text` with every CRLF as LF (a lone CR is kept).
-fn lf(text: &str) -> std::borrow::Cow<'_, str> {
-    if text.contains("\r\n") {
-        text.replace("\r\n", "\n").into()
-    } else {
-        text.into()
-    }
-}
-
 /// A unit's id: its file, its input text and its output text. Units with the
 /// same file and texts are told apart by their order (`~2`, `~3`, ...).
 pub fn unit_ids(path: &str, input: &str, c: &Conversion) -> Vec<String> {
@@ -271,30 +258,6 @@ pub fn unit_ids(path: &str, input: &str, c: &Conversion) -> Vec<String> {
             )
         }),
     )
-}
-
-/// [`unit_ids`] from each unit's input and output text, with CRLF hashed as
-/// LF (see [`file_hash`]).
-pub fn ids_of<'a>(path: &str, units: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<String> {
-    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-    units
-        .map(|(src, out)| {
-            let mut h = Sha256::new();
-            h.update(path.as_bytes());
-            h.update([0u8]);
-            h.update(lf(src).as_bytes());
-            h.update([0u8]);
-            h.update(lf(out).as_bytes());
-            let base = format!("u{}", hex(&h.finalize()[..8]));
-            let n = seen.entry(base.clone()).or_insert(0);
-            *n += 1;
-            if *n == 1 {
-                base
-            } else {
-                format!("{base}~{n}")
-            }
-        })
-        .collect()
 }
 
 /// How a decision relates to the current conversion.

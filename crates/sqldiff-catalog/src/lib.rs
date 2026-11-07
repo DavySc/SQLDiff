@@ -157,6 +157,21 @@ pub struct Table {
     /// of its sources they stand for is not.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub star_outputs: bool,
+    /// A view whose column types are those of a single base table or view
+    /// read directly (no join, set operation, CTE or derived table), so
+    /// that a column listed with a known type has that type. Only such
+    /// types may be relied on; any other view's column types are a guess.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub types_from_source: bool,
+    /// With `types_from_source`: the stored name of the base table read, and
+    /// per column the source column its type was copied from (`None` for an
+    /// expression or an unresolved one). Lets a consumer check the types
+    /// against the table as it is *now*: a later ALTER COLUMN or a dropped
+    /// and re-created table leaves the view's copy stale.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_table: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_columns: Vec<Option<String>>,
     #[serde(default)]
     pub keys: Vec<Key>,
     #[serde(default)]
@@ -190,6 +205,9 @@ impl Table {
             columns: Vec::new(),
             columns_known: true,
             star_outputs: false,
+            types_from_source: false,
+            source_table: String::new(),
+            source_columns: Vec::new(),
             keys: Vec::new(),
             indexes: Vec::new(),
             triggers: Vec::new(),
@@ -634,7 +652,7 @@ pub fn table_position(d: Dialect, cat: &Catalog, parts: &[Ident]) -> Option<usiz
 #[derive(Debug, Clone)]
 pub struct CatalogView {
     pub dialect: Dialect,
-    pub catalog: Catalog,
+    catalog: Catalog,
     /// Whether any catalog was supplied for this side. Without one, persistent
     /// objects stay unresolved and become assumptions.
     pub supplied: bool,
@@ -666,6 +684,59 @@ impl CatalogView {
             index,
             indexed,
         }
+    }
+
+    /// The merged catalog. Read-only on purpose: the name index is built for
+    /// it, so every change goes through `put_table`, `put_routine` or
+    /// `apply_statement`, which keep the index current.
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
+    /// An empty view that objects are added to as they are created (a
+    /// binder's temporary tables and routines): looked up through the same
+    /// index, which each addition keeps current.
+    pub fn scratch(dialect: Dialect) -> CatalogView {
+        CatalogView::new(dialect, &[&Catalog::default()])
+    }
+
+    fn reindexed(&mut self) {
+        self.indexed = (self.catalog.tables.len(), self.catalog.routines.len());
+    }
+
+    /// Adds or replaces a table, as [`Catalog::put_table`].
+    pub fn put_table(&mut self, t: Table) {
+        if self.is_indexed() {
+            self.index.put_table(self.dialect, &mut self.catalog, t);
+        } else {
+            self.catalog.put_table(self.dialect, t);
+            self.index = NameIndex::new(self.dialect, &self.catalog);
+        }
+        self.reindexed();
+    }
+
+    /// Adds or replaces a routine, as [`Catalog::put_routine`].
+    pub fn put_routine(&mut self, r: Routine) {
+        if self.is_indexed() {
+            self.index.put_routine(self.dialect, &mut self.catalog, r);
+        } else {
+            self.catalog.put_routine(self.dialect, r);
+            self.index = NameIndex::new(self.dialect, &self.catalog);
+        }
+        self.reindexed();
+    }
+
+    /// Applies one DDL statement ([`ddl::apply_statement`]) to the view.
+    pub fn apply_statement(&mut self, t: &[crate::tokens::Tok]) {
+        if !self.is_indexed() {
+            self.index = NameIndex::new(self.dialect, &self.catalog);
+        }
+        ddl::apply_indexed(&mut self.catalog, &mut self.index, t, self.dialect);
+        self.reindexed();
+    }
+
+    fn is_indexed(&self) -> bool {
+        self.indexed == (self.catalog.tables.len(), self.catalog.routines.len())
     }
 
     /// Supplied tables are authoritative: a table that is not there does not exist.
@@ -843,8 +914,8 @@ mod tests {
                     "{d:?} {n}"
                 );
             }
-            let (f1, f2) = (ddl::load("CREATE FUNCTION f(p int) RETURNS int AS 'x'; CREATE FUNCTION f(p text) RETURNS int AS 'x'; CREATE FUNCTION f(p int) RETURNS int AS 'y'; CREATE FUNCTION f(a int, b int) RETURNS int AS 'z';", d, "t"), Catalog::default());
-            let _ = f2;
+            let f1 = ddl::load("CREATE FUNCTION f(p int) RETURNS int AS 'x'; CREATE FUNCTION f(p text) RETURNS int AS 'x'; CREATE FUNCTION f(p int) RETURNS int AS 'y'; CREATE FUNCTION f(a int, b int) RETURNS int AS 'z';", d, "t");
+            assert!(!f1.routines.is_empty(), "{d:?}: the functions load");
             let (mut plain, mut via) = (Catalog::default(), Catalog::default());
             let mut ix = NameIndex::new(d, &via);
             for r in f1.routines.iter().chain(&f1.routines) {
@@ -860,7 +931,7 @@ mod tests {
             let v = CatalogView::new(d, &[&plain]);
             for r in &plain.routines {
                 let Lookup::Found(found) = v.routines(&[Ident::new(r.name.clone(), true)]) else {
-                    continue;
+                    panic!("{d:?} {}: the routine is found", r.name);
                 };
                 let scan: Vec<&Routine> = plain
                     .routines

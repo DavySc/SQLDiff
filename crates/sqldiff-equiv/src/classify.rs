@@ -4,7 +4,7 @@ use sqldiff_syntax::{ast, Dialect, SyntaxKind, SyntaxNode, SyntaxToken};
 
 use crate::model::ChangeClass;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum StmtKind {
     Select,
     Insert,

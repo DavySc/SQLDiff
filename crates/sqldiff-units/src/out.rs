@@ -2,22 +2,22 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Note, Step};
+use crate::{Note, Step, Written};
 
 /// A unit before verification: byte ranges in input and output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct RawUnit {
+pub struct RawUnit {
     pub src: (usize, usize),
     pub out: (usize, usize),
     pub notes: Vec<Note>,
     /// The rewrites that produced this unit's output.
     pub trace: Vec<Step>,
     /// Set when a person or an agent wrote this unit's output by hand.
-    pub written: Option<crate::Written>,
+    pub written: Option<Written>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub(crate) struct Out {
+pub struct Out {
     pub text: String,
     pub units: Vec<RawUnit>,
 }
@@ -70,7 +70,7 @@ impl Out {
 /// blank lines are left empty. A line break inside a string literal is part
 /// of its value: the line after it is kept as it is, and a carriage return
 /// before it stays.
-pub(crate) fn indented(indent: usize, text: &str) -> String {
+pub fn indented(indent: usize, text: &str) -> String {
     let pad = " ".repeat(indent);
     let mut out = String::new();
     let mut parts: Vec<&str> = text.split('\n').collect();
@@ -99,7 +99,7 @@ pub(crate) fn indented(indent: usize, text: &str) -> String {
 /// For each line break of SQL text, in order: whether it falls inside a
 /// string literal (`'…'`, `''` inside it) or a quoted name (`"…"`). Line
 /// comments and nested block comments are skipped.
-pub(crate) fn quoted_breaks(text: &str) -> Vec<bool> {
+pub fn quoted_breaks(text: &str) -> Vec<bool> {
     #[derive(PartialEq)]
     enum In {
         Code,

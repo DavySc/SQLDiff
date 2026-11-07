@@ -58,7 +58,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("sqldiff-convert/src/job.rs", &["fs::"]),
     ("sqldiff-convert/src/queue.rs", &["fs::"]),
     ("sqldiff-convert/src/review.rs", &["fs::"]),
-    ("sqldiff-convert/src/shared.rs", &["Mutex"]),
+    ("sqldiff-units/src/shared.rs", &["Mutex"]),
     ("sqldiff-convert/src/store.rs", &["fs::", "thread::current"]),
     (
         "sqldiff-convert/src/tree.rs",
@@ -94,7 +94,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("sqldiff-model/src/profile.rs", &["OnceLock"]),
     ("sqldiff-core/src/lint.rs", &["OnceLock"]),
     ("sqldiff-core/src/rule_proofs.rs", &["OnceLock"]),
-    ("sqldiff-core/src/rules/rule.rs", &["OnceLock"]),
+    ("sqldiff-equiv/src/rules/rule.rs", &["OnceLock"]),
     ("sqldiff-model/src/target.rs", &["Mutex", "OnceLock"]),
 ];
 
@@ -135,6 +135,7 @@ fn the_check_reads_nothing_outside_its_arguments() {
         "sqldiff-model",
         "sqldiff-catalog",
         "sqldiff-equiv",
+        "sqldiff-units",
     ] {
         scan(&root.join(krate).join("src"), &root, &mut found);
     }
