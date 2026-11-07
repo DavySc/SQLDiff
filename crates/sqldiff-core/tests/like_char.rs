@@ -234,3 +234,19 @@ fn char_columns_through_temporal_reads_and_views() {
     assert!(matches!(v, Verdict::Different), "temporal control: {v:?}");
     assert!(bad.is_empty(), "shown Different:\n{}", bad.join("\n"));
 }
+
+/// An unqualified column of a join is typed by the table that has it: the
+/// other table lacking it does not make it may-be-char.
+#[test]
+fn an_unqualified_column_in_a_join_is_typed_by_its_own_table() {
+    let ddl = |ty: &str| {
+        format!("CREATE TABLE t (id integer PRIMARY KEY, c {ty} NOT NULL); CREATE TABLE u (uid integer PRIMARY KEY, x integer);")
+    };
+    let f = |pat: &str| {
+        format!("CREATE FUNCTION g(p_id integer) RETURNS integer LANGUAGE plpgsql AS $$ DECLARE r integer; BEGIN SELECT count(*) INTO r FROM t JOIN u ON u.uid = t.id WHERE t.id = p_id AND c = 'abc' AND c LIKE {pat}; RETURN r; END $$;")
+    };
+    let v = verdict(&ddl("varchar(6)"), &f("'abc'"), &f("'zzzzzzz'"));
+    assert!(matches!(v, Verdict::Different), "varchar control: {v:?}");
+    let v = verdict(&ddl("char(6)"), &f("'abc'"), &f("'zzzzzzz'"));
+    assert!(!matches!(v, Verdict::Different), "char(6): {v:?}");
+}

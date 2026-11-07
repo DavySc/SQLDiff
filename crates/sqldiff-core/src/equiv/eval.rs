@@ -1706,22 +1706,23 @@ impl Ctx<'_> {
     /// Whether column `col` of the table read `table` (a key as
     /// [`Self::column`] takes it) may be `char(n)`. A table function's column
     /// is typed by its WITH schema; a temporal read (`t FOR SYSTEM_TIME AS OF
-    /// x`) by the catalog of `t`. A view, or a table or column the catalog
-    /// does not type, counts as may-be.
+    /// x`) by the catalog of `t`. A view, or a table the catalog does not
+    /// know, counts as may-be; a table it knows that lacks the column does not.
     fn base_may_be_char(&self, table: &str, col: &str) -> bool {
         if let Some(schema) = self.func_schema.get(table) {
+            // Typed by its WITH schema: a column it lacks is not this one.
             return schema
                 .iter()
-                .find(|(c, _)| c == col)
-                .map_or(true, |(_, t)| {
-                    Ty::from_type(t, self.d, false).fam == Fam::Char
-                });
+                .any(|(c, t)| c == col && Ty::from_type(t, self.d, false).fam == Fam::Char);
         }
         let base = table.split(' ').next().unwrap_or(table);
-        self.schema
-            .table(base)
-            .and_then(|t| t.column(col))
-            .map_or(true, |c| c.ty.fam == Fam::Char)
+        match self.schema.table(base) {
+            // Unknown to the catalog (a view, say): may be anything.
+            None => true,
+            // Known: only a column it has can be this one. A table without
+            // the column is another table of a join.
+            Some(t) => t.column(col).is_some_and(|c| c.ty.fam == Fam::Char),
+        }
     }
 
     fn var_may_be_char(&self, key: &str) -> bool {
