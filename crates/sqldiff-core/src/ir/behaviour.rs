@@ -2036,6 +2036,7 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
 
 /// The analysis of one pair of routines (or, with `None`, of the statements
 /// outside any routine).
+#[allow(clippy::too_many_arguments)]
 fn analyze_pair(
     a: &Analyzed,
     b: &Analyzed,
