@@ -3,7 +3,7 @@
 How `sqldiff diff` (and `tree`, `pairs`, `queue`) decides that a routine in one
 dialect behaves like its counterpart in another, and what an "equal under
 assumptions" relies on. Statement-level comparison itself is described in
-`crates/sqldiff-core/src/equiv`; this page covers the routine around the
+`crates/sqldiff-equiv/src/equiv`; this page covers the routine around the
 statements and the names inside them.
 
 ## Routine options

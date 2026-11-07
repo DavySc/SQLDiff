@@ -1,6 +1,6 @@
 # OPENJSON probes
 
-These probes check the PostgreSQL rule for `OPENJSON … WITH` in FROM: `openjson_pg` in `crates/sqldiff-convert/src/tsql.rs` and `pg_json_rows` / `json_rows` in `crates/sqldiff-core/src/equiv/canon.rs`. They were run on SQL Server 2022 and PostgreSQL 18.6 on 2026-10-29.
+These probes check the PostgreSQL rule for `OPENJSON … WITH` in FROM: `openjson_pg` in `crates/sqldiff-convert/src/tsql.rs` and `pg_json_rows` / `json_rows` in `crates/sqldiff-equiv/src/equiv/canon.rs`. They were run on SQL Server 2022 and PostgreSQL 18.6 on 2026-10-29.
 
 - **SQL Server** (`sqlcmd -C -I -W -s'|'`):
   - `ms1.sql`: row shapes, lax and strict paths, keys, duplicates and conversions.
