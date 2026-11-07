@@ -487,9 +487,10 @@ pub mod pairs;
 
 const MAX_PATHS: usize = 128;
 const MAX_STEPS: usize = 4000;
-/// Ticks and memo entries a run with path joining may use before it stops
-/// forking (like the path budget): what the longest run without joining
-/// could use is `MAX_PATHS * MAX_STEPS`.
+/// Ticks a run with path joining may use before it stops forking (like the
+/// path budget): what the longest run without joining could use is
+/// `MAX_PATHS * MAX_STEPS`. Memo entries are capped separately and only
+/// where they are made (`Interp::joins`).
 const JOIN_TICKS: usize = 200_000;
 const JOIN_ENTRIES: usize = 10_000;
 const JOIN_KEY_BYTES: usize = 16 * 1024;
@@ -541,6 +542,8 @@ struct Join {
     /// Number of the tick the machine runs next.
     tick: usize,
     joined: usize,
+    /// Tick of the arrival whose entry the last dropped path joined.
+    last_arrived: usize,
 }
 
 #[derive(Clone)]
@@ -575,6 +578,7 @@ impl Join {
             open: Vec::new(),
             tick: 0,
             joined: 0,
+            last_arrived: 0,
         }
     }
 
@@ -928,7 +932,17 @@ impl Explorer {
             it.tick(&mut m);
             // A path dropped by joining ran nothing: a replay must not merge
             // into it (its outcomes are the joined path's).
-            if m.join.as_ref().map_or(0, |j| j.joined) > joined_before {
+            // Every open tick after the joined entry's arrival is
+            // on the dropped path's own segment (not an ancestor of the kept
+            // path): its outcome slice lacks the dropped continuation, so a
+            // replay must not merge into it either.
+            if let Some(j) = m.join.as_ref().filter(|j| j.joined > joined_before) {
+                for &o in open.iter().rev() {
+                    if o <= j.last_arrived {
+                        break;
+                    }
+                    ticks[o].dropped = true;
+                }
                 ticks[t].dropped = true;
             }
             t += 1;
@@ -1561,12 +1575,12 @@ impl Interp<'_> {
             Step::Fork(mut v) => {
                 let (n, mut s) = v.remove(0);
                 // Paths dropped by joining are not outcomes, so the path budget
-                // alone does not bound the work of a joined run: its ticks and
-                // the memo are bounded the same way (work budget).
-                let over = m
-                    .join
-                    .as_ref()
-                    .is_some_and(|j| j.tick >= JOIN_TICKS || j.memo.borrow().len() >= JOIN_ENTRIES);
+                // alone does not bound the work of a joined run: its ticks are
+                // bounded the same way (work budget). The memo's size is not
+                // read here: a re-run from a checkpoint sees the finished
+                // memo, so a size test would stop forking earlier than the
+                // run that made it (`entries are capped where they are made`).
+                let over = m.join.as_ref().is_some_and(|j| j.tick >= JOIN_TICKS);
                 if m.work.len() + m.outs.len() + v.len() < MAX_PATHS && !over {
                     m.work.extend(v);
                 } else {
@@ -1611,7 +1625,10 @@ impl Interp<'_> {
         let key = (node, Rc::<str>::from(text));
         let mut memo = j.memo.borrow_mut();
         let Some(e) = memo.get(&key) else {
-            if j.live {
+            // Entries are capped where they are made, never where they are
+            // read: a full memo only stops new entries, which every re-run
+            // (it makes none) sees as absent before their arrival too.
+            if j.live && memo.len() < JOIN_ENTRIES {
                 memo.insert(
                     key.clone(),
                     JoinEntry {
@@ -1643,6 +1660,7 @@ impl Interp<'_> {
             return false;
         }
         j.joined += 1;
+        j.last_arrived = e.arrived;
         true
     }
 

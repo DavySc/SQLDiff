@@ -116,12 +116,17 @@ was.
   continuation fits wherever the earlier one did. The path budget counts
   outcomes, so dropped paths free it: more of the routine is explored, and a
   routine still over the budget cuts different branches than before.
-* A run with joining is bounded like one without: 200,000 ticks and 10,000
-  memo entries, after which it stops forking (an `imprecise` path budget cut).
+* A run with joining is bounded like one without: after 200,000 ticks it
+  stops forking (an `imprecise` path budget cut). The memo holds at most
+  10,000 entries; a full memo only stops *making* entries (a re-run makes
+  none, and sees an entry absent before its arrival either way), so the size
+  of the memo never changes where a re-run forks.
 * The memo belongs to the `Explorer` and is shared with its checkpoints; an
   entry is visible from the tick its subtree finished, so a re-run from a
-  checkpoint drops the same paths. The ticks of dropped paths are never merge
-  targets for a fault replay (their outcomes are the earlier path's), and the
+  checkpoint drops the same paths. No tick on the segment of a dropped path
+  is a merge target for a fault replay: the joined tick and every tick opened
+  after the entry's arrival (their outcome slices lack the dropped
+  continuation, which is the earlier path's). The
   replay itself does not join. Joining is a property of the pair: the same
   routine against another counterpart may explore differently.
 
