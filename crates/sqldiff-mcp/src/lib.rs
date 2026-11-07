@@ -93,10 +93,16 @@ pub struct Server {
     trees: Vec<(String, tree::Tree)>,
     /// Trees converted in this session, for ids.
     tree_count: usize,
+    /// Resolves the configuration again (`reload_config`); set by the
+    /// binary, which knows where the configuration comes from.
+    reload: Option<Reloader>,
     /// Background `convert_tree` runs, oldest first.
     runs: Vec<Run>,
     run_count: usize,
 }
+
+/// Resolves the configuration again from the sources the server started with.
+pub type Reloader = Box<dyn Fn() -> Result<Resolved, String>>;
 
 /// What a background run returns: the tree, and the report files written.
 type RunResult = Result<(tree::Tree, Option<(std::path::PathBuf, std::path::PathBuf)>), String>;
@@ -161,6 +167,12 @@ impl Server {
         Ok(Self::build(config, gui_url, store))
     }
 
+    /// Lets `reload_config` resolve the configuration again.
+    pub fn with_reloader(mut self, reload: Reloader) -> Self {
+        self.reload = Some(reload);
+        self
+    }
+
     fn build(config: Resolved, gui_url: Option<String>, store: Store) -> Self {
         Server {
             config,
@@ -171,6 +183,7 @@ impl Server {
             store,
             trees: Vec::new(),
             tree_count: 0,
+            reload: None,
             runs: Vec::new(),
             run_count: 0,
         }
@@ -298,6 +311,8 @@ impl Server {
             "run_status" => self.run_status(args),
             "cancel_run" => self.cancel_run(args),
             "compare_runs" => self.compare_runs(args),
+            "engine" => self.engine(args),
+            "reload_config" => self.reload_config(args),
             _ => return None,
         })
     }
@@ -1546,6 +1561,91 @@ impl Server {
             .ok_or_else(|| format!("no run `{id}` in this session (the last {RUN_LIMIT} are kept)"))
     }
 
+    /// The configuration layers and packs in effect, each with the hash of
+    /// its content.
+    fn config_state(&self) -> Value {
+        json!({
+            "layers": self.config.layers.iter().map(|l| json!({
+                "kind": l.kind, "name": l.name, "version": l.version, "hash": l.hash,
+            })).collect::<Vec<_>>(),
+            "packs": self.config.packs.iter().map(|p| json!({
+                "path": p.path, "hash": p.hash,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// What this server runs: the engine's fingerprints (a hash of the
+    /// sources and settings that decide a conversion result, from the build)
+    /// and the configuration in effect. After a rebuild and a restart the
+    /// fingerprints show whether the new engine is the one running, and
+    /// stored results made by an engine with the same check fingerprint are
+    /// still reused.
+    fn engine(&self, _args: &Value) -> Result<(String, Value), String> {
+        let fp = json!({
+            "version": TOOL_VERSION,
+            "engine_fingerprint": sqldiff_convert::ENGINE_FINGERPRINT,
+            "check_fingerprint": sqldiff_convert::CHECK_FINGERPRINT,
+            "engine_crates": sqldiff_convert::FINGERPRINTED_CRATES,
+            "check_crates": sqldiff_convert::CHECK_FINGERPRINTED_CRATES,
+            "config": self.config_state(),
+            "can_reload_config": self.reload.is_some(),
+        });
+        let text = format!(
+            "sqldiff {TOOL_VERSION}\nengine fingerprint {}\ncheck fingerprint  {}\n{} configuration layer(s), {} pack(s)\n",
+            sqldiff_convert::ENGINE_FINGERPRINT,
+            sqldiff_convert::CHECK_FINGERPRINT,
+            self.config.layers.len(),
+            self.config.packs.len()
+        );
+        Ok((text, fp))
+    }
+
+    /// Resolves the configuration (config files, packs) again without a
+    /// restart, so a pack or config edit takes effect in the next call. A
+    /// configuration that does not load changes nothing. Stored conversion
+    /// results are unaffected: their keys hold what the packs contribute to
+    /// a check (helpers, rules), so a changed pack misses exactly the
+    /// results it can change. Trees already converted in this session keep
+    /// the configuration they were converted under.
+    fn reload_config(&mut self, _args: &Value) -> Result<(String, Value), String> {
+        if self
+            .runs
+            .iter()
+            .any(|r| r.handle.as_ref().is_some_and(|h| !h.is_finished()))
+        {
+            return Err(
+                "a background run is working: reload when it has finished or been cancelled"
+                    .to_string(),
+            );
+        }
+        let Some(reload) = &self.reload else {
+            return Err("this server cannot reload its configuration".to_string());
+        };
+        let fresh = reload()?;
+        let before = self.config_state();
+        // Rebuild the review store from the fresh configuration before assigning anything, so
+        // an unresolvable data key is refused exactly as at startup and leaves the old state.
+        let store = Store::from_config(&fresh).map_err(|e| e.0)?;
+        self.config = fresh;
+        self.store = store;
+        let after = self.config_state();
+        let changed = before != after;
+        let text = format!(
+            "Configuration reloaded: {} layer(s), {} pack(s); {}.\n",
+            self.config.layers.len(),
+            self.config.packs.len(),
+            if changed {
+                "something changed"
+            } else {
+                "nothing changed"
+            }
+        );
+        Ok((
+            text,
+            json!({ "changed": changed, "before": before, "after": after }),
+        ))
+    }
+
     /// What changed between two conversions (`sqldiff_convert::compare`):
     /// units that improved, regressed, changed, appeared or went. Each side
     /// is a tree id of this session or a `conversion-report.json` (or the
@@ -2459,6 +2559,20 @@ fn tools() -> Value {
                 "properties": { "run": { "type": "string", "description": "Run id from `convert_tree`" } },
                 "required": ["run"],
             },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
+        },
+        {
+            "name": "engine",
+            "title": "Engine and configuration in effect",
+            "description": "What this server runs: the tool version, the engine fingerprint and the check fingerprint (hashes of the sources and settings that decide a conversion, fixed at build time; stored results are keyed by them), the crates each covers, and the configuration layers and packs in effect with their content hashes. After `cargo build` and a restart, compare with an earlier answer to see which engine is running; results stored by an engine with the same check fingerprint are reused.",
+            "inputSchema": { "type": "object", "properties": {} },
+            "annotations": ro,
+        },
+        {
+            "name": "reload_config",
+            "title": "Reload packs and configuration",
+            "description": "Resolve the configuration (project and user config, packs) again from the sources this server started with, without a restart; the next call uses it. A configuration that fails to load changes nothing. Returns whether the layers or packs changed, before and after, with content hashes. Conversions already made in this session keep the configuration they were made under; stored results need no handling, since their keys hold what packs contribute to a check. Refused while a background run works.",
+            "inputSchema": { "type": "object", "properties": {} },
             "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
         },
         {
