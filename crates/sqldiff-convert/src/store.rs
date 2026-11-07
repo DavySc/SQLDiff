@@ -573,7 +573,8 @@ impl Store {
     /// follow, so a reader that sees the reads sees the result. An entry
     /// already stored under the same id is left as it is: a second check
     /// with the same reads must give the same bytes, and `Put::Differs`
-    /// reports that it did not.
+    /// reports that it did not. A `--fresh` run (`replace`) does not trust the
+    /// store and writes its results over whatever is there.
     pub fn put(
         &self,
         key: &Key,
@@ -581,6 +582,7 @@ impl Store {
         mix: Option<&crate::check::Mix>,
         mix_tried: bool,
         reads: &Reads,
+        replace: bool,
     ) -> Result<(EntryRef, Put), String> {
         let id = entry_id(reads, mix_tried);
         let mut value = serde_json::to_value(c).map_err(|e| e.to_string())?;
@@ -605,6 +607,9 @@ impl Store {
             Ok(old) if verified_body(&old).is_some() => {
                 if old == bytes {
                     Put::Same
+                } else if replace {
+                    write_atomically(&dest, &bytes)?;
+                    Put::Written
                 } else {
                     return Ok((entry, Put::Differs));
                 }

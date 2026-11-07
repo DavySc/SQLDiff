@@ -1774,7 +1774,10 @@ fn convert_files(
                 // stored.
                 eprintln!("sqldiff: result not stored: the catalog answered {q:?} two ways");
             } else {
-                match cc.store.put(k, &c, mix.as_ref(), rebuild.is_some(), &reads) {
+                match cc
+                    .store
+                    .put(k, &c, mix.as_ref(), rebuild.is_some(), &reads, cc.fresh)
+                {
                     Ok((e, crate::store::Put::Differs)) => {
                         // Same reads, other bytes: not an entry to keep.
                         if let Some((old, ..)) = cc.store.get(&e) {

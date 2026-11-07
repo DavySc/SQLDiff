@@ -273,6 +273,20 @@ fn thread_count_store_and_folder_never_change_the_output() {
 /// change: the converted files, the review queue (reasons) and the names of
 /// the stored results (their keys). The reports list the base catalog files
 /// by the path they were given, so they are left out.
+/// The stored flag files: `<result key>/<entry id>/<flags key>.json`.
+fn flag_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        if e.path().is_dir() {
+            out.extend(flag_files(&e.path()));
+        } else {
+            out.push(e.path());
+        }
+    }
+    out.sort();
+    out
+}
+
 fn location_free(f: &Fixture, out: &str) -> Vec<(String, String)> {
     let mut v: Vec<(String, String)> = tree_of(&f.out(out))
         .into_iter()
@@ -498,10 +512,8 @@ fn stand_in_flags_come_from_the_store_without_changing_the_output() {
         same(&base, &tree_of(&f.out("a")), "resumed with stored flags");
     }
     // A stored flag set that does not read back is computed again.
-    for e in std::fs::read_dir(&flags).unwrap().flatten() {
-        for g in std::fs::read_dir(e.path()).unwrap().flatten() {
-            std::fs::write(g.path(), b"not json").unwrap();
-        }
+    for g in flag_files(&flags) {
+        std::fs::write(g, b"not json").unwrap();
     }
     run(&f, &c, "a", 2, Select::default(), false);
     same(&base, &tree_of(&f.out("a")), "unreadable flags");
@@ -528,11 +540,9 @@ fn a_checked_again_file_must_give_the_stored_stand_in_flags() {
     let flags = f.out("a").join(".sqldiff/flags");
     // A flag set that reads back but is not what the file gives now.
     let mut changed = 0;
-    for e in std::fs::read_dir(&flags).unwrap().flatten() {
-        for g in std::fs::read_dir(e.path()).unwrap().flatten() {
-            std::fs::write(g.path(), framed(b"[]")).unwrap();
-            changed += 1;
-        }
+    for g in flag_files(&flags) {
+        std::fs::write(g, framed(b"[]")).unwrap();
+        changed += 1;
     }
     assert!(changed > 0);
     // Every file is checked again (`--fresh`): the flags are compared.
@@ -589,13 +599,8 @@ fn mismatches_are_all_reported_in_a_fixed_order() {
     let mut texts = Vec::new();
     for (tag, jobs) in [("m1", 1), ("m4", 4), ("m7", 7)] {
         snapshot(tag);
-        for e in std::fs::read_dir(f.out(tag).join(".sqldiff/flags"))
-            .unwrap()
-            .flatten()
-        {
-            for g in std::fs::read_dir(e.path()).unwrap().flatten() {
-                std::fs::write(g.path(), framed(b"[]")).unwrap();
-            }
+        for g in flag_files(&f.out(tag).join(".sqldiff/flags")) {
+            std::fs::write(g, framed(b"[]")).unwrap();
         }
         let mut job = f.job(tag, jobs, Select::default(), c.to, c.catalogs);
         job.fresh = true;
