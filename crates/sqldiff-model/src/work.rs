@@ -115,6 +115,34 @@ thread_local! {
     static DEPTH: Cell<usize> = const { Cell::new(0) };
     /// Open [`muted`] sections: counts are dropped while it is above 0.
     static MUTED: Cell<usize> = const { Cell::new(0) };
+    /// Behaviour units open on this thread ([`UnitPhase`]).
+    static UNITS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Marks a behaviour unit as open while it lives. The statement-level
+/// [`Allowance`] and the behaviour model's caps count disjoint phases of a
+/// diff, so no statement-level spend may happen inside a unit: a debug
+/// assertion in [`Allowance`] checks it, and a later change cannot make one
+/// budget pay for the other's work unnoticed.
+#[derive(Debug)]
+pub struct UnitPhase(());
+
+impl UnitPhase {
+    pub fn open() -> UnitPhase {
+        UNITS.with(|u| u.set(u.get() + 1));
+        UnitPhase(())
+    }
+}
+
+impl Drop for UnitPhase {
+    fn drop(&mut self) {
+        UNITS.with(|u| u.set(u.get() - 1));
+    }
+}
+
+/// Whether a behaviour unit is open on this thread.
+pub fn unit_open() -> bool {
+    UNITS.with(|u| u.get() > 0)
 }
 
 /// Events counted with no scope open: an entry point nobody metered. Once a
@@ -184,11 +212,19 @@ impl Allowance {
 
     /// Whether `n` more units may be spent.
     pub fn allows(&self, n: u64) -> bool {
+        debug_assert!(
+            !unit_open() || !self.is_on(),
+            "a statement-level allowance was used inside a behaviour unit"
+        );
         self.left.get().map_or(true, |l| n <= l)
     }
 
     /// Spends `n` units (saturating); nothing when the allowance is off.
     pub fn take(&self, n: u64) {
+        debug_assert!(
+            !unit_open() || !self.is_on(),
+            "a statement-level allowance was used inside a behaviour unit"
+        );
         if let Some(l) = self.left.get() {
             self.left.set(Some(l.saturating_sub(n)));
         }
@@ -339,5 +375,33 @@ mod tests {
         assert!(r.is_err());
         let (_, w) = scope("after", || ());
         assert_eq!(w.total(), 0);
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod phase_tests {
+    use super::*;
+
+    #[test]
+    fn an_allowance_that_is_off_is_fine_inside_a_unit() {
+        let _u = UnitPhase::open();
+        assert!(Allowance::new(None).allows(5));
+    }
+
+    #[test]
+    #[should_panic(expected = "inside a behaviour unit")]
+    fn a_statement_level_allowance_inside_a_unit_is_refused() {
+        let _u = UnitPhase::open();
+        Allowance::new(Some(10)).take(1);
+    }
+
+    #[test]
+    fn the_phase_closes_with_its_guard() {
+        {
+            let _u = UnitPhase::open();
+            assert!(unit_open());
+        }
+        assert!(!unit_open());
+        Allowance::new(Some(10)).take(1);
     }
 }
