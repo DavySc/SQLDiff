@@ -228,7 +228,7 @@ const POOL_MIN: usize = 40;
 /// Starts a marker. A real string starting with it is written with one more.
 const MARK: char = '\u{1}';
 
-fn count(v: &serde_json::Value, seen: &mut std::collections::HashMap<String, usize>) {
+fn count(v: &serde_json::Value, seen: &mut std::collections::BTreeMap<String, usize>) {
     match v {
         serde_json::Value::String(s) if s.len() >= POOL_MIN => {
             *seen.entry(s.clone()).or_default() += 1;
@@ -239,7 +239,7 @@ fn count(v: &serde_json::Value, seen: &mut std::collections::HashMap<String, usi
     }
 }
 
-fn replace(v: &mut serde_json::Value, index: &std::collections::HashMap<&str, usize>) {
+fn replace(v: &mut serde_json::Value, index: &std::collections::BTreeMap<&str, usize>) {
     match v {
         serde_json::Value::String(s) => {
             if let Some(i) = index.get(s.as_str()) {
@@ -256,7 +256,7 @@ fn replace(v: &mut serde_json::Value, index: &std::collections::HashMap<&str, us
 
 /// Moves the strings that repeat into a pool. Object keys are not touched.
 fn intern(mut v: serde_json::Value) -> (Vec<String>, serde_json::Value) {
-    let mut seen = std::collections::HashMap::new();
+    let mut seen = std::collections::BTreeMap::new();
     count(&v, &mut seen);
     let mut pool: Vec<String> = seen
         .into_iter()
@@ -264,7 +264,7 @@ fn intern(mut v: serde_json::Value) -> (Vec<String>, serde_json::Value) {
         .map(|(s, _)| s)
         .collect();
     pool.sort();
-    let index: std::collections::HashMap<&str, usize> = pool
+    let index: std::collections::BTreeMap<&str, usize> = pool
         .iter()
         .enumerate()
         .map(|(i, s)| (s.as_str(), i))
@@ -285,7 +285,7 @@ fn share_notes(v: &mut serde_json::Value) {
         return;
     };
     let mut table: Vec<serde_json::Value> = Vec::new();
-    let mut at: std::collections::HashMap<String, usize> = Default::default();
+    let mut at: std::collections::BTreeMap<String, usize> = Default::default();
     for u in units.iter_mut() {
         let Some(notes) = u.get_mut("notes").and_then(|n| n.as_array_mut()) else {
             continue;
@@ -433,7 +433,7 @@ impl Store {
     /// program, which no later run of this tree can use. Files that are not
     /// results are left alone, except a temporary file of a killed write
     /// older than an hour. Returns how many were removed.
-    pub fn gc(&self, live: &std::collections::HashSet<String>) -> usize {
+    pub fn gc(&self, live: &std::collections::BTreeSet<String>) -> usize {
         let Ok(dir) = crate::tree::dest_under(&self.out, DIR) else {
             return 0;
         };

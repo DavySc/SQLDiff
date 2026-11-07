@@ -1086,11 +1086,27 @@ impl Explorer {
 /// the fault-free run.
 const MAX_MERGE_TRIES: usize = 16;
 
+/// 64-bit FNV-1a as a `Hasher`: the same value on every build, platform and
+/// Rust version, unlike `DefaultHasher`, whose algorithm is not promised.
+struct Fnv64(u64);
+
+impl std::hash::Hasher for Fnv64 {
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = (self.0 ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 /// Hash of the small part of the run state, to find the fault-free steps a
 /// path may merge into without comparing whole states.
 fn small_hash(st: &State) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = Fnv64(0xcbf2_9ce4_8422_2325);
     (
         st.depth,
         st.caller_depth,

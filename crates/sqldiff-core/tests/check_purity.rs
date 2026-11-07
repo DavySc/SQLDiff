@@ -38,6 +38,11 @@ const PATTERNS: &[&str] = &[
     "OnceLock",
     "OnceCell",
     "Mutex",
+    // Nothing the check computes may depend on a per-process hash seed or
+    // on which thread runs it.
+    "DefaultHasher",
+    "RandomState",
+    "thread::current",
 ];
 
 const ALLOWED: &[(&str, &[&str])] = &[
@@ -52,7 +57,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("sqldiff-convert/src/queue.rs", &["fs::"]),
     ("sqldiff-convert/src/review.rs", &["fs::"]),
     ("sqldiff-convert/src/shared.rs", &["Mutex"]),
-    ("sqldiff-convert/src/store.rs", &["SystemTime", "fs::"]),
+    ("sqldiff-convert/src/store.rs", &["fs::", "thread::current"]),
     (
         "sqldiff-convert/src/tree.rs",
         &["Instant::now", "Mutex", "OnceLock", "fs::"],

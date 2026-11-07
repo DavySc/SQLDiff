@@ -28,7 +28,7 @@
 //! target dialect), side B holds exactly that instead: nothing is converted
 //! or flagged, and a base object it lacks does not bind on side B.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -76,7 +76,7 @@ pub fn read_b(paths: &[PathBuf], a: &[PathBuf], no_catalog: bool) -> Result<Vec<
 }
 
 fn read_files(paths: &[PathBuf], flag: &str, side: &str) -> Result<Vec<File>, String> {
-    let mut seen = HashSet::new();
+    let mut seen = BTreeSet::new();
     let mut files = Vec::new();
     for p in paths {
         let path = p.display().to_string();
@@ -546,7 +546,7 @@ pub fn prepare(
         node.defines.iter().map(|o| &o.key).chain(&node.touches)
     };
     let mut suspect: Vec<(Key, Seen)> = Vec::new();
-    let mut failed: HashSet<usize> = HashSet::new();
+    let mut failed: BTreeSet<usize> = BTreeSet::new();
     for (i, seen) in own.iter().enumerate() {
         if seen.status > Status::Assumptions {
             failed.insert(i);
@@ -849,7 +849,7 @@ type Exact = (Option<String>, String);
 /// that is not `own`'s own.
 fn shadow(cat: &mut Catalog, own: &Catalog, d: Dialect) {
     let exact = |s: &Option<String>, n: &str| (s.as_deref().map(|s| key(d, s)), key(d, n));
-    let mut tables: HashMap<String, Vec<(Key, Exact)>> = HashMap::new();
+    let mut tables: BTreeMap<String, Vec<(Key, Exact)>> = BTreeMap::new();
     for t in &own.tables {
         let k = Key::new(d, false, t.schema.as_deref(), &t.name);
         tables
@@ -865,8 +865,8 @@ fn shadow(cat: &mut Catalog, own: &Catalog, d: Dialect) {
         let e = exact(&t.schema, &t.name);
         !list.iter().any(|(o, _)| o.same(&k)) || list.iter().any(|(_, oe)| *oe == e)
     });
-    let mut routines: HashMap<String, Vec<Key>> = HashMap::new();
-    let mut mine: HashSet<String> = HashSet::new();
+    let mut routines: BTreeMap<String, Vec<Key>> = BTreeMap::new();
+    let mut mine: BTreeSet<String> = BTreeSet::new();
     for r in &own.routines {
         let k = Key::new(d, true, r.schema.as_deref(), &r.name);
         routines.entry(k.name.clone()).or_default().push(k);

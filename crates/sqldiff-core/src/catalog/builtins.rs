@@ -65,6 +65,7 @@ pub struct Helper {
     pub returns: Option<String>,
 }
 
+#[allow(clippy::disallowed_methods)] // hash order cannot reach an output: extends a set
 fn all() -> &'static [Builtins; 3] {
     static ALL: OnceLock<[Builtins; 3]> = OnceLock::new();
     ALL.get_or_init(|| {

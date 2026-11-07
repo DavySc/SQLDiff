@@ -9,7 +9,7 @@
 //! it needs (a note), or refuses, in which case the unit is kept as a comment
 //! and marked not converted. Behavioural checks are left to the engine.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use sqldiff_syntax::{Dialect, SyntaxElement, SyntaxKind, SyntaxNode};
 use SyntaxKind::*;
@@ -109,15 +109,15 @@ pub(crate) fn convert(
         loops: Vec::new(),
         labels: 0,
         cursors: Vec::new(),
-        cursor_plans: HashMap::new(),
+        cursor_plans: BTreeMap::new(),
         xact_abort: false,
         seen_work: false,
-        tables: HashMap::new(),
+        tables: BTreeMap::new(),
         routine: None,
         routine_parts: Vec::new(),
         rolls_back: false,
         savepoints: Vec::new(),
-        vars: HashMap::new(),
+        vars: BTreeMap::new(),
         notes: Vec::new(),
         trace: Vec::new(),
         stepped: 0,
@@ -161,7 +161,7 @@ pub(crate) fn convert(
         in_table_check: false,
         table_items: Vec::new(),
         left_out_indexes: Vec::new(),
-        alias_types: HashMap::new(),
+        alias_types: BTreeMap::new(),
         update_ctes: Vec::new(),
         stmt_ctes: Vec::new(),
         stmt_insert: false,
@@ -406,7 +406,7 @@ struct Cx<'a> {
     cursors: Vec<Decl>,
     /// PostgreSQL: the cursor loops of this routine or script, by lower-case
     /// cursor name: the plan its statements follow, or why it is refused.
-    cursor_plans: HashMap<String, Result<CursorPlan, String>>,
+    cursor_plans: BTreeMap<String, Result<CursorPlan, String>>,
     /// Db2: `SET XACT_ABORT ON` seen; the routine gets an EXIT handler that
     /// rolls back and resignals.
     xact_abort: bool,
@@ -414,7 +414,7 @@ struct Cx<'a> {
     seen_work: bool,
     /// Table variables (lower-case name without `@`) → the temporary table
     /// they became (`SESSION.tv_…` on Db2 for i, `pg_temp.tv_…` on PostgreSQL).
-    tables: HashMap<String, String>,
+    tables: BTreeMap<String, String>,
     /// Name of the routine being converted: part of its table variables'
     /// temporary table names (`classify::table_variable_table`).
     routine: Option<String>,
@@ -426,7 +426,7 @@ struct Cx<'a> {
     rolls_back: bool,
     /// Savepoint names set with SAVE TRANSACTION in this routine or script.
     savepoints: Vec<String>,
-    vars: HashMap<String, Var>,
+    vars: BTreeMap<String, Var>,
     /// Notes of the unit being converted.
     notes: Vec<Note>,
     /// The rewrites made in the unit being converted (`step`).
@@ -537,7 +537,7 @@ struct Cx<'a> {
     left_out_indexes: Vec<String>,
     /// Alias types this file creates (`CREATE TYPE n FROM base`), by schema
     /// and name (lower case, `dbo` for none).
-    alias_types: HashMap<(String, String), AliasType>,
+    alias_types: BTreeMap<(String, String), AliasType>,
     /// The CTEs of the `WITH … UPDATE … FROM` being converted (lower case),
     /// with the GROUP BY key their query returns (`group_key`), if any.
     update_ctes: Vec<(String, Option<Vec<String>>)>,
@@ -6131,7 +6131,7 @@ impl<'a> Cx<'a> {
             "level2type",
             "level2name",
         ];
-        let mut val: HashMap<&str, T> = HashMap::new();
+        let mut val: BTreeMap<&str, T> = BTreeMap::new();
         for (k, a) in split_commas(args).into_iter().enumerate() {
             let a = trimmed(a);
             let (key, v) = match a.iter().position(|x| x.k == OP && x.s == "=") {
@@ -12584,7 +12584,7 @@ fn fetch_into(n: &SyntaxNode, cursor: &str) -> Option<Vec<String>> {
         let v = x.strip_prefix('@').filter(|v| !v.starts_with('@'))?;
         vars.push(v.to_ascii_lowercase());
     }
-    (!vars.is_empty() && vars.iter().collect::<std::collections::HashSet<_>>().len() == vars.len())
+    (!vars.is_empty() && vars.iter().collect::<std::collections::BTreeSet<_>>().len() == vars.len())
         .then_some(vars)
 }
 

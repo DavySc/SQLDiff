@@ -5,7 +5,7 @@
 //! first, so two routines of the tree must never map a table variable to
 //! the same name: the converter refuses the later one (`Claims::clash`).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use sqldiff_syntax::{ast, Dialect, SyntaxKind, SyntaxNode};
 
@@ -27,7 +27,7 @@ pub struct Claim {
 /// in the file) wins.
 #[derive(Debug, Default)]
 pub struct Claims {
-    by_table: HashMap<String, Claim>,
+    by_table: BTreeMap<String, Claim>,
 }
 
 impl Claims {

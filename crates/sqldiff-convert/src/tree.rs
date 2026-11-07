@@ -677,7 +677,7 @@ fn convert_kept(
     let mut reused: Vec<bool> = Vec::new();
     let mut unchecked: Vec<bool> = Vec::new();
     let mut progress = None;
-    let mut live: Option<std::collections::HashSet<String>> = None;
+    let mut live: Option<std::collections::BTreeSet<String>> = None;
     let results = match &a.template {
         None => convert_files(
             a,
@@ -1174,7 +1174,7 @@ fn convert_files(
     select: Option<&crate::plan::Select>,
     unchecked: &mut Vec<bool>,
     progress: &mut Option<crate::plan::Progress>,
-    live: &mut Option<std::collections::HashSet<String>>,
+    live: &mut Option<std::collections::BTreeSet<String>>,
 ) -> Result<Vec<(Held, f64)>, String> {
     // What the checks start from (catalogs, drafts, stand-ins) is a function
     // of the whole tree: taken from the store when its key matches exactly,
@@ -1312,7 +1312,7 @@ fn convert_files(
     let in_increment: Option<Vec<bool>> = match (select, cache) {
         (Some(sel), Some(c)) => {
             let plan = crate::plan::Plan::build(inputs, a.from);
-            let at: std::collections::HashMap<&str, usize> = plan
+            let at: std::collections::BTreeMap<&str, usize> = plan
                 .files
                 .iter()
                 .enumerate()
@@ -2154,7 +2154,7 @@ pub fn catalog<'a>(
         let full = format!("{}.{name}", schema.as_deref().unwrap_or("")).to_ascii_lowercase();
         full.contains(stem).then_some(full)
     };
-    let mut files: std::collections::HashMap<String, usize> = Default::default();
+    let mut files: std::collections::BTreeMap<String, usize> = Default::default();
     for c in &per_file {
         let mut names: std::collections::BTreeSet<String> = Default::default();
         names.extend(
@@ -2626,7 +2626,7 @@ pub fn review(t: &mut Tree, inputs: &[Input], ledger: &crate::review::Ledger, pa
     for ((f, c), input) in t.report.files.iter_mut().zip(&t.conversions).zip(inputs) {
         let records = by_path.get(f.path.as_str()).map_or(&[][..], Vec::as_slice);
         let fr = crate::review::review_records(&f.path, &input.text, c, records, base.as_deref());
-        let mut by_id: std::collections::HashMap<String, crate::review::UnitReview> =
+        let mut by_id: std::collections::BTreeMap<String, crate::review::UnitReview> =
             fr.units.into_iter().map(|u| (u.id.clone(), u)).collect();
         let mut outdated = 0;
         for u in f.units.iter_mut().chain(f.converted_units.iter_mut()) {
@@ -2696,7 +2696,7 @@ fn totals(files: &[FileReport]) -> Totals {
         files: files.len(),
         ..Totals::default()
     };
-    let mut reasons: std::collections::HashMap<String, usize> = Default::default();
+    let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
     for s in ORDER {
         t.files_by_status.insert(s.label(), 0);
         t.units.insert(s.label(), 0);
@@ -2772,7 +2772,7 @@ pub fn annotate_proof(
             .flat_map(|x| &x.routines)
             .collect();
         // The units' spans, by the ids the report keys them with.
-        let spans: std::collections::HashMap<String, (usize, usize)> =
+        let spans: std::collections::BTreeMap<String, (usize, usize)> =
             crate::review::unit_ids(&f.path, &input.text, c)
                 .into_iter()
                 .zip(c.units.iter().map(|u| (u.src.start, u.src.end)))

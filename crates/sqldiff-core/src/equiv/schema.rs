@@ -398,6 +398,7 @@ impl Schema {
     }
 
     /// The tables of the catalog (system catalogs left out).
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: its consumer needs all tables to agree
     pub fn tables(&self) -> impl Iterator<Item = &Table> {
         self.tables.values()
     }
@@ -462,6 +463,7 @@ impl Schema {
 
     /// This schema with the tables `ddl` creates added; they replace tables
     /// of the same name.
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: set union / membership; set union
     pub fn with_ddl(&self, ddl: &str, d: Dialect) -> Schema {
         let mut cat = Catalog::default();
         ddl::load_tree(&mut cat, &parse(ddl, d).syntax(), d);
@@ -498,6 +500,7 @@ impl Schema {
     /// `temp:t`): a table the unit creates for its own use (a table
     /// variable, a temporary table), which no catalog holds. `None` when
     /// `ddl` is not one table with known columns.
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: single-table catalog
     pub fn with_local(
         &self,
         ddl: &str,
@@ -572,6 +575,7 @@ impl Schema {
     }
 
     /// Whether a table has a HIDDEN column (T-SQL period column).
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: `any`
     pub fn hides_columns(&self) -> bool {
         self.tables
             .values()
@@ -582,6 +586,7 @@ impl Schema {
     /// table with HIDDEN columns: T-SQL's `*` leaves them out and
     /// PostgreSQL's returns every column, so the two stars are only the same
     /// when the columns they return are.
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: `all`
     pub fn list_stars_with(&mut self, other: &mut Schema) {
         if self.hides_columns() || other.hides_columns() {
             self.list_stars = true;
