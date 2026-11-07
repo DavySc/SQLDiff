@@ -83,7 +83,7 @@ pub fn sig_range(node: &SyntaxNode) -> (usize, usize) {
     let (Some(first_tok), Some(last_tok)) = (node.first_token(), node.last_token()) else {
         return sig_range_walking(node);
     };
-    let first = match significant_from(first_tok, node, true) {
+    let first = match significant_from(first_tok.clone(), &last_tok, node, true) {
         Ok(Some(t)) => t,
         Ok(None) => {
             let r = node.text_range();
@@ -91,7 +91,7 @@ pub fn sig_range(node: &SyntaxNode) -> (usize, usize) {
         }
         Err(Stopped) => return sig_range_walking(node),
     };
-    let last = match significant_from(last_tok, node, false) {
+    let last = match significant_from(last_tok.clone(), &first_tok, node, false) {
         Ok(t) => t.unwrap_or_else(|| first.clone()),
         Err(Stopped) => return sig_range_walking(node),
     };
@@ -109,16 +109,18 @@ struct Stopped;
 /// before it (backward) that is still inside `node`; `Ok(None)` when the
 /// node has none that way. rowan's `next_token`/`prev_token` also return
 /// `None` when the adjacent sibling is an empty node, which looks like
-/// the end of the walk; that is told apart from the real end (the token
-/// touches the node's edge) and reported as [`Stopped`], so the result never
-/// depends on the parser keeping trivia away from empty nodes.
+/// the end of the walk; that is told apart from the real end (the walk is
+/// at `edge`, the node's own last token going forward, first going
+/// backward; text positions would be fooled by zero-width tokens) and
+/// reported as [`Stopped`], so the result never depends on the parser
+/// keeping trivia away from empty nodes.
 fn significant_from(
     from: SyntaxToken,
+    edge: &SyntaxToken,
     node: &SyntaxNode,
     forward: bool,
 ) -> Result<Option<SyntaxToken>, Stopped> {
     let within = |t: &SyntaxToken| t.parent_ancestors().any(|a| a == *node);
-    let range = node.text_range();
     let mut t = from;
     loop {
         if is_significant(t.kind()) {
@@ -133,12 +135,7 @@ fn significant_from(
             Some(n) if within(&n) => t = n,
             Some(_) => return Ok(None),
             None => {
-                let at_edge = if forward {
-                    t.text_range().end() == range.end()
-                } else {
-                    t.text_range().start() == range.start()
-                };
-                return if at_edge { Ok(None) } else { Err(Stopped) };
+                return if t == *edge { Ok(None) } else { Err(Stopped) };
             }
         }
     }

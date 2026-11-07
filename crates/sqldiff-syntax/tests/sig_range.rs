@@ -111,6 +111,7 @@ fn trivia_next_to_an_empty_node_is_handled() {
             match c {
                 'w' => b.token(K::WHITESPACE.into(), " "),
                 'i' => b.token(K::IDENT.into(), "x"),
+                'z' => b.token(K::IDENT.into(), ""),
                 _ => {
                     b.start_node(K::BRANCH.into());
                     b.finish_node();
