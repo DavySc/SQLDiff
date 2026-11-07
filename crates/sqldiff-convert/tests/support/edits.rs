@@ -410,7 +410,7 @@ pub enum Edit {
     ChangeDefault,
     ToggleIndex,
     /// A view's body changes.
-    EditView,
+    ViewBody,
     /// An `ALTER TABLE ... ADD` in a file of its own (A4: the source table
     /// of a view changes).
     AlterSourceTable,
@@ -445,7 +445,7 @@ pub const ALL_EDITS: &[Edit] = &[
     Edit::FlipNullability,
     Edit::ChangeDefault,
     Edit::ToggleIndex,
-    Edit::EditView,
+    Edit::ViewBody,
     Edit::AlterSourceTable,
     Edit::AddRoutine,
     Edit::DropRoutine,
@@ -589,7 +589,7 @@ impl Edit {
                 };
                 format!("toggle index on {}", m.tables[ti].name)
             }
-            Edit::EditView => {
+            Edit::ViewBody => {
                 let vi = r.below(m.views.len());
                 m.views[vi].star ^= true;
                 format!("edit view {}", m.views[vi].name)
