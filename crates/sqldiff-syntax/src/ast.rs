@@ -84,13 +84,13 @@ pub fn sig_range(node: &SyntaxNode) -> (usize, usize) {
         return sig_range_walking(node);
     };
     let within = |t: &SyntaxToken| t.parent_ancestors().any(|a| a == *node);
-    let first = std::iter::successors(Some(first_tok), |t| t.next_token().filter(&within))
+    let first = std::iter::successors(Some(first_tok), |t| t.next_token().filter(within))
         .find(|t| is_significant(t.kind()));
     let Some(first) = first else {
         let r = node.text_range();
         return (r.start().into(), r.end().into());
     };
-    let last = std::iter::successors(Some(last_tok), |t| t.prev_token().filter(&within))
+    let last = std::iter::successors(Some(last_tok), |t| t.prev_token().filter(within))
         .find(|t| is_significant(t.kind()))
         .unwrap_or_else(|| first.clone());
     (
