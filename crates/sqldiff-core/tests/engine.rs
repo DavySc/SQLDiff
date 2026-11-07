@@ -548,3 +548,14 @@ fn a_repeated_batch_is_never_equal() {
         r.unknown_reasons
     );
 }
+
+#[test]
+fn cache_keys_hash_the_exact_text() {
+    use sqldiff_core::artifact::{content_hash, exact_hash};
+    // Trailing white space inside a multi-line string literal is data.
+    let a = "CREATE TABLE t (c varchar(9) DEFAULT 'x \ny');\n";
+    let b = "CREATE TABLE t (c varchar(9) DEFAULT 'x\ny');\n";
+    assert_eq!(content_hash(a), content_hash(b));
+    assert_ne!(exact_hash(a), exact_hash(b));
+    assert_ne!(exact_hash("a\r\nb"), exact_hash("a\nb"));
+}

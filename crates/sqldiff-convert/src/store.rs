@@ -273,6 +273,54 @@ fn intern(mut v: serde_json::Value) -> (Vec<String>, serde_json::Value) {
     (pool, v)
 }
 
+/// Key of the table of distinct unit notes in a stored conversion.
+const NOTE_TABLE: &str = "note_table";
+
+/// Units of a file carry the file-level assumptions as notes of their own
+/// (one file of 1,200 units held 200,000 equal notes, 94 % of its stored
+/// result). In the stored form every distinct note is written once, in
+/// order of first use, and a unit's `notes` are indices into that table.
+fn share_notes(v: &mut serde_json::Value) {
+    let Some(units) = v.get_mut("units").and_then(|u| u.as_array_mut()) else {
+        return;
+    };
+    let mut table: Vec<serde_json::Value> = Vec::new();
+    let mut at: std::collections::HashMap<String, usize> = Default::default();
+    for u in units.iter_mut() {
+        let Some(notes) = u.get_mut("notes").and_then(|n| n.as_array_mut()) else {
+            continue;
+        };
+        for n in notes.iter_mut() {
+            let key = n.to_string();
+            let i = *at.entry(key).or_insert_with(|| {
+                table.push(n.clone());
+                table.len() - 1
+            });
+            *n = serde_json::Value::from(i);
+        }
+    }
+    v[NOTE_TABLE] = serde_json::Value::Array(table);
+}
+
+/// The inverse of [`share_notes`]; `None` when an index is outside the table.
+fn unshare_notes(v: &mut serde_json::Value) -> Option<()> {
+    let table = match v.as_object_mut()?.remove(NOTE_TABLE)? {
+        serde_json::Value::Array(t) => t,
+        _ => return None,
+    };
+    if let Some(units) = v.get_mut("units").and_then(|u| u.as_array_mut()) {
+        for u in units.iter_mut() {
+            let Some(notes) = u.get_mut("notes").and_then(|n| n.as_array_mut()) else {
+                continue;
+            };
+            for n in notes.iter_mut() {
+                *n = table.get(usize::try_from(n.as_u64()?).ok()?)?.clone();
+            }
+        }
+    }
+    Some(())
+}
+
 /// The inverse of [`intern`]; `None` when a marker points outside the pool.
 fn expand(v: &mut serde_json::Value, pool: &[String]) -> Option<()> {
     match v {
@@ -330,6 +378,7 @@ impl Store {
             return None;
         }
         expand(&mut e.conversion, &e.pool)?;
+        unshare_notes(&mut e.conversion)?;
         serde_json::from_value(e.conversion).ok()
     }
 
@@ -337,7 +386,9 @@ impl Store {
     /// retried a few times because a virus scanner on Windows can hold the
     /// file for a moment.
     pub fn put(&self, key: &Key, c: &Conversion) -> Result<(), String> {
-        let (pool, conversion) = intern(serde_json::to_value(c).map_err(|e| e.to_string())?);
+        let mut value = serde_json::to_value(c).map_err(|e| e.to_string())?;
+        share_notes(&mut value);
+        let (pool, conversion) = intern(value);
         let bytes = serde_json::to_vec(&Entry {
             key: key.0.clone(),
             pool,
@@ -433,14 +484,18 @@ impl Store {
     pub fn put_tree(&self, key: &TreeKey, st: &TreeState) -> Result<(), String> {
         // Compressed as it is written: the drafts repeat the same long
         // strings, and nothing is held in memory beside the state itself.
-        let mut enc = flate2::write::GzEncoder::new(
-            std::io::BufWriter::new(Vec::new()),
-            flate2::Compression::fast(),
+        // serde_json writes many tiny pieces and the encoder prepares its
+        // whole output buffer for each write: a buffer in front of it turns
+        // that into a few large writes (this step took a second on WWI).
+        let mut enc = std::io::BufWriter::with_capacity(
+            1 << 16,
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()),
         );
         serde_json::to_writer(&mut enc, st).map_err(|e| e.to_string())?;
         let bytes = enc
+            .into_inner()
+            .map_err(|e| e.into_error().to_string())?
             .finish()
-            .and_then(|w| w.into_inner().map_err(|e| e.into_error()))
             .map_err(|e| e.to_string())?;
         let dest = crate::tree::dest_under(&self.out, &Self::tree_rel(key))?;
         if let Some(p) = dest.parent() {
@@ -685,5 +740,31 @@ mod tests {
         // A single file is always re-checked.
         assert_eq!(pick(&[(5, 123)], 3), BTreeSet::from([5]));
         assert!(pick(&[], 1).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod note_table_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn unit_notes_are_written_once_and_read_back_in_order() {
+        let a = json!({"status": "assumptions", "rule": "ASM-A", "text": "a"});
+        let b = json!({"status": "converted", "rule": "ASM-B", "text": "b"});
+        let original = json!({"units": [
+            {"notes": [a, b, a]},
+            {"notes": []},
+            {"notes": [b, a]},
+        ], "other": 1});
+        let mut v = original.clone();
+        share_notes(&mut v);
+        assert_eq!(v[NOTE_TABLE].as_array().unwrap().len(), 2);
+        assert_eq!(v["units"][0]["notes"], json!([0, 1, 0]));
+        unshare_notes(&mut v).unwrap();
+        assert_eq!(v, original);
+        // An index outside the table is a miss, not a panic.
+        let mut bad = json!({"units": [{"notes": [3]}], NOTE_TABLE: []});
+        assert!(unshare_notes(&mut bad).is_none());
     }
 }
