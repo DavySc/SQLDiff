@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 196 | 35 (18%) | 6 (3%) | 155 (79%) |
+| `converter` | 197 | 35 (18%) | 6 (3%) | 156 (79%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 225 | 38 (17%) | 8 (4%) | 179 (80%) |
+| **All** | 226 | 38 (17%) | 8 (4%) | 180 (80%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -125,6 +125,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.expr.undeclared-variable` | `converter` | engine |  | `sqldiff-draft/src/tsql.rs` |
 | `tsql.expr.unicode-literal` | `converter` | lemma: `Sqldiff.Mirror/C2b strings/Literals` | `N'...'` of printable ASCII without a backslash reads as the same literal as `'...'` | `sqldiff-draft/src/tsql.rs` |
 | `tsql.expr.variable` | `converter` | lemma: `Sqldiff.Mirror/Expressions` | a variable read; the rename (`p_`/`v_` prefix) is the certificate's renaming, checked injective | `sqldiff-draft/src/tsql.rs` |
+| `tsql.from.apply` | `converter` | engine | CROSS APPLY (q) to CROSS JOIN LATERAL (q); OUTER APPLY (q) to LEFT JOIN LATERAL (q) ON TRUE (PostgreSQL). The engine does not model LATERAL yet, so the unit stays not proven (equiv.unsupported) | `sqldiff-draft/src/tsql.rs` |
 | `tsql.from.openjson` | `converter` | engine | OPENJSON ... WITH in FROM → a jsonb_array_elements derived table; the engine compares the column list (key, strict or lax, type) under ASM-OPENJSON-VALUES | `sqldiff-draft/src/tsql.rs` |
 | `tsql.from.table-function` | `converter` | engine |  | `sqldiff-draft/src/tsql.rs` |
 | `tsql.from.table-hint` | `converter` | engine |  | `sqldiff-draft/src/tsql.rs` |

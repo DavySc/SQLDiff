@@ -8359,11 +8359,60 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// `CROSS APPLY (subquery) alias` is `CROSS JOIN LATERAL (subquery)
+    /// alias`; `OUTER APPLY (subquery) alias` is `LEFT JOIN LATERAL
+    /// (subquery) alias ON TRUE` (PostgreSQL). A function after APPLY, and
+    /// Db2 for i, keep the T-SQL text and are left to the checks.
+    fn apply_edits(&mut self, ts: &[T], e: &mut bits::BitEdits) {
+        if self.to != Dialect::Postgres {
+            return;
+        }
+        for i in sig(ts) {
+            let outer = ts[i].k == IDENT && ts[i].is("OUTER");
+            if !(outer || ts[i].k == IDENT && ts[i].is("CROSS")) {
+                continue;
+            }
+            let Some(ap) = next_sig(ts, i).filter(|&a| ts[a].is("APPLY")) else {
+                continue;
+            };
+            let Some(open) = next_sig(ts, ap).filter(|&o| ts[o].k == L_PAREN) else {
+                continue;
+            };
+            let Some(close) = matching(ts, open) else {
+                continue;
+            };
+            let mut end = close;
+            if outer {
+                // The derived table's alias and column list, before ON TRUE.
+                let mut n = next_sig(ts, end);
+                if n.is_some_and(|a| ts[a].is("AS")) {
+                    n = n.and_then(|a| next_sig(ts, a));
+                }
+                if let Some(a) = n.filter(|&a| {
+                    matches!(ts[a].k, IDENT | QUOTED_IDENT) && !is_clause_word(&ts[a].s)
+                }) {
+                    end = a;
+                    if let Some(l) = next_sig(ts, a).filter(|&l| ts[l].k == L_PAREN) {
+                        end = matching(ts, l).unwrap_or(a);
+                    }
+                }
+            }
+            e.rep
+                .insert(i, if outer { "LEFT JOIN" } else { "CROSS JOIN" }.into());
+            e.rep.insert(ap, "LATERAL".into());
+            if outer {
+                e.post.insert(end, " ON TRUE".into());
+            }
+            e.steps.push(("tsql.from.apply", i, ap));
+        }
+    }
+
     fn expr(&mut self, ts: &[T]) -> String {
         let paged = self.paging(ts);
         let ts: &[T] = &paged;
         let mut edits = self.bit_edits(ts);
         self.geography_edits(ts, &mut edits);
+        self.apply_edits(ts, &mut edits);
         if let Some(outer) = self.bit_outer.take() {
             edits.wrap(outer);
         }

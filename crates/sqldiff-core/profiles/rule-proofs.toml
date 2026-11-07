@@ -736,6 +736,13 @@ proof = "engine"
 sites = ["sqldiff-draft/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.from.apply"
+kind = "converter"
+proof = "engine"
+note = "CROSS APPLY (q) to CROSS JOIN LATERAL (q); OUTER APPLY (q) to LEFT JOIN LATERAL (q) ON TRUE (PostgreSQL). The engine does not model LATERAL yet, so the unit stays not proven (equiv.unsupported)"
+sites = ["sqldiff-draft/src/tsql.rs"]
+
+[[rule]]
 id = "tsql.geography.from-wkb"
 kind = "converter"
 proof = "engine"
