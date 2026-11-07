@@ -146,6 +146,23 @@ fn reused(out: &Path) -> Vec<(String, bool)> {
         .collect()
 }
 
+/// A stored result is its body's SHA-256 in hex, a newline, the body.
+fn read_result(p: &Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(p).unwrap()[65..]).unwrap()
+}
+
+/// Writes `v` as a result with a digest that matches it: a stored result that
+/// is wrong but whole, as an engine bug would leave one.
+fn write_result(p: &Path, v: &serde_json::Value) {
+    use sha2::{Digest, Sha256};
+    let body = serde_json::to_vec(v).unwrap();
+    let hex: String = Sha256::digest(&body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    std::fs::write(p, [hex.as_bytes(), b"\n", &body].concat()).unwrap();
+}
+
 fn results(out: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(out.join(".sqldiff/results"))
         .map(|d| d.flatten().map(|e| e.path()).collect())
@@ -285,7 +302,7 @@ fn a_damaged_result_is_a_miss() {
     assert!(reused(&f.out("o")).iter().all(|(_, r)| !r));
     // And they are whole again.
     for p in results(&f.out("o")) {
-        serde_json::from_slice::<serde_json::Value>(&std::fs::read(p).unwrap()).unwrap();
+        read_result(&p);
     }
 }
 
@@ -296,10 +313,9 @@ fn a_stored_result_that_a_fresh_check_contradicts_fails_the_run_and_empties_the_
     convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
     let stored = results(&f.out("o"));
     assert_eq!(stored.len(), 1);
-    let mut e: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&stored[0]).unwrap()).unwrap();
+    let mut e = read_result(&stored[0]);
     e["conversion"]["output"] = "-- tampered\n".into();
-    std::fs::write(&stored[0], serde_json::to_vec(&e).unwrap()).unwrap();
+    write_result(&stored[0], &e);
     let err = convert_into(&f.job("o", true, false), &Hooks::default())
         .err()
         .expect("a mismatch fails the run");
@@ -453,9 +469,9 @@ fn with_recheck(mut j: Job, r: tree::Recheck) -> Job {
 
 fn tamper_every_result(out: &Path) {
     for p in results(out) {
-        let mut e: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let mut e = read_result(&p);
         e["conversion"]["output"] = "-- tampered\n".into();
-        std::fs::write(&p, serde_json::to_vec(&e).unwrap()).unwrap();
+        write_result(&p, &e);
     }
 }
 
@@ -467,10 +483,9 @@ fn recheck_all_finds_a_wrong_stored_result_in_any_file() {
     let stored = results(&f.out("o"));
     assert_eq!(stored.len(), 4);
     for p in &stored {
-        let good = std::fs::read(p).unwrap();
-        let mut e: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        let mut e = read_result(p);
         e["conversion"]["output"] = "-- tampered\n".into();
-        std::fs::write(p, serde_json::to_vec(&e).unwrap()).unwrap();
+        write_result(p, &e);
         let err = convert_into(
             &with_recheck(f.job("o", true, false), tree::Recheck::All),
             &Hooks::default(),
@@ -572,4 +587,47 @@ fn recheck_none_says_so_when_only_the_tree_state_was_reused() {
     .unwrap();
     assert!(w.tree.report.run.files.iter().all(|r| !r.reused));
     assert!(tree::summary(&w.tree.report).contains("unverified reuse"));
+}
+
+#[test]
+fn an_edited_result_that_is_still_valid_json_is_a_miss_and_converted_again() {
+    let f = Fixture::standard("digest");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    let sql = |out: &Path| -> Vec<(String, String)> {
+        // The reports say which recheck mode the run used; the files do not.
+        tree_of(out)
+            .into_iter()
+            .filter(|(p, _)| p.ends_with(".sql"))
+            .collect()
+    };
+    let base = sql(&f.out("o"));
+    assert!(!base.is_empty());
+    // Edited in place, the digest left as it was; no recheck samples it.
+    for p in results(&f.out("o")) {
+        let mut bytes = std::fs::read(&p).unwrap();
+        let mut e: serde_json::Value = serde_json::from_slice(&bytes[65..]).unwrap();
+        e["conversion"]["output"] = "-- tampered\n".into();
+        bytes.truncate(65);
+        bytes.extend(serde_json::to_vec(&e).unwrap());
+        std::fs::write(&p, bytes).unwrap();
+    }
+    let w = convert_into(
+        &with_recheck(f.job("o", true, false), tree::Recheck::None),
+        &Hooks::default(),
+    )
+    .expect("an edited result is converted again, not trusted");
+    assert!(w.tree.report.run.files.iter().all(|r| !r.reused));
+    assert_eq!(base, sql(&f.out("o")), "the same files as a fresh run");
+    // A truncated digest line and a bare body are misses too.
+    for (i, p) in results(&f.out("o")).iter().enumerate() {
+        let bytes = std::fs::read(p).unwrap();
+        let bad = if i % 2 == 0 {
+            bytes[65..].to_vec()
+        } else {
+            bytes[..40].to_vec()
+        };
+        std::fs::write(p, bad).unwrap();
+    }
+    convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
+    assert_eq!(base, sql(&f.out("o")));
 }
