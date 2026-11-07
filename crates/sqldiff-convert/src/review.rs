@@ -25,7 +25,7 @@
 //! where records are built: a writer (CLI, GUI, MCP) sets `by` itself and
 //! never takes it from its caller.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -184,8 +184,8 @@ impl Ledger {
     /// The records of each file, borrowed, in [`Ledger::records`] order:
     /// read once for a whole tree, so applying the ledger costs its records
     /// once and not once per unit.
-    pub fn by_path(&self) -> HashMap<&str, Vec<&Record>> {
-        let mut m: HashMap<&str, Vec<&Record>> = HashMap::new();
+    pub fn by_path(&self) -> BTreeMap<&str, Vec<&Record>> {
+        let mut m: BTreeMap<&str, Vec<&Record>> = BTreeMap::new();
         for r in self.records() {
             m.entry(r.path.as_str()).or_default().push(r);
         }
@@ -377,8 +377,8 @@ pub fn review_records(
     let ids = unit_ids(path, input, c);
     let (ih, oh) = (file_hash(input), file_hash(&c.output));
     // By unit, in ledger order: decisions, and hand-written texts.
-    let mut decided: HashMap<&str, Vec<&Record>> = HashMap::new();
-    let mut texts: HashMap<&str, Vec<&Record>> = HashMap::new();
+    let mut decided: BTreeMap<&str, Vec<&Record>> = BTreeMap::new();
+    let mut texts: BTreeMap<&str, Vec<&Record>> = BTreeMap::new();
     for &r in records {
         match r.text {
             None => decided.entry(r.unit.as_str()).or_default().push(r),
@@ -440,7 +440,7 @@ pub fn review_records(
         decisions.sort_by(|a, b| a.record.at.cmp(&b.record.at));
         units.push(judge(id, u, decisions));
     }
-    let known: HashSet<&str> = ids
+    let known: BTreeSet<&str> = ids
         .iter()
         .map(String::as_str)
         .chain(

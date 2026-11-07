@@ -236,11 +236,11 @@ fn single_from(ts: &[T], from: Option<usize>) -> Option<(Vec<String>, Option<Str
 #[derive(Default)]
 pub(super) struct BitEdits {
     /// Output in place of the token.
-    pub rep: HashMap<usize, String>,
+    pub rep: BTreeMap<usize, String>,
     /// Output before the token.
-    pub pre: HashMap<usize, String>,
+    pub pre: BTreeMap<usize, String>,
     /// Output after the token.
-    pub post: HashMap<usize, String>,
+    pub post: BTreeMap<usize, String>,
     /// The rule of each rewrite and the tokens it rewrote (first and last
     /// index): the expression walk that applies the edits records them as
     /// steps.

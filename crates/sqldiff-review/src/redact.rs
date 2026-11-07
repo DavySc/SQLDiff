@@ -16,7 +16,7 @@
 //! [`Redactor::verify_report`] and [`Redactor::verify_value`] re-check the
 //! redacted data; exports refuse to write data that still contains a term.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
@@ -71,7 +71,7 @@ struct Entry {
 pub struct Redactor {
     salt: Vec<u8>,
     /// Lower-cased term to its entry.
-    terms: HashMap<String, Entry>,
+    terms: BTreeMap<String, Entry>,
     work_items: Vec<Regex>,
     matcher: Option<Regex>,
     /// Registered terms, longest first, for the fallback at one start.
@@ -136,7 +136,7 @@ impl Redactor {
     pub fn new(cfg: &Resolved, salt: &[u8]) -> Redactor {
         let mut r = Redactor {
             salt: salt.to_vec(),
-            terms: HashMap::new(),
+            terms: BTreeMap::new(),
             work_items: Vec::new(),
             matcher: None,
             ordered: Vec::new(),
