@@ -8420,9 +8420,37 @@ impl<'a> Cx<'a> {
             if n.is_some_and(|a| ts[a].is("AS")) {
                 n = n.and_then(|a| next_sig(ts, a));
             }
-            if let Some(a) =
-                n.filter(|&a| matches!(ts[a].k, IDENT | QUOTED_IDENT) && !is_clause_word(&ts[a].s))
-            {
+            // A bare alias is a name, not a word that continues the query
+            // (T-SQL allows no alias after a function call).
+            const NOT_AN_ALIAS: [&str; 22] = [
+                "ORDER",
+                "GROUP",
+                "HAVING",
+                "UNION",
+                "EXCEPT",
+                "INTERSECT",
+                "INNER",
+                "LEFT",
+                "RIGHT",
+                "FULL",
+                "CROSS",
+                "OUTER",
+                "JOIN",
+                "WHERE",
+                "ON",
+                "FOR",
+                "OPTION",
+                "WINDOW",
+                "PIVOT",
+                "UNPIVOT",
+                "TABLESAMPLE",
+                "WITH",
+            ];
+            if let Some(a) = n.filter(|&a| {
+                matches!(ts[a].k, IDENT | QUOTED_IDENT)
+                    && !is_clause_word(&ts[a].s)
+                    && !(ts[a].k == IDENT && NOT_AN_ALIAS.iter().any(|w| ts[a].is(w)))
+            }) {
                 end = a;
                 if let Some(l) = next_sig(ts, a).filter(|&l| ts[l].k == L_PAREN) {
                     end = matching(ts, l).unwrap_or(a);

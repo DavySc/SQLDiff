@@ -70,3 +70,17 @@ fn an_unrecognised_apply_shape_on_postgres_is_not_converted() {
     );
     assert_eq!(st, sqldiff_convert::Status::NotConverted, "{o}");
 }
+
+#[test]
+fn outer_apply_without_an_alias_puts_on_true_before_the_next_clause() {
+    for (tail, want) in [
+        ("order by p.id", "ON TRUE\norder by p.id"),
+        ("group by p.id", "ON TRUE\ngroup by p.id"),
+        ("inner join \"c\" c on c.p_id = p.id", "ON TRUE\ninner join"),
+        ("outer apply \"g\"(p.id) g", "ON TRUE\nLEFT JOIN LATERAL"),
+        ("union all select 1, null from \"p\"", "ON TRUE\nunion all"),
+    ] {
+        let o = out(&format!("create view \"v\" as\nselect p.id, 1 as x from \"p\" p outer apply \"f\"(p.id)\n{tail}\ngo\n"));
+        assert!(o.contains(want), "{tail}: {o}");
+    }
+}
