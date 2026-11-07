@@ -13,7 +13,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def git(*args, cwd=None):
-    subprocess.run(["git", *args], cwd=cwd, check=True, stdout=subprocess.DEVNULL)
+    # Never prompt: a source that has gone private or been removed must fail
+    # with a clear message, not wait for credentials (and none are ever added).
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        subprocess.run(["git", *args], cwd=cwd, check=True, stdout=subprocess.DEVNULL, env=env)
+    except subprocess.CalledProcessError:
+        sys.exit(f"real-code gate: `git {' '.join(args)}` failed; the pinned source may be gone or private. Drop or re-pin it in corpus/real-code/sources.json.")
 
 
 def fetch(src, work):
