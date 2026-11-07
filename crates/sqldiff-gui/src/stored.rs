@@ -270,12 +270,14 @@ mod tests {
             drop(pending);
         });
         assert_eq!(s.clear().files, 0);
+        // The write has landed by now: had `clear` not waited for it, the
+        // file would still be there.
+        t.join().unwrap();
         assert_eq!(
             s.usage().files,
             0,
             "the late write did not survive the clear"
         );
-        t.join().unwrap();
         let _ = std::fs::remove_dir_all(&d);
     }
 }
