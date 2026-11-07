@@ -159,3 +159,39 @@ fn a_stored_review_conversion_reuses_results_and_equals_the_whole_one() {
     );
     assert_eq!(second.outputs, whole.outputs);
 }
+
+#[test]
+fn a_run_and_a_review_share_one_store_without_wiping_each_other() {
+    let d = tree_dir();
+    let out = d.join("out-shared");
+    let mut a = args(&d);
+    a.recheck = tree::Recheck::None;
+    let (inputs, unreadable) = tree::read(&a).unwrap();
+    let hooks = tree::Hooks::default();
+    let reused = |t: &tree::Tree| t.report.run.files.iter().filter(|f| f.reused).count();
+    let n = inputs.len();
+    let run1 = tree::convert_stored(&a, &inputs, unreadable.clone(), &out, &hooks, false).unwrap();
+    let review1 =
+        tree::convert_for_review_stored(&a, &inputs, unreadable.clone(), &out, &hooks).unwrap();
+    let run2 = tree::convert_stored(&a, &inputs, unreadable.clone(), &out, &hooks, false).unwrap();
+    let review2 = tree::convert_for_review_stored(&a, &inputs, unreadable, &out, &hooks).unwrap();
+    let counts = (
+        reused(&run1),
+        reused(&review1),
+        reused(&run2),
+        reused(&review2),
+    );
+    let same = report(&run1) == report(&run2) && run1.outputs == run2.outputs;
+    let review_same = report(&review1) == report(&review2) && review1.outputs == run1.outputs;
+    let _ = std::fs::remove_dir_all(&d);
+    assert_eq!(
+        counts,
+        (0, n, n, n),
+        "each step after the first reuses every file"
+    );
+    assert!(
+        same,
+        "a run after a review gives the run's report and outputs"
+    );
+    assert!(review_same);
+}
