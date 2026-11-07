@@ -6,6 +6,10 @@
 //! are listed in `known-failing.toml`; the gate fails when an unlisted one
 //! fails (regression) and when a listed one passes (the list must shrink).
 
+// Determinism guard (perf plan W0): iterating a hash map or set in a `for` loop is
+// as order-dependent as `.iter()`; each site needs a reasoned `#[allow]`.
+#![warn(clippy::iter_over_hash_type)]
+
 pub mod fuzz;
 
 use std::collections::{BTreeMap, BTreeSet};

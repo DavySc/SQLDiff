@@ -3,6 +3,9 @@
 //! Exit codes: 0 equal (or equal under assumptions), 1 different or
 //! unknown, 2 usage or I/O error.
 
+// Determinism guard (perf plan W0): see the other crates.
+#![warn(clippy::iter_over_hash_type)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
