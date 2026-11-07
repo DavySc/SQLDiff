@@ -11,6 +11,7 @@ name = "sqldiff"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc.workspace = true
 sqldiff-syntax.workspace = true
 regex.workspace = true
 sqldiff-core.workspace = true
