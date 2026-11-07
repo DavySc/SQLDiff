@@ -177,7 +177,7 @@ impl Default for TreeKeyBuilder {
 impl TreeKeyBuilder {
     pub fn new() -> Self {
         let mut k = KeyBuilder::new();
-        k.field("format", b"tree-1");
+        k.field("format", b"tree-2");
         TreeKeyBuilder(k)
     }
 
@@ -212,6 +212,16 @@ fn verified_body(raw: &[u8]) -> Option<&[u8]> {
         return None;
     }
     Some(body)
+}
+
+/// A stored file as written: the SHA-256 of `body` in hex, a newline, then
+/// the body. Every file of the store has this frame (see [`verified_body`]).
+pub(crate) fn framed(body: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(body.len() + 65);
+    bytes.extend_from_slice(hex(&Sha256::digest(body)).as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(body);
+    bytes
 }
 
 /// A result file is named by its key: 64 hex digits.
@@ -412,10 +422,7 @@ impl Store {
             conversion,
         })
         .map_err(|e| e.to_string())?;
-        let mut bytes = Vec::with_capacity(body.len() + 65);
-        bytes.extend_from_slice(hex(&Sha256::digest(&body)).as_bytes());
-        bytes.push(b'\n');
-        bytes.extend_from_slice(&body);
+        let bytes = framed(&body);
         let dest = crate::tree::dest_under(&self.out, &Self::rel(key))?;
         if let Some(p) = dest.parent() {
             std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
@@ -502,7 +509,7 @@ impl Store {
         to: Dialect,
     ) -> Key {
         let mut k = KeyBuilder::new();
-        k.field("format", b"flags-1");
+        k.field("format", b"flags-2");
         k.field("result", result.0.as_bytes());
         k.field("stand-ins", stand_ins_digest.as_bytes());
         k.field("file", &(fi as u64).to_le_bytes());
@@ -519,7 +526,8 @@ impl Store {
     /// whole).
     pub fn get_flags(&self, result: &Key, flags: &Key) -> Option<Vec<crate::refused::UnitFlag>> {
         let path = crate::tree::dest_under(&self.out, &Self::flags_rel(result, flags)).ok()?;
-        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+        let raw = std::fs::read(path).ok()?;
+        serde_json::from_slice(verified_body(&raw)?).ok()
     }
 
     /// Stores flags (best effort: a flag set that is not stored is computed
@@ -528,9 +536,10 @@ impl Store {
         let Ok(dest) = crate::tree::dest_under(&self.out, &Self::flags_rel(result, flags)) else {
             return;
         };
-        let Ok(bytes) = serde_json::to_vec(v) else {
+        let Ok(body) = serde_json::to_vec(v) else {
             return;
         };
+        let bytes = framed(&body);
         if let Some(p) = dest.parent() {
             if std::fs::create_dir_all(p).is_err() {
                 return;
@@ -554,11 +563,11 @@ impl Store {
     /// does not name its own key, is a miss.
     pub fn get_tree(&self, key: &TreeKey) -> Option<TreeState> {
         let path = crate::tree::dest_under(&self.out, &Self::tree_rel(key)).ok()?;
-        let packed = std::fs::read(path).ok()?;
+        let raw = std::fs::read(path).ok()?;
+        let packed = verified_body(&raw)?;
         let mut json = Vec::new();
-        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&packed[..]), &mut json)
-            .ok()?;
-        drop(packed);
+        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(packed), &mut json).ok()?;
+        drop(raw);
         let st: TreeState = serde_json::from_slice(&json).ok()?;
         drop(json);
         (st.key == key.0).then_some(st)
@@ -577,11 +586,12 @@ impl Store {
             flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()),
         );
         serde_json::to_writer(&mut enc, st).map_err(|e| e.to_string())?;
-        let bytes = enc
-            .into_inner()
-            .map_err(|e| e.into_error().to_string())?
-            .finish()
-            .map_err(|e| e.to_string())?;
+        let bytes = framed(
+            &enc.into_inner()
+                .map_err(|e| e.into_error().to_string())?
+                .finish()
+                .map_err(|e| e.to_string())?,
+        );
         let dest = crate::tree::dest_under(&self.out, &Self::tree_rel(key))?;
         if let Some(p) = dest.parent() {
             let _ = std::fs::remove_dir_all(p);
@@ -606,7 +616,8 @@ impl Store {
     /// miss.
     pub fn get_draft(&self, key: &TreeKey, rel: &str) -> Option<crate::Draft> {
         let path = crate::tree::dest_under(&self.out, &Self::draft_rel(key, rel)).ok()?;
-        let e: DraftEntry = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        let raw = std::fs::read(path).ok()?;
+        let e: DraftEntry = serde_json::from_slice(verified_body(&raw)?).ok()?;
         (e.key == key.0 && e.rel == rel).then_some(e.draft)
     }
 
@@ -619,9 +630,10 @@ impl Store {
             rel,
             draft,
         };
-        let Ok(bytes) = serde_json::to_vec(&e) else {
+        let Ok(body) = serde_json::to_vec(&e) else {
             return;
         };
+        let bytes = framed(&body);
         let Ok(dest) = crate::tree::dest_under(&self.out, &Self::draft_rel(key, rel)) else {
             return;
         };
@@ -800,6 +812,36 @@ mod tests {
         assert_eq!(back, v);
         let mut bad = serde_json::json!([format!("{MARK}9")]);
         assert!(expand(&mut bad, &pool).is_none());
+    }
+
+    #[test]
+    fn a_framed_file_is_read_back_only_whole() {
+        let body = b"[1,2,3]";
+        let f = framed(body);
+        assert_eq!(verified_body(&f), Some(&body[..]));
+        let mut edited = f.clone();
+        *edited.last_mut().unwrap() = b'4';
+        assert_eq!(verified_body(&edited), None, "edited body");
+        assert_eq!(verified_body(&f[..40]), None, "truncated digest");
+        assert_eq!(verified_body(&f[65..]), None, "no digest");
+        assert_eq!(verified_body(b""), None);
+    }
+
+    #[test]
+    fn stored_flags_with_a_wrong_digest_are_a_miss() {
+        let out = std::env::temp_dir().join(format!("sqldiff-flags-digest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        let store = Store::of(&out);
+        let (r, k) = (Key("r".repeat(64)), Key("f".repeat(64)));
+        store.put_flags(&r, &k, &[]);
+        assert!(store.get_flags(&r, &k).is_some_and(|v| v.is_empty()));
+        let path = out.join(Store::flags_rel(&r, &k));
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.truncate(65);
+        bytes.extend_from_slice(b"[]  "); // still valid JSON, not what was written
+        std::fs::write(&path, bytes).unwrap();
+        assert!(store.get_flags(&r, &k).is_none());
+        let _ = std::fs::remove_dir_all(&out);
     }
 
     #[test]
