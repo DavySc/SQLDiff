@@ -605,3 +605,29 @@ fn loop_wake_ups_agree_with_the_pass_loop_reference() {
         after.0 - before.0
     );
 }
+
+/// A header change whose parameter no statement mentions: the name still
+/// makes the reached set non-empty, so the changed jump in the body (the
+/// `RETURN`) is reached and the pair stays unknown. A missed wake of the
+/// unknown name would call the header change different.
+#[test]
+fn an_unmentioned_changed_parameter_still_reaches_the_changed_jump() {
+    std::env::set_var("SQLDIFF_EDIT_ORACLE", "1");
+    let _guard = serial();
+    let d = Dialect::Tsql;
+    let a =
+        "CREATE PROCEDURE dbo.r @p int, @q decimal(5,2) AS BEGIN IF @p > 1 RETURN; SELECT 1; END";
+    let b =
+        "CREATE PROCEDURE dbo.r @p int, @q decimal(7,2) AS BEGIN IF @p > 2 RETURN; SELECT 1; END";
+    let r = diff(
+        &Artifact::new("a.sql", d, a),
+        &Artifact::new("b.sql", d, b),
+        &Options::default(),
+    );
+    assert_eq!(
+        r.verdict(),
+        sqldiff_core::Verdict::Unknown,
+        "{:#?}",
+        r.findings
+    );
+}

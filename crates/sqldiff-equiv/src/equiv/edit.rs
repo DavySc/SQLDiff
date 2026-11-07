@@ -4731,7 +4731,20 @@ fn header_change(
             None => (Vec::new(), usize::from(!STATUS.contains(&name.as_str()))),
         };
         let set = SpanSet::new(ch);
-        if let Some(l) = r.reaches_change(&seed, unknown, (body.0, body.0), r.units(), &set) {
+        let got = r.reaches_change(&seed, unknown, (body.0, body.0), r.units(), &set);
+        if std::env::var_os("SQLDIFF_EDIT_ORACLE").is_some() {
+            let want = r.reaches_change_reference(
+                HashSet::from([name.clone()]),
+                (body.0, body.0),
+                r.units(),
+                &set,
+            );
+            assert_eq!(
+                got, want,
+                "edit checker: the worklist differs from the pass-loop reference for a header change"
+            );
+        }
+        if let Some(l) = got {
             return Err(format!(
                 "another change interacts with it: {shown} reaches the changed code at line {l}"
             ));
