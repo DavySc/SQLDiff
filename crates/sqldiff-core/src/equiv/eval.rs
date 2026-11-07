@@ -1651,6 +1651,55 @@ impl Ctx<'_> {
         unsupported(format!("unresolved name {}", lower.join(".")))
     }
 
+    /// Whether `e` may be a fixed-length (`char(n)`) value: a cast to one, a
+    /// parameter or variable declared as one, or a column of the catalog that
+    /// is one. A name that resolves to a derived column, a record field or a
+    /// variable of unknown type counts as may-be, so the answer errs on
+    /// refusing. Other expressions (function results, concatenations) are
+    /// text, not blank-padded.
+    fn may_be_char(&self, e: &Expr, scopes: &[Scope]) -> bool {
+        match e {
+            Expr::Cast(_, ty) => Ty::from_type(ty, self.d, true).fam == Fam::Char,
+            Expr::Var(v) => self.var_may_be_char(&var_key(v)),
+            Expr::Name(parts) => {
+                let lower: Vec<String> = parts.iter().map(|p| p.to_lowercase()).collect();
+                let col = lower.last().cloned().unwrap_or_default();
+                if lower.len() == 1 && self.d != Dialect::Tsql && self.vars.contains_key(&col) {
+                    return self.var_may_be_char(&col);
+                }
+                if lower.len() == 2 && self.d != Dialect::Tsql && self.records.contains(&lower[0]) {
+                    return true;
+                }
+                let qual = (lower.len() >= 2).then(|| lower[..lower.len() - 1].join("."));
+                scopes.iter().any(|scope| {
+                    scope.iter().any(|b| {
+                        let named = match &qual {
+                            Some(q) => b.names.iter().any(|n| n == q || n == last_part(q)),
+                            None => true,
+                        };
+                        named
+                            && match &b.src {
+                                Src::Base(t, _) => self
+                                    .schema
+                                    .table(t)
+                                    .and_then(|t| t.column(&col))
+                                    .is_some_and(|c| c.ty.fam == Fam::Char),
+                                Src::Derived(cols) => cols.iter().any(|(n, _)| *n == col),
+                                Src::Nulls => false,
+                            }
+                    })
+                })
+            }
+            _ => false,
+        }
+    }
+
+    fn var_may_be_char(&self, key: &str) -> bool {
+        self.vars
+            .get(key)
+            .map_or(true, |f| f.ty.as_ref().map_or(true, |t| t.fam == Fam::Char))
+    }
+
     fn has_column(&self, b: &Binding, col: &str) -> Option<bool> {
         match &b.src {
             Src::Derived(cols) => Some(cols.iter().any(|(n, _)| n == col)),
@@ -1753,6 +1802,16 @@ impl Ctx<'_> {
             Expr::Like(x, p, neg, ci) => {
                 let v = self.expr(x, scopes, g)?;
                 let pat = self.expr(p, scopes, g)?;
+                // Both dialects blank-pad a fixed-length value and the
+                // evaluator keeps values unpadded, whatever their source (a
+                // row, a parameter, a variable, a cast): LIKE would answer for
+                // the unpadded text. So a subject or pattern that may be
+                // declared `char(n)` is not evaluated.
+                if matches!((&v, &pat), (V::Str(_), V::Str(_)))
+                    && (self.may_be_char(x, scopes) || self.may_be_char(p, scopes))
+                {
+                    return rej();
+                }
                 match (&v, &pat) {
                     (V::Err(_), _) => Ok(v.clone()),
                     (_, V::Err(_)) => Ok(pat.clone()),
@@ -4692,14 +4751,6 @@ impl Ctx<'_> {
         };
         let too_long = || V::Err(format!("value too long for column {col}"));
         match (ty.fam, &v) {
-            // A shorter value in a fixed-length column is blank-padded by
-            // both dialects, and the evaluator keeps values unpadded. What
-            // reads the padding (LIKE, a concatenation) would answer for an
-            // unpadded value, so the store is refused, as a cast to `char(n)`
-            // of a shorter value is.
-            (Fam::Char, V::Str(s)) if ty.len.is_some_and(|l| s.chars().count() < l as usize) => {
-                rej()
-            }
             (Fam::VarChar | Fam::Char, V::Str(s)) => match ty.len {
                 Some(l) if s.chars().count() > l as usize => {
                     let kept: String = s.chars().take(l as usize).collect();
@@ -5144,22 +5195,6 @@ mod tests {
         // Blanks inside or in front are ordinary characters.
         assert_eq!(like(" abc", " a%", true), Some(true));
         assert_eq!(like("a bc", "a_bc", true), Some(true));
-    }
-
-    #[test]
-    fn a_shorter_value_is_not_stored_unpadded_in_a_fixed_length_column() {
-        let schema = Schema::default().with_ddl(
-            "CREATE TABLE t (c char(6) NOT NULL, v varchar(6) NOT NULL);",
-            Dialect::Tsql,
-        );
-        let mut c = Ctx::new(Dialect::Tsql, &schema);
-        let s = |x: &str| V::Str(x.into());
-        // char(6): a full-length value is stored, a shorter one (which both
-        // dialects pad, and LIKE would then see the padding) is refused.
-        assert!(matches!(c.store("t", "c", s("abcdef")), Ok(V::Str(x)) if x == "abcdef"));
-        assert!(c.store("t", "c", s("abc")).is_err());
-        // varchar(6) keeps it as it is.
-        assert!(matches!(c.store("t", "v", s("abc")), Ok(V::Str(x)) if x == "abc"));
     }
 
     #[test]
