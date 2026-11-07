@@ -2256,6 +2256,7 @@ fn prepare(
             to,
             jobs: None,
             no_catalog: false,
+            recheck: Default::default(),
             template,
             extensions: tree::extensions(names(&spec.extensions)),
             helpers: cfg.options().helpers,

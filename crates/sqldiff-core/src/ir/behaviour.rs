@@ -97,6 +97,7 @@ impl<'x, 'a> SideIr<'x, 'a> {
     /// Lowers one side and indexes its effects and reads: the scenarios
     /// look keys up for every outcome pair, so a scan per lookup made large
     /// routines cubic.
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: sorts each entry independently
     fn new(a: &'x Analyzed<'a>, other: &Analyzed, routine: Option<SyntaxNode>) -> Self {
         let cfg = super::cfg::lower_routine(a, other_temps(a, other), routine);
         let mut at = HashMap::new();
@@ -1233,6 +1234,9 @@ struct Collector<'x, 'a> {
     /// `diff` calls spent by this routine pair, and whether a budget ran out.
     spent: Cell<u64>,
     out_of_budget: Cell<bool>,
+    /// Which work budget ran out first (`out_of_budget` says only that one
+    /// did), for the witness of the `equiv.budget` findings.
+    cap_hit: Cell<Option<&'static str>>,
     /// `diff` calls spent by the whole file so far (shared by its routine
     /// pairs), and the budgets in force (routine, file).
     file_spent: Rc<Cell<u64>>,
@@ -1286,6 +1290,7 @@ impl<'x, 'a> Collector<'x, 'a> {
             flipped: RefCell::new(HashMap::new()),
             spent: Cell::new(0),
             out_of_budget: Cell::new(false),
+            cap_hit: Cell::new(None),
             file_spent,
             budgets: env_budgets,
         };
@@ -1294,13 +1299,27 @@ impl<'x, 'a> Collector<'x, 'a> {
         c
     }
 
+    /// Marks the routine as cut by a work budget, and remembers which one ran
+    /// out first (the routine's own before the file's).
+    fn note_cap(&self) {
+        self.out_of_budget.set(true);
+        if self.cap_hit.get().is_none() {
+            self.cap_hit
+                .set(Some(if self.spent.get() >= self.budgets.0 {
+                    "routine work budget"
+                } else {
+                    "file work budget"
+                }));
+        }
+    }
+
     /// Spends one `diff` call; false (and the routine marked as cut by its
     /// budget) when the routine's or the file's allowance is used up.
     fn spend(&self) -> bool {
         let file = self.file_spent.get();
         let (routine_max, file_max) = self.budgets;
         if self.spent.get() >= routine_max || file >= file_max {
-            self.out_of_budget.set(true);
+            self.note_cap();
             return false;
         }
         self.spent.set(self.spent.get() + 1);
@@ -1421,7 +1440,7 @@ impl<'x, 'a> Collector<'x, 'a> {
         // the other cost of a branchy routine), and the routine is reported
         // as not proven.
         if self.spent.get() >= self.budgets.0 || self.file_spent.get() >= self.budgets.1 {
-            self.out_of_budget.set(true);
+            self.note_cap();
             return (Vec::new(), Vec::new());
         }
         let (pa, pb) = self.outcomes(&sc, &scen_a, &scen_b);
@@ -1709,6 +1728,13 @@ impl<'x, 'a> Collector<'x, 'a> {
                 .collect();
             nodes.sort_by_key(|n| n.text_range().start());
             nodes.dedup_by_key(|n| n.text_range());
+            let witness = match self.cap_hit.get() {
+                Some(cap) => format!(
+                    "Not proven: the behaviour model reached its {cap} ({} outcome comparisons for a routine, {} for a file) before it compared this statement in at least one scenario, so what happens when it fails and how its transaction goes are not compared.",
+                    self.budgets.0, self.budgets.1
+                ),
+                None => "Not proven: the behaviour model stopped at its step or path budget before it ran or compared this statement in at least one scenario, so what happens when it fails and how its transaction goes are not compared.".to_string(),
+            };
             let mut seen: HashMap<String, usize> = HashMap::new();
             for n in nodes {
                 let words = ast::first_words(n, 3).join(" ");
@@ -1728,7 +1754,7 @@ impl<'x, 'a> Collector<'x, 'a> {
                     class: ChangeClass::Transactional,
                     severity: Severity::Medium,
                     verdict: Verdict::Unknown,
-                    witness: "Not proven: the behaviour model stopped at its step, path or work budget before it ran or compared this statement in at least one scenario, so what happens when it fails and how its transaction goes are not compared.".to_string(),
+                    witness: witness.clone(),
                     a: on_a.then(|| loc.clone()),
                     b: (!on_a).then_some(loc),
                     assumptions: Vec::new(),
