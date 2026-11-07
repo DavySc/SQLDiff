@@ -97,6 +97,7 @@ impl<'x, 'a> SideIr<'x, 'a> {
     /// Lowers one side and indexes its effects and reads: the scenarios
     /// look keys up for every outcome pair, so a scan per lookup made large
     /// routines cubic.
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: sorts each entry independently
     fn new(a: &'x Analyzed<'a>, other: &Analyzed, routine: Option<SyntaxNode>) -> Self {
         let cfg = super::cfg::lower_routine(a, other_temps(a, other), routine);
         let mut at = HashMap::new();
@@ -1135,13 +1136,47 @@ fn pairs(pa: &[Outcome], pb: &[Outcome]) -> (Vec<(usize, usize)>, bool) {
             .collect();
         return (v, true);
     }
+    // Not the same set of paths: every pair of outcomes except those no input
+    // can produce (see `feasible`).
     let mut v = Vec::new();
-    for i in 0..pa.len() {
-        for j in 0..pb.len() {
-            v.push((i, j));
+    for (i, x) in siga.iter().enumerate() {
+        for (j, y) in sigb.iter().enumerate() {
+            if feasible(x, y) {
+                v.push((i, j));
+            }
         }
     }
     (v, false)
+}
+
+/// Whether one input could take path `a` on side A and path `b` on side B.
+/// The paths decide conditions in order; the same condition (after folding)
+/// decided with two values makes the pair impossible. At the first position
+/// where the two decide different conditions, nothing is known about the
+/// rest (the sides may decide in another order, or a condition may be
+/// another spelling of one the other side decides), so the pair stays. This
+/// only ever removes pairs a real input cannot produce, so every input still
+/// has its pair and a divergence shown by all remaining pairs is shown by
+/// every input.
+///
+/// Conditions are identified by their text only: this assumes, as the exact
+/// pairing does, that the same text has the same truth value on both sides.
+/// A row-count test after a failed statement is named with the dialect, since
+/// its value after an error differs between dialects.
+fn feasible(a: &[(String, bool)], b: &[(String, bool)]) -> bool {
+    // A condition decided more than once on a path (a loop test, or the same
+    // text at two places) can have different values each time: its values
+    // say nothing about the other side's.
+    let once = |p: &[(String, bool)], c: &str| p.iter().filter(|x| x.0 == c).count() == 1;
+    for (x, y) in a.iter().zip(b) {
+        if x.0 != y.0 || !once(a, &x.0) || !once(b, &x.0) {
+            return true;
+        }
+        if x.1 != y.1 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Behavioural findings, the assumptions they rest on, and a structured
@@ -1199,6 +1234,9 @@ struct Collector<'x, 'a> {
     /// `diff` calls spent by this routine pair, and whether a budget ran out.
     spent: Cell<u64>,
     out_of_budget: Cell<bool>,
+    /// Which work budget ran out first (`out_of_budget` says only that one
+    /// did), for the witness of the `equiv.budget` findings.
+    cap_hit: Cell<Option<&'static str>>,
     /// `diff` calls spent by the whole file so far (shared by its routine
     /// pairs), and the budgets in force (routine, file).
     file_spent: Rc<Cell<u64>>,
@@ -1252,6 +1290,7 @@ impl<'x, 'a> Collector<'x, 'a> {
             flipped: RefCell::new(HashMap::new()),
             spent: Cell::new(0),
             out_of_budget: Cell::new(false),
+            cap_hit: Cell::new(None),
             file_spent,
             budgets: env_budgets,
         };
@@ -1260,13 +1299,27 @@ impl<'x, 'a> Collector<'x, 'a> {
         c
     }
 
+    /// Marks the routine as cut by a work budget, and remembers which one ran
+    /// out first (the routine's own before the file's).
+    fn note_cap(&self) {
+        self.out_of_budget.set(true);
+        if self.cap_hit.get().is_none() {
+            self.cap_hit
+                .set(Some(if self.spent.get() >= self.budgets.0 {
+                    "routine work budget"
+                } else {
+                    "file work budget"
+                }));
+        }
+    }
+
     /// Spends one `diff` call; false (and the routine marked as cut by its
     /// budget) when the routine's or the file's allowance is used up.
     fn spend(&self) -> bool {
         let file = self.file_spent.get();
         let (routine_max, file_max) = self.budgets;
         if self.spent.get() >= routine_max || file >= file_max {
-            self.out_of_budget.set(true);
+            self.note_cap();
             return false;
         }
         self.spent.set(self.spent.get() + 1);
@@ -1387,7 +1440,7 @@ impl<'x, 'a> Collector<'x, 'a> {
         // the other cost of a branchy routine), and the routine is reported
         // as not proven.
         if self.spent.get() >= self.budgets.0 || self.file_spent.get() >= self.budgets.1 {
-            self.out_of_budget.set(true);
+            self.note_cap();
             return (Vec::new(), Vec::new());
         }
         let (pa, pb) = self.outcomes(&sc, &scen_a, &scen_b);
@@ -1675,6 +1728,13 @@ impl<'x, 'a> Collector<'x, 'a> {
                 .collect();
             nodes.sort_by_key(|n| n.text_range().start());
             nodes.dedup_by_key(|n| n.text_range());
+            let witness = match self.cap_hit.get() {
+                Some(cap) => format!(
+                    "Not proven: the behaviour model reached its {cap} ({} outcome comparisons for a routine, {} for a file) before it compared this statement in at least one scenario, so what happens when it fails and how its transaction goes are not compared.",
+                    self.budgets.0, self.budgets.1
+                ),
+                None => "Not proven: the behaviour model stopped at its step or path budget before it ran or compared this statement in at least one scenario, so what happens when it fails and how its transaction goes are not compared.".to_string(),
+            };
             let mut seen: HashMap<String, usize> = HashMap::new();
             for n in nodes {
                 let words = ast::first_words(n, 3).join(" ");
@@ -1694,7 +1754,7 @@ impl<'x, 'a> Collector<'x, 'a> {
                     class: ChangeClass::Transactional,
                     severity: Severity::Medium,
                     verdict: Verdict::Unknown,
-                    witness: "Not proven: the behaviour model stopped at its step, path or work budget before it ran or compared this statement in at least one scenario, so what happens when it fails and how its transaction goes are not compared.".to_string(),
+                    witness: witness.clone(),
                     a: on_a.then(|| loc.clone()),
                     b: (!on_a).then_some(loc),
                     assumptions: Vec::new(),
@@ -2257,6 +2317,56 @@ pub fn what_if(
         findings: std::mem::take(&mut c.out.findings),
         witnesses: std::mem::take(&mut c.out.witnesses),
         notes,
+    }
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::feasible;
+
+    fn p(x: &[(&str, bool)]) -> Vec<(String, bool)> {
+        x.iter().map(|(c, v)| (c.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn the_same_condition_with_two_values_is_impossible() {
+        assert!(!feasible(&p(&[("c", true)]), &p(&[("c", false)])));
+        assert!(!feasible(
+            &p(&[("c", true), ("d", true)]),
+            &p(&[("c", true), ("d", false)])
+        ));
+    }
+
+    #[test]
+    fn a_prefix_and_its_extensions_pair() {
+        assert!(feasible(
+            &p(&[("c", true)]),
+            &p(&[("c", true), ("d", false)])
+        ));
+        assert!(feasible(&p(&[]), &p(&[("c", true)])));
+    }
+
+    #[test]
+    fn different_conditions_say_nothing() {
+        // Another order, or another spelling of the same condition.
+        assert!(feasible(&p(&[("c", true)]), &p(&[("d", false)])));
+        assert!(feasible(
+            &p(&[("c", true), ("d", true)]),
+            &p(&[("d", false), ("c", true)])
+        ));
+    }
+
+    #[test]
+    fn a_condition_decided_twice_is_not_compared() {
+        // A loop test has a value per iteration.
+        assert!(feasible(
+            &p(&[("w", true), ("w", false)]),
+            &p(&[("w", true), ("w", true), ("w", false)])
+        ));
+        assert!(feasible(
+            &p(&[("w", true)]),
+            &p(&[("w", false), ("w", true)])
+        ));
     }
 }
 

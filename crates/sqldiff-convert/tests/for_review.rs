@@ -47,6 +47,7 @@ fn args(d: &std::path::Path) -> tree::Args {
         to: Dialect::Postgres,
         jobs: Some(2),
         no_catalog: false,
+        recheck: Default::default(),
         template: None,
         extensions: tree::extensions(Vec::new()),
         helpers: Vec::new(),

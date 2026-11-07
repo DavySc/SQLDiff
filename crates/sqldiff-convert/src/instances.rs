@@ -701,18 +701,11 @@ fn hash(text: &str) -> String {
     d.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The running executable's hash: another build may check differently.
+/// What decides a result: a hash of the engine's sources and build
+/// settings (`ENGINE_FINGERPRINT`, from `build.rs`), the same for every
+/// binary that links the engine. Another engine may check differently.
 pub(crate) fn build_hash() -> Result<String, String> {
-    use sha2::{Digest, Sha256};
-    static HASH: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
-    HASH.get_or_init(|| {
-        let exe = std::env::current_exe().map_err(|e| format!("the sqldiff executable: {e}"))?;
-        let mut f = std::fs::File::open(&exe).map_err(|e| format!("{}: {e}", exe.display()))?;
-        let mut h = Sha256::new();
-        std::io::copy(&mut f, &mut h).map_err(|e| format!("{}: {e}", exe.display()))?;
-        Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
-    })
-    .clone()
+    Ok(crate::ENGINE_FINGERPRINT.to_string())
 }
 
 /// Everything an instance's checks read besides the instance itself.

@@ -51,6 +51,7 @@ impl Fixture {
                 to: Dialect::Postgres,
                 jobs: Some(2),
                 no_catalog: false,
+                recheck: Default::default(),
                 template: None,
                 extensions: tree::extensions(Vec::new()),
                 helpers: Vec::new(),
@@ -462,4 +463,132 @@ fn a_damaged_stored_draft_fails_the_run_cleanly_whichever_file_it_is() {
         assert!(err.contains("stored tree state"), "{err}");
         convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
     }
+}
+
+fn with_recheck(mut j: Job, r: tree::Recheck) -> Job {
+    j.tree.recheck = r;
+    j
+}
+
+fn tamper_every_result(out: &Path) {
+    for p in results(out) {
+        let mut e: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        e["conversion"]["output"] = "-- tampered\n".into();
+        std::fs::write(&p, serde_json::to_vec(&e).unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn recheck_all_finds_a_wrong_stored_result_in_any_file() {
+    // Four files: the default sample covers one of them, `all` every one.
+    let f = Fixture::standard("recheckall");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    let stored = results(&f.out("o"));
+    assert_eq!(stored.len(), 4);
+    for p in &stored {
+        let good = std::fs::read(p).unwrap();
+        let mut e: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        e["conversion"]["output"] = "-- tampered\n".into();
+        std::fs::write(p, serde_json::to_vec(&e).unwrap()).unwrap();
+        let err = convert_into(
+            &with_recheck(f.job("o", true, false), tree::Recheck::All),
+            &Hooks::default(),
+        )
+        .err()
+        .expect("`all` builds every stored result again");
+        assert!(err.contains("differs from a fresh check"), "{err}");
+        // The store was emptied; build it again for the next file.
+        convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
+    }
+}
+
+#[test]
+fn recheck_none_trusts_the_store_and_says_so() {
+    let f = Fixture::standard("recheknone");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    tamper_every_result(&f.out("o"));
+    let w = convert_into(
+        &with_recheck(f.job("o", true, false), tree::Recheck::None),
+        &Hooks::default(),
+    )
+    .expect("nothing is built again to compare");
+    assert_eq!(w.tree.report.run.recheck, tree::Recheck::None);
+    assert!(w.tree.report.run.files.iter().all(|r| r.reused));
+    let summary = tree::summary(&w.tree.report);
+    assert!(summary.contains("unverified reuse"), "{summary}");
+    assert!(
+        tree::markdown(&w.tree.report).contains("Unverified reuse"),
+        "the markdown report says it too"
+    );
+    // The default and `all` do not claim it.
+    let ok = convert_into(&f.job("o", true, true), &Hooks::default()).unwrap();
+    assert!(!tree::summary(&ok.tree.report).contains("unverified reuse"));
+}
+
+#[test]
+fn recheck_all_builds_the_whole_tree_state_again() {
+    let f = Fixture::standard("recheckstate");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    let p = states(&f.out("o")).remove(0);
+    let mut st = read_state(&p);
+    // The last file's draft: the default sample (one file, by seed) may miss it.
+    st["drafts"][3]["raw"]["text"] = "-- tampered\n".into();
+    write_state(&p, &st);
+    let err = convert_into(
+        &with_recheck(f.job("o", true, false), tree::Recheck::All),
+        &Hooks::default(),
+    )
+    .err()
+    .expect("`all` builds the state again");
+    assert!(err.contains("stored tree state"), "{err}");
+}
+
+#[test]
+fn the_recheck_mode_never_changes_the_output() {
+    let f = Fixture::standard("recheckmodes");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    // The mode itself is reported (`run.recheck`, and a line in the summary
+    // for `none`); nothing else may differ.
+    let plain = |out: &Path| {
+        let mut t = tree_of(out);
+        for (_, text) in &mut t {
+            *text = text
+                .lines()
+                .filter(|l| {
+                    !l.contains("\"recheck\":")
+                        && !l.starts_with("unverified reuse")
+                        && !l.starts_with("**Unverified reuse")
+                        && !l.trim().is_empty()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        t
+    };
+    let want = plain(&f.out("o"));
+    for r in [
+        tree::Recheck::None,
+        tree::Recheck::Sample,
+        tree::Recheck::All,
+    ] {
+        convert_into(&with_recheck(f.job("o", true, false), r), &Hooks::default()).unwrap();
+        assert_eq!(want, plain(&f.out("o")), "{}", r.label());
+    }
+}
+
+#[test]
+fn recheck_none_says_so_when_only_the_tree_state_was_reused() {
+    let f = Fixture::standard("recheckstateonly");
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    // No per-file result is left to reuse; the tree state still is.
+    for p in results(&f.out("o")) {
+        std::fs::remove_file(p).unwrap();
+    }
+    let w = convert_into(
+        &with_recheck(f.job("o", true, false), tree::Recheck::None),
+        &Hooks::default(),
+    )
+    .unwrap();
+    assert!(w.tree.report.run.files.iter().all(|r| !r.reused));
+    assert!(tree::summary(&w.tree.report).contains("unverified reuse"));
 }

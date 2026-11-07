@@ -39,6 +39,9 @@ pub const TREE_DIR: &str = ".sqldiff/tree";
 /// killed in pass 1 and are dropped once the whole tree state is stored.
 pub const DRAFTS_DIR: &str = ".sqldiff/drafts";
 
+/// The stand-in flags of each stored result: `<result key>/<flags key>.json`.
+pub const FLAGS_DIR: &str = ".sqldiff/flags";
+
 pub const MISMATCH_DIR: &str = ".sqldiff/mismatch";
 
 /// A 256-bit content hash, in hex.
@@ -88,7 +91,7 @@ pub fn catalog_digest(c: &Catalog) -> String {
 /// Everything [`crate::check`] reads for one file of a tree: the only
 /// argument a stored result's key is made from.
 pub struct CheckInput<'a> {
-    /// The running executable's hash: another build may check differently.
+    /// The engine fingerprint (`ENGINE_FINGERPRINT`): another engine may check differently.
     pub build: &'a str,
     pub from: Dialect,
     pub to: Dialect,
@@ -228,7 +231,7 @@ const POOL_MIN: usize = 40;
 /// Starts a marker. A real string starting with it is written with one more.
 const MARK: char = '\u{1}';
 
-fn count(v: &serde_json::Value, seen: &mut std::collections::HashMap<String, usize>) {
+fn count(v: &serde_json::Value, seen: &mut std::collections::BTreeMap<String, usize>) {
     match v {
         serde_json::Value::String(s) if s.len() >= POOL_MIN => {
             *seen.entry(s.clone()).or_default() += 1;
@@ -239,7 +242,7 @@ fn count(v: &serde_json::Value, seen: &mut std::collections::HashMap<String, usi
     }
 }
 
-fn replace(v: &mut serde_json::Value, index: &std::collections::HashMap<&str, usize>) {
+fn replace(v: &mut serde_json::Value, index: &std::collections::BTreeMap<&str, usize>) {
     match v {
         serde_json::Value::String(s) => {
             if let Some(i) = index.get(s.as_str()) {
@@ -256,7 +259,7 @@ fn replace(v: &mut serde_json::Value, index: &std::collections::HashMap<&str, us
 
 /// Moves the strings that repeat into a pool. Object keys are not touched.
 fn intern(mut v: serde_json::Value) -> (Vec<String>, serde_json::Value) {
-    let mut seen = std::collections::HashMap::new();
+    let mut seen = std::collections::BTreeMap::new();
     count(&v, &mut seen);
     let mut pool: Vec<String> = seen
         .into_iter()
@@ -264,7 +267,7 @@ fn intern(mut v: serde_json::Value) -> (Vec<String>, serde_json::Value) {
         .map(|(s, _)| s)
         .collect();
     pool.sort();
-    let index: std::collections::HashMap<&str, usize> = pool
+    let index: std::collections::BTreeMap<&str, usize> = pool
         .iter()
         .enumerate()
         .map(|(i, s)| (s.as_str(), i))
@@ -285,7 +288,7 @@ fn share_notes(v: &mut serde_json::Value) {
         return;
     };
     let mut table: Vec<serde_json::Value> = Vec::new();
-    let mut at: std::collections::HashMap<String, usize> = Default::default();
+    let mut at: std::collections::BTreeMap<String, usize> = Default::default();
     for u in units.iter_mut() {
         let Some(notes) = u.get_mut("notes").and_then(|n| n.as_array_mut()) else {
             continue;
@@ -421,7 +424,7 @@ impl Store {
 
     /// Empties the store (after a mismatch).
     pub fn clear(&self) {
-        for d in [DIR, TREE_DIR, DRAFTS_DIR] {
+        for d in [DIR, TREE_DIR, DRAFTS_DIR, FLAGS_DIR] {
             if let Ok(p) = crate::tree::dest_under(&self.out, d) {
                 let _ = std::fs::remove_dir_all(p);
             }
@@ -433,7 +436,7 @@ impl Store {
     /// program, which no later run of this tree can use. Files that are not
     /// results are left alone, except a temporary file of a killed write
     /// older than an hour. Returns how many were removed.
-    pub fn gc(&self, live: &std::collections::HashSet<String>) -> usize {
+    pub fn gc(&self, live: &std::collections::BTreeSet<String>) -> usize {
         let Ok(dir) = crate::tree::dest_under(&self.out, DIR) else {
             return 0;
         };
@@ -458,7 +461,71 @@ impl Store {
                 removed += 1;
             }
         }
+        // The flags of results that are gone go with them.
+        if let Ok(dir) = crate::tree::dest_under(&self.out, FLAGS_DIR) {
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if is_key(&name) && !live.contains(&name) {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+        }
         removed
+    }
+
+    /// The key of the flags of file `fi` for the result `result`: the flags
+    /// are a function of the result, the stand-ins, the file's place in the
+    /// tree and the dialects ([`crate::refused::StandIns::flags_of`]).
+    pub fn flags_key(
+        result: &Key,
+        stand_ins_digest: &str,
+        fi: usize,
+        from: Dialect,
+        to: Dialect,
+    ) -> Key {
+        let mut k = KeyBuilder::new();
+        k.field("format", b"flags-1");
+        k.field("result", result.0.as_bytes());
+        k.field("stand-ins", stand_ins_digest.as_bytes());
+        k.field("file", &(fi as u64).to_le_bytes());
+        k.field("from", from.id().as_bytes());
+        k.field("to", to.id().as_bytes());
+        k.finish()
+    }
+
+    fn flags_rel(result: &Key, flags: &Key) -> String {
+        format!("{FLAGS_DIR}/{}/{}.json", result.0, flags.0)
+    }
+
+    /// The stored flags, or a miss (also for a file that does not read back
+    /// whole).
+    pub fn get_flags(&self, result: &Key, flags: &Key) -> Option<Vec<crate::refused::UnitFlag>> {
+        let path = crate::tree::dest_under(&self.out, &Self::flags_rel(result, flags)).ok()?;
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    }
+
+    /// Stores flags (best effort: a flag set that is not stored is computed
+    /// again next time).
+    pub fn put_flags(&self, result: &Key, flags: &Key, v: &[crate::refused::UnitFlag]) {
+        let Ok(dest) = crate::tree::dest_under(&self.out, &Self::flags_rel(result, flags)) else {
+            return;
+        };
+        let Ok(bytes) = serde_json::to_vec(v) else {
+            return;
+        };
+        if let Some(p) = dest.parent() {
+            if std::fs::create_dir_all(p).is_err() {
+                return;
+            }
+        }
+        let tmp = dest.with_extension(format!(
+            "tmp{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        if std::fs::write(&tmp, &bytes).is_err() || std::fs::rename(&tmp, &dest).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 
     fn tree_rel(key: &TreeKey) -> String {

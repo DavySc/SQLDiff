@@ -33,6 +33,16 @@ const FILES: &[(&str, &str)] = &[
         "CREATE PROCEDURE dbo.cur AS\nBEGIN\n  DECLARE @v int;\n  DECLARE c CURSOR FOR SELECT a FROM dbo.t;\n  OPEN c;\n  FETCH NEXT FROM c INTO @v;\n  WHILE @@FETCH_STATUS = 0\n  BEGIN\n    UPDATE dbo.t SET b = 'x' WHERE a = @v;\n    FETCH NEXT FROM c INTO @v;\n  END\n  CLOSE c;\n  DEALLOCATE c;\nEND\n",
     ),
     ("load.sql", "INSERT INTO dbo.t (a) VALUES (1);\n"),
+    // A table refused for its computed column stands in for binding; what
+    // uses it is flagged, and the flags are stored with the result.
+    (
+        "tables/c.sql",
+        "CREATE TABLE dbo.c (a int NOT NULL, custom nvarchar(max) NULL, other AS (json_query(custom, N'strict $.Other')));\n",
+    ),
+    (
+        "procs/usec.sql",
+        "CREATE PROCEDURE dbo.usec AS\nBEGIN\n  UPDATE dbo.c SET a = 1;\nEND\n",
+    ),
 ];
 
 struct Fixture {
@@ -48,23 +58,29 @@ impl Fixture {
             std::fs::create_dir_all(f.parent().unwrap()).unwrap();
             std::fs::write(f, text).unwrap();
         }
+        std::fs::write(
+            dir.join("base.sql"),
+            "CREATE TABLE dbo.ext (k int NOT NULL PRIMARY KEY, v varchar(10) NULL);\n",
+        )
+        .unwrap();
         Fixture { dir }
     }
 
-    fn job(&self, out: &str, jobs: usize, select: Select) -> Job {
+    fn job(&self, out: &str, jobs: usize, select: Select, to: Dialect, catalogs: &[&str]) -> Job {
         Job {
             tree: tree::Args {
                 rules: Default::default(),
                 src: self.dir.join("src"),
                 from: Dialect::Tsql,
-                to: Dialect::Postgres,
+                to,
                 jobs: Some(jobs),
                 no_catalog: false,
+                recheck: Default::default(),
                 template: None,
                 extensions: tree::extensions(Vec::new()),
                 helpers: Vec::new(),
                 deployment: Default::default(),
-                catalogs: Vec::new(),
+                catalogs: catalogs.iter().map(|c| self.dir.join(c)).collect(),
                 catalogs_b: Vec::new(),
             },
             out: self.dir.join(out),
@@ -97,33 +113,43 @@ fn next(n: usize) -> Select {
     }
 }
 
-/// A JSON value without what differs between runs by design: the `run`
-/// object, and what only describes an increment or a folder.
-fn plain(v: &mut serde_json::Value, dir: &str) {
+/// One run of the matrix.
+struct Case<'a> {
+    to: Dialect,
+    catalogs: &'a [&'a str],
+}
+
+/// A JSON value without what differs between runs by design. At the top: the
+/// `run` object and the two folder names. In a report of an increment, also
+/// what says which files it checked.
+fn plain(v: &mut serde_json::Value, top: bool, increments: bool) {
     match v {
         serde_json::Value::Object(m) => {
-            for k in [
-                "run",
-                "checked",
-                "progress",
-                "files_not_checked",
-                "out",
-                "src",
-            ] {
-                m.remove(k);
+            if top {
+                for k in ["run", "src", "out"] {
+                    m.remove(k);
+                }
+                // The ledger file is named by its path in the output folder.
+                if let Some(l) = m.get_mut("ledger").and_then(|l| l.as_object_mut()) {
+                    l.remove("path");
+                }
             }
-            m.values_mut().for_each(|x| plain(x, dir));
+            if increments {
+                for k in ["checked", "progress", "files_not_checked"] {
+                    m.remove(k);
+                }
+            }
+            m.values_mut().for_each(|x| plain(x, false, increments));
         }
-        serde_json::Value::Array(a) => a.iter_mut().for_each(|x| plain(x, dir)),
-        serde_json::Value::String(s) => *s = s.replace(dir, "<dir>"),
+        serde_json::Value::Array(a) => a.iter_mut().for_each(|x| plain(x, false, increments)),
         _ => {}
     }
 }
 
-/// Every file under `dir` except the store, relative, with its text; JSON
-/// reports without what may differ (markdown reports compared whole, the
-/// folder spelt `<dir>`).
-fn tree_of(dir: &Path, root: &Path) -> Vec<(String, String)> {
+/// Every file under `dir` except the store, relative, with its text; the
+/// JSON reports without what may differ. Nothing else is masked: the
+/// markdown reports and every reason compare whole.
+fn tree_of(dir: &Path, increments: bool) -> Vec<(String, String)> {
     let mut v = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -142,13 +168,20 @@ fn tree_of(dir: &Path, root: &Path) -> Vec<(String, String)> {
                 continue;
             }
             let text = std::fs::read_to_string(&p).unwrap();
-            let text = if rel.ends_with(".json") {
+            let text = if rel.ends_with(".json") && rel.starts_with("conversion-report") {
                 let mut j: serde_json::Value = serde_json::from_str(&text).unwrap();
-                plain(&mut j, &dir.display().to_string());
-                plain(&mut j, &root.display().to_string());
+                plain(&mut j, true, increments);
                 j.to_string()
+            } else if rel.ends_with(".md") && rel.starts_with("conversion-report") {
+                if increments {
+                    // The increment line of the summary; the tables are
+                    // compared through the JSON report.
+                    continue;
+                }
+                // The report names its output folder once, in its heading.
+                text.replace(&dir.display().to_string(), "<out>")
             } else {
-                text.replace(&dir.display().to_string(), "<dir>")
+                text
             };
             v.push((rel, text));
         }
@@ -167,7 +200,7 @@ fn same(a: &[(String, String)], b: &[(String, String)], what: &str) {
                     .zip(y.1.bytes())
                     .position(|(p, q)| p != q)
                     .unwrap_or(0);
-            let (lo, hi) = (at.saturating_sub(150), at + 250);
+            let (lo, hi) = (at.saturating_sub(150), at + 650);
             panic!(
                 "{what}: {} differs at {at}\n left:  {}\n right: {}",
                 x.0,
@@ -178,49 +211,184 @@ fn same(a: &[(String, String)], b: &[(String, String)], what: &str) {
     }
 }
 
-fn run(f: &Fixture, out: &str, jobs: usize, select: Select, fresh: bool) {
-    let mut job = f.job(out, jobs, select);
+fn run(f: &Fixture, c: &Case, out: &str, jobs: usize, select: Select, fresh: bool) {
+    let mut job = f.job(out, jobs, select, c.to, c.catalogs);
     job.fresh = fresh;
     convert_into(&job, &Hooks::default()).unwrap();
 }
 
-#[test]
-fn thread_count_store_and_folder_never_change_the_output() {
-    let f = Fixture::new("matrix");
-    run(&f, "a", 1, Select::default(), true);
-    let base = tree_of(&f.out("a"), &f.dir);
+/// Every way of running the same tree gives the same files and report.
+fn matrix(name: &str, c: Case, ledger: Option<&str>) {
+    let f = Fixture::new(name);
+    let start = |out: &str| {
+        if let Some(text) = ledger {
+            let o = f.out(out);
+            std::fs::create_dir_all(&o).unwrap();
+            std::fs::write(o.join("review-decisions.jsonl"), text).unwrap();
+        }
+    };
+    start("o-a");
+    run(&f, &c, "o-a", 1, Select::default(), true);
+    let base = tree_of(&f.out("o-a"), false);
     // Fresh with more threads, into another folder.
-    run(&f, "b", 4, Select::default(), true);
+    start("o-b");
+    run(&f, &c, "o-b", 4, Select::default(), true);
     same(
         &base,
-        &tree_of(&f.out("b"), &f.dir),
+        &tree_of(&f.out("o-b"), false),
         "-j4 fresh, other folder",
     );
     // Resumed from the store another thread count made, both ways.
-    run(&f, "a", 4, Select::default(), false);
+    run(&f, &c, "o-a", 4, Select::default(), false);
     same(
         &base,
-        &tree_of(&f.out("a"), &f.dir),
+        &tree_of(&f.out("o-a"), false),
         "-j4 resumed on a -j1 store",
     );
-    run(&f, "b", 1, Select::default(), false);
+    run(&f, &c, "o-b", 1, Select::default(), false);
     same(
         &base,
-        &tree_of(&f.out("b"), &f.dir),
+        &tree_of(&f.out("o-b"), false),
         "-j1 resumed on a -j4 store",
+    );
+    // --fresh over a store that exists.
+    run(&f, &c, "o-a", 3, Select::default(), true);
+    same(
+        &base,
+        &tree_of(&f.out("o-a"), false),
+        "--fresh over a store",
     );
     // Resumed again and again: the re-check samples differ per run, the
     // output does not.
     for n in 0..4 {
-        run(&f, "a", 1 + n % 3, Select::default(), false);
-        same(&base, &tree_of(&f.out("a"), &f.dir), "repeated resume");
+        run(&f, &c, "o-a", 1 + n % 3, Select::default(), false);
+        same(&base, &tree_of(&f.out("o-a"), false), "repeated resume");
     }
     // Increments with alternating thread counts end where the full run does.
+    start("o-inc");
     for step in 0..FILES.len() {
-        run(&f, "inc", if step % 2 == 0 { 1 } else { 3 }, next(1), false);
+        run(
+            &f,
+            &c,
+            "o-inc",
+            if step % 2 == 0 { 1 } else { 3 },
+            next(1),
+            false,
+        );
     }
-    run(&f, "inc", 2, Select::default(), false);
-    same(&base, &tree_of(&f.out("inc"), &f.dir), "increments");
+    run(&f, &c, "o-inc", 2, Select::default(), false);
+    same(
+        &tree_of(&f.out("o-a"), true),
+        &tree_of(&f.out("o-inc"), true),
+        "increments",
+    );
+}
+
+#[test]
+fn thread_count_store_and_folder_never_change_the_output() {
+    matrix(
+        "pg",
+        Case {
+            to: Dialect::Postgres,
+            catalogs: &[],
+        },
+        None,
+    );
+}
+
+#[test]
+fn the_same_holds_for_db2_for_i() {
+    matrix(
+        "db2",
+        Case {
+            to: Dialect::Db2i,
+            catalogs: &[],
+        },
+        None,
+    );
+}
+
+#[test]
+fn the_same_holds_with_a_base_catalog() {
+    matrix(
+        "base",
+        Case {
+            to: Dialect::Postgres,
+            catalogs: &["base.sql"],
+        },
+        None,
+    );
+}
+
+#[test]
+fn the_same_holds_with_a_hand_written_unit_in_the_ledger() {
+    // The id of the function's unit comes from a first run.
+    let f = Fixture::new("ledger-id");
+    run(
+        &f,
+        &Case {
+            to: Dialect::Postgres,
+            catalogs: &[],
+        },
+        "x",
+        1,
+        Select::default(),
+        true,
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(f.out("x").join("conversion-report.json")).unwrap())
+            .unwrap();
+    let file = report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["path"] == "funcs/f.sql")
+        .unwrap();
+    let unit = file["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(file["converted_units"].as_array().unwrap())
+        .next()
+        .unwrap();
+    let record = serde_json::json!({
+        "unit": unit["id"],
+        "path": "funcs/f.sql",
+        "state": "written",
+        "by": "human",
+        "author": "tester",
+        "at": "2026-01-01T00:00:00Z",
+        "input_hash": "",
+        "output_hash": "",
+        "text": "CREATE OR REPLACE FUNCTION f(p_x integer) RETURNS integer LANGUAGE sql AS $$ SELECT p_x + 2 $$;\n",
+    });
+    matrix(
+        "ledger",
+        Case {
+            to: Dialect::Postgres,
+            catalogs: &[],
+        },
+        Some(&format!("{record}\n")),
+    );
+}
+
+#[test]
+fn a_run_cancelled_before_it_starts_leaves_the_folder_as_it_was() {
+    use std::sync::{atomic::AtomicBool, Arc};
+    let f = Fixture::new("cancel");
+    let hooks = Hooks {
+        progress: None,
+        cancel: Some(Arc::new(AtomicBool::new(true))),
+    };
+    let _ = convert_into(
+        &f.job("c", 1, Select::default(), Dialect::Postgres, &[]),
+        &hooks,
+    );
+    let o = f.out("c");
+    assert!(
+        !o.join(".sqldiff").join("run-counter").exists(),
+        "a cancelled run recorded itself"
+    );
 }
 
 #[test]
@@ -243,17 +411,39 @@ fn the_re_check_seed_is_not_the_clock() {
 }
 
 #[test]
-fn a_run_cancelled_before_it_starts_leaves_the_folder_as_it_was() {
-    use std::sync::{atomic::AtomicBool, Arc};
-    let f = Fixture::new("cancel");
-    let hooks = Hooks {
-        progress: None,
-        cancel: Some(Arc::new(AtomicBool::new(true))),
+fn stand_in_flags_come_from_the_store_without_changing_the_output() {
+    let f = Fixture::new("flags");
+    let c = Case {
+        to: Dialect::Postgres,
+        catalogs: &[],
     };
-    let _ = convert_into(&f.job("c", 1, Select::default()), &hooks);
-    let o = f.out("c");
+    run(&f, &c, "a", 2, Select::default(), true);
+    let base = tree_of(&f.out("a"), false);
+    let flags = f.out("a").join(".sqldiff/flags");
+    let stored = std::fs::read_dir(&flags).map(|d| d.count()).unwrap_or(0);
     assert!(
-        !o.join(".sqldiff").join("run-counter").exists(),
-        "a cancelled run recorded itself"
+        stored > 0,
+        "the flags of the file using the stand-in are stored"
     );
+    assert!(
+        base.iter().any(|(_, t)| t.contains("ASM-TABLE-STAND-IN")),
+        "the fixture does flag a unit"
+    );
+    // Resumed: the flags are read, not computed; same files.
+    for jobs in [1, 3] {
+        run(&f, &c, "a", jobs, Select::default(), false);
+        same(
+            &base,
+            &tree_of(&f.out("a"), false),
+            "resumed with stored flags",
+        );
+    }
+    // A stored flag set that does not read back is computed again.
+    for e in std::fs::read_dir(&flags).unwrap().flatten() {
+        for g in std::fs::read_dir(e.path()).unwrap().flatten() {
+            std::fs::write(g.path(), b"not json").unwrap();
+        }
+    }
+    run(&f, &c, "a", 2, Select::default(), false);
+    same(&base, &tree_of(&f.out("a"), false), "unreadable flags");
 }
