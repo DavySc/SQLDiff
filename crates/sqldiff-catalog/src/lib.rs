@@ -634,7 +634,7 @@ pub fn table_position(d: Dialect, cat: &Catalog, parts: &[Ident]) -> Option<usiz
 #[derive(Debug, Clone)]
 pub struct CatalogView {
     pub dialect: Dialect,
-    pub catalog: Catalog,
+    catalog: Catalog,
     /// Whether any catalog was supplied for this side. Without one, persistent
     /// objects stay unresolved and become assumptions.
     pub supplied: bool,
@@ -666,6 +666,13 @@ impl CatalogView {
             index,
             indexed,
         }
+    }
+
+    /// The merged catalog. Read-only on purpose: the name index is built for
+    /// it, so every change goes through `put_table`, `put_routine` or
+    /// `apply_statement`, which keep the index current.
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
     }
 
     /// An empty view that objects are added to as they are created (a
@@ -889,8 +896,8 @@ mod tests {
                     "{d:?} {n}"
                 );
             }
-            let (f1, f2) = (ddl::load("CREATE FUNCTION f(p int) RETURNS int AS 'x'; CREATE FUNCTION f(p text) RETURNS int AS 'x'; CREATE FUNCTION f(p int) RETURNS int AS 'y'; CREATE FUNCTION f(a int, b int) RETURNS int AS 'z';", d, "t"), Catalog::default());
-            let _ = f2;
+            let f1 = ddl::load("CREATE FUNCTION f(p int) RETURNS int AS 'x'; CREATE FUNCTION f(p text) RETURNS int AS 'x'; CREATE FUNCTION f(p int) RETURNS int AS 'y'; CREATE FUNCTION f(a int, b int) RETURNS int AS 'z';", d, "t");
+            assert!(!f1.routines.is_empty(), "{d:?}: the functions load");
             let (mut plain, mut via) = (Catalog::default(), Catalog::default());
             let mut ix = NameIndex::new(d, &via);
             for r in f1.routines.iter().chain(&f1.routines) {
@@ -906,7 +913,7 @@ mod tests {
             let v = CatalogView::new(d, &[&plain]);
             for r in &plain.routines {
                 let Lookup::Found(found) = v.routines(&[Ident::new(r.name.clone(), true)]) else {
-                    continue;
+                    panic!("{d:?} {}: the routine is found", r.name);
                 };
                 let scan: Vec<&Routine> = plain
                     .routines

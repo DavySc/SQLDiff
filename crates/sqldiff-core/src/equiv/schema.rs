@@ -640,7 +640,7 @@ impl Schema {
             ..Schema::default()
         };
         if d == Dialect::Postgres {
-            let c = &view.catalog;
+            let c = &view.catalog();
             let names = c
                 .schemas
                 .iter()
@@ -665,7 +665,7 @@ impl Schema {
             }
         }
         std::sync::Arc::make_mut(&mut s.star_views).extend(
-            view.catalog
+            view.catalog()
                 .tables
                 .iter()
                 .filter(|t| t.kind == TableKind::View && t.star_outputs)
@@ -674,7 +674,7 @@ impl Schema {
         // Base and temporary tables only: view columns are derived, and their
         // types and nullability are not facts equivalence may rely on.
         for t in view
-            .catalog
+            .catalog()
             .tables
             .iter()
             .filter(|t| matches!(t.kind, TableKind::Table | TableKind::Temporary))
