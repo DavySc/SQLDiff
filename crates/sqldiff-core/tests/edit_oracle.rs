@@ -216,3 +216,69 @@ fn shared_state_agrees_with_the_exact_scan() {
     }
     assert!(compared > 200, "the generated cases produce findings");
 }
+
+/// Fixed shapes for the sweep's wake-ups. The generator reaches them only by
+/// chance, so each is pinned here: a unit that reads only through the
+/// any-name (a quoted identifier `*` is the only way a read gets it) is offered while the taint is still empty, and a
+/// later edit makes the taint non-empty; the unit must then fire, and its
+/// any-name write must reach the last edit.
+#[test]
+fn sweep_wake_ups_agree_with_the_exact_scan() {
+    std::env::set_var("SQLDIFF_EDIT_ORACLE", "1");
+    let tsql = |k1: u32, k2: u32| {
+        format!(
+            "CREATE PROCEDURE dbo.r @p int, @q int AS\nBEGIN\nDECLARE @v2 int = 0;\nSET @q = (SELECT @p AS [*]);\nSET @v2 = @p + {k1};\nSELECT @q + {k2};\nEND\n"
+        )
+    };
+    let pg = |k1: u32, k2: u32| {
+        format!(
+            "CREATE FUNCTION r(p int, q int) RETURNS void LANGUAGE plpgsql AS $$\nDECLARE v2 int := 0;\nBEGIN\nq := (SELECT p AS \"*\");\nv2 := p + {k1};\nPERFORM q + {k2};\nEND $$;\n"
+        )
+    };
+    // The same unit between the two edits: the reach sweep must wake it.
+    let tsql_mid = |k1: u32, k2: u32| {
+        format!(
+            "CREATE PROCEDURE dbo.r @p int, @q int AS\nBEGIN\nDECLARE @v2 int = 0;\nSET @v2 = @p + {k1};\nSET @q = (SELECT @p AS [*]);\nSELECT @q + {k2};\nEND\n"
+        )
+    };
+    let pg_mid = |k1: u32, k2: u32| {
+        format!(
+            "CREATE FUNCTION r(p int, q int) RETURNS void LANGUAGE plpgsql AS $$\nDECLARE v2 int := 0;\nBEGIN\nv2 := p + {k1};\nq := (SELECT p AS \"*\");\nPERFORM q + {k2};\nEND $$;\n"
+        )
+    };
+    let mut answered = 0;
+    for d in [Dialect::Tsql, Dialect::Postgres] {
+        let mid = |a: u32, b: u32| {
+            if d == Dialect::Tsql {
+                tsql_mid(a, b)
+            } else {
+                pg_mid(a, b)
+            }
+        };
+        for (x, y) in [(mid(1, 1), mid(2, 2)), (mid(2, 2), mid(1, 1))] {
+            let r = diff(
+                &Artifact::new("a.sql", d, x.as_str()),
+                &Artifact::new("b.sql", d, y.as_str()),
+                &Options::default(),
+            );
+            answered += r.findings.len();
+        }
+        let make = |a: u32, b: u32| {
+            if d == Dialect::Tsql {
+                tsql(a, b)
+            } else {
+                pg(a, b)
+            }
+        };
+        // both statements after the dynamic call are edited
+        for (x, y) in [(make(1, 1), make(2, 2)), (make(2, 2), make(1, 1))] {
+            let r = diff(
+                &Artifact::new("a.sql", d, x.as_str()),
+                &Artifact::new("b.sql", d, y.as_str()),
+                &Options::default(),
+            );
+            answered += r.findings.len();
+        }
+    }
+    assert!(answered > 0);
+}
