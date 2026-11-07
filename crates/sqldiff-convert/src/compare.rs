@@ -107,6 +107,24 @@ fn side(u: &UnitReport) -> Side {
     }
 }
 
+/// A unit's rewrites with their byte offsets taken from the first one. The
+/// offsets in a trace are positions in the file, so a statement inserted
+/// above a unit moves them all; what the unit's rules did is the same.
+fn rewrites(u: &UnitReport) -> Vec<(&str, usize, usize, Option<&str>)> {
+    let base = u.trace.iter().map(|s| s.start).min().unwrap_or(0);
+    u.trace
+        .iter()
+        .map(|s| {
+            (
+                s.rule.as_str(),
+                s.start - base,
+                s.end - base,
+                s.inst.as_deref(),
+            )
+        })
+        .collect()
+}
+
 /// What differs between two sides of a unit, in a fixed order. A converted
 /// unit has no rules, findings or reason, so its `trace` is what shows that
 /// a rule edit changed its output.
@@ -124,7 +142,7 @@ fn differs(x: &UnitReport, y: &UnitReport) -> Vec<&'static str> {
     if x.reason != y.reason {
         d.push("reason");
     }
-    if x.trace != y.trace {
+    if rewrites(x) != rewrites(y) {
         d.push("rewrites");
     }
     if x.impossible != y.impossible {
@@ -405,6 +423,35 @@ mod tests {
         assert_eq!(c.rows[0].differs, vec!["rewrites"]);
         let same = compare_files(&[file("f.sql", vec![x.clone()])], &[file("f.sql", vec![x])]);
         assert!(same.rows.is_empty() && same.unchanged == 1);
+    }
+
+    #[test]
+    fn a_unit_moved_down_the_file_is_not_a_change() {
+        let step = |rule: &str, start: usize, end: usize, inst: &str| json!({"rule": rule, "start": start, "end": end, "inst": inst});
+        let mut x = unit("u", "converted", 1, "");
+        x["trace"] = json!([
+            step("tsql.type.int", 19, 22, "integer"),
+            step("tsql.x", 35, 47, "a")
+        ]);
+        // A statement inserted above: every offset moves by 33.
+        let mut moved = x.clone();
+        moved["trace"] = json!([
+            step("tsql.type.int", 52, 55, "integer"),
+            step("tsql.x", 68, 80, "a")
+        ]);
+        let c = compare_files(
+            &[file("f.sql", vec![x.clone()])],
+            &[file("f.sql", vec![moved])],
+        );
+        assert!(c.rows.is_empty() && c.unchanged == 1, "{c:?}");
+        // The same offsets with another instantiation is a change.
+        let mut other = x.clone();
+        other["trace"] = json!([
+            step("tsql.type.int", 19, 22, "bigint"),
+            step("tsql.x", 35, 47, "a")
+        ]);
+        let c = compare_files(&[file("f.sql", vec![x])], &[file("f.sql", vec![other])]);
+        assert_eq!(c.rows[0].differs, vec!["rewrites"]);
     }
 
     #[test]
