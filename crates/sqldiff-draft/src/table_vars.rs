@@ -28,6 +28,10 @@ pub struct Claim {
 #[derive(Debug, Default)]
 pub struct Claims {
     by_table: BTreeMap<String, Claim>,
+    /// The `CREATE TYPE … FROM` statements of the tree, as written, in tree
+    /// order: what a file's draft reads another file's alias types from.
+    alias_stmts: Vec<String>,
+    alias_types: std::sync::OnceLock<crate::tsql::AliasMap>,
 }
 
 impl Claims {
@@ -46,6 +50,9 @@ impl Claims {
     /// Adds the claims of one parsed T-SQL file.
     pub fn add_root(&mut self, root: &SyntaxNode, file: &str) {
         for n in root.descendants() {
+            if n.kind() == SyntaxKind::STATEMENT && alias_type_statement(&n) {
+                self.alias_stmts.push(n.text().to_string());
+            }
             if n.kind() != SyntaxKind::STATEMENT || !table_variable_declare(&n) {
                 continue;
             }
@@ -67,6 +74,17 @@ impl Claims {
         }
     }
 
+    /// The alias types the tree's files create (`CREATE TYPE n FROM base`),
+    /// worked out once, for the dialect the tree is converted to.
+    pub(crate) fn alias_types(
+        &self,
+        to: Dialect,
+        options: sqldiff_units::RuleOptions,
+    ) -> &crate::tsql::AliasMap {
+        self.alias_types
+            .get_or_init(|| crate::tsql::alias_types_of(&self.alias_stmts, to, options))
+    }
+
     /// The claim on `table` (lower case, without the schema) by a routine
     /// other than `routine`, if any: the table variable `routine` would map
     /// there clashes with it. Two definitions of one routine do not clash.
@@ -83,6 +101,15 @@ fn same_routine(a: Option<&str>, b: Option<&str>) -> bool {
         (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
         _ => false,
     }
+}
+
+/// `CREATE TYPE n FROM base …`, an alias type (not `AS TABLE`).
+fn alias_type_statement(n: &SyntaxNode) -> bool {
+    let w = ast::first_words(n, 4);
+    let w = |i: usize| w.get(i).map(String::as_str).unwrap_or("");
+    w(0) == "CREATE"
+        && w(1) == "TYPE"
+        && ast::sig_tokens(n).any(|t| t.text().eq_ignore_ascii_case("FROM"))
 }
 
 /// `DECLARE @t [AS] TABLE (…)`, as the rules recognise it

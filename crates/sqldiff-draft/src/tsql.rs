@@ -93,15 +93,42 @@ pub fn with_plain_routines<T>(at: &[usize], f: impl FnOnce() -> T) -> T {
     f()
 }
 
-pub(crate) fn convert(
-    root: &SyntaxNode,
-    src: &str,
+/// The alias types of a tree, by schema and name (lower case, `dbo` for none).
+pub(crate) type AliasMap = BTreeMap<(String, String), AliasType>;
+
+/// The alias types the `CREATE TYPE … FROM` statements `stmts` (each one
+/// statement of T-SQL) create, read the way a file's own `CREATE TYPE` is, so
+/// that a file can read a type another file of its tree creates as its base
+/// type (`Claims::alias_types`). Statements the rules cannot convert make no
+/// alias type; nothing they note or trace reaches any file's draft.
+pub(crate) fn alias_types_of(
+    stmts: &[String],
     to: Dialect,
-    catalog: Option<SourceReads<'_>>,
-    claims: &crate::table_vars::Claims,
     options: sqldiff_units::RuleOptions,
-) -> Out {
-    let mut cx = Cx {
+) -> AliasMap {
+    let claims = crate::table_vars::Claims::default();
+    let mut map = AliasMap::new();
+    for text in stmts {
+        let root = sqldiff_syntax::parse(text, Dialect::Tsql).syntax();
+        let Some(n) = root.descendants().find(|n| n.kind() == STATEMENT) else {
+            continue;
+        };
+        let mut cx = new_cx(text, to, None, &claims, options);
+        cx.alias_types = std::mem::take(&mut map);
+        let _ = cx.create_alias_type(&tokens(&n));
+        map = cx.alias_types;
+    }
+    map
+}
+
+fn new_cx<'a>(
+    src: &'a str,
+    to: Dialect,
+    catalog: Option<SourceReads<'a>>,
+    claims: &'a crate::table_vars::Claims,
+    options: sqldiff_units::RuleOptions,
+) -> Cx<'a> {
+    Cx {
         src,
         lines: std::cell::OnceCell::new(),
         to,
@@ -168,7 +195,20 @@ pub(crate) fn convert(
         update_ctes: Vec::new(),
         stmt_ctes: Vec::new(),
         stmt_insert: false,
-    };
+    }
+}
+
+pub(crate) fn convert(
+    root: &SyntaxNode,
+    src: &str,
+    to: Dialect,
+    catalog: Option<SourceReads<'_>>,
+    claims: &crate::table_vars::Claims,
+    options: sqldiff_units::RuleOptions,
+) -> Out {
+    let mut cx = new_cx(src, to, catalog, claims, options);
+    // Alias types the tree's other files create read as their base type here too.
+    cx.alias_types = claims.alias_types(to, options).clone();
     let mut out = Out::default();
     let els: Vec<SyntaxElement> = root.children_with_tokens().collect();
     let mut joined = 0;
@@ -373,8 +413,8 @@ const PG_TYPE_NAMES: &[&str] = &[
 
 /// An alias type created in the file: the domain it became and what a
 /// column of it inherits.
-#[derive(Clone)]
-struct AliasType {
+#[derive(Clone, Debug)]
+pub(crate) struct AliasType {
     /// The domain name as written in the target.
     domain: String,
     /// `Some(true)` for `NOT NULL`, `Some(false)` for `NULL`.
