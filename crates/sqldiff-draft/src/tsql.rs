@@ -8348,6 +8348,28 @@ impl<'a> Cx<'a> {
             IDENT if next_sig(ts, j).is_some_and(|n| ts[n].k == L_PAREN) => {
                 (string_builtin(ts, j), false)
             }
+            // A column, written `c`, `t.c` or `s.t.c`: its type in the
+            // catalog, by the statement's tables.
+            IDENT | QUOTED_IDENT if !t.s.starts_with('@') => {
+                let (mut a, mut b) = (j, j);
+                while let Some(d) = prev_sig(ts, a).filter(|&d| ts[d].k == DOT) {
+                    match prev_sig(ts, d).filter(|&q| matches!(ts[q].k, IDENT | QUOTED_IDENT)) {
+                        Some(q) => a = q,
+                        None => return (false, false),
+                    }
+                }
+                while let Some(d) = next_sig(ts, b).filter(|&d| ts[d].k == DOT) {
+                    match next_sig(ts, d).filter(|&q| matches!(ts[q].k, IDENT | QUOTED_IDENT)) {
+                        Some(q) => b = q,
+                        None => return (false, false),
+                    }
+                }
+                match self.column_dt(&ts[a..=b]) {
+                    Some(Dt::Text) => (true, false),
+                    Some(Dt::Int | Dt::BigInt | Dt::Fraction | Dt::Money) => (false, true),
+                    _ => (false, false),
+                }
+            }
             R_PAREN => {
                 let open = (0..j)
                     .rev()
