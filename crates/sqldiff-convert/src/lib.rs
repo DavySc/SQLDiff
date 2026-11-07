@@ -16,6 +16,8 @@ pub use shared::Shared;
 use sqldiff_core::{Artifact, Dialect, Options, Report};
 use sqldiff_syntax::{parse, LineIndex};
 
+include!(concat!(env!("OUT_DIR"), "/fingerprint.rs"));
+
 pub mod base;
 pub mod callees;
 pub mod cert;
