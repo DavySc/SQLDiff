@@ -357,23 +357,33 @@ impl<'a> Parser<'a> {
             self.too_deep = true;
             self.start(ERROR);
             // Stop at the next batch separator: the objects after a deep
-            // routine are separate batches and still parse. The statements
-            // swallowed (each `;`) are counted for the report.
-            let mut skipped = 0usize;
-            while let Some(k) = self.nth_kind(0).filter(|k| *k != BATCH_SEP) {
-                skipped += usize::from(k == SEMICOLON);
+            // routine are separate batches and still parse.
+            while self.nth_kind(0).is_some_and(|k| k != BATCH_SEP) {
                 self.bump();
             }
-            let end = if self.nth_kind(0).is_some() {
-                "the next batch separator"
+            // Say exactly what was left unread: the lines from here to the
+            // separator or the end of the file (a count of statements is not
+            // exact, since `;` is optional in T-SQL and the `END`s of the
+            // blocks already read are swallowed too).
+            let (stop, end) = match self.sig_index(0) {
+                Some(i) => (self.tokens[i].start, "the next batch separator"),
+                None => (self.src.len(), "the end of the file"),
+            };
+            let line = |o: usize| self.src[..o].bytes().filter(|&b| b == b'\n').count() + 1;
+            let (first, last) = (
+                line(offset),
+                line(self.src[..stop].trim_end().len().max(offset)),
+            );
+            let lines = if first == last {
+                format!("line {first} was")
             } else {
-                "the end of the file"
+                format!("lines {first} to {last} were")
             };
             self.diags.push(Diagnostic {
                 offset,
                 message: format!(
                     "statements nested deeper than {MAX_STATEMENT_NESTING}: nesting too deep; \
-                     {skipped} statements up to {end} were not read"
+                     {lines} not read (up to {end})"
                 ),
             });
             self.finish();
@@ -1498,15 +1508,6 @@ mod tests {
                 "{d:?}"
             );
             assert_eq!(bad.syntax().text().to_string(), deep, "{d:?}: lossless");
-            // The innermost SELECT's `;` and one `;`-less END per level: only
-            // the `;` count, so exactly one statement is reported skipped.
-            assert!(
-                bad.diagnostics
-                    .iter()
-                    .any(|x| x.message.contains("1 statements up to the end of the file")),
-                "{:?}",
-                bad.diagnostics
-            );
             assert!(
                 !good
                     .diagnostics
@@ -1515,6 +1516,83 @@ mod tests {
                 "{d:?}"
             );
         }
+    }
+
+    #[test]
+    fn too_deep_message_names_the_unread_lines_exactly() {
+        let k = MAX_STATEMENT_NESTING;
+        let msg = |text: &str, d: Dialect| {
+            let p = parse(text, d);
+            assert_eq!(p.syntax().text().to_string(), text, "{d:?}: lossless");
+            let m: Vec<_> = p
+                .diagnostics
+                .iter()
+                .filter(|x| x.message.contains("nesting too deep"))
+                .map(|x| x.message.clone())
+                .collect();
+            assert_eq!(m.len(), 1, "{d:?}: {m:?}");
+            m[0].clone()
+        };
+        let want = |what: &str, end: &str| {
+            format!("statements nested deeper than {k}: nesting too deep; {what} not read (up to {end})")
+        };
+        let n = k + 10;
+        // T-SQL without semicolons: statements are not counted, lines are.
+        // The error starts at the BEGIN nested k deep (line k + 1) and runs to
+        // the last END (line n + 3 + n).
+        let text = format!(
+            "{}SELECT 1\nSELECT 2\nPRINT 'x'\n{}",
+            "BEGIN\n".repeat(n),
+            "END\n".repeat(n)
+        );
+        assert_eq!(
+            msg(&text, Dialect::Tsql),
+            want(
+                &format!("lines {} to {} were", k + 1, n + 3 + n),
+                "the end of the file"
+            )
+        );
+        // The same nest with `;` and `END;` reports lines the same way.
+        let text = format!("{}SELECT 1;\n{}", "BEGIN\n".repeat(n), "END;\n".repeat(n));
+        assert_eq!(
+            msg(&text, Dialect::Tsql),
+            want(
+                &format!("lines {} to {} were", k + 1, n + 1 + n),
+                "the end of the file"
+            )
+        );
+        // A batch separator ends the unread span.
+        let text = format!(
+            "{}SELECT 1\n{}GO\nSELECT 2\n",
+            "BEGIN\n".repeat(n),
+            "END\n".repeat(n)
+        );
+        assert_eq!(
+            msg(&text, Dialect::Tsql),
+            want(
+                &format!("lines {} to {} were", k + 1, n + 1 + n),
+                "the next batch separator"
+            )
+        );
+        // One unread line.
+        let text = format!(
+            "{}SELECT 1 {}",
+            "BEGIN ".repeat(k + 1),
+            "END ".repeat(k + 1)
+        );
+        assert_eq!(
+            msg(&text, Dialect::Tsql),
+            want("line 1 was", "the end of the file")
+        );
+        // Db2 for i (no batch separator: the rest of the file).
+        let text = format!("{}SET v = 1;\n{}", "BEGIN\n".repeat(n), "END;\n".repeat(n));
+        assert_eq!(
+            msg(&text, Dialect::Db2i),
+            want(
+                &format!("lines {} to {} were", k + 1, n + 1 + n),
+                "the end of the file"
+            )
+        );
     }
 
     #[test]
