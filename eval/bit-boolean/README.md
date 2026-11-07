@@ -1,6 +1,6 @@
 # Bit and boolean probes
 
-These are the engine checks behind the bit rules: `crates/sqldiff-convert/src/tsql/bits.rs` (the converter) and the "bit and boolean" section of `crates/sqldiff-equiv/src/equiv/canon.rs` (the engine). They were run on SQL Server 2022 and PostgreSQL 18 on 2026-10-26.
+These are the engine checks behind the bit rules: `crates/sqldiff-draft/src/tsql/bits.rs` (the converter) and the "bit and boolean" section of `crates/sqldiff-equiv/src/equiv/canon.rs` (the engine). They were run on SQL Server 2022 and PostgreSQL 18 on 2026-10-26.
 
 - `mssql.sql`: how SQL Server reads and stores a bit. It covers strings and numbers cast to bit, stored values, comparisons, `~ & | ^`, result types, ISNULL against COALESCE, aggregates, defaults and CHECK. Run it with `sqlcmd -I -W -s"|" -h -1`. Some batches fail on purpose. The output is in `mssql.out`.
 - `postgres.sql`: the same questions for boolean. It covers which comparisons, casts, assignments and operators PostgreSQL rejects, PL/pgSQL assignment, and boolean as text. Run it with `psql -At`. The output is in `postgres.out`.

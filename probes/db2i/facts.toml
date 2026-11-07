@@ -80,46 +80,46 @@ review = ["crates/sqldiff-equiv/src/equiv/canon.rs", "eval/casts/README.md"]
 [[fact]]
 id = "V32"
 title = "ORDER BY and FETCH FIRST n ROWS ONLY below the outer query (subquery, derived table, CTE, INSERT ... SELECT, view), and a NULL row count"
-review = ["crates/sqldiff-convert/src/tsql/paging.rs", "docs/convert-mode.md"]
+review = ["crates/sqldiff-draft/src/tsql/paging.rs", "docs/convert-mode.md"]
 
 [[fact]]
 id = "V28"
 title = "BIT as SMALLINT, and BOOLEAN: open questions for a later BIT mapping"
-review = ["crates/sqldiff-convert/src/tsql/bits.rs"]
+review = ["crates/sqldiff-draft/src/tsql/bits.rs"]
 
 [[link]]
 facts = ["V4"]
-file = "crates/sqldiff-convert/src/tsql.rs"
+file = "crates/sqldiff-draft/src/tsql.rs"
 anchor = "ASM-DB2-SCRIPT-COMMIT"
 hedge = "V4 not checked on a real system"
 
 [[link]]
 facts = ["V4"]
-file = "crates/sqldiff-convert/src/tsql.rs"
+file = "crates/sqldiff-draft/src/tsql.rs"
 anchor = "\"ASM-DB2-COMMIT-CS\","
 hedge = "V4 not checked on a real system"
 
 [[link]]
 facts = ["V4"]
-file = "crates/sqldiff-convert/src/tsql.rs"
+file = "crates/sqldiff-draft/src/tsql.rs"
 anchor = "under *NONE the ROLLBACK undoes nothing"
 hedge = "fact V4, not checked on a real system"
 
 [[link]]
 facts = ["V9"]
-file = "crates/sqldiff-convert/src/tsql.rs"
+file = "crates/sqldiff-draft/src/tsql.rs"
 anchor = "\"ASM-FACT-V9\""
 hedge = "not checked on a real system"
 
 [[link]]
 facts = ["V14"]
-file = "crates/sqldiff-convert/src/tsql.rs"
+file = "crates/sqldiff-draft/src/tsql.rs"
 anchor = "\"ASM-FACT-V14\""
 hedge = "only partly verified"
 
 [[link]]
 facts = ["V15"]
-file = "crates/sqldiff-convert/src/tsql.rs"
+file = "crates/sqldiff-draft/src/tsql.rs"
 anchor = "USE AND KEEP EXCLUSIVE LOCKS (its rules"
 hedge = "were not checked, fact V15"
 
@@ -137,25 +137,25 @@ hedge = "fact V25, not checked on a real system"
 
 [[link]]
 facts = ["V27"]
-file = "crates/sqldiff-convert/src/tsql.rs"
+file = "crates/sqldiff-draft/src/tsql.rs"
 anchor = "\"ASM-DB2-DATEADD-NUMBER\","
 hedge = "fact V27, not checked on a real system"
 
 [[link]]
 facts = ["V27"]
-file = "crates/sqldiff-convert/src/tsql.rs"
+file = "crates/sqldiff-draft/src/tsql.rs"
 anchor = "\"ASM-DB2-MONTH-END\","
 hedge = "fact V27, not checked on a real system"
 
 [[link]]
 facts = ["V27"]
-file = "crates/sqldiff-convert/src/tsql.rs"
+file = "crates/sqldiff-draft/src/tsql.rs"
 anchor = "\"ASM-DB2-TIME-WRAP\","
 hedge = "fact V27, not checked on a real system"
 
 [[link]]
 facts = ["V27"]
-file = "crates/sqldiff-convert/src/tsql.rs"
+file = "crates/sqldiff-draft/src/tsql.rs"
 anchor = "Db2 for i dates and timestamps also end at 0001 and 9999"
 hedge = "fact V27, not checked on a real system"
 
@@ -172,30 +172,30 @@ review = ["crates/sqldiff-equiv/src/equiv/call.rs", "docs/cross-dialect-proofs.m
 [[fact]]
 id = "V34"
 title = "BEFORE INSERT trigger filling a NOT NULL column from NEXT VALUE FOR (the converted sequence default)"
-review = ["crates/sqldiff-convert/src/tsql.rs", "docs/convert-mode.md"]
+review = ["crates/sqldiff-draft/src/tsql.rs", "docs/convert-mode.md"]
 
 [[link]]
 facts = ["V34"]
-file = "crates/sqldiff-convert/src/tsql.rs"
+file = "crates/sqldiff-draft/src/tsql.rs"
 anchor = "\"ASM-FACT-V34\""
 hedge = "not checked on a real system"
 
 [[link]]
 facts = ["V32"]
-file = "crates/sqldiff-convert/src/tsql/paging.rs"
+file = "crates/sqldiff-draft/src/tsql/paging.rs"
 anchor = "\"ASM-FACT-V32\""
 hedge = "not checked on a real system"
 
 [[link]]
 facts = ["V19"]
-file = "crates/sqldiff-convert/src/tsql/paging.rs"
+file = "crates/sqldiff-draft/src/tsql/paging.rs"
 anchor = "\"ASM-FACT-V19\""
 hedge = "not checked on a real system"
 
 [[fact]]
 id = "V33"
 title = "Date and timestamp strings: ISO and IBM SQL forms read on assignment as in a CAST; T-SQL's compact yyyymmdd rejected"
-review = ["crates/sqldiff-equiv/src/equiv/literal.rs", "crates/sqldiff-convert/src/tsql.rs", "docs/vendor-facts-verification.md"]
+review = ["crates/sqldiff-equiv/src/equiv/literal.rs", "crates/sqldiff-draft/src/tsql.rs", "docs/vendor-facts-verification.md"]
 
 [[link]]
 facts = ["V33"]
@@ -205,6 +205,6 @@ hedge = "not checked on a real system"
 
 [[link]]
 facts = ["V33"]
-file = "crates/sqldiff-convert/src/tsql.rs"
+file = "crates/sqldiff-draft/src/tsql.rs"
 anchor = "\"ASM-FACT-V33\""
 hedge = "not checked on a real system"

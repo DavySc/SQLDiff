@@ -150,7 +150,7 @@ fn select_items(ts: &[T], sel: usize) -> Option<(Items, Option<usize>)> {
 /// or a leading `alias =`.
 fn item_expr(ts: &[T], f: usize, l: usize) -> (usize, usize) {
     let named = |t: &T| {
-        t.k == QUOTED_IDENT || t.k == IDENT && !sqldiff_core::normalize::is_keyword(&t.up())
+        t.k == QUOTED_IDENT || t.k == IDENT && !sqldiff_equiv::normalize::is_keyword(&t.up())
     };
     if named(&ts[f]) {
         if let Some(eq) = next_sig(ts, f).filter(|&q| q < l && ts[q].k == OP && ts[q].s == "=") {
@@ -207,7 +207,7 @@ fn single_from(ts: &[T], from: Option<usize>) -> Option<(Vec<String>, Option<Str
     }
     if let Some(n) = next.filter(|&n| {
         ts[n].k == QUOTED_IDENT
-            || ts[n].k == IDENT && !sqldiff_core::normalize::is_keyword(&ts[n].up())
+            || ts[n].k == IDENT && !sqldiff_equiv::normalize::is_keyword(&ts[n].up())
     }) {
         alias = Some(tsql_unquote(&ts[n].s).to_ascii_lowercase());
         next = next_sig(ts, n);
@@ -300,7 +300,7 @@ pub(super) fn operand_start(ts: &[T], j: usize) -> Option<usize> {
             match prev_sig(ts, open) {
                 // A call: the function name (keywords like IN or AND are not).
                 Some(f)
-                    if ts[f].k == IDENT && !sqldiff_core::normalize::is_keyword(&ts[f].up())
+                    if ts[f].k == IDENT && !sqldiff_equiv::normalize::is_keyword(&ts[f].up())
                         || ts[f].is("CAST")
                         || ts[f].is("CONVERT")
                         || ts[f].is("COALESCE")
@@ -499,7 +499,7 @@ impl Cx<'_> {
                     _ => continue,
                 }
             } else if matches!(ts[i].k, IDENT | QUOTED_IDENT)
-                && !sqldiff_core::normalize::is_keyword(&ts[i].up())
+                && !sqldiff_equiv::normalize::is_keyword(&ts[i].up())
                 && s.get(k + 1)
                     .is_some_and(|&n| ts[n].k == COMMA || ts[n].is("FROM"))
                 && k > 0
@@ -992,7 +992,7 @@ impl Cx<'_> {
     /// columns, by position; None when the table or a column is not known
     /// or none is a bit.
     fn insert_bit_cols(&self, ts: &[T], close: usize) -> Option<Vec<bool>> {
-        use sqldiff_core::catalog::Ident;
+        use sqldiff_equiv::catalog::Ident;
         let open = opening(ts, close)?;
         let name_end = prev_sig(ts, open)?;
         let name_start = operand_start(ts, name_end)?;
@@ -1248,7 +1248,7 @@ impl Cx<'_> {
         };
         let c = self.entry_table(&entry)?.column(
             Dialect::Tsql,
-            &sqldiff_core::catalog::Ident::plain(col.clone()),
+            &sqldiff_equiv::catalog::Ident::plain(col.clone()),
         )?;
         match self.dt_cat(&c.data_type.base, &c.data_type.args) {
             Dt::Bit => Some(Held::Bit),

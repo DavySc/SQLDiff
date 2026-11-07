@@ -822,7 +822,7 @@ Each needs a test before it counts as a bug; outcomes are recorded here.
   review also confirms the other. To be split, with care for the review
   store, which keys on assumption ids.
 - `GENERATE_UUID` needs IBM i 7.6 or a Technology Refresh on 7.4 and 7.5
-  (converter note in `sqldiff-convert/src/tsql.rs`), but has no
+  (converter note in `sqldiff-draft/src/tsql.rs`), but has no
   `[db2i.since]` entry, so the binder never gates it.
 - PostgreSQL `MERGE` (15+) and its 17+ clauses are not version-gated in code.
 - `version_lt` treats an unparsable version part as 0.
