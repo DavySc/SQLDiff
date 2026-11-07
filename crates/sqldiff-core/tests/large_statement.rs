@@ -174,3 +174,53 @@ fn a_statement_moved_into_an_unaligned_stretch_is_not_called_removed() {
     }
     assert_eq!(r.verdict(), Verdict::Unknown);
 }
+
+/// The edit checker must not prove a difference by assuming that the
+/// statements of a stretch that was not aligned are unchanged. Here the edit
+/// `SET @y = @x * 2` against `(@x - 1) * 2` is compensated by an edit inside
+/// the unaligned stretch (`@x` is one larger), so both sides return the same
+/// `@y`. With only the first statement of the stretch marked, the checker
+/// proved `equiv.edit` Different ("when @x is 2: A sets @y to 4 and B to 2").
+#[test]
+fn an_edit_after_an_unaligned_stretch_is_not_proven_different_by_assuming_it_unchanged() {
+    let src = |b: bool| {
+        let mut s = String::from(
+            "CREATE PROCEDURE dbo.p @p int AS\nBEGIN\nDECLARE @x int, @y int, @z int;\n",
+        );
+        for i in 0..2_100 {
+            if i == 7 {
+                s += if b {
+                    "SET @x = @p + 2;\n"
+                } else {
+                    "SET @x = @p + 1;\n"
+                };
+            } else {
+                s += &format!("PRINT {};\n", if b { i + 100_000 } else { i });
+            }
+        }
+        s += "SELECT 1 AS k;\n";
+        s += if b {
+            "SET @y = (@x - 1) * 2;\n"
+        } else {
+            "SET @y = @x * 2;\n"
+        };
+        s += "SELECT @y AS y;\nEND;\n";
+        s
+    };
+    let r = diff(
+        &Artifact::new("a.sql", Dialect::Tsql, src(false)),
+        &Artifact::new("b.sql", Dialect::Tsql, src(true)),
+        &Options {
+            alignment_bound: Some(1_000_000),
+            ..Options::default()
+        },
+    );
+    assert!(r.findings.iter().any(|f| f.rule == "align.bound"));
+    let proven: Vec<_> = r
+        .findings
+        .iter()
+        .filter(|f| f.rule == "equiv.edit" && f.verdict == Verdict::Different)
+        .map(|f| f.witness.clone())
+        .collect();
+    assert!(proven.is_empty(), "{proven:?}");
+}

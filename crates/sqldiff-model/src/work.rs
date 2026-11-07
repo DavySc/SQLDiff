@@ -53,9 +53,12 @@ pub enum Site {
     /// Outcome-pair comparisons of the behaviour model: the existing
     /// per-routine and per-file allowance (`Collector::spend`), kept as it is.
     BehaviourDiffs,
+    /// Similarity scores of a gap between two aligned lists
+    /// (`treediff::diff_gap`: the product of the two lengths).
+    GapScores,
 }
 
-const SITES: usize = 7;
+const SITES: usize = 8;
 
 const NAMES: [&str; SITES] = [
     "explorer_steps",
@@ -65,6 +68,7 @@ const NAMES: [&str; SITES] = [
     "edit_closure",
     "witness_tries",
     "behaviour_diffs",
+    "gap_scores",
 ];
 
 /// The counts of one scope.
@@ -159,6 +163,55 @@ pub fn in_scope() -> bool {
     METER.with(|m| m.borrow().is_some())
 }
 
+/// What the statement-level checker (alignment, tree diff) may still spend,
+/// passed down as a parameter so the functions that use it stay pure: a
+/// deterministic count, decremented in program order, never a time. Off (the
+/// default) it allows everything and changes nothing.
+#[derive(Debug, Default)]
+pub struct Allowance {
+    left: Cell<Option<u64>>,
+    cap: Option<u64>,
+}
+
+impl Allowance {
+    /// An allowance of `cap` units, or none (`None`).
+    pub fn new(cap: Option<u64>) -> Allowance {
+        Allowance {
+            left: Cell::new(cap),
+            cap,
+        }
+    }
+
+    /// Whether `n` more units may be spent.
+    pub fn allows(&self, n: u64) -> bool {
+        self.left.get().map_or(true, |l| n <= l)
+    }
+
+    /// Spends `n` units (saturating); nothing when the allowance is off.
+    pub fn take(&self, n: u64) {
+        if let Some(l) = self.left.get() {
+            self.left.set(Some(l.saturating_sub(n)));
+        }
+    }
+
+    pub fn is_on(&self) -> bool {
+        self.cap.is_some()
+    }
+
+    /// The whole allowance, for the witness of a cut.
+    pub fn cap(&self) -> Option<u64> {
+        self.cap
+    }
+
+    /// What has been spent so far.
+    pub fn spent(&self) -> u64 {
+        match (self.cap, self.left.get()) {
+            (Some(c), Some(l)) => c - l,
+            _ => 0,
+        }
+    }
+}
+
 /// Counts a recorded amount of work again, per site: what a cache or memo
 /// entry cost when it was made, charged when it is used instead, so that the
 /// total is what the algorithm does and not what its caches happened to save.
@@ -178,6 +231,7 @@ const SITE_LIST: [Site; SITES] = [
     Site::EditClosure,
     Site::WitnessTries,
     Site::BehaviourDiffs,
+    Site::GapScores,
 ];
 
 /// Runs `f` without counting: work that only re-creates a state whose cost
