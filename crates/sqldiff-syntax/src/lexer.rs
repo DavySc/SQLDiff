@@ -360,13 +360,20 @@ impl<'a> Lexer<'a> {
         IDENT
     }
 
+    /// Whether only whitespace lies between the start of the line and `start`.
+    /// Walks back from `start` and stops at the first non-whitespace
+    /// character or line break, so a long line holding many `GO` words costs
+    /// each of them only the blanks before it, not the line before it.
     fn at_line_start(&self, start: usize) -> bool {
-        let before = &self.src[self.range_start..start];
-        let line = match before.rfind('\n') {
-            Some(i) => &before[i + 1..],
-            None => before,
-        };
-        line.chars().all(char::is_whitespace)
+        for c in self.src[self.range_start..start].chars().rev() {
+            if c == '\n' {
+                return true;
+            }
+            if !c.is_whitespace() {
+                return false;
+            }
+        }
+        true
     }
 
     /// If the rest of the line after `GO` is `[count] [-- comment]`, return the
@@ -497,6 +504,59 @@ mod tests {
             .filter(|t| !t.kind.is_trivia())
             .map(|t| (t.kind, &text[t.start..t.end]))
             .collect()
+    }
+
+    /// The batch separators a naive scan finds: `GO` alone on its line (blanks
+    /// around it), the old definition of "at the start of a line".
+    #[test]
+    fn go_is_a_separator_only_after_blanks_on_its_line() {
+        for text in [
+            "GO\n",
+            "  \tGO\n",
+            "SELECT 1\nGO\nSELECT 2\n  GO 3\n",
+            "SELECT 1 GO\n",
+            "SELECT 1; GO\nGO\n",
+            "a\r\nGO\r\nb\r\n \u{a0}GO\r\n",
+            "x go\ngo\n",
+        ] {
+            let got: Vec<usize> = tokenize(text, Dialect::Tsql)
+                .tokens
+                .iter()
+                .filter(|t| t.kind == BATCH_SEP)
+                .map(|t| t.start)
+                .collect();
+            let want: Vec<usize> = text
+                .match_indices("GO")
+                .chain(text.match_indices("go"))
+                .filter(|(i, _)| {
+                    let before = &text[..*i];
+                    let line = before.rfind('\n').map_or(before, |n| &before[n + 1..]);
+                    line.chars().all(char::is_whitespace)
+                        && text[*i + 2..]
+                            .split('\n')
+                            .next()
+                            .is_some_and(|r| r.trim().chars().all(|c| c.is_ascii_digit()))
+                })
+                .map(|(i, _)| i)
+                .collect();
+            let mut want = want;
+            want.sort();
+            assert_eq!(got, want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn many_go_words_on_one_line_are_lexed_in_linear_time() {
+        // 200k words on one line: every one used to scan back to the line
+        // start. Only the shape is asserted; the time shows as a hang.
+        let text = "GO ".repeat(200_000);
+        let seps = tokenize(&text, Dialect::Tsql)
+            .tokens
+            .iter()
+            .filter(|t| t.kind == BATCH_SEP)
+            .count();
+        // `GO GO` is not `GO [count]`, and no other GO starts the line.
+        assert_eq!(seps, 0);
     }
 
     #[test]

@@ -3097,13 +3097,33 @@ fn like(s: &str, p: &str, ci: bool) -> Option<bool> {
     } else {
         (s.chars().collect(), p.chars().collect())
     };
+    // Whether `p` matches all of `s`: a table over pattern prefixes and text
+    // prefixes, O(len(s) x len(p)) time and O(len(s)) space. (The obvious
+    // backtracking matcher is exponential in the number of `%`.) `reach[j]`
+    // says whether the pattern read so far matches `s[..j]`.
     fn m(s: &[char], p: &[char]) -> bool {
-        match p.first() {
-            None => s.is_empty(),
-            Some('%') => (0..=s.len()).any(|i| m(&s[i..], &p[1..])),
-            Some('_') => !s.is_empty() && m(&s[1..], &p[1..]),
-            Some(c) => s.first() == Some(c) && m(&s[1..], &p[1..]),
+        let mut reach = vec![false; s.len() + 1];
+        reach[0] = true;
+        for c in p {
+            match c {
+                '%' => {
+                    // Matches any run: once reachable, every later prefix is.
+                    let mut seen = false;
+                    for r in reach.iter_mut() {
+                        seen |= *r;
+                        *r = seen;
+                    }
+                }
+                _ => {
+                    // One character, which must be `c` unless `c` is `_`.
+                    for j in (1..=s.len()).rev() {
+                        reach[j] = reach[j - 1] && (*c == '_' || s[j - 1] == *c);
+                    }
+                    reach[0] = false;
+                }
+            }
         }
+        reach[s.len()]
     }
     let r = m(&s, &p);
     // A case-sensitive mismatch that only differs by case is collation-dependent.
@@ -5051,6 +5071,55 @@ fn rej<T>() -> R<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The backtracking matcher `like` used to have: the oracle for the table.
+    fn like_backtracking(s: &str, p: &str) -> bool {
+        fn m(s: &[u8], p: &[u8]) -> bool {
+            match p.first() {
+                None => s.is_empty(),
+                Some(b'%') => (0..=s.len()).any(|i| m(&s[i..], &p[1..])),
+                Some(b'_') => !s.is_empty() && m(&s[1..], &p[1..]),
+                Some(c) => s.first() == Some(c) && m(&s[1..], &p[1..]),
+            }
+        }
+        m(s.as_bytes(), p.as_bytes())
+    }
+
+    #[test]
+    fn like_agrees_with_the_backtracking_matcher_on_every_short_string() {
+        // Every text and pattern over {a, b, %, _} up to length 5 and 4.
+        fn all(alpha: &[char], max: usize) -> Vec<String> {
+            let mut out = vec![String::new()];
+            let mut layer = vec![String::new()];
+            for _ in 0..max {
+                layer = layer
+                    .iter()
+                    .flat_map(|w| alpha.iter().map(move |c| format!("{w}{c}")))
+                    .collect();
+                out.extend(layer.iter().cloned());
+            }
+            out
+        }
+        for t in all(&['a', 'b'], 5) {
+            for p in all(&['a', 'b', '%', '_'], 4) {
+                // Lower case only, so the case rules do not interfere.
+                assert_eq!(
+                    like(&t, &p, true),
+                    Some(like_backtracking(&t, &p)),
+                    "{t:?} LIKE {p:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn like_with_many_wildcards_does_not_blow_up() {
+        // 40 `%` against a text that never matches: exponential when backtracking.
+        let p = format!("{}b", "a%".repeat(40));
+        let t = "a".repeat(200);
+        assert_eq!(like(&t, &p, true), Some(false));
+        assert_eq!(like(&format!("{t}b"), &p, true), Some(true));
+    }
 
     #[test]
     fn grouping_does_not_split_strings_a_collation_may_join() {

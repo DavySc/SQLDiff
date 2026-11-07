@@ -887,7 +887,8 @@ pub fn write(tree: &Tree, out: &Path) -> Result<(PathBuf, PathBuf), String> {
         write_under(out, &f.path, text.as_bytes())?;
     }
     crate::mem::release();
-    let json = write_json_under(out, "conversion-report.json", &tree.report)?;
+    let (json, report_hash) = write_json_under(out, "conversion-report.json", &tree.report)?;
+    write_output_hashes(out, &report_hash, &tree.report.files);
     let md = write_under(
         out,
         "conversion-report.md",
@@ -910,24 +911,68 @@ pub fn inside(rel: &str) -> bool {
 /// Writes `value` to `out/rel` as pretty JSON and a newline, straight to the
 /// file: the report of a large tree is hundreds of megabytes, which built as
 /// one string doubled the run's size at its last step. The bytes are the same
-/// as `to_string_pretty(value) + "\n"`.
+/// as `to_string_pretty(value) + "\n"`. Also returns the SHA-256 of those bytes.
 pub(crate) fn write_json_under<T: Serialize>(
     out: &Path,
     rel: &str,
     value: &T,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, String), String> {
+    use sha2::{Digest, Sha256};
     use std::io::Write;
+
+    /// Hashes what passes through.
+    struct Hashing<W>(W, Sha256);
+    impl<W: Write> Write for Hashing<W> {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            let n = self.0.write(b)?;
+            self.1.update(&b[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.flush()
+        }
+    }
     let dest = dest_under(out, rel)?;
     if let Some(p) = dest.parent() {
         std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
     }
     let file = std::fs::File::create(&dest).map_err(|e| format!("{}: {e}", dest.display()))?;
-    let mut w = std::io::BufWriter::new(file);
+    let mut w = Hashing(std::io::BufWriter::new(file), Sha256::new());
     serde_json::to_writer_pretty(&mut w, value).map_err(|e| format!("{}: {e}", dest.display()))?;
     w.write_all(b"\n")
         .and_then(|()| w.flush())
         .map_err(|e| format!("{}: {e}", dest.display()))?;
-    Ok(dest)
+    Ok((dest, hex_digest(&w.1.finalize())))
+}
+
+fn hex_digest(d: &[u8]) -> String {
+    d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Where [`write`] records the output hashes of the report it wrote.
+pub const OUTPUT_HASHES: &str = ".sqldiff/output-hashes.json";
+
+/// The output hashes of a report, with the hash of the report they belong
+/// to: [`hand_edits`] reads them instead of parsing the whole report, and
+/// only when the report on disk is the one they were written with.
+#[derive(Serialize, Deserialize)]
+struct OutputHashes {
+    report: String,
+    files: Vec<(String, String)>,
+}
+
+/// Best effort: without the file, [`hand_edits`] reads the report.
+fn write_output_hashes(out: &Path, report_hash: &str, files: &[FileReport]) {
+    let v = OutputHashes {
+        report: report_hash.to_string(),
+        files: files
+            .iter()
+            .map(|f| (f.path.clone(), f.output_hash.clone()))
+            .collect(),
+    };
+    if let Ok(bytes) = serde_json::to_vec(&v) {
+        let _ = write_under(out, OUTPUT_HASHES, &bytes);
+    }
 }
 
 /// Writes `bytes` to `out/rel`, creating the directories between. Refuses a
@@ -1048,6 +1093,15 @@ pub(crate) fn verify_tree_state(
     if st.drafts.len() != inputs.len() || st.source.is_some() == a.no_catalog {
         return wrong("its shape");
     }
+    // Whatever else is compared, a damaged draft is never used.
+    if let Some(i) = inputs
+        .iter()
+        .zip(&st.drafts)
+        .find(|(i, d)| !d.well_formed(&i.text))
+        .map(|(i, _)| i)
+    {
+        return wrong(&format!("the draft of {}", i.rel));
+    }
     if a.recheck == Recheck::None {
         return None;
     }
@@ -1137,7 +1191,12 @@ pub(crate) fn build_tree_state(
     let built = parallel(jobs, inputs, |i| {
         if let Some(c) = drafts_of {
             if c.read {
-                if let Some(d) = c.store.get_draft(c.key, &i.rel) {
+                // A damaged stored draft is a miss: it is built again.
+                if let Some(d) = c
+                    .store
+                    .get_draft(c.key, &i.rel)
+                    .filter(|d| d.well_formed(&i.text))
+                {
                     return (d, true);
                 }
             }
@@ -1374,7 +1433,7 @@ fn convert_files(
     // the store when their key matches, else they are not checked.
     let in_increment: Option<Vec<bool>> = match (select, cache) {
         (Some(sel), Some(c)) => {
-            let plan = crate::plan::Plan::build(inputs, a.from);
+            let plan = crate::plan::Plan::build_with(inputs, a.from, jobs);
             let at: std::collections::BTreeMap<&str, usize> = plan
                 .files
                 .iter()
@@ -2534,28 +2593,49 @@ pub fn written_record(
 /// `output_hash` the last report recorded: an `--overwrite` run would lose
 /// those edits. Empty when there is no earlier report.
 pub fn hand_edits(out: &Path) -> Result<Vec<String>, String> {
+    use sha2::{Digest, Sha256};
     let report = out.join("conversion-report.json");
-    let text = match std::fs::read_to_string(&report) {
+    let bytes = match std::fs::read(&report) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("{}: {e}", report.display())),
     };
-    let v: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", report.display()))?;
+    // The hashes `write` recorded with this very report (same bytes), else
+    // the report itself, parsed.
+    let recorded = dest_under(out, OUTPUT_HASHES)
+        .ok()
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|b| serde_json::from_slice::<OutputHashes>(&b).ok())
+        .filter(|h| h.report == hex_digest(&Sha256::digest(&bytes)));
+    let pairs: Vec<(String, Option<String>)> = match recorded {
+        Some(h) => h.files.into_iter().map(|(p, h)| (p, Some(h))).collect(),
+        None => {
+            let v: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", report.display()))?;
+            v["files"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|f| {
+                    Some((
+                        f["path"].as_str()?.to_string(),
+                        f["output_hash"].as_str().map(str::to_string),
+                    ))
+                })
+                .collect()
+        }
+    };
     let mut edited = Vec::new();
-    for f in v["files"].as_array().into_iter().flatten() {
-        let Some(path) = f["path"].as_str() else {
-            continue;
-        };
-        let now = std::fs::read(out.join(path)).ok();
+    for (path, recorded) in pairs {
+        let now = std::fs::read(out.join(&path)).ok();
         let now = now.map(|b| crate::review::file_hash(&String::from_utf8_lossy(&b)));
-        match (f["output_hash"].as_str(), now) {
+        match (recorded.as_deref(), now) {
             // A report from before output hashes: nothing to compare with.
             (None, _) => {}
             // Deleted since: nothing to lose.
             (_, None) => {}
             (Some(h), Some(n)) if h == n => {}
-            _ => edited.push(path.to_string()),
+            _ => edited.push(path),
         }
     }
     Ok(edited)
