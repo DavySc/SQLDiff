@@ -72,14 +72,10 @@ fn every_edit(to: Dialect) {
                     "{to:?} seed {seed} {e:?}: only {reused} of {total} reused"
                 );
             } else {
-                // T2, soundness side: every file whose output the edit
-                // changed was checked again, not taken from the store.
-                for d in &o.dependents_changed {
-                    assert!(
-                        o.again.contains(d),
-                        "{to:?} seed {seed} {e:?}: {d} changed but was reused"
-                    );
-                }
+                // (Soundness is the comparison with the fresh run in `one`. A
+                // file can be reused and still change: the cross-file passes,
+                // such as a call's status following the callee's, run on
+                // reused results too.)
                 // T2, reuse side: only the files that read what the edit
                 // changed are checked again (the bound is what a run
                 // measured, and two more for the sample of one file in 50).
