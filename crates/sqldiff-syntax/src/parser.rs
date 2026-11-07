@@ -42,6 +42,7 @@ pub fn parse(text: &str, dialect: Dialect) -> Parse {
         mode: Mode::Sql,
         stops: Vec::new(),
         nest: 0,
+        too_deep: false,
     };
     p.parse_file();
     Parse {
@@ -128,6 +129,10 @@ struct Parser<'a> {
     stops: Vec<&'static [&'static str]>,
     /// Statements being read inside one another (blocks, IF, loops).
     nest: usize,
+    /// A nest past [`MAX_STATEMENT_NESTING`] was met in the outermost
+    /// statement being read: the diagnostics of the statements around it
+    /// are left out.
+    too_deep: bool,
 }
 
 /// The deepest nesting of statements the parser reads (BEGIN inside IF
@@ -256,14 +261,18 @@ impl<'a> Parser<'a> {
     }
 
     fn diag_here(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        // While the enclosing statements unwind from a nest that was too
+        // deep, each of them would report its own missing END: the one
+        // too-deep report says it.
+        if self.too_deep && !message.contains("nesting too deep") {
+            return;
+        }
         let offset = self
             .sig_index(0)
             .map(|i| self.tokens[i].start)
             .unwrap_or(self.src.len());
-        self.diags.push(Diagnostic {
-            offset,
-            message: message.into(),
-        });
+        self.diags.push(Diagnostic { offset, message });
     }
 
     fn with_stops<R>(
@@ -344,6 +353,7 @@ impl<'a> Parser<'a> {
             self.diag_here(format!(
                 "statements nested deeper than {MAX_STATEMENT_NESTING}: nesting too deep"
             ));
+            self.too_deep = true;
             self.start(ERROR);
             // Stop at the next batch separator: the objects after a deep
             // routine are separate batches and still parse.
@@ -356,6 +366,9 @@ impl<'a> Parser<'a> {
         self.nest += 1;
         self.parse_statement_at();
         self.nest -= 1;
+        if self.nest == 0 {
+            self.too_deep = false;
+        }
     }
 
     fn parse_statement_at(&mut self) {
