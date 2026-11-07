@@ -117,6 +117,24 @@ struct Run {
 /// Runs kept in a session, finished ones included.
 const RUN_LIMIT: usize = 8;
 
+/// The client went away (end of input) or the server is dropped: a run
+/// still working is asked to stop and waited for. It stops before its next
+/// check, or finishes writing its output tree if it had begun; the process
+/// never exits halfway through a write, which would leave a cut-off report
+/// in `out` that the next conversion there cannot read.
+impl Drop for Server {
+    fn drop(&mut self) {
+        for r in &self.runs {
+            r.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        for r in &mut self.runs {
+            if let Some(h) = r.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+}
+
 impl Default for Server {
     fn default() -> Self {
         Self::build(Resolved::builtin(), None, Store::in_memory())

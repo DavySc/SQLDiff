@@ -703,3 +703,52 @@ fn a_background_run_reports_like_the_foreground_call_and_can_be_stopped() {
     assert_eq!(r[1]["result"]["isError"], true);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn the_server_waits_for_a_background_run_when_its_input_ends() {
+    let d = scratch("eof");
+    let src = d.join("src");
+    for i in 0..40 {
+        write(
+            &src.join(format!("f{i}.sql")),
+            &format!("CREATE TABLE t{i} (id int NOT NULL);\nSELECT id FROM t{i};\n"),
+        );
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sqldiff-mcp"))
+        .arg("--isolated")
+        .env(
+            "SQLDIFF_DATA_DIR",
+            std::env::temp_dir().join(format!("sqldiff-mcp-data-{}", std::process::id())),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let m = call(
+        1,
+        "convert_tree",
+        json!({ "src": src, "to": "postgres", "out": d.join("o"), "background": true }),
+    );
+    writeln!(stdin, "{m}").unwrap();
+    stdin.flush().unwrap();
+    let mut line = String::new();
+    out.read_line(&mut line).unwrap();
+    // The client goes away while the run works.
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    // Stopped before writing, or written whole: never a cut-off report.
+    let report = d.join("o/conversion-report.json");
+    if report.exists() {
+        let text = std::fs::read_to_string(&report).unwrap();
+        serde_json::from_str::<Value>(&text).expect("a whole report");
+    }
+    let r = session(&[call(
+        1,
+        "convert_tree",
+        json!({ "src": src, "to": "postgres", "out": d.join("o"), "overwrite": true }),
+    )]);
+    result(&r[0]);
+    let _ = std::fs::remove_dir_all(&d);
+}
