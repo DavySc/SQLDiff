@@ -9,7 +9,19 @@
 //!
 //! The generator renders the *source* tree (T-SQL) and a base catalog in the
 //! source dialect and in the target dialect, so edits reach the source
-//! catalog, the target catalog (base catalogs) and the stand-ins.
+//! catalog and the target catalog (base catalogs).
+//!
+//! An edit only proves something if some file whose own text did not change
+//! produces other output because of it. So the tree has fixed *dependents*,
+//! routines whose text never changes and that use what the edits change:
+//! column types in arithmetic and concatenation, an `INSERT` without a
+//! column list, `SELECT *` from tables and views, writes to tables that gain
+//! or lose triggers, calls of functions and procedures whose signature changes
+//! or that do not exist yet, reads of base-catalog tables and columns, and
+//! names that appear later (a table, a schema, a mixed-case column). Edits
+//! pick their target among the objects the dependents use. The probe test in
+//! `replay_equals_fresh.rs` checks that every real edit changes some
+//! dependent's fresh output.
 
 #![allow(dead_code)]
 
@@ -81,7 +93,6 @@ pub struct View {
 pub struct Routine {
     pub name: String,
     pub reads: String,
-    pub writes: Option<String>,
     pub param: String,
     pub function: bool,
 }
@@ -99,101 +110,124 @@ pub struct Model {
     pub views: Vec<View>,
     pub routines: Vec<Routine>,
     pub triggers: Vec<Trigger>,
-    /// Objects that exist already (`--catalog`): `(schema, name, columns)`.
+    /// Objects that exist already (`--catalog`).
     pub base: Vec<Table>,
-    /// Extra files edits add (an `ALTER TABLE` file, a comment).
+    /// Extra files edits add.
     pub extra: Vec<(String, String)>,
     /// Text appended to a file by a no-op edit.
     pub notes: Vec<(String, String)>,
 }
 
-fn col(r: &mut Rng, name: &str) -> Col {
-    let ty = r.pick(TYPES).to_string();
-    let null = r.below(2) == 0;
-    let default = match (ty.as_str(), r.below(3)) {
-        ("int" | "bigint" | "smallint", 0) => Some("0".to_string()),
-        ("nvarchar(40)" | "varchar(20)", 0) => Some("N''".to_string()),
-        _ => None,
-    };
+/// The three tables the fixed dependents use.
+pub const ANCHORS: usize = 3;
+
+fn key() -> Col {
     Col {
-        name: name.to_string(),
-        ty,
+        name: "Id".into(),
+        ty: "int".into(),
+        null: false,
+        default: None,
+    }
+}
+
+fn col(name: &str, ty: &str, null: bool) -> Col {
+    Col {
+        name: name.into(),
+        ty: ty.into(),
         null,
-        default,
+        default: None,
     }
 }
 
 impl Model {
     pub fn generate(seed: u64) -> Model {
         let mut r = Rng::new(seed);
-        let n_tables = 4 + r.below(3);
         let mut tables = Vec::new();
-        for i in 0..n_tables {
-            let mut cols = vec![Col {
-                name: "Id".into(),
-                ty: "int".into(),
-                null: false,
-                default: None,
-            }];
-            for j in 0..2 + r.below(3) {
-                cols.push(col(&mut r, &format!("C{j}")));
-            }
-            let index = (r.below(2) == 0).then(|| 1 + r.below(cols.len() - 1));
+        for i in 0..ANCHORS {
+            let c0 = *r.pick(&["nvarchar(40)", "varchar(20)"]);
+            let c1 = *r.pick(&["int", "bigint", "smallint"]);
+            let nullable = r.below(2) == 0;
             tables.push(Table {
                 schema: "dbo".into(),
                 name: format!("T{i}"),
-                cols,
-                index,
+                cols: vec![
+                    key(),
+                    col("C0", c0, true),
+                    col("C1", c1, nullable),
+                    col("C2", "datetime2(3)", false),
+                ],
+                index: None,
                 versioned: false,
             });
         }
-        let mut views = Vec::new();
-        for i in 0..2 + r.below(2) {
-            views.push(View {
-                name: format!("V{i}"),
-                over: r.pick(&tables).name.clone(),
+        // Tables nothing depends on, so a few edits have no dependent: they
+        // keep the tree from being only the anchors.
+        for i in 0..1 + r.below(3) {
+            tables.push(Table {
+                schema: "dbo".into(),
+                name: format!("X{i}"),
+                cols: vec![key(), col("C0", r.pick(TYPES), true)],
+                index: None,
+                versioned: false,
+            });
+        }
+        // Fixed tables the dependents copy rows into with `INSERT ... SELECT *`.
+        let sink = |name: &str, cols: Vec<Col>| Table {
+            schema: "dbo".into(),
+            name: name.into(),
+            cols,
+            index: None,
+            versioned: false,
+        };
+        tables.push(sink(
+            "Sink",
+            vec![
+                key(),
+                col("C0", "nvarchar(40)", true),
+                col("C1", "int", true),
+                col("C2", "datetime2(3)", true),
+            ],
+        ));
+        tables.push(sink("SinkNN", vec![key(), col("C1", "int", false)]));
+        tables.push(sink("SinkV", vec![key(), col("C0", "nvarchar(40)", true)]));
+        tables.push(sink(
+            "SinkRef",
+            vec![key(), col("Note", "nvarchar(40)", true)],
+        ));
+        let views = vec![
+            View {
+                name: "V0".into(),
+                over: "T0".into(),
                 star: r.below(2) == 0,
-            });
-        }
-        let mut routines = Vec::new();
-        for i in 0..3 + r.below(3) {
-            let writes = (r.below(2) == 0).then(|| r.pick(&tables).name.clone());
-            routines.push(Routine {
-                name: format!("P{i}"),
-                reads: r.pick(&tables).name.clone(),
-                writes,
-                param: r.pick(&["int", "bigint", "nvarchar(40)"]).to_string(),
+            },
+            View {
+                name: "V1".into(),
+                over: "T1".into(),
+                star: r.below(2) == 0,
+            },
+        ];
+        let routines = vec![
+            Routine {
+                name: "F0".into(),
+                reads: "T0".into(),
+                param: "int".into(),
+                function: true,
+            },
+            Routine {
+                name: "Callee".into(),
+                reads: "T1".into(),
+                param: "int".into(),
                 function: false,
-            });
-        }
-        routines.push(Routine {
-            name: "F0".into(),
-            reads: tables[0].name.clone(),
-            writes: None,
-            param: "int".into(),
-            function: true,
-        });
+            },
+        ];
         let triggers = vec![Trigger {
             name: "Tr0".into(),
-            on: tables[1].name.clone(),
+            on: "T1".into(),
         }];
         let base = vec![Table {
             schema: "ext".into(),
             name: "Ref".into(),
-            cols: vec![
-                Col {
-                    name: "Id".into(),
-                    ty: "int".into(),
-                    null: false,
-                    default: None,
-                },
-                Col {
-                    name: "Note".into(),
-                    ty: "nvarchar(40)".into(),
-                    null: true,
-                    default: None,
-                },
-            ],
+            cols: vec![key(), col("Note", "nvarchar(40)", true)],
             index: None,
             versioned: false,
         }];
@@ -208,10 +242,6 @@ impl Model {
         }
     }
 
-    fn table(&self, name: &str) -> Option<&Table> {
-        self.tables.iter().find(|t| t.name == name)
-    }
-
     /// The files of the source tree, `(relative path, text)`.
     pub fn files(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
@@ -222,19 +252,10 @@ impl Model {
             ));
         }
         for v in &self.views {
-            let body = match (self.table(&v.over), v.star) {
-                (_, true) => format!("SELECT * FROM dbo.{}", v.over),
-                (Some(t), false) => format!(
-                    "SELECT {} FROM dbo.{}",
-                    t.cols
-                        .iter()
-                        .take(2)
-                        .map(|c| c.name.clone())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    v.over
-                ),
-                (None, false) => format!("SELECT 1 AS Id FROM dbo.{}", v.over),
+            let body = if v.star {
+                format!("SELECT * FROM dbo.{}", v.over)
+            } else {
+                format!("SELECT Id, C0 FROM dbo.{}", v.over)
             };
             out.push((
                 format!("views/{}.sql", v.name),
@@ -242,17 +263,18 @@ impl Model {
             ));
         }
         for r in &self.routines {
-            out.push((format!("routines/{}.sql", r.name), routine(self, r)));
+            out.push((format!("routines/{}.sql", r.name), routine(r)));
         }
         for g in &self.triggers {
             out.push((
                 format!("triggers/{}.sql", g.name),
                 format!(
-                    "CREATE TRIGGER dbo.{} ON dbo.{} AFTER INSERT AS\nBEGIN\n  SET NOCOUNT ON;\n  UPDATE dbo.{} SET Id = Id WHERE Id IN (SELECT Id FROM inserted);\nEND\nGO\n",
-                    g.name, g.on, g.on
+                    "CREATE TRIGGER dbo.{} ON dbo.{} AFTER INSERT AS\nBEGIN\n  SET NOCOUNT ON;\n  INSERT INTO dbo.X0 (Id) SELECT Id FROM inserted;\nEND\nGO\n",
+                    g.name, g.on
                 ),
             ));
         }
+        out.extend(dependents());
         out.extend(self.extra.iter().cloned());
         for (path, note) in &self.notes {
             if let Some(f) = out.iter_mut().find(|f| &f.0 == path) {
@@ -271,6 +293,144 @@ impl Model {
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+/// Routines whose text never changes. Each holds one statement that reads
+/// something an edit changes; see the module comment. One statement per
+/// routine, because a routine with several writes is reported as differing
+/// in its transaction behaviour whatever the catalogs say, which hides every
+/// other change. Reads go into fixed sink tables with `INSERT ... SELECT`: a
+/// statement that returns rows or assigns a variable is not compared at all.
+fn dependents() -> Vec<(String, String)> {
+    let mut stmts: Vec<(String, String)> = Vec::new();
+    let mut add = |name: String, stmt: String| stmts.push((name, stmt));
+    for k in 0..ANCHORS {
+        let n = (k + 1) % ANCHORS;
+        add(
+            format!("Expr{k}"),
+            format!("INSERT INTO dbo.Sink (Id, C0, C1) SELECT Id, C0 + N'x', C1 + @x FROM dbo.T{k} WHERE Id = @x"),
+        );
+        add(
+            format!("Star{k}"),
+            format!("INSERT INTO dbo.Sink SELECT * FROM dbo.T{k}"),
+        );
+        add(
+            format!("Positional{k}"),
+            format!("INSERT INTO dbo.T{k} VALUES (@x, N'a', 1, '2020-01-01')"),
+        );
+        add(
+            format!("Defaults{k}"),
+            format!("INSERT INTO dbo.T{k} (Id) VALUES (@x)"),
+        );
+        add(
+            format!("Named{k}"),
+            format!("INSERT INTO dbo.T{k} (Id, C0, C1, C2) VALUES (@x, N'a', 1, '2020-01-01')"),
+        );
+        // Two writes: whether the first can fail (a NULL for a NOT NULL
+        // column, an omitted column with no default) decides how the pair
+        // behaves when the second does not run.
+        add(
+            format!("NullPair{k}"),
+            format!("INSERT INTO dbo.T{k} VALUES (@x, N'a', NULL, '2020-01-01');\n  UPDATE dbo.T{k} SET C0 = N'b' WHERE Id = @x"),
+        );
+        add(
+            format!("DefaultPair{k}"),
+            format!("INSERT INTO dbo.T{k} (Id, C0) VALUES (@x, N'a');\n  UPDATE dbo.T{k} SET C0 = N'b' WHERE Id = @x"),
+        );
+        add(
+            format!("NotNullSink{k}"),
+            format!("INSERT INTO dbo.SinkNN (Id, C1) SELECT Id, C1 FROM dbo.T{k}"),
+        );
+        add(
+            format!("OrderBy{k}"),
+            format!(
+                "INSERT INTO dbo.Sink (Id) SELECT TOP (1) Id FROM dbo.T{k} ORDER BY C0, C1, C2"
+            ),
+        );
+        add(
+            format!("DefaultKeyword{k}"),
+            format!("INSERT INTO dbo.T{k} (Id, C0, C1, C2) VALUES (@x, DEFAULT, DEFAULT, DEFAULT)"),
+        );
+        add(
+            format!("Arith{k}"),
+            format!("UPDATE dbo.T{k} SET C1 = C1 + @x"),
+        );
+        add(
+            format!("NotIn{k}"),
+            format!("INSERT INTO dbo.Sink (Id) SELECT Id FROM dbo.T{k} WHERE C1 NOT IN (SELECT C1 FROM dbo.T{n})"),
+        );
+        add(
+            format!("Delete{k}"),
+            format!("DELETE FROM dbo.T{k} WHERE C1 <> @x"),
+        );
+        add(
+            format!("Update{k}"),
+            format!("UPDATE dbo.T{k} SET C1 = 1 WHERE Id = @x"),
+        );
+        add(
+            format!("Join{k}"),
+            format!("UPDATE t SET C0 = s.C0 FROM dbo.T{k} AS t JOIN dbo.T{n} AS s ON s.C1 = t.C1"),
+        );
+    }
+    add("DropTr0".into(), "DROP TRIGGER dbo.Tr0".into());
+    add("DropTg1".into(), "DROP TRIGGER dbo.Tg1".into());
+    add(
+        "ViewStar".into(),
+        "INSERT INTO dbo.SinkV SELECT * FROM dbo.V0".into(),
+    );
+    add(
+        "ViewFilter".into(),
+        "INSERT INTO dbo.Sink (Id) SELECT Id FROM dbo.V1 WHERE C0 = N'a'".into(),
+    );
+    add(
+        "FunctionInt".into(),
+        "INSERT INTO dbo.Sink (Id) SELECT dbo.F0(@x)".into(),
+    );
+    add(
+        "FunctionText".into(),
+        "INSERT INTO dbo.Sink (Id) SELECT dbo.F0(N'a')".into(),
+    );
+    add("CallInt".into(), "EXEC dbo.Callee @x".into());
+    add("CallText".into(), "EXEC dbo.Callee N'a'".into());
+    add("CallAdded".into(), "EXEC dbo.Added @x".into());
+    add(
+        "BaseAll".into(),
+        "INSERT INTO dbo.SinkRef (Id, Note) SELECT Id, Note FROM ext.Ref".into(),
+    );
+    add(
+        "BaseNote".into(),
+        "INSERT INTO dbo.SinkRef (Id, Note) SELECT Id, Note FROM ext.Ref WHERE Id = @x".into(),
+    );
+    add(
+        "BaseMore".into(),
+        "INSERT INTO dbo.Sink (Id) SELECT Id FROM ext.More".into(),
+    );
+    add(
+        "NewTable".into(),
+        "INSERT INTO dbo.Sink (Id) SELECT Id FROM dbo.Fresh".into(),
+    );
+    add(
+        "NewSchema".into(),
+        "INSERT INTO dbo.Sink (Id) SELECT Id FROM app.Other".into(),
+    );
+    add(
+        "MixedCase".into(),
+        "INSERT INTO dbo.Sink (Id, C1) SELECT Id, [MiXed] FROM dbo.T0".into(),
+    );
+    stmts
+        .into_iter()
+        .map(|(name, stmt)| {
+            if stmt.starts_with("DROP TRIGGER") {
+                return (format!("dependents/{name}.sql"), format!("{stmt};\nGO\n"));
+            }
+            (
+                format!("dependents/{name}.sql"),
+                format!(
+                    "CREATE PROCEDURE dbo.{name} @x int\nAS\nBEGIN\n  SET NOCOUNT ON;\n  {stmt};\nEND\nGO\n"
+                ),
+            )
+        })
+        .collect()
 }
 
 fn q(d: Dialect, s: &str) -> String {
@@ -344,7 +504,7 @@ fn create_table(t: &Table, d: Dialect) -> String {
     }
     if let Some(i) = t.index {
         s.push_str(&format!(
-            "CREATE INDEX IX_{}_{} ON {}.{} ({});\n",
+            "CREATE UNIQUE INDEX IX_{}_{} ON {}.{} ({});\n",
             q(d, &t.name),
             i,
             q(d, &t.schema),
@@ -358,44 +518,25 @@ fn create_table(t: &Table, d: Dialect) -> String {
     s
 }
 
-fn routine(m: &Model, r: &Routine) -> String {
-    let first = m
-        .table(&r.reads)
-        .and_then(|t| t.cols.first())
-        .map(|c| c.name.clone())
-        .unwrap_or_else(|| "Id".into());
+fn routine(r: &Routine) -> String {
     if r.function {
         return format!(
-            "CREATE FUNCTION dbo.{}(@x {}) RETURNS int AS\nBEGIN\n  RETURN (SELECT COUNT(*) FROM dbo.{} WHERE {} = @x);\nEND\nGO\n",
-            r.name, r.param, r.reads, first
+            "CREATE FUNCTION dbo.{}(@x {}) RETURNS int AS\nBEGIN\n  RETURN (SELECT COUNT(*) FROM dbo.{} WHERE Id = @x);\nEND\nGO\n",
+            r.name, r.param, r.reads
         );
     }
-    let mut body = format!(
-        "  SELECT {} FROM dbo.{} WHERE {} = @x;\n",
-        first, r.reads, first
-    );
-    if let Some(w) = &r.writes {
-        let wc = m
-            .table(w)
-            .and_then(|t| t.cols.first())
-            .map(|c| c.name.clone())
-            .unwrap_or_else(|| "Id".into());
-        body.push_str(&format!(
-            "  UPDATE dbo.{w} SET {wc} = {wc} WHERE {wc} = @x;\n  SELECT TOP (1) * FROM ext.Ref;\n"
-        ));
-    }
     format!(
-        "CREATE PROCEDURE dbo.{} @x {}\nAS\nBEGIN\n  SET NOCOUNT ON;\n{}END\nGO\n",
-        r.name, r.param, body
+        "CREATE PROCEDURE dbo.{} @x {}\nAS\nBEGIN\n  SET NOCOUNT ON;\n  INSERT INTO dbo.Sink (Id) VALUES (@x);\nEND\nGO\n",
+        r.name, r.param
     )
 }
 
 /// One catalog edit. Each variant names the read it is meant to disturb.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum Edit {
     /// No read changes: a comment on one file.
     NoOpComment,
-    /// No read changes: a table definition's order in the catalog moves.
+    /// No read changes: the catalog's tables are listed in another order.
     NoOpReorderTables,
     AddTable,
     DropTable,
@@ -408,12 +549,10 @@ pub enum Edit {
     ReorderColumns,
     FlipNullability,
     ChangeDefault,
+    /// A unique index on one column appears or goes.
     ToggleIndex,
-    /// A view's body changes.
+    /// A view's body changes (`*` or a column list).
     ViewBody,
-    /// An `ALTER TABLE ... ADD` in a file of its own (A4: the source table
-    /// of a view changes).
-    AlterSourceTable,
     AddRoutine,
     DropRoutine,
     ChangeParameterType,
@@ -421,11 +560,11 @@ pub enum Edit {
     AddSchemaTable,
     AddTrigger,
     DropTrigger,
-    /// System versioning on (a HIDDEN period column appears; A1).
+    /// System versioning on (a HIDDEN column appears; A1).
     VersioningOn,
-    /// The base catalog (target side) gains a column.
-    BaseColumn,
-    /// The base catalog gains a table another file reads.
+    /// A column of the base catalog (both dialects) changes type.
+    BaseRetype,
+    /// The base catalog gains a table a dependent reads.
     BaseTable,
     /// The base catalog loses its table.
     BaseDrop,
@@ -446,7 +585,6 @@ pub const ALL_EDITS: &[Edit] = &[
     Edit::ChangeDefault,
     Edit::ToggleIndex,
     Edit::ViewBody,
-    Edit::AlterSourceTable,
     Edit::AddRoutine,
     Edit::DropRoutine,
     Edit::ChangeParameterType,
@@ -454,16 +592,24 @@ pub const ALL_EDITS: &[Edit] = &[
     Edit::AddTrigger,
     Edit::DropTrigger,
     Edit::VersioningOn,
-    Edit::BaseColumn,
+    Edit::BaseRetype,
     Edit::BaseTable,
     Edit::BaseDrop,
 ];
 
 impl Edit {
+    /// Whether the edit is meant to change nothing a file can see.
+    pub fn is_no_op(&self) -> bool {
+        matches!(self, Edit::NoOpComment | Edit::NoOpReorderTables)
+    }
+
     /// Applies the edit to `m`, drawing every choice from `r`. Returns a
     /// short description for failure messages.
     pub fn apply(&self, m: &mut Model, r: &mut Rng) -> String {
-        let ti = r.below(m.tables.len());
+        // The anchor table and a non-key column of it the edit works on.
+        let ti = r.below(ANCHORS);
+        let ci = 1 + r.below(3);
+        let tname = m.tables[ti].name.clone();
         match self {
             Edit::NoOpComment => {
                 let files = m.files();
@@ -476,145 +622,92 @@ impl Edit {
                 "table order reversed (files unchanged)".into()
             }
             Edit::AddTable => {
-                let name = format!("N{}", r.below(1000));
-                let cols = vec![
-                    Col {
-                        name: "Id".into(),
-                        ty: "int".into(),
-                        null: false,
-                        default: None,
-                    },
-                    col(r, "C0"),
-                ];
                 m.tables.push(Table {
                     schema: "dbo".into(),
-                    name: name.clone(),
-                    cols,
+                    name: "Fresh".into(),
+                    cols: vec![key(), col("C0", "int", true)],
                     index: None,
                     versioned: false,
                 });
-                format!("add table {name}")
+                "add table Fresh".into()
             }
             Edit::DropTable => {
-                let t = m.tables.remove(ti);
-                format!("drop table {}", t.name)
+                m.tables.remove(ti);
+                format!("drop table {tname}")
             }
             Edit::RenameTable => {
-                let old = m.tables[ti].name.clone();
-                let new = format!("{old}x");
+                let new = format!("{tname}x");
                 m.tables[ti].name = new.clone();
-                format!("rename table {old} to {new} (dependents keep the old name)")
+                format!("rename table {tname} to {new} (dependents keep the old name)")
             }
             Edit::AddColumn => {
                 let nm = format!("X{}", r.below(100));
-                let c = col(r, &nm);
-                let n = c.name.clone();
-                m.tables[ti].cols.push(c);
-                format!("add column {n} to {}", m.tables[ti].name)
+                m.tables[ti].cols.push(col(&nm, "int", true));
+                format!("add column {nm} to {tname}")
             }
             Edit::AddMixedCaseColumn => {
-                m.tables[ti].cols.push(Col {
-                    name: "MiXed".into(),
-                    ty: "int".into(),
-                    null: true,
-                    default: None,
-                });
-                format!("add column MiXed to {}", m.tables[ti].name)
+                m.tables[0].cols.push(col("MiXed", "int", true));
+                "add column MiXed to T0".into()
             }
             Edit::DropColumn => {
-                let n = m.tables[ti].cols.len();
-                if n > 2 {
-                    let c = m.tables[ti].cols.remove(1 + r.below(n - 1));
-                    m.tables[ti].index = None;
-                    format!("drop column {} of {}", c.name, m.tables[ti].name)
-                } else {
-                    "drop column (table too narrow, no change)".into()
-                }
+                let c = m.tables[ti].cols.remove(ci);
+                m.tables[ti].index = None;
+                format!("drop column {} of {tname}", c.name)
             }
             Edit::RetypeColumn => {
-                let n = m.tables[ti].cols.len();
-                let ci = 1 + r.below(n - 1);
-                let old = m.tables[ti].cols[ci].ty.clone();
-                let mut new = r.pick(TYPES).to_string();
-                if new == old {
-                    new = "float".into();
-                }
-                m.tables[ti].cols[ci].ty = new.clone();
-                m.tables[ti].cols[ci].default = None;
-                format!(
-                    "retype {}.{} {old} -> {new}",
-                    m.tables[ti].name, m.tables[ti].cols[ci].name
-                )
+                let c = &mut m.tables[ti].cols[ci];
+                let new = match c.ty.as_str() {
+                    "nvarchar(40)" => "int",
+                    "varchar(20)" => "bigint",
+                    "int" | "smallint" => "nvarchar(40)",
+                    "bigint" => "varchar(20)",
+                    _ => "int",
+                };
+                let old = std::mem::replace(&mut c.ty, new.into());
+                c.default = None;
+                format!("retype {tname}.{} {old} -> {new}", c.name)
             }
             Edit::ReorderColumns => {
                 let n = m.tables[ti].cols.len();
                 m.tables[ti].cols[1..n].reverse();
                 m.tables[ti].index = None;
-                format!("reorder columns of {}", m.tables[ti].name)
+                format!("reorder columns of {tname}")
             }
             Edit::FlipNullability => {
-                let n = m.tables[ti].cols.len();
-                let ci = 1 + r.below(n - 1);
-                m.tables[ti].cols[ci].null ^= true;
-                format!(
-                    "flip nullability {}.{}",
-                    m.tables[ti].name, m.tables[ti].cols[ci].name
-                )
+                let c = &mut m.tables[ti].cols[ci];
+                c.null ^= true;
+                format!("flip nullability {tname}.{}", c.name)
             }
             Edit::ChangeDefault => {
-                let n = m.tables[ti].cols.len();
-                let start = r.below(n - 1);
-                let tname = m.tables[ti].name.clone();
-                for k in 0..n - 1 {
-                    let ci = 1 + (start + k) % (n - 1);
-                    let c = &mut m.tables[ti].cols[ci];
-                    let new = match &c.default {
-                        Some(_) => Some(None),
-                        None if c.ty.contains("char") => Some(Some("N'a'".to_string())),
-                        None if c.ty.contains("int") => Some(Some("1".to_string())),
-                        None => None,
-                    };
-                    if let Some(d) = new {
-                        c.default = d;
-                        return format!("change default {tname}.{}", c.name);
-                    }
-                }
-                format!("change default of {tname} (no column takes one: no change)")
+                let c = &mut m.tables[ti].cols[ci];
+                c.default = match (&c.default, c.ty.contains("char"), c.ty.contains("datetime")) {
+                    (Some(_), _, _) => None,
+                    (None, true, _) => Some("N'a'".into()),
+                    (None, _, true) => Some("SYSDATETIME()".into()),
+                    (None, _, _) => Some("1".into()),
+                };
+                format!("change default {tname}.{}", c.name)
             }
             Edit::ToggleIndex => {
-                let n = m.tables[ti].cols.len();
                 m.tables[ti].index = match m.tables[ti].index {
                     Some(_) => None,
-                    None => Some(1 + r.below(n - 1)),
+                    None => Some(2),
                 };
-                format!("toggle index on {}", m.tables[ti].name)
+                format!("toggle unique index on {tname}.C1")
             }
             Edit::ViewBody => {
                 let vi = r.below(m.views.len());
                 m.views[vi].star ^= true;
-                format!("edit view {}", m.views[vi].name)
-            }
-            Edit::AlterSourceTable => {
-                let over = m.views[r.below(m.views.len())].over.clone();
-                m.extra.push((
-                    "alters/a.sql".into(),
-                    format!(
-                        "ALTER TABLE dbo.{over} ADD Extra{} int NULL;\nGO\n",
-                        r.below(9)
-                    ),
-                ));
-                format!("ALTER TABLE {over} ADD in a file of its own")
+                format!("view {} body", m.views[vi].name)
             }
             Edit::AddRoutine => {
-                let name = format!("Q{}", r.below(1000));
                 m.routines.push(Routine {
-                    name: name.clone(),
-                    reads: m.tables[ti].name.clone(),
-                    writes: None,
+                    name: "Added".into(),
+                    reads: "T2".into(),
                     param: "int".into(),
                     function: false,
                 });
-                format!("add routine {name}")
+                "add routine Added".into()
             }
             Edit::DropRoutine => {
                 let ri = r.below(m.routines.len());
@@ -624,7 +717,7 @@ impl Edit {
             Edit::ChangeParameterType => {
                 let ri = r.below(m.routines.len());
                 let new = if m.routines[ri].param == "int" {
-                    "bigint"
+                    "nvarchar(40)"
                 } else {
                     "int"
                 };
@@ -632,63 +725,43 @@ impl Edit {
                 format!("parameter of {} -> {new}", m.routines[ri].name)
             }
             Edit::AddSchemaTable => {
-                let schema = format!("s{}", r.below(50));
                 m.tables.push(Table {
-                    schema: schema.clone(),
+                    schema: "app".into(),
                     name: "Other".into(),
-                    cols: vec![Col {
-                        name: "Id".into(),
-                        ty: "int".into(),
-                        null: false,
-                        default: None,
-                    }],
+                    cols: vec![key()],
                     index: None,
                     versioned: false,
                 });
-                m.extra.push((
-                    "schemas/s.sql".into(),
-                    format!("CREATE SCHEMA {schema};\nGO\n"),
-                ));
-                format!("table {schema}.Other in a new schema")
+                m.extra
+                    .push(("schemas/app.sql".into(), "CREATE SCHEMA app;\nGO\n".into()));
+                "table app.Other in a new schema".into()
             }
             Edit::AddTrigger => {
-                let name = format!("Tg{}", r.below(1000));
+                // A table other than the one Tr0 is on.
+                let on = if ti == 1 { "T2".to_string() } else { tname };
                 m.triggers.push(Trigger {
-                    name: name.clone(),
-                    on: m.tables[ti].name.clone(),
+                    name: "Tg1".into(),
+                    on: on.clone(),
                 });
-                format!("add trigger {name} on {}", m.tables[ti].name)
+                format!("add trigger Tg1 on {on}")
             }
             Edit::DropTrigger => {
-                if m.triggers.is_empty() {
-                    return "drop trigger (none)".into();
-                }
-                let g = m.triggers.remove(0);
-                format!("drop trigger {}", g.name)
+                m.triggers.clear();
+                "drop trigger Tr0".into()
             }
             Edit::VersioningOn => {
                 m.tables[ti].versioned = true;
-                format!("system versioning on for {}", m.tables[ti].name)
+                format!("system versioning on for {tname}")
             }
-            Edit::BaseColumn => {
-                m.base[0].cols.push(Col {
-                    name: "Extra".into(),
-                    ty: "int".into(),
-                    null: true,
-                    default: None,
-                });
-                "base catalog: ext.Ref gains a column".into()
+            Edit::BaseRetype => {
+                m.base[0].cols[1].ty = "int".into();
+                "base catalog: ext.Ref.Note becomes int".into()
             }
             Edit::BaseTable => {
                 m.base.push(Table {
                     schema: "ext".into(),
                     name: "More".into(),
-                    cols: vec![Col {
-                        name: "Id".into(),
-                        ty: "int".into(),
-                        null: false,
-                        default: None,
-                    }],
+                    cols: vec![key()],
                     index: None,
                     versioned: false,
                 });
