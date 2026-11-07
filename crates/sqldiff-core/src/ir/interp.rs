@@ -406,6 +406,8 @@ impl State {
 /// Pseudo-effect for the caller's pending work in caller-transaction scenarios.
 pub const CALLER: &str = "caller";
 
+pub mod pairs;
+
 const MAX_PATHS: usize = 128;
 const MAX_STEPS: usize = 4000;
 

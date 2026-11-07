@@ -131,15 +131,79 @@ fn ddl_catalog(dialect: sqldiff_syntax::Dialect, ddl: &[Artifact]) -> Arc<Catalo
     c
 }
 
-/// The catalog one side binds against.
-fn catalog_view(
+/// The catalog one side binds against, and the equivalence schema read from
+/// it, built once and shared by every file compared against the same
+/// catalogs (a tree run compares hundreds of files against two).
+struct BoundSide {
+    view: Arc<CatalogView>,
+    schema: equiv::schema::Schema,
+}
+
+/// What a side is built from: the dialect, the DDL artifacts (by content)
+/// and the supplied catalogs (by identity; `held` keeps them alive, so an
+/// address is never reused by another catalog while an entry names it).
+struct SideKey {
+    dialect: sqldiff_syntax::Dialect,
+    ddl: String,
+    held: Vec<Arc<Catalog>>,
+}
+
+impl SideKey {
+    fn is(&self, dialect: sqldiff_syntax::Dialect, ddl: &str, facts: &[Arc<Catalog>]) -> bool {
+        self.dialect == dialect
+            && self.ddl == ddl
+            && self.held.len() == facts.len()
+            && self.held.iter().zip(facts).all(|(a, b)| Arc::ptr_eq(a, b))
+    }
+}
+
+fn side(
     dialect: sqldiff_syntax::Dialect,
     ddl: &[Artifact],
     facts: &[Arc<Catalog>],
-) -> CatalogView {
+) -> Arc<BoundSide> {
+    type Cache = Mutex<Vec<(SideKey, Arc<BoundSide>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    const MAX_ENTRIES: usize = 4;
+    let mut ddl_key = String::new();
+    for a in ddl {
+        ddl_key.push_str(&a.path);
+        ddl_key.push('\0');
+        ddl_key.push_str(a.dialect.id());
+        ddl_key.push('\0');
+        ddl_key.push_str(&content_hash(&a.text));
+        ddl_key.push('\0');
+    }
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(s) = cache.lock().ok().and_then(|m| {
+        m.iter()
+            .find(|(k, _)| k.is(dialect, &ddl_key, facts))
+            .map(|(_, s)| s.clone())
+    }) {
+        return s;
+    }
     let loaded = (!ddl.is_empty()).then(|| ddl_catalog(dialect, ddl));
     let sources: Vec<&Catalog> = loaded.iter().chain(facts).map(|c| c.as_ref()).collect();
-    CatalogView::new(dialect, &sources)
+    let view = Arc::new(CatalogView::new(dialect, &sources));
+    let schema = equiv::schema::Schema::from_shared_view(&view);
+    let built = Arc::new(BoundSide { view, schema });
+    // A side without supplied catalogs is cheap to build: not kept.
+    if !facts.is_empty() || !ddl.is_empty() {
+        if let Ok(mut m) = cache.lock() {
+            if m.len() >= MAX_ENTRIES {
+                m.remove(0);
+            }
+            m.push((
+                SideKey {
+                    dialect,
+                    ddl: ddl_key,
+                    held: facts.to_vec(),
+                },
+                built.clone(),
+            ));
+        }
+    }
+    built
 }
 
 pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -161,10 +225,11 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     let mut unknown_reasons = Vec::new();
     let mut noise = NoiseCounts::default();
     // One catalog per side serves binding and statement equivalence.
-    let view_a = catalog_view(a.dialect, &opts.catalog_a, &opts.facts_a);
-    let view_b = catalog_view(b.dialect, &opts.catalog_b, &opts.facts_b);
-    let mut schema_a = equiv::schema::Schema::from_view(&view_a);
-    let mut schema_b = equiv::schema::Schema::from_view(&view_b);
+    let side_a = side(a.dialect, &opts.catalog_a, &opts.facts_a);
+    let side_b = side(b.dialect, &opts.catalog_b, &opts.facts_b);
+    let (view_a, view_b) = (&side_a.view, &side_b.view);
+    let mut schema_a = side_a.schema.clone();
+    let mut schema_b = side_b.schema.clone();
     schema_a.list_stars_with(&mut schema_b);
     let mut eq = equiv::Outcome::default();
     let mut txn_unknown = Vec::new();
@@ -306,14 +371,14 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     let bound_a = bind::bind(
         &aa,
         &BindInput {
-            view: &view_a,
+            view: view_a,
             helpers: &opts.helpers,
         },
     );
     let bound_b = bind::bind(
         &ab,
         &BindInput {
-            view: &view_b,
+            view: view_b,
             helpers: &opts.helpers,
         },
     );
@@ -417,6 +482,21 @@ pub fn what_if(
     crate::ir::behaviour::what_if(&aa, &ab, side, line, kind, &env)
 }
 
+/// Measurement only (perf plan W6): how many lockstep pair-states the
+/// behaviour explorer would need for each routine pair of `a` and `b`.
+/// Nothing calls this on the diff path.
+pub fn pair_states(
+    a: &Artifact,
+    b: &Artifact,
+    opts: &Options,
+    max_states: usize,
+) -> Vec<crate::ir::behaviour::PairRow> {
+    let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
+    let ab = Analyzed::new(b, Side::B, opts.excerpt_lines);
+    let env = crate::ir::behaviour::Env::from_options(opts);
+    crate::ir::behaviour::pair_states(&aa, &ab, &env, max_states)
+}
+
 /// Transaction overlay brackets of both sides (design §6.2).
 pub fn overlay(a: &Artifact, b: &Artifact) -> crate::ir::overlay::Overlay {
     let aa = Analyzed::new(a, Side::A, 1);
@@ -427,8 +507,8 @@ pub fn overlay(a: &Artifact, b: &Artifact) -> crate::ir::overlay::Overlay {
 /// Lint one artifact on its own.
 pub fn check(a: &Artifact, opts: &Options) -> Report {
     let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
-    let view = catalog_view(a.dialect, &opts.catalog_a, &opts.facts_a);
-    let schema = equiv::schema::Schema::from_view(&view);
+    let side_a = side(a.dialect, &opts.catalog_a, &opts.facts_a);
+    let (view, schema) = (&side_a.view, side_a.schema.clone());
     let mut findings: Vec<Finding> = lint::all_hits(&aa)
         .iter()
         .map(|h| lint::to_finding(&aa, h))
@@ -439,7 +519,7 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
     let bound = bind::bind(
         &aa,
         &BindInput {
-            view: &view,
+            view,
             helpers: &opts.helpers,
         },
     );

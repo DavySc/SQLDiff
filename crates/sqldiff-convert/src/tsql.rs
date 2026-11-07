@@ -720,6 +720,9 @@ impl<'a> Cx<'a> {
     // ----- batches, routines, bodies -------------------------------------------
 
     fn batch(&mut self, out: &mut Out, b: &SyntaxNode) {
+        // Every batch converts to its own block: a cursor plan made in an
+        // earlier batch names a `refcursor` that this one does not declare.
+        self.cursor_plans.clear();
         let units: Vec<SyntaxNode> = b.children().filter(|c| c.kind().is_unit()).collect();
         if units.iter().any(|u| u.kind() == ROUTINE) {
             // T-SQL wants CREATE PROCEDURE alone in its batch, but views and
@@ -742,6 +745,9 @@ impl<'a> Cx<'a> {
         self.decls.clear();
         self.rc_scratch = false;
         self.cursors.clear();
+        // A cursor is the routine's own: a later routine that FETCHes a
+        // cursor it never declared must not find this one's plan.
+        self.cursor_plans.clear();
         self.loops.clear();
         self.labels = 0;
         self.xact_abort = false;

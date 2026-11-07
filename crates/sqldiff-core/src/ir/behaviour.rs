@@ -398,26 +398,39 @@ fn continues(o: &Outcome) -> bool {
 /// arrays: an outcome that merged into the fault-free run shares that
 /// run's array, so comparing two of them starts from this and costs the
 /// slots they changed.
+///
+/// One cache serves a whole routine pair. It is keyed by the arrays'
+/// identity (a pair of `Rc` addresses) and keeps the arrays alive, so an
+/// address is never reused while its entry exists. Eviction clears
+/// everything once the arrays held reach `BYTES`; it only costs time, the
+/// differences are a pure function of the two arrays.
 #[derive(Default)]
 struct DiffCache {
     #[allow(clippy::type_complexity)]
-    pairs: RefCell<Vec<(Rc<Vec<u8>>, Rc<Vec<u8>>, Rc<Vec<u32>>)>>,
+    pairs: RefCell<(
+        HashMap<(usize, usize), (Rc<Vec<u8>>, Rc<Vec<u8>>, Rc<Vec<u32>>)>,
+        usize,
+    )>,
 }
 
 impl DiffCache {
+    /// Bytes of fate arrays the cache may keep alive before it starts over.
+    const BYTES: usize = 64 << 20;
+
     fn of(&self, a: &Rc<Vec<u8>>, b: &Rc<Vec<u8>>) -> Rc<Vec<u32>> {
         let mut c = self.pairs.borrow_mut();
-        if let Some((_, _, d)) = c
-            .iter()
-            .find(|(x, y, _)| Rc::ptr_eq(x, a) && Rc::ptr_eq(y, b))
-        {
+        let key = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
+        if let Some((_, _, d)) = c.0.get(&key) {
             return d.clone();
         }
         let d = Rc::new(scan_differing(a, b));
-        if c.len() >= 64 {
-            c.clear();
+        let cost = a.len() + b.len() + 4 * d.len() + 64;
+        if c.1 + cost > Self::BYTES {
+            c.0.clear();
+            c.1 = 0;
         }
-        c.push((a.clone(), b.clone(), d.clone()));
+        c.1 += cost;
+        c.0.insert(key, (a.clone(), b.clone(), d.clone()));
         d
     }
 }
@@ -1055,7 +1068,7 @@ fn side_outcome(s: &SideIr, o: &Outcome) -> SideOutcome {
 
 /// Folded text of a condition, so paths of two dialects can be matched:
 /// case, quoting, default schemas and parameter prefixes are not compared.
-fn norm_cond(c: &str) -> String {
+pub(crate) fn norm_cond(c: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let toks: Vec<String> = c
         .to_lowercase()
@@ -1210,7 +1223,16 @@ struct Collector<'x, 'a> {
     /// side (see `Outcome::cut`).
     cut_a: BTreeSet<NodeId>,
     cut_b: BTreeSet<NodeId>,
+    /// The divergences of a scenario with a default flipped (`persists`),
+    /// by scenario.
+    flipped: RefCell<HashMap<String, Rc<Divergences>>>,
 }
+
+/// The (rule, anchor) of divergences found.
+type Divergences = BTreeSet<(&'static str, String)>;
+
+/// Flipped scenarios kept before the cache starts over (time only).
+const FLIPPED_MAX: usize = 4096;
 
 impl<'x, 'a> Collector<'x, 'a> {
     fn new(
@@ -1240,6 +1262,7 @@ impl<'x, 'a> Collector<'x, 'a> {
             salt: String::new(),
             cut_a: BTreeSet::new(),
             cut_b: BTreeSet::new(),
+            flipped: RefCell::new(HashMap::new()),
         };
         c.splits = splits(&c.sa, &c.sb, true);
         c.splits.extend(splits(&c.sb, &c.sa, false));
@@ -1298,14 +1321,39 @@ impl<'x, 'a> Collector<'x, 'a> {
 
     /// Whether a divergence still shows with a default setting flipped; if
     /// so, the finding does not rest on the assumption behind that default.
+    ///
+    /// The divergences of the flipped scenario are worked out once for all
+    /// findings that flip it (`flipped`): a scenario with many findings used
+    /// to explore and compare every outcome pair again for each of them.
     fn persists(&self, sc: &Kind, scen_a: &Scenario, scen_b: &Scenario, d: &Div) -> bool {
+        let key = format!("{sc:?}|{scen_a:?}|{scen_b:?}");
+        let known = self.flipped.borrow().get(&key).cloned();
+        let set = match known {
+            Some(set) => set,
+            None => {
+                let set = Rc::new(self.divergences_of(sc, scen_a, scen_b));
+                let mut c = self.flipped.borrow_mut();
+                if c.len() >= FLIPPED_MAX {
+                    c.clear();
+                }
+                c.insert(key, set.clone());
+                set
+            }
+        };
+        set.contains(&(d.rule, d.anchor.clone()))
+    }
+
+    /// The (rule, anchor) of every divergence between any pair of outcomes
+    /// of the two sides under the scenarios.
+    fn divergences_of(&self, sc: &Kind, scen_a: &Scenario, scen_b: &Scenario) -> Divergences {
         let (pa, pb) = self.outcomes(sc, scen_a, scen_b);
         let (ps, _) = pairs(&pa, &pb);
         let ra: Vec<Reads> = pa.iter().map(|o| reads(&self.sa, o)).collect();
         let rb: Vec<Reads> = pb.iter().map(|o| reads(&self.sb, o)).collect();
-        ps.iter().any(|&(i, j)| {
+        let mut out = BTreeSet::new();
+        for &(i, j) in &ps {
             let (a, b) = ((&pa[i], &ra[i]), (&pb[j], &rb[j]));
-            diff(
+            for x in diff(
                 &self.sa,
                 &self.sb,
                 &self.splits,
@@ -1314,10 +1362,11 @@ impl<'x, 'a> Collector<'x, 'a> {
                 b,
                 &|_, _| false,
                 &self.al,
-            )
-            .iter()
-            .any(|x| x.rule == d.rule && x.anchor == d.anchor)
-        })
+            ) {
+                out.insert((x.rule, x.anchor));
+            }
+        }
+        out
     }
 
     fn run(
@@ -2225,4 +2274,189 @@ mod pairing_tests {
             &p(&[("w", false), ("w", true)])
         ));
     }
+}
+
+/// One routine pair's pair-state measurement (see `interp::pairs`).
+#[derive(Debug, Clone)]
+pub struct PairRow {
+    pub routine: String,
+    pub lines_a: usize,
+    pub lines_b: usize,
+    pub nodes_a: usize,
+    pub nodes_b: usize,
+    /// "baseline" or "caller-txn" (the environment of the run).
+    pub env: &'static str,
+    /// Unknown branch tests (decisions) in the two CFGs.
+    pub decisions_a: usize,
+    pub decisions_b: usize,
+    /// Decisions whose condition the other side also decides, under the
+    /// folding `pairs` uses and the lenient one of the last variant.
+    pub matched_a: [usize; 2],
+    pub matched_b: [usize; 2],
+    /// What the production explorer finds under the same environment: paths
+    /// per side (at most 128 each) and whether a budget cut any of them.
+    pub prod_paths_a: usize,
+    pub prod_paths_b: usize,
+    pub prod_cut: bool,
+    /// Perfect-alignment bound: each side against a copy of itself, with the
+    /// `agree` key (every decision matches, nothing is solo): what pair-state
+    /// merging needs when the conditions pair up completely.
+    pub self_a: super::interp::pairs::Measure,
+    pub self_b: super::interp::pairs::Measure,
+    /// The key variants, in the order of [`PAIR_VARIANTS`].
+    pub measures: Vec<super::interp::pairs::Measure>,
+}
+
+/// strict+steps, strict, agree+steps, agree (no steps, dead loops dropped),
+/// agree with local-variable prefixes also ignored when matching conditions,
+/// and that with the uncommitted-log abstraction.
+pub const PAIR_VARIANTS: [super::interp::pairs::Variant; 6] = {
+    use super::interp::pairs::Variant as V;
+    const fn v(agree: bool, steps: bool, deadloop: bool, lenient: bool, abstract_log: bool) -> V {
+        V {
+            agree,
+            steps,
+            deadloop,
+            lenient,
+            abstract_log,
+        }
+    }
+    [
+        v(false, true, false, false, false),
+        v(false, false, true, false, false),
+        v(true, true, false, false, false),
+        v(true, false, true, false, false),
+        v(true, false, true, true, false),
+        v(true, false, true, true, true),
+    ]
+};
+
+/// Measures the lockstep pair-state counts of every routine pair of `a` and
+/// `b` (the pairs `analyze` would analyse). On demand only: nothing in
+/// `analyze` calls it, so verdicts cannot depend on it.
+pub fn pair_states(a: &Analyzed, b: &Analyzed, env: &Env, max_states: usize) -> Vec<PairRow> {
+    let pairs: Vec<(Option<SyntaxNode>, Option<SyntaxNode>, String)> = match meet(a, b) {
+        None => vec![(
+            routines_of(a).first().cloned(),
+            routines_of(b).first().cloned(),
+            String::new(),
+        )],
+        Some(m) => m
+            .pairs
+            .iter()
+            .map(|(x, y)| {
+                (
+                    Some(x.clone()),
+                    Some(y.clone()),
+                    sqldiff_syntax::ast::routine_name(x).unwrap_or_default(),
+                )
+            })
+            .collect(),
+    };
+    let mut rows = Vec::new();
+    for (ra, rb, name) in pairs {
+        let (sa, sb) = (SideIr::new(a, b, ra.clone()), SideIr::new(b, a, rb.clone()));
+        let keys = KeyUniverse::of(&[&sa.cfg, &sb.cfg]);
+        let dec = |c: &Cfg| {
+            c.nodes
+                .iter()
+                .filter(|n| {
+                    matches!(
+                        &n.op,
+                        super::cfg::Op::Test {
+                            test: super::cfg::Test::Unknown(_) | super::cfg::Test::NoRows(_),
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+        let lines = |r: &Option<SyntaxNode>, an: &Analyzed| {
+            r.as_ref().map_or(0, |r| {
+                let l = an.node_location(r);
+                l.end_line + 1 - l.start_line
+            })
+        };
+        let mut envs = vec![("baseline", env.scenario())];
+        if !env.caller_txn {
+            envs.push((
+                "caller-txn",
+                Scenario {
+                    caller_txn: true,
+                    ..env.scenario()
+                },
+            ));
+        }
+        let tests = |c: &Cfg, lenient: bool| -> Vec<String> {
+            c.nodes
+                .iter()
+                .filter_map(|n| match &n.op {
+                    super::cfg::Op::Test {
+                        test: super::cfg::Test::Unknown(t),
+                        ..
+                    } => Some(super::interp::pairs::canon(t, lenient)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let matched = |x: &Cfg, y: &Cfg, lenient: bool| {
+            let ys: HashSet<String> = tests(y, lenient).into_iter().collect();
+            tests(x, lenient).iter().filter(|t| ys.contains(*t)).count()
+        };
+        for (label, sc) in envs {
+            let (xa, xb) = (
+                Explorer::in_universe(&sa.cfg, &sc, &keys),
+                Explorer::in_universe(&sb.cfg, &sc, &keys),
+            );
+            let cut = xa.base().iter().chain(xb.base()).any(|o| !o.cut.is_empty());
+            rows.push(PairRow {
+                matched_a: [
+                    matched(&sa.cfg, &sb.cfg, false),
+                    matched(&sa.cfg, &sb.cfg, true),
+                ],
+                matched_b: [
+                    matched(&sb.cfg, &sa.cfg, false),
+                    matched(&sb.cfg, &sa.cfg, true),
+                ],
+                prod_paths_a: xa.base().len(),
+                prod_paths_b: xb.base().len(),
+                prod_cut: cut,
+                self_a: super::interp::pairs::measure(
+                    &sa.cfg,
+                    &sa.cfg,
+                    &keys,
+                    &sc,
+                    &sc,
+                    PAIR_VARIANTS[3],
+                    max_states,
+                ),
+                self_b: super::interp::pairs::measure(
+                    &sb.cfg,
+                    &sb.cfg,
+                    &keys,
+                    &sc,
+                    &sc,
+                    PAIR_VARIANTS[3],
+                    max_states,
+                ),
+                routine: name.clone(),
+                lines_a: lines(&ra, a),
+                lines_b: lines(&rb, b),
+                nodes_a: sa.cfg.nodes.len(),
+                nodes_b: sb.cfg.nodes.len(),
+                env: label,
+                decisions_a: dec(&sa.cfg),
+                decisions_b: dec(&sb.cfg),
+                measures: PAIR_VARIANTS
+                    .iter()
+                    .map(|v| {
+                        super::interp::pairs::measure(
+                            &sa.cfg, &sb.cfg, &keys, &sc, &sc, *v, max_states,
+                        )
+                    })
+                    .collect(),
+            });
+        }
+    }
+    rows
 }

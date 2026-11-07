@@ -132,7 +132,7 @@ fn reused(out: &Path) -> Vec<(String, bool)> {
     let r: serde_json::Value =
         serde_json::from_slice(&std::fs::read(out.join("conversion-report.json")).unwrap())
             .unwrap();
-    r["files"]
+    r["run"]["files"]
         .as_array()
         .unwrap()
         .iter()

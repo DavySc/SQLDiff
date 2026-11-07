@@ -58,10 +58,7 @@ fn args(d: &std::path::Path) -> tree::Args {
 
 fn report(t: &tree::Tree) -> serde_json::Value {
     let mut v = serde_json::to_value(&t.report).unwrap();
-    v["totals"]["seconds"] = serde_json::Value::Null;
-    for f in v["files"].as_array_mut().unwrap() {
-        f["seconds"] = serde_json::Value::Null;
-    }
+    v.as_object_mut().unwrap().remove("run");
     v
 }
 
