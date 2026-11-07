@@ -91,6 +91,10 @@ fn trivia_next_to_an_empty_node_is_handled() {
     // Each shape is a list of children: 'w' trivia, 'i' significant token,
     // 'e' empty BRANCH node.
     let shapes = [
+        "wez",
+        "zew",
+        "wezw",
+        "wzew",
         "wie",
         "wew",
         "weiw",
