@@ -653,7 +653,12 @@ struct Finish {
 
 impl Finish {
     fn apply(&self, c: &mut Conversion) {
-        self.pool.share_notes(c);
+        for u in &mut c.units {
+            for n in &mut u.notes {
+                self.pool.share(&mut n.rule);
+                self.pool.share(&mut n.text);
+            }
+        }
         if self.trim {
             crate::trim_reports(c);
         }

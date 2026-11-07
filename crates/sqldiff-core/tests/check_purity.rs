@@ -58,7 +58,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("sqldiff-convert/src/job.rs", &["fs::"]),
     ("sqldiff-convert/src/queue.rs", &["fs::"]),
     ("sqldiff-convert/src/review.rs", &["fs::"]),
-    ("sqldiff-convert/src/shared.rs", &["Mutex"]),
+    ("sqldiff-units/src/shared.rs", &["Mutex"]),
     ("sqldiff-convert/src/store.rs", &["fs::", "thread::current"]),
     (
         "sqldiff-convert/src/tree.rs",
@@ -135,6 +135,7 @@ fn the_check_reads_nothing_outside_its_arguments() {
         "sqldiff-model",
         "sqldiff-catalog",
         "sqldiff-equiv",
+        "sqldiff-units",
     ] {
         scan(&root.join(krate).join("src"), &root, &mut found);
     }

@@ -1583,7 +1583,7 @@ impl<'a> Cx<'a> {
             text: format!("Converted by the idiom rules ({}).", p.rules.join(", ")).into(),
         }];
         notes.extend(p.notes.iter().map(|a| Note {
-            status: a.status.into(),
+            status: unit_status(a.status),
             rule: a.rule.clone().into(),
             text: a.text.clone().into(),
         }));
@@ -10829,15 +10829,14 @@ fn adjacent_unit(els: &[SyntaxElement], i: usize) -> Option<SyntaxNode> {
     None
 }
 
-impl From<rules::Status> for Status {
-    fn from(s: rules::Status) -> Self {
-        match s {
-            rules::Status::Converted => Status::Converted,
-            rules::Status::Assumptions => Status::Assumptions,
-            rules::Status::Decision => Status::Decision,
-            rules::Status::Differs => Status::Differs,
-            rules::Status::NotConverted => Status::NotConverted,
-        }
+/// The unit status a rule's status stands for.
+fn unit_status(s: rules::Status) -> Status {
+    match s {
+        rules::Status::Converted => Status::Converted,
+        rules::Status::Assumptions => Status::Assumptions,
+        rules::Status::Decision => Status::Decision,
+        rules::Status::Differs => Status::Differs,
+        rules::Status::NotConverted => Status::NotConverted,
     }
 }
 
