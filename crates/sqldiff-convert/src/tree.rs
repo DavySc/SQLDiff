@@ -1481,7 +1481,10 @@ fn convert_files(
         _ => Default::default(),
     };
     let stand_ins_digest = stand_ins.digest();
-    let mismatch: std::sync::Mutex<Option<String>> = Default::default();
+    // Every mismatch found, not the last one a thread happened to store: the
+    // messages are sorted before they are reported, so the error does not
+    // depend on which thread finished when.
+    let mismatch: std::sync::Mutex<Vec<String>> = Default::default();
     let claims: std::sync::OnceLock<crate::table_vars::Claims> = std::sync::OnceLock::new();
     let work = slots(inputs.iter().zip(drafts).zip(keys.iter()).enumerate());
     let progress = Progress::new(work.len(), hooks);
@@ -1530,10 +1533,14 @@ fn convert_files(
                         // flags the store holds for the same result.
                         if let Some(old) = cc.store.get_flags(k, fk) {
                             if old != flags {
-                                *mismatch.lock().unwrap() = Some(format!(
+                                cc.store.bundle_flags(k, fk, &old, &flags);
+                                mismatch.lock().unwrap().push(format!(
                                     "{}: the stored stand-in flags {} differ from flags computed \
-                                     again for the same result. The store is emptied: run again.",
+                                     again for the same result; both are in {}/flags-{}.json. \
+                                     The store is emptied: run again.",
                                     input.rel,
+                                    fk.as_str(),
+                                    crate::store::MISMATCH_DIR,
                                     fk.as_str(),
                                 ));
                             }
@@ -1585,7 +1592,7 @@ fn convert_files(
             finish.apply(&mut old);
             if !crate::store::compare(&old, &c) {
                 cc.store.bundle(k, &old, &c);
-                *mismatch.lock().unwrap() = Some(format!(
+                mismatch.lock().unwrap().push(format!(
                     "{}: the stored result {} differs from a fresh check of the same input; \
                      both are in {}/{}.json. The store is emptied: run again.",
                     input.rel,
@@ -1606,11 +1613,13 @@ fn convert_files(
         Some((hold(c, key.as_ref(), in_store, false), secs, false, false))
     });
     crate::mem::release();
-    if let Some(msg) = mismatch.into_inner().unwrap() {
+    let mut found = mismatch.into_inner().unwrap();
+    if !found.is_empty() {
         if let Some(c) = cache {
             c.store.clear();
         }
-        return Err(msg);
+        found.sort();
+        return Err(found.join("\n"));
     }
     let done: Vec<(Held, f64, bool, bool)> = done
         .into_iter()
@@ -3574,6 +3583,40 @@ mod tree_state_tests {
         let third =
             build_tree_state(&a, &out, &inputs, 1, None, None, Some(&cache(true, 1))).unwrap();
         assert!(first.same_as(&third));
+        // A draft edited into other valid JSON (same length, so its ranges still
+        // fit), its digest left as it was, is
+        // not trusted: it is built again whatever the sample picks, so every
+        // seed gives the same state (without the digest check a draft is
+        // only found out when the sample happens to cover its file).
+        for e in std::fs::read_dir(&drafts_dir).unwrap().flatten() {
+            let mut bytes = std::fs::read(e.path()).unwrap();
+            let mut v: serde_json::Value = serde_json::from_slice(&bytes[65..]).unwrap();
+            let t = v["draft"]["raw"]["text"].as_str().unwrap().to_lowercase();
+            v["draft"]["raw"]["text"] = t.into();
+            bytes.truncate(65);
+            bytes.extend(serde_json::to_vec(&v).unwrap());
+            std::fs::write(e.path(), bytes).unwrap();
+        }
+        for seed in 0..8 {
+            let st = build_tree_state(&a, &out, &inputs, 1, None, None, Some(&cache(true, seed)))
+                .unwrap_or_else(|e| panic!("seed {seed}: an edited draft was trusted: {e}"));
+            assert!(first.same_as(&st), "seed {seed}");
+            // Built again, so the drafts are whole once more; edit them back
+            // for the next seed.
+            for e in std::fs::read_dir(&drafts_dir).unwrap().flatten() {
+                let mut bytes = std::fs::read(e.path()).unwrap();
+                let mut v: serde_json::Value = serde_json::from_slice(&bytes[65..]).unwrap();
+                let t = v["draft"]["raw"]["text"].as_str().unwrap().to_lowercase();
+                v["draft"]["raw"]["text"] = t.into();
+                bytes.truncate(65);
+                bytes.extend(serde_json::to_vec(&v).unwrap());
+                std::fs::write(e.path(), bytes).unwrap();
+            }
+        }
+        // Whole again for the steps below.
+        let again =
+            build_tree_state(&a, &out, &inputs, 1, None, None, Some(&cache(true, 1))).unwrap();
+        assert!(first.same_as(&again));
         // A stored draft that differs from the one built again is refused:
         // here p.sql's file holds a.sql's draft under p.sql's name. Both files
         // are sampled (one in fifty, at least one, of two reused).
