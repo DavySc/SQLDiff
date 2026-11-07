@@ -383,6 +383,83 @@ impl State {
         same.then_some(shifted)
     }
 
+    /// The state of a path but for `steps`, the signature, the trace and the
+    /// names of the row-count tests, as text: everything the step function
+    /// reads (compare [`State::same_run`]) and all the history that reaches
+    /// an outcome. Two paths with equal keys at one node make equal outcomes
+    /// from any continuation but for those. The fields are all listed, so a
+    /// new one must be put on one side or the other.
+    fn run_key(&self) -> String {
+        use std::fmt::Write;
+        let State {
+            depth,
+            caller_depth,
+            owner,
+            no_commit,
+            doomed,
+            xact_abort,
+            xact_abort_local,
+            implicit,
+            live,
+            log,
+            temp,
+            scopes,
+            savepoints,
+            resume,
+            caught,
+            last_error,
+            no_rows,
+            entry_depth,
+            loop_seen,
+            ret,
+            raising,
+            durability_unknown,
+            partial,
+            temp_reads,
+            raised,
+            imprecise,
+            cut,
+            rows,
+            assumptions,
+            untested,
+            // The budget is compared by the caller.
+            steps: _,
+            // Only name the condition of a later row-count test in the
+            // signature, which no comparison reads (the fork itself depends
+            // on `no_rows`).
+            rows_stmt: _,
+            rows_failed: _,
+            // Which statements ran and which conditions were decided: the
+            // only things two joined paths may differ in, and no comparison
+            // reads them (see [`Join`]).
+            signature: _,
+            trace: _,
+            // Fault bookkeeping: the caller refuses a path that has any.
+            faults_done: _,
+            before_fault: _,
+            faulted: _,
+            fault_index: _,
+            fault_route: _,
+        } = self;
+        #[allow(clippy::disallowed_methods)] // sorted right below
+        let mut seen: Vec<(&NodeId, &Vec<String>)> = loop_seen.iter().collect();
+        seen.sort();
+        let mut s = String::new();
+        let _ = write!(
+            s,
+            "{depth},{caller_depth},{owner:?},{no_commit},{doomed},{xact_abort},{xact_abort_local},{implicit}|{live:?}|{log:?}|{temp:?}|{scopes:?}|{savepoints:?}|{resume:?}|{caught:?}|"
+        );
+        let _ = write!(
+            s,
+            "{last_error:?},{no_rows:?},{entry_depth}|{seen:?}|{ret:?}|{raising:?}|{durability_unknown:?}|"
+        );
+        let _ = write!(
+            s,
+            "{partial:?}|{temp_reads:?}|{raised}|{imprecise:?}|{cut:?}|{rows:?}|{assumptions:?}|{untested:?}"
+        );
+        s
+    }
+
     /// Whether what `b` (a path of the fault-free run) had recorded is also
     /// in the history of `self`, so that the union of `self`'s history and
     /// the fault-free outcome's is `self`'s outcome's. A read of a temporary
@@ -410,6 +487,13 @@ pub mod pairs;
 
 const MAX_PATHS: usize = 128;
 const MAX_STEPS: usize = 4000;
+/// Ticks a run with path joining may use before it stops forking (like the
+/// path budget): what the longest run without joining could use is
+/// `MAX_PATHS * MAX_STEPS`. Memo entries are capped separately and only
+/// where they are made (`Interp::joins`).
+const JOIN_TICKS: usize = 200_000;
+const JOIN_ENTRIES: usize = 10_000;
+const JOIN_KEY_BYTES: usize = 16 * 1024;
 
 enum Step {
     Go(NodeId, Box<State>),
@@ -424,7 +508,105 @@ struct Machine {
     cur: Option<(NodeId, Box<State>)>,
     work: Vec<(NodeId, Box<State>)>,
     outs: Vec<Outcome>,
+    /// Path joining (see [`Join`]); `None` runs every path to its end.
+    join: Option<Join>,
 }
+
+/// One-sided path joining.
+///
+/// A path that reaches a join point (a node with several predecessors) in the
+/// same state as an earlier path whose subtree is finished is dropped: its
+/// continuation is the earlier path's step for step, and the outcomes it
+/// would make equal the earlier path's in every field a comparison reads (the
+/// *state*, history included, is the same; only the statements it ran and the
+/// conditions it decided differ). See `docs/behavioural-diff.md` ("Path
+/// joining") for the argument and for why it is used only when the other side
+/// has no decision.
+///
+/// The memo of arrivals belongs to the [`Explorer`] and is shared by the
+/// machines it checkpoints; an entry is visible to a tick only once its
+/// subtree is finished (`done_at`), so re-running the fault-free run from a
+/// checkpoint drops the same paths.
+type JoinKey = (NodeId, Rc<str>);
+type JoinMemo = BTreeMap<JoinKey, JoinEntry>;
+
+#[derive(Clone)]
+struct Join {
+    points: Rc<Vec<bool>>,
+    memo: Rc<std::cell::RefCell<JoinMemo>>,
+    /// The memo is being made (the fault-free run) or only read (a re-run).
+    live: bool,
+    /// Entries whose subtree is still running: (forked paths waiting when the
+    /// path arrived, entry), innermost last.
+    open: Vec<(usize, JoinKey)>,
+    /// Number of the tick the machine runs next.
+    tick: usize,
+    joined: usize,
+    /// Tick of the arrival whose entry the last dropped path joined.
+    last_arrived: usize,
+}
+
+#[derive(Clone)]
+struct JoinEntry {
+    /// Tick of the arrival that made the entry, and its `steps`.
+    arrived: usize,
+    steps: usize,
+    outs_from: usize,
+    /// Set when the subtree is finished: the end of its outcomes and the
+    /// tick from which the entry may be joined.
+    outs_to: Option<usize>,
+    done_at: Option<usize>,
+    /// Some outcome of the subtree was cut by the step budget.
+    step_cut: bool,
+}
+
+impl Join {
+    fn new(cfg: &Cfg) -> Join {
+        let mut preds = vec![0usize; cfg.nodes.len()];
+        for n in &cfg.nodes {
+            for (_, t) in &n.succ {
+                preds[*t] += 1;
+            }
+        }
+        // Only the control flow of the statements merges here; the error
+        // routes (every statement has one to its successor) do not, or every
+        // node would be a join point.
+        Join {
+            points: Rc::new(preds.iter().map(|p| *p >= 2).collect()),
+            memo: Rc::default(),
+            live: true,
+            open: Vec::new(),
+            tick: 0,
+            joined: 0,
+            last_arrived: 0,
+        }
+    }
+
+    /// A path was taken off the work stack, which now holds `waiting` paths:
+    /// the subtrees of the entries made when more were waiting are finished.
+    fn close(&mut self, waiting: usize, outs: &[Outcome]) {
+        if !self.live {
+            return;
+        }
+        while let Some((mark, _)) = self.open.last() {
+            if *mark <= waiting {
+                break;
+            }
+            let Some((_, key)) = self.open.pop() else {
+                break;
+            };
+            if let Some(e) = self.memo.borrow_mut().get_mut(&key) {
+                e.outs_to = Some(outs.len());
+                e.done_at = Some(self.tick);
+                e.step_cut = outs[e.outs_from..]
+                    .iter()
+                    .any(|o| o.imprecise.iter().any(|i| i == STEP_CUT));
+            }
+        }
+    }
+}
+
+const STEP_CUT: &str = "step budget exhausted";
 
 impl Machine {
     /// The node the next step runs, taking the next forked path when the
@@ -432,6 +614,9 @@ impl Machine {
     fn next_node(&mut self) -> Option<NodeId> {
         if self.cur.is_none() {
             self.cur = self.work.pop();
+            if let Some(j) = self.join.as_mut() {
+                j.close(self.work.len(), &self.outs);
+            }
         }
         self.cur.as_ref().map(|(n, _)| *n)
     }
@@ -520,6 +705,23 @@ impl std::fmt::Debug for LiveByName<'_> {
     }
 }
 
+/// Whether `cfg` has no node that forks a path (a test on a condition the
+/// interpreter cannot evaluate, or on a row count a scenario does not fix):
+/// every scenario then has exactly one path, with an empty signature. The
+/// outcomes of the other side are paired with it by every combination, which
+/// is what path joining needs (see [`Join`]).
+pub fn decision_free(cfg: &Cfg) -> bool {
+    !cfg.nodes.iter().any(|n| {
+        matches!(
+            n.op,
+            Op::Test {
+                test: Test::Unknown(_) | Test::NoRows(_),
+                ..
+            }
+        )
+    })
+}
+
 /// Explores every path of `cfg` under `sc` and returns one outcome per path.
 pub fn explore(cfg: &Cfg, sc: &Scenario) -> Vec<Outcome> {
     let keys = Keys::of(cfg);
@@ -605,6 +807,7 @@ pub struct Explorer {
     /// The statements that have a durable effect with each key id.
     key_nodes: Vec<Vec<NodeId>>,
     merges: std::cell::Cell<usize>,
+    joined: usize,
 }
 
 /// What the fault-free run looked like at one step.
@@ -622,6 +825,8 @@ struct Tick {
     outs_end: u32,
     /// Hash of the small part of the run state.
     small: u64,
+    /// The path was dropped here by joining.
+    dropped: bool,
 }
 
 impl Explorer {
@@ -633,6 +838,18 @@ impl Explorer {
     /// [`Explorer::new`] numbering the effects over `keys`, which must hold
     /// every effect key of `cfg`.
     pub fn in_universe(cfg: &Cfg, base: &Scenario, keys: &KeyUniverse) -> Explorer {
+        Explorer::in_universe_joined(cfg, base, keys, false)
+    }
+
+    /// [`Explorer::in_universe`] joining paths of the fault-free run when
+    /// `join` (see [`Join`]). Only sound where the other side of the
+    /// comparison makes no decision: see [`decision_free`].
+    pub fn in_universe_joined(
+        cfg: &Cfg,
+        base: &Scenario,
+        keys: &KeyUniverse,
+        join: bool,
+    ) -> Explorer {
         let base = Scenario {
             faults: Vec::new(),
             ..base.clone()
@@ -645,6 +862,9 @@ impl Explorer {
             sc: &base,
         };
         let mut m = it.start();
+        if join {
+            m.join = Some(Join::new(cfg));
+        }
         let mut first = HashMap::new();
         let mut checkpoints = Vec::new();
         let mut ticks: Vec<Tick> = Vec::new();
@@ -674,6 +894,7 @@ impl Explorer {
                             cur: m.cur.clone(),
                             work: m.work.clone(),
                             outs: Vec::new(),
+                            join: m.join.clone(),
                         },
                     ));
                 }
@@ -697,6 +918,7 @@ impl Explorer {
                 }
             }
             open.push(t);
+            let joined_before = m.join.as_ref().map_or(0, |j| j.joined);
             ticks.push(Tick {
                 node: n,
                 steps,
@@ -705,8 +927,24 @@ impl Explorer {
                 end: 0,
                 outs_end: 0,
                 small,
+                dropped: false,
             });
             it.tick(&mut m);
+            // A path dropped by joining ran nothing: a replay must not merge
+            // into it (its outcomes are the joined path's).
+            // Every open tick after the joined entry's arrival is
+            // on the dropped path's own segment (not an ancestor of the kept
+            // path): its outcome slice lacks the dropped continuation, so a
+            // replay must not merge into it either.
+            if let Some(j) = m.join.as_ref().filter(|j| j.joined > joined_before) {
+                for &o in open.iter().rev() {
+                    if o <= j.last_arrived {
+                        break;
+                    }
+                    ticks[o].dropped = true;
+                }
+                ticks[t].dropped = true;
+            }
             t += 1;
         }
         for top in open {
@@ -715,6 +953,9 @@ impl Explorer {
         }
         let mut at: HashMap<(NodeId, usize), Vec<u32>> = HashMap::new();
         for (i, k) in ticks.iter().enumerate() {
+            if k.dropped {
+                continue;
+            }
             at.entry((k.node, k.steps)).or_default().push(i as u32);
         }
         let mut key_nodes = vec![Vec::new(); keys.names.len()];
@@ -741,6 +982,7 @@ impl Explorer {
             at,
             key_nodes,
             merges: std::cell::Cell::new(0),
+            joined: m.join.as_ref().map_or(0, |j| j.joined),
         }
     }
 
@@ -752,6 +994,17 @@ impl Explorer {
     /// The outcomes of the fault-free scenario.
     pub fn base(&self) -> &[Outcome] {
         &self.outs
+    }
+
+    /// How many paths of the fault-free run joining dropped.
+    pub fn joined(&self) -> usize {
+        self.joined
+    }
+
+    /// Whether the fault-free run reaches `node` (a statement it dropped
+    /// with a joined path is still reached by the path it joined).
+    pub fn reaches(&self, node: NodeId) -> bool {
+        self.first.contains_key(&node)
     }
 
     /// How many fault scenarios ended by merging into the fault-free run.
@@ -781,6 +1034,11 @@ impl Explorer {
             prof: Profile::of(cfg.dialect),
             sc: &self.base,
         };
+        // The memo is complete: the re-run only reads it.
+        if let Some(j) = m.join.as_mut() {
+            j.live = false;
+            j.open.clear();
+        }
         while at < t {
             m.next_node()?;
             base.tick(&mut m);
@@ -812,6 +1070,10 @@ impl Explorer {
         if m.next_node() != Some(fault.node) {
             return self.full(cfg, sc);
         }
+        // The replay runs every path to its end: what joining dropped from the
+        // fault-free run cannot reach the failing statement (it is first
+        // reached at tick `t`), so those paths are as in the fault-free run.
+        m.join = None;
         let it = Interp {
             cfg,
             keys: &self.keys,
@@ -1275,6 +1537,7 @@ impl Interp<'_> {
             cur: None,
             work: vec![(first, Box::new(init))],
             outs: Vec::new(),
+            join: None,
         }
     }
 
@@ -1287,12 +1550,22 @@ impl Interp<'_> {
 
     /// One step of the current path (see [`Machine::next_node`]).
     fn tick(&self, m: &mut Machine) {
+        self.tick_path(m);
+        if let Some(j) = m.join.as_mut() {
+            j.tick += 1;
+        }
+    }
+
+    fn tick_path(&self, m: &mut Machine) {
         let Some((node, mut st)) = m.cur.take() else {
             return;
         };
+        if m.join.is_some() && Self::joins(m, node, &st) {
+            return;
+        }
         st.steps += 1;
         if st.steps > MAX_STEPS {
-            st.imprecise.push("step budget exhausted".into());
+            st.imprecise.push(STEP_CUT.into());
             st.cut.push(node);
             m.outs.push(self.finish(Exit::Normal, *st));
             return;
@@ -1301,7 +1574,14 @@ impl Interp<'_> {
             Step::Go(n, s) => m.cur = Some((n, s)),
             Step::Fork(mut v) => {
                 let (n, mut s) = v.remove(0);
-                if m.work.len() + m.outs.len() + v.len() < MAX_PATHS {
+                // Paths dropped by joining are not outcomes, so the path budget
+                // alone does not bound the work of a joined run: its ticks are
+                // bounded the same way (work budget). The memo's size is not
+                // read here: a re-run from a checkpoint sees the finished
+                // memo, so a size test would stop forking earlier than the
+                // run that made it (`entries are capped where they are made`).
+                let over = m.join.as_ref().is_some_and(|j| j.tick >= JOIN_TICKS);
+                if m.work.len() + m.outs.len() + v.len() < MAX_PATHS && !over {
                     m.work.extend(v);
                 } else {
                     s.imprecise.push("path budget exhausted".into());
@@ -1311,6 +1591,77 @@ impl Interp<'_> {
             }
             Step::Done(o) => m.outs.push(*o),
         }
+    }
+
+    /// Path joining: whether the path about to run `node` in state `st` is
+    /// dropped because an earlier path in the same state has finished
+    /// everything below `node` (see [`Join`]). Otherwise the arrival is
+    /// remembered (when the memo is being made).
+    fn joins(m: &mut Machine, node: NodeId, st: &State) -> bool {
+        let Machine {
+            work, outs, join, ..
+        } = m;
+        let Some(j) = join.as_mut() else {
+            return false;
+        };
+        if !j.points[node] {
+            return false;
+        }
+        // Fault bookkeeping is part of what an outcome says; joined runs are
+        // fault-free.
+        if !st.faults_done.is_empty()
+            || st.fault_index.is_some()
+            || st.fault_route.is_some()
+            || st.before_fault.is_some()
+            || st.faulted.is_some()
+        {
+            return false;
+        }
+        let text = st.run_key();
+        // A state this big (a long script's log) is not worth a memo entry.
+        if text.len() > JOIN_KEY_BYTES {
+            return false;
+        }
+        let key = (node, Rc::<str>::from(text));
+        let mut memo = j.memo.borrow_mut();
+        let Some(e) = memo.get(&key) else {
+            // Entries are capped where they are made, never where they are
+            // read: a full memo only stops new entries, which every re-run
+            // (it makes none) sees as absent before their arrival too.
+            if j.live && memo.len() < JOIN_ENTRIES {
+                memo.insert(
+                    key.clone(),
+                    JoinEntry {
+                        arrived: j.tick,
+                        steps: st.steps,
+                        outs_from: outs.len(),
+                        outs_to: None,
+                        done_at: None,
+                        step_cut: false,
+                    },
+                );
+                drop(memo);
+                j.open.push((work.len(), key));
+            }
+            return false;
+        };
+        // Still running (this path is inside the earlier one's subtree), or
+        // this is the arrival that made the entry.
+        let (Some(done), Some(to)) = (e.done_at, e.outs_to) else {
+            return false;
+        };
+        if done > j.tick || e.arrived >= j.tick || e.outs_from == to {
+            return false;
+        }
+        // The earlier path had used at most as many steps, or its subtree was
+        // not cut by the step budget: this path's continuation fits the budget
+        // wherever the earlier one did.
+        if st.steps < e.steps && e.step_cut {
+            return false;
+        }
+        j.joined += 1;
+        j.last_arrived = e.arrived;
+        true
     }
 
     fn row(&self, st: &mut State, id: &str, fact: Option<&str>, status: Status) {
