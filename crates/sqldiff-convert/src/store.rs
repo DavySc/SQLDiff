@@ -1220,4 +1220,118 @@ mod note_table_tests {
         let mut bad = json!({"units": [{"notes": [3]}], NOTE_TABLE: []});
         assert!(unshare_notes(&mut bad).is_none());
     }
+
+    fn sample() -> Conversion {
+        crate::convert("SELECT 1;\n", Dialect::Tsql, Dialect::Postgres).unwrap()
+    }
+
+    fn reads_of(n: u8) -> Reads {
+        let mut r = Reads::default();
+        r.0.insert(
+            (ReadSide::Source, Query::Supplied),
+            Outcome::of(&format!("answer {n}")),
+        );
+        r
+    }
+
+    fn scratch(name: &str) -> (PathBuf, Store) {
+        let out = std::env::temp_dir().join(format!("sqldiff-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        let store = Store::of(&out);
+        (out, store)
+    }
+
+    #[test]
+    fn an_entry_reads_back_with_its_reads_and_a_second_write_of_other_bytes_is_refused() {
+        let (out, store) = scratch("entries");
+        let key = Key("a".repeat(64));
+        let mut c = sample();
+        c.output = "one".into();
+        let (e, put) = store
+            .put(&key, &c, None, true, &reads_of(1), false)
+            .unwrap();
+        assert_eq!(put, Put::Written);
+        assert_eq!(store.entries(&key), vec![(e.id.clone(), reads_of(1))]);
+        assert_eq!(store.get(&e).unwrap().0.output, "one");
+        // The same bytes again: nothing to do.
+        assert_eq!(
+            store
+                .put(&key, &c, None, true, &reads_of(1), false)
+                .unwrap()
+                .1,
+            Put::Same
+        );
+        // Other bytes under the same reads: refused, and the entry stays.
+        c.output = "two".into();
+        assert_eq!(
+            store
+                .put(&key, &c, None, true, &reads_of(1), false)
+                .unwrap()
+                .1,
+            Put::Differs
+        );
+        assert_eq!(store.get(&e).unwrap().0.output, "one");
+        // A `--fresh` run writes over it.
+        store.put(&key, &c, None, true, &reads_of(1), true).unwrap();
+        assert_eq!(store.get(&e).unwrap().0.output, "two");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn a_reads_file_that_names_another_id_is_not_an_entry() {
+        let (out, store) = scratch("reads-id");
+        let key = Key("b".repeat(64));
+        let (e, _) = store
+            .put(&key, &sample(), None, true, &reads_of(1), false)
+            .unwrap();
+        let other = entry_id(&reads_of(2), true);
+        let dir = out.join(DIR).join(&key.0);
+        std::fs::copy(
+            dir.join(format!("{}.reads", e.id)),
+            dir.join(format!("{other}.reads")),
+        )
+        .unwrap();
+        std::fs::copy(
+            dir.join(format!("{}.json", e.id)),
+            dir.join(format!("{other}.json")),
+        )
+        .unwrap();
+        assert_eq!(store.entries(&key).len(), 1, "only the honest entry");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn eviction_keeps_the_entries_this_run_used_then_fills_by_id() {
+        let (out, store) = scratch("evict");
+        let key = Key("c".repeat(64));
+        let mut ids = Vec::new();
+        for n in 0..(MAX_ENTRIES as u8 + 4) {
+            let (e, _) = store
+                .put(&key, &sample(), None, true, &reads_of(n), false)
+                .unwrap();
+            ids.push(e);
+        }
+        // Use the entries with the largest ids: a purely sorted cut would
+        // drop exactly these.
+        let mut sorted = ids.clone();
+        sorted.sort();
+        let used: BTreeSet<EntryRef> = sorted.iter().rev().take(3).cloned().collect();
+        let live: BTreeSet<String> = [key.0.clone()].into();
+        store.gc(&live, &used);
+        let left: Vec<String> = store.entries(&key).into_iter().map(|e| e.0).collect();
+        assert_eq!(left.len(), MAX_ENTRIES);
+        for u in &used {
+            assert!(left.contains(&u.id), "a used entry was evicted");
+        }
+        // The rest are the smallest ids, and the same on every run.
+        let mut want: Vec<String> = sorted
+            .iter()
+            .take(MAX_ENTRIES - 3)
+            .map(|e| e.id.clone())
+            .collect();
+        want.extend(used.iter().map(|u| u.id.clone()));
+        want.sort();
+        assert_eq!(left, want);
+        let _ = std::fs::remove_dir_all(&out);
+    }
 }
