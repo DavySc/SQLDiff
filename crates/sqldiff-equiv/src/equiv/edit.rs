@@ -149,8 +149,21 @@ pub fn decide(
             eprintln!("edit: {} at A line {}", f.rule, la.start_line);
         }
         let before = sqldiff_model::work::now().total();
-        let r = examine(&ra, &rb, &na, &nb, sa, sb, (&sides.0, &sides.1), i);
+        let r = examine(
+            &ra,
+            &rb,
+            &na,
+            &nb,
+            sa,
+            sb,
+            (&sides.0, &sides.1),
+            i,
+            allowance.left(),
+        );
         allowance.take(sqldiff_model::work::now().total().saturating_sub(before));
+        if matches!(&r, Err(e) if e == BUDGET_ERR) {
+            note_budget(f, allowance);
+        }
         if std::env::var_os("SQLDIFF_DEBUG_EDIT").is_some() {
             match &r {
                 Ok(g) => eprintln!("  => different: {}", g.witness),
@@ -186,6 +199,10 @@ pub fn decide(
         }
     }
 }
+
+/// The error of an `examine` whose witness search stopped at the
+/// statement-level allowance; `decide` shows it on the candidate.
+const BUDGET_ERR: &str = "witness search stopped at the statement-level work budget";
 
 fn candidate(f: &Finding) -> bool {
     matches!(f.rule.as_str(), "stmt.modified" | "header.modified") && f.verdict == Verdict::Unknown
@@ -4013,6 +4030,7 @@ fn examine(
     sb: &Schema,
     sides: (&SideEdits, &SideEdits),
     idx: usize,
+    tries: Option<u64>,
 ) -> Result<Decided, String> {
     let d = ra.d;
     if na.kind() != nb.kind() {
@@ -4088,7 +4106,7 @@ fn examine(
         c.focus = focus.clone();
         c
     };
-    let found = match eval::search(&make, &xa.probe, &xb.probe) {
+    let found = match eval::search_within(&make, &xa.probe, &xb.probe, tries) {
         Ok(f) => f,
         Err(m) => {
             // One version fails whenever it runs the statement.
@@ -4098,6 +4116,7 @@ fn examine(
             return Err(match m {
                 Miss::Unsupported(w) => format!("not evaluated: {w}"),
                 Miss::NoWitness => "no witness found".to_string(),
+                Miss::Budget => BUDGET_ERR.to_string(),
             });
         }
     };
@@ -4366,6 +4385,7 @@ fn table_change(
         let found = eval::search(&make, &pa, &pb).map_err(|m| match m {
             Miss::Unsupported(w) => format!("not evaluated: {w}"),
             Miss::NoWitness => "no witness found".to_string(),
+            Miss::Budget => BUDGET_ERR.to_string(),
         })?;
         let first = |o: &Obs| match o {
             Obs::Rows(r, _) => r.first().and_then(|r| r.first()).cloned(),

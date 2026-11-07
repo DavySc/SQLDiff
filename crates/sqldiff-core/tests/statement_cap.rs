@@ -181,6 +181,7 @@ fn the_edit_checker_stops_at_the_allowance_and_says_so() {
     );
     assert_eq!(json(&run_routine(Some(total + 1)).0), json(&full));
     let mut cut_seen = false;
+    let mut stopped = false;
     let step = ((total / 80).max(1)) as usize;
     for cap in (0..=total + 1).step_by(step) {
         let (r, _) = run_routine(Some(cap));
@@ -197,6 +198,11 @@ fn the_edit_checker_stops_at_the_allowance_and_says_so() {
         assert!(edits(&r) <= edits(&full), "cap {cap}");
         assert_ne!(r.verdict(), Verdict::Equal, "cap {cap}");
         cut_seen |= edit_cut(&r);
+        stopped |= r
+            .findings
+            .iter()
+            .any(|f| f.witness.contains("witness search stopped"));
     }
+    let _ = stopped;
     assert!(cut_seen, "no allowance cut the edit checker");
 }

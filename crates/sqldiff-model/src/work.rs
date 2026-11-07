@@ -203,6 +203,11 @@ impl Allowance {
         self.is_on() && !self.allows(1)
     }
 
+    /// What is left (`None` when the allowance is off).
+    pub fn left(&self) -> Option<u64> {
+        self.left.get()
+    }
+
     /// The whole allowance, for the witness of a cut.
     pub fn cap(&self) -> Option<u64> {
         self.cap
