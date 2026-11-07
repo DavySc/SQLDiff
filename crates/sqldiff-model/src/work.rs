@@ -198,6 +198,11 @@ impl Allowance {
         self.cap.is_some()
     }
 
+    /// On, and nothing is left: the next unit of work is refused.
+    pub fn exhausted(&self) -> bool {
+        self.is_on() && !self.allows(1)
+    }
+
     /// The whole allowance, for the witness of a cut.
     pub fn cap(&self) -> Option<u64> {
         self.cap

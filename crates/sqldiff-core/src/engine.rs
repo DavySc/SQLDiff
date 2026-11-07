@@ -347,12 +347,13 @@ fn diff_inner(
     let mut receipts = Vec::new();
 
     if same {
+        let allowance = sqldiff_model::work::Allowance::new(opts.statement_work_cap);
         let mut td = treediff::diff_within(
             &aa,
             &ab,
             opts.alignment_bound
                 .unwrap_or(crate::normalize::DEFAULT_ALIGNMENT_BOUND),
-            opts.statement_work_cap,
+            &allowance,
         );
         // An observer that does not read row counts does not see SET NOCOUNT,
         // unless the code reads them itself: SET resets @@ROWCOUNT (and
@@ -396,7 +397,15 @@ fn diff_inner(
             }
         }
         equiv::refine_modified(&aa, &ab, &schema_a, &schema_b, &mut td.findings, &mut eq);
-        equiv::edit::decide(&aa, &ab, &schema_a, &schema_b, &mut td.findings, &mut eq);
+        equiv::edit::decide(
+            &aa,
+            &ab,
+            &schema_a,
+            &schema_b,
+            &mut td.findings,
+            &mut eq,
+            &allowance,
+        );
         findings.extend(td.findings);
         receipts.append(&mut td.receipts);
         receipts.append(&mut eq.receipts);
