@@ -262,6 +262,7 @@ pub(crate) struct Node {
 pub(crate) fn nodes(text: &str, d: Dialect) -> Vec<Node> {
     let root = sqldiff_syntax::parse(text, d).syntax();
     let mut out = Vec::new();
+    let lines = sqldiff_syntax::LineIndex::new(text);
     for node in root.descendants() {
         let top = node
             .parent()
@@ -298,7 +299,7 @@ pub(crate) fn nodes(text: &str, d: Dialect) -> Vec<Node> {
         out.push(Node {
             start,
             end,
-            line: text[..start].matches('\n').count() + 1,
+            line: lines.line_col(start).0,
             defines,
             touches: touched(&node, d),
         });
