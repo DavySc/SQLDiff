@@ -216,6 +216,8 @@ struct Routine<'x, 'a> {
     jump_marks: std::cell::OnceCell<Vec<usize>>,
     /// Interval index over `units`, when they are in start order.
     unit_index: std::cell::OnceCell<Option<UnitIndex>>,
+    /// For each name id, the numbers of the units that read it (ascending).
+    readers: std::cell::OnceCell<Vec<Vec<u32>>>,
 }
 
 impl<'x, 'a> Routine<'x, 'a> {
@@ -280,6 +282,7 @@ impl<'x, 'a> Routine<'x, 'a> {
                     && matches!(u.kind, lower::UnitKind::Proc | lower::UnitKind::Script),
             sql_set_result,
             units: std::cell::OnceCell::new(),
+            readers: std::cell::OnceCell::new(),
             names: std::cell::OnceCell::new(),
             starts: std::cell::OnceCell::new(),
             spelling: std::cell::OnceCell::new(),
@@ -1919,17 +1922,14 @@ impl<'x, 'a> Routine<'x, 'a> {
             });
         }
         let index = self.unit_index().expect("the sweep needs the index");
-        let seed: HashSet<String> = index
+        let seed: Vec<u32> = index
             .overlapping(here)
             .into_iter()
-            .flat_map(|u| {
-                units[u]
-                    .writes
-                    .iter()
-                    .map(|&i| names.names[i as usize].clone())
-            })
+            .flat_map(|u| units[u].writes.iter().copied())
+            .collect::<std::collections::BTreeSet<u32>>()
+            .into_iter()
             .collect();
-        self.reaches_change(seed, here, units, &side.set)
+        self.reaches_change(&seed, 0, here, units, &side.set)
             .map(|l| format!("its result reaches the changed code at line {l}"))
     }
 
@@ -1948,23 +1948,20 @@ impl<'x, 'a> Routine<'x, 'a> {
         let units = self.units();
         let changed_set = SpanSet::new(changed);
         let changed_unit = |u: &Unit| changed_set.overlaps((u.start, u.end));
-        let in_loop_with_n = |u: &Unit| {
-            self.loops
-                .iter()
-                .any(|(ls, le)| *ls <= u.start && u.end <= *le && *ls <= here.0 && here.1 <= *le)
-        };
-        let others: Vec<&Unit> = units
-            .iter()
-            .filter(|u| !overlaps((u.start, u.end), here))
-            .collect();
-        let before = |u: &Unit| u.end <= here.0 || in_loop_with_n(u);
+        let outer = self.outer_loop(here);
+        if outer.is_some() {
+            LOOP_ANSWERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let in_loop_with_n =
+            |u: &Unit| outer.is_some_and(|(ls, le)| ls <= u.start && u.end <= le);
+        let before = |u: &Unit| !overlaps((u.start, u.end), here) && (u.end <= here.0 || in_loop_with_n(u));
         let line = |off: usize| self.side.lines.line_col(off).0;
 
         // Values at `n` that changed code may have set.
         let names = self.unit_names();
         let mut tainted = Taint::new(names.names.len());
         let mut first_change: Option<usize> = None;
-        for u in others.iter().filter(|u| before(u) && changed_unit(u)) {
+        for u in units.iter().filter(|u| before(u) && changed_unit(u)) {
             tainted.add_all(&u.writes);
             first_change = Some(first_change.map_or(u.start, |f| f.min(u.start)));
             // A changed jump on the way that is not evaluated as a guard.
@@ -1978,22 +1975,14 @@ impl<'x, 'a> Routine<'x, 'a> {
         if let Some(first) = first_change {
             // The closure does not depend on the order the units are met,
             // only on which of them are unchanged and before `n`.
-            let prior: Vec<&Unit> = others
+            let window: Vec<bool> = units
                 .iter()
-                .copied()
-                .filter(|u| before(u) && !changed_unit(u))
+                .map(|u| before(u) && !changed_unit(u))
                 .collect();
-            loop {
-                let mut grew = false;
-                for u in &prior {
-                    if tainted.meets(&u.reads) {
-                        grew |= tainted.add_all(&u.writes);
-                    }
-                }
-                if !grew {
-                    break;
-                }
-            }
+            let pending: Vec<u32> = (0..tainted.on.len() as u32)
+                .filter(|&i| tainted.has(i))
+                .collect();
+            close_over(units, self.readers(), &window, &mut tainted, pending, None);
             let deciding = self.deciding_conditions(n);
             let mut needed: Vec<u32> = units
                 .iter()
@@ -2027,82 +2016,155 @@ impl<'x, 'a> Routine<'x, 'a> {
         }
 
         // What `n` writes that changed code later reads or overwrites.
-        let seed: HashSet<String> = units
+        let seed: Vec<u32> = units
             .iter()
             .filter(|u| overlaps((u.start, u.end), here))
-            .flat_map(|u| u.writes.iter().map(|&i| names.names[i as usize].clone()))
+            .flat_map(|u| u.writes.iter().copied())
+            .collect::<std::collections::BTreeSet<u32>>()
+            .into_iter()
             .collect();
-        self.reaches_change(seed, here, units, &changed_set)
+        self.reaches_change(&seed, 0, here, units, &changed_set)
             .map(|l| format!("its result reaches the changed code at line {l}"))
     }
 
+    /// The outermost loop statement that holds `here`: every unit inside it
+    /// runs both before and after an edit anywhere in it. Loops are tree
+    /// nodes, so the ones holding `here` are nested and the union is the
+    /// outermost.
+    fn outer_loop(&self, here: Span) -> Option<Span> {
+        let mut held = self
+            .loops
+            .iter()
+            .filter(|(ls, le)| *ls <= here.0 && here.1 <= *le);
+        let first = held.next()?;
+        Some(held.fold(*first, |a, l| (a.0.min(l.0), a.1.max(l.1))))
+    }
+
+    /// For each name id, the units that read it.
+    fn readers(&self) -> &[Vec<u32>] {
+        self.readers.get_or_init(|| {
+            let mut readers = vec![Vec::new(); self.unit_names().names.len()];
+            for (i, u) in self.units().iter().enumerate() {
+                for &r in &u.reads {
+                    readers[r as usize].push(i as u32);
+                }
+            }
+            readers
+        })
+    }
+
     /// The line of the first changed unit after `here` (or in a loop with
-    /// it) that reads or overwrites one of `seed`, directly or through
-    /// unchanged units in between.
-    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: the seed only decides which names are reached; order never matters
+    /// it) that reads or overwrites one of `seed` (sorted name ids; `unknown`
+    /// more names no unit mentions, which make the set non-empty and nothing
+    /// else), directly or through unchanged units in between.
     fn reaches_change(
         &self,
-        seed: HashSet<String>,
+        seed: &[u32],
+        unknown: usize,
         here: Span,
         units: &[Unit],
         changed_set: &SpanSet,
     ) -> Option<usize> {
         let changed_unit = |u: &Unit| changed_set.overlaps((u.start, u.end));
+        let outer = self.outer_loop(here);
         let after = |u: &Unit| {
             !overlaps((u.start, u.end), here)
                 && (u.start >= here.1
-                    || self.loops.iter().any(|(ls, le)| {
-                        *ls <= u.start && u.end <= *le && *ls <= here.0 && here.1 <= *le
-                    }))
+                    || outer.is_some_and(|(ls, le)| ls <= u.start && u.end <= le))
         };
         let names = self.unit_names();
-        // A name no unit mentions can never be met again, but it still
-        // makes the set non-empty.
-        let seed: Vec<&String> = seed
-            .iter()
-            .filter(|x| !STATUS.contains(&x.as_str()))
-            .collect();
-        if seed.is_empty() {
+        // Status names are never carried along.
+        let mut reached = Taint::new(names.names.len() + unknown);
+        let mut pending = Vec::new();
+        for &x in seed.iter().filter(|&&x| !names.status[x as usize]) {
+            if reached.add(x) {
+                pending.push(x);
+            }
+        }
+        for k in 0..unknown {
+            let x = (names.names.len() + k) as u32;
+            reached.add(x);
+            pending.push(x);
+        }
+        if pending.is_empty() {
             return None;
         }
-        let mut reached = Taint::new(names.names.len() + seed.len());
-        let mut unknown = names.names.len();
-        for x in seed {
-            match names.ids.get(x.as_str()) {
-                Some(&i) => {
-                    reached.add(i);
-                }
-                None => {
-                    reached.add(unknown as u32);
-                    unknown += 1;
-                }
-            }
-        }
-        let later: Vec<&Unit> = units
+        let window: Vec<bool> = units
             .iter()
-            .filter(|u| after(u) && !changed_unit(u))
+            .map(|u| after(u) && !changed_unit(u))
             .collect();
-        loop {
-            let mut grew = false;
-            for u in &later {
-                if reached.meets(&u.reads) {
-                    for &w in &u.writes {
-                        if !names.status[w as usize] {
-                            grew |= reached.add(w);
-                        }
-                    }
-                }
-            }
-            if !grew {
-                break;
-            }
-        }
+        close_over(
+            units,
+            self.readers(),
+            &window,
+            &mut reached,
+            pending,
+            Some(&names.status),
+        );
         units
             .iter()
             .filter(|u| after(u) && changed_unit(u))
             .find(|u| u.jumps || reached.meets(&u.touches))
             .map(|u| self.side.lines.line_col(u.start).0)
     }
+}
+
+/// Grows `set` to the closure over the units in `window`: a unit in the
+/// window that reads something in the set adds what it writes (names flagged
+/// in `skip` excepted). `pending` holds the names already in the set. Each
+/// added name wakes its readers once, so the work is the reader lists of the
+/// names reached, not a pass over every unit per link of a chain. The result
+/// does not depend on the order units are woken in; the count returned (the
+/// wake-ups, each name's readers once plus the any-readers once) does not
+/// either, and is the deterministic work measure.
+fn close_over(
+    units: &[Unit],
+    readers: &[Vec<u32>],
+    window: &[bool],
+    set: &mut Taint,
+    mut pending: Vec<u32>,
+    skip: Option<&[bool]>,
+) -> usize {
+    let mut fired = vec![false; units.len()];
+    let mut visits = 0usize;
+    let mut any_woken = false;
+    let mut wake = |u: usize, set: &mut Taint, pending: &mut Vec<u32>| {
+        visits += 1;
+        if window[u] && !fired[u] && set.meets(&units[u].reads) {
+            fired[u] = true;
+            for &w in &units[u].writes {
+                if skip.is_some_and(|s| s[w as usize]) {
+                    continue;
+                }
+                if set.add(w) {
+                    pending.push(w);
+                }
+            }
+        }
+    };
+    while let Some(x) = pending.pop() {
+        if x == ANY_ID {
+            // The any-name meets every non-empty read.
+            for u in 0..units.len() {
+                wake(u, set, &mut pending);
+            }
+        } else {
+            // A name no unit mentions has no readers.
+            for &u in readers.get(x as usize).map_or(&[][..], |r| r) {
+                wake(u as usize, set, &mut pending);
+            }
+        }
+        if !any_woken {
+            // The set is non-empty from now on: units that read the
+            // any-name meet it.
+            any_woken = true;
+            for &u in &readers[ANY_ID as usize] {
+                wake(u as usize, set, &mut pending);
+            }
+        }
+    }
+    CLOSURE_VISITS.fetch_add(visits, std::sync::atomic::Ordering::Relaxed);
+    visits
 }
 
 // ---- shared interaction state ---------------------------------------------------------
@@ -2473,6 +2535,22 @@ pub fn shared_answer_counts() -> (usize, usize) {
     (
         SHARED_ANSWERS.load(std::sync::atomic::Ordering::Relaxed),
         REACH_ANSWERS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Edits that took the exact path with the edit inside a loop, and the
+/// wake-ups the closures made (see [`close_over`]). Counted for tests and the
+/// work meter; no output reads them.
+static LOOP_ANSWERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CLOSURE_VISITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `(edits answered by the exact path inside a loop, closure wake-ups)` so
+/// far in this process.
+#[doc(hidden)]
+pub fn loop_answer_counts() -> (usize, usize) {
+    (
+        LOOP_ANSWERS.load(std::sync::atomic::Ordering::Relaxed),
+        CLOSURE_VISITS.load(std::sync::atomic::Ordering::Relaxed),
     )
 }
 
@@ -4462,9 +4540,14 @@ fn header_change(
             .descendants()
             .find(|b| b.kind() == SyntaxKind::ROUTINE_BODY)
             .map_or((0, 0), |b| cst::sig_range(&b));
-        let seed = HashSet::from([x.name.trim_start_matches('@').to_lowercase()]);
+        let name = x.name.trim_start_matches('@').to_lowercase();
+        // A name no unit mentions still makes the set non-empty.
+        let (seed, unknown) = match r.unit_names().ids.get(&name) {
+            Some(&i) => (vec![i], 0),
+            None => (Vec::new(), usize::from(!STATUS.contains(&name.as_str()))),
+        };
         let set = SpanSet::new(ch);
-        if let Some(l) = r.reaches_change(seed, (body.0, body.0), r.units(), &set) {
+        if let Some(l) = r.reaches_change(&seed, unknown, (body.0, body.0), r.units(), &set) {
             return Err(format!(
                 "another change interacts with it: {shown} reaches the changed code at line {l}"
             ));
