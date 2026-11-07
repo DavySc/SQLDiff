@@ -3583,6 +3583,40 @@ mod tree_state_tests {
         let third =
             build_tree_state(&a, &out, &inputs, 1, None, None, Some(&cache(true, 1))).unwrap();
         assert!(first.same_as(&third));
+        // A draft edited into other valid JSON (same length, so its ranges still
+        // fit), its digest left as it was, is
+        // not trusted: it is built again whatever the sample picks, so every
+        // seed gives the same state (without the digest check a draft is
+        // only found out when the sample happens to cover its file).
+        for e in std::fs::read_dir(&drafts_dir).unwrap().flatten() {
+            let mut bytes = std::fs::read(e.path()).unwrap();
+            let mut v: serde_json::Value = serde_json::from_slice(&bytes[65..]).unwrap();
+            let t = v["draft"]["raw"]["text"].as_str().unwrap().to_lowercase();
+            v["draft"]["raw"]["text"] = t.into();
+            bytes.truncate(65);
+            bytes.extend(serde_json::to_vec(&v).unwrap());
+            std::fs::write(e.path(), bytes).unwrap();
+        }
+        for seed in 0..8 {
+            let st = build_tree_state(&a, &out, &inputs, 1, None, None, Some(&cache(true, seed)))
+                .unwrap_or_else(|e| panic!("seed {seed}: an edited draft was trusted: {e}"));
+            assert!(first.same_as(&st), "seed {seed}");
+            // Built again, so the drafts are whole once more; edit them back
+            // for the next seed.
+            for e in std::fs::read_dir(&drafts_dir).unwrap().flatten() {
+                let mut bytes = std::fs::read(e.path()).unwrap();
+                let mut v: serde_json::Value = serde_json::from_slice(&bytes[65..]).unwrap();
+                let t = v["draft"]["raw"]["text"].as_str().unwrap().to_lowercase();
+                v["draft"]["raw"]["text"] = t.into();
+                bytes.truncate(65);
+                bytes.extend(serde_json::to_vec(&v).unwrap());
+                std::fs::write(e.path(), bytes).unwrap();
+            }
+        }
+        // Whole again for the steps below.
+        let again =
+            build_tree_state(&a, &out, &inputs, 1, None, None, Some(&cache(true, 1))).unwrap();
+        assert!(first.same_as(&again));
         // A stored draft that differs from the one built again is refused:
         // here p.sql's file holds a.sql's draft under p.sql's name. Both files
         // are sampled (one in fifty, at least one, of two reused).
