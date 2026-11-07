@@ -1324,6 +1324,7 @@ impl<'x, 'a> Collector<'x, 'a> {
     fn explorer(
         cache: &RefCell<Vec<Rc<Explorer>>>,
         cfg: &Cfg,
+        other: &Cfg,
         sc: &Scenario,
         keys: &KeyUniverse,
     ) -> Rc<Explorer> {
@@ -1335,7 +1336,10 @@ impl<'x, 'a> Collector<'x, 'a> {
         if let Some(x) = c.iter().find(|x| *x.base_scenario() == env) {
             return x.clone();
         }
-        let x = Rc::new(Explorer::in_universe(cfg, &env, keys));
+        // Paths of this side that reach the same state are joined when the
+        // other side makes no decision (see `interp::decision_free`).
+        let join = crate::ir::interp::decision_free(other);
+        let x = Rc::new(Explorer::in_universe_joined(cfg, &env, keys, join));
         c.push(x.clone());
         x
     }
@@ -1347,8 +1351,8 @@ impl<'x, 'a> Collector<'x, 'a> {
         scen_b: &Scenario,
     ) -> (Vec<Outcome>, Vec<Outcome>) {
         let (ca, cb) = (&self.sa.cfg, &self.sb.cfg);
-        let mut pa = Self::explorer(&self.xa, ca, scen_a, &self.keys).explore(ca, scen_a);
-        let mut pb = Self::explorer(&self.xb, cb, scen_b, &self.keys).explore(cb, scen_b);
+        let mut pa = Self::explorer(&self.xa, ca, cb, scen_a, &self.keys).explore(ca, scen_a);
+        let mut pb = Self::explorer(&self.xb, cb, ca, scen_b, &self.keys).explore(cb, scen_b);
         if let Kind::Fault { key, .. } = sc {
             // Only paths that reach the failing statement belong to the scenario.
             let reached = |o: &Outcome| o.fault_hit || o.effects.contains_key(key.as_str());
@@ -2366,6 +2370,16 @@ pub struct PairRow {
     pub prod_paths_a: usize,
     pub prod_paths_b: usize,
     pub prod_cut: bool,
+    /// The same with path joining switched on for the side (whatever the
+    /// other side is): paths left, paths joined, whether a budget still cuts.
+    pub join_paths_a: usize,
+    pub join_paths_b: usize,
+    pub joined_a: usize,
+    pub joined_b: usize,
+    pub join_cut: bool,
+    /// The other side makes no decision, so joining is used in production.
+    pub gate_a: bool,
+    pub gate_b: bool,
     /// Perfect-alignment bound: each side against a copy of itself, with the
     /// `agree` key (every decision matches, nothing is solo): what pair-state
     /// merging needs when the conditions pair up completely.
@@ -2477,7 +2491,19 @@ pub fn pair_states(a: &Analyzed, b: &Analyzed, env: &Env, max_states: usize) -> 
                 Explorer::in_universe(&sb.cfg, &sc, &keys),
             );
             let cut = xa.base().iter().chain(xb.base()).any(|o| !o.cut.is_empty());
+            let (ja, jb) = (
+                Explorer::in_universe_joined(&sa.cfg, &sc, &keys, true),
+                Explorer::in_universe_joined(&sb.cfg, &sc, &keys, true),
+            );
+            let join_cut = ja.base().iter().chain(jb.base()).any(|o| !o.cut.is_empty());
             rows.push(PairRow {
+                join_paths_a: ja.base().len(),
+                join_paths_b: jb.base().len(),
+                joined_a: ja.joined(),
+                joined_b: jb.joined(),
+                join_cut,
+                gate_a: super::interp::decision_free(&sb.cfg),
+                gate_b: super::interp::decision_free(&sa.cfg),
                 matched_a: [
                     matched(&sa.cfg, &sb.cfg, false),
                     matched(&sa.cfg, &sb.cfg, true),
