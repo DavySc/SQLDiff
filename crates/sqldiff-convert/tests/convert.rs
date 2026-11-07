@@ -713,8 +713,14 @@ fn output_check_findings_quote_the_template() {
     };
     let tdraft = rewrite_template(&table, Dialect::Tsql, Dialect::Postgres, &stand, None);
     let opts = sqldiff_core::Options {
-        facts_a: vec![catalog(&template_fragment(&table, &stand), Dialect::Tsql)],
-        facts_b: vec![catalog(tdraft.output(), Dialect::Postgres)],
+        facts_a: vec![sqldiff_core::Facts::from(catalog(
+            &template_fragment(&table, &stand),
+            Dialect::Tsql,
+        ))],
+        facts_b: vec![sqldiff_core::Facts::from(catalog(
+            tdraft.output(),
+            Dialect::Postgres,
+        ))],
         ..Default::default()
     };
     let d = rewrite_template(&proc, Dialect::Tsql, Dialect::Postgres, &stand, None);

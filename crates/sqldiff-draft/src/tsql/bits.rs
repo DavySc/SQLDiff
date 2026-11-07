@@ -832,7 +832,7 @@ impl Cx<'_> {
             let mut v: Vec<(String, Vec<u32>)> = self
                 .type_catalog()
                 .map(|c| {
-                    c.tables
+                    c.tables()
                         .iter()
                         .flat_map(|t| t.columns.iter())
                         .map(|c| (c.data_type.base.clone(), c.data_type.args.clone()))

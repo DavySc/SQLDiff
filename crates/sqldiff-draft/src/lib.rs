@@ -86,7 +86,18 @@ pub fn rewrite_in_tree_plain(
     let run = || {
         guarded(&root, text, || match (from, to) {
             (Dialect::Tsql, Dialect::Postgres | Dialect::Db2i) => {
-                tsql::convert(&root, text, to, source, claims, options)
+                tsql::convert(
+                    &root,
+                    text,
+                    to,
+                    // The one place the tree's catalog enters pass 1: wrapped, so
+                    // that every read after it is a `SourceReads` method.
+                    source.map(|c| {
+                        sqldiff_equiv::catalog::record::SourceReads::new(c, Dialect::Tsql)
+                    }),
+                    claims,
+                    options,
+                )
             }
             _ => no_rules(&root, text, from, to),
         })

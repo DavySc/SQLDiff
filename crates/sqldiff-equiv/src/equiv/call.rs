@@ -42,7 +42,8 @@ use super::lower::Unit;
 use super::schema::Schema;
 use super::table::{self, Name, Ty};
 use super::term::{a, n, Term};
-use crate::catalog::{self, CatalogView, Ident, Lookup, ParamMode, Routine, RoutineKind};
+use crate::catalog::record::RecordingView;
+use crate::catalog::{self, Ident, Lookup, ParamMode, Routine, RoutineKind};
 use crate::model::Assumption;
 
 type R<T> = Result<T, String>;
@@ -962,8 +963,8 @@ fn ident(n: &Name) -> Ident {
 }
 
 /// Whether the object a comment names exists in a side's catalog, and why not.
-fn exists(target: &Target, view: &CatalogView, side: &str) -> R<()> {
-    let d = view.dialect;
+fn exists(target: &Target, view: RecordingView<'_>, side: &str) -> R<()> {
+    let d = view.dialect();
     let missing = |what: String| Err(format!("{side}'s catalog has no {what}"));
     let table = |s: &Name, t: &Name| -> Option<&catalog::Table> {
         match view.table(&[ident(s), ident(t)]) {
@@ -976,18 +977,14 @@ fn exists(target: &Target, view: &CatalogView, side: &str) -> R<()> {
     match target {
         Target::Schema(s) => {
             let k = ident(s).key(d);
-            let known = view
-                .catalog()
-                .schemas
-                .iter()
-                .any(|x| catalog::key(d, x) == k)
+            let known = view.whole().schemas.iter().any(|x| catalog::key(d, x) == k)
                 || view
-                    .catalog()
+                    .whole()
                     .tables
                     .iter()
                     .filter_map(|t| t.schema.as_deref())
                     .chain(
-                        view.catalog()
+                        view.whole()
                             .routines
                             .iter()
                             .filter_map(|r| r.schema.as_deref()),
@@ -1037,7 +1034,7 @@ fn exists(target: &Target, view: &CatalogView, side: &str) -> R<()> {
         Target::Index(s, t, x) => {
             let k = ident(x).key(d);
             let sk = ident(s).key(d);
-            let hit = view.catalog().tables.iter().any(|tb| {
+            let hit = view.whole().tables.iter().any(|tb| {
                 let in_schema = match &tb.schema {
                     Some(ts) => catalog::key(d, ts) == sk,
                     None => catalog::default_schema(d)

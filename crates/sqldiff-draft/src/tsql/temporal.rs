@@ -27,7 +27,7 @@
 //! history table's columns are not verified on IBM i yet, so Db2 refuses.
 
 use super::*;
-use sqldiff_equiv::catalog::{table_position, Ident};
+use sqldiff_equiv::catalog::Ident;
 
 /// What `PERIOD FOR SYSTEM_TIME` and `SYSTEM_VERSIONING = ON (…)` say.
 pub(super) struct Temporal {
@@ -407,10 +407,8 @@ CREATE TRIGGER {} BEFORE TRUNCATE ON {table}
             Some(p.into_iter().map(Ident::plain).collect())
         };
         let found = self.catalog.and_then(|cat| {
-            let main = &cat.tables[table_position(Dialect::Tsql, cat, &lookup(name_t)?)?];
-            let hist = lookup(&t.history)
-                .and_then(|p| table_position(Dialect::Tsql, cat, &p))
-                .map(|i| &cat.tables[i]);
+            let main = cat.table(&lookup(name_t)?)?;
+            let hist = lookup(&t.history).and_then(|p| cat.table(&p));
             Some((main, hist))
         });
         let Some((main, hist)) = found else {
@@ -489,7 +487,7 @@ impl Cx<'_> {
                 .collect::<Vec<_>>()
         };
         let name = strip(name_parts(name_t)?);
-        cat.tables
+        cat.tables()
             .iter()
             .filter(|t| self.historyless(t))
             .find(|t| {
@@ -589,7 +587,7 @@ impl Cx<'_> {
                 return None;
             }
             let idents: Vec<Ident> = parts.iter().map(|p| Ident::plain(p.clone())).collect();
-            let t = &cat.tables[table_position(Dialect::Tsql, cat, &idents)?];
+            let t = cat.table(&idents)?;
             if self.historyless(t) {
                 return Some(None);
             }

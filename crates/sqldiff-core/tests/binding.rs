@@ -319,7 +319,11 @@ fn every_reference_resolves_or_is_assumed() {
             let bound = bind::bind(
                 &analyzed,
                 &BindInput {
-                    view: &view,
+                    view: sqldiff_core::catalog::record::RecordingView::new(
+                        &view,
+                        sqldiff_core::catalog::record::Side::Source,
+                        &sqldiff_core::catalog::record::NO_SINK,
+                    ),
                     helpers: &[],
                 },
             );
@@ -619,7 +623,11 @@ fn incomplete_input_never_panics() {
                 bind::bind(
                     &analyzed,
                     &BindInput {
-                        view: &view,
+                        view: sqldiff_core::catalog::record::RecordingView::new(
+                            &view,
+                            sqldiff_core::catalog::record::Side::Source,
+                            &sqldiff_core::catalog::record::NO_SINK,
+                        ),
                         helpers: &[],
                     },
                 );

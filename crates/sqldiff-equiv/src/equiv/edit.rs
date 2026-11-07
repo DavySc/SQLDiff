@@ -2350,6 +2350,7 @@ fn close_over(
         }
     }
     CLOSURE_VISITS.fetch_add(visits, std::sync::atomic::Ordering::Relaxed);
+    sqldiff_model::work::spend(sqldiff_model::work::Site::EditClosure, visits as u64);
     visits
 }
 
@@ -2537,6 +2538,7 @@ impl SideEdits {
                 }
             }
             me.reach_steps = reach.steps;
+            sqldiff_model::work::spend(sqldiff_model::work::Site::EditReach, reach.steps as u64);
         }
         me
     }

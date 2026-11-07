@@ -23,10 +23,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 
 use serde::Serialize;
-use sqldiff_core::{Artifact, ChangeClass, Dialect, Options, Verdict};
+use sqldiff_core::{Artifact, ChangeClass, Dialect, Facts, Options, Verdict};
 use sqldiff_source::compose;
 use sqldiff_source::weave::{Instance, Manifest, Weaver, Woven};
 use sqldiff_syntax::SyntaxKind;
@@ -334,14 +333,14 @@ pub fn check(a: &Args, hooks: &Hooks) -> Result<Checked, String> {
 
     // Catalogs: every woven instance on its side, plus any given.
     let mut opts = a.options.clone();
-    opts.facts_a.push(Arc::new(catalog(
+    opts.facts_a.push(Facts::from(catalog(
         woven.iter().map(|(s, _)| s.text.as_str()),
         a.from,
         &source_root,
         None,
         1,
     )));
-    opts.facts_b.push(Arc::new(catalog(
+    opts.facts_b.push(Facts::from(catalog(
         woven.iter().map(|(_, t)| t.text.as_str()),
         a.to,
         &target_root,
@@ -1708,7 +1707,7 @@ mod tests {
             catalog_a,
             catalog_b,
             facts_a,
-            facts_b: vec![Arc::new(facts(DDL))],
+            facts_b: vec![Facts::from(facts(DDL))],
             helpers,
             flips,
             declared,
@@ -1727,11 +1726,16 @@ mod tests {
             ("catalog_b", Box::new(move |o| o.catalog_b.push(artifact()))),
             (
                 "facts_a",
-                Box::new(|o| o.facts_a.push(Arc::new(facts("CREATE TABLE u (id int);")))),
+                Box::new(|o| {
+                    o.facts_a
+                        .push(Facts::from(facts("CREATE TABLE u (id int);")))
+                }),
             ),
             (
                 "facts_b",
-                Box::new(|o| o.facts_b = vec![Arc::new(facts(&DDL.replace("(12, 2)", "(12, 3)")))]),
+                Box::new(|o| {
+                    o.facts_b = vec![Facts::from(facts(&DDL.replace("(12, 2)", "(12, 3)")))]
+                }),
             ),
             (
                 "helpers",
@@ -1779,11 +1783,12 @@ mod tests {
             (
                 "proof checker",
                 Box::new(|o| {
-                    o.proof.checker = Some(Arc::new(sqldiff_core::proof::FnChecker(|_| {
-                        sqldiff_core::proof::Answer::Unconfirmed {
-                            reason: "test".into(),
-                        }
-                    })))
+                    o.proof.checker =
+                        Some(std::sync::Arc::new(sqldiff_core::proof::FnChecker(|_| {
+                            sqldiff_core::proof::Answer::Unconfirmed {
+                                reason: "test".into(),
+                            }
+                        })))
                 }),
             ),
         ];

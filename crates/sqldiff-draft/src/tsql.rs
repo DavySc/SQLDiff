@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use sqldiff_syntax::{Dialect, SyntaxElement, SyntaxKind, SyntaxNode};
 use SyntaxKind::*;
 
+use sqldiff_equiv::catalog::record::SourceReads;
 use sqldiff_equiv::catalog::ParamMode;
 use sqldiff_equiv::classify::{pg_rolls_back, rollback_rethrow};
 
@@ -96,7 +97,7 @@ pub(crate) fn convert(
     root: &SyntaxNode,
     src: &str,
     to: Dialect,
-    catalog: Option<&sqldiff_equiv::catalog::Catalog>,
+    catalog: Option<SourceReads<'_>>,
     claims: &crate::table_vars::Claims,
     options: sqldiff_units::RuleOptions,
 ) -> Out {
@@ -399,7 +400,7 @@ struct Cx<'a> {
     /// The options this conversion runs with.
     options: sqldiff_units::RuleOptions,
     /// The source catalog of the whole tree being converted, when there is one.
-    catalog: Option<&'a sqldiff_equiv::catalog::Catalog>,
+    catalog: Option<SourceReads<'a>>,
     /// The temporary table names the tree's table variables claim, by the
     /// routine that first declared one: a table variable that would take
     /// another routine's name is refused.
@@ -4224,7 +4225,7 @@ impl<'a> Cx<'a> {
     }
 
     fn catalog_table(&self, name: &[String]) -> Option<&sqldiff_equiv::catalog::Table> {
-        use sqldiff_equiv::catalog::{table_position, Ident};
+        use sqldiff_equiv::catalog::Ident;
         let cat = self.type_catalog()?;
         let name = self.image_table(name);
         let parts: Vec<Ident> = match name {
@@ -4232,13 +4233,13 @@ impl<'a> Cx<'a> {
             [.., t] => vec![Ident::plain(t.clone())],
             [] => return None,
         };
-        Some(&cat.tables[table_position(Dialect::Tsql, cat, &parts)?])
+        cat.table(&parts)
     }
 
     /// How many of the DELETE's FROM tables have column `name`, by the
     /// source catalog; `None` without a catalog entry for every table.
     fn column_owners(&self, leaves: &[Leaf], name: &str) -> Option<usize> {
-        use sqldiff_equiv::catalog::{table_position, Ident};
+        use sqldiff_equiv::catalog::Ident;
         let cat = self.catalog?;
         let mut n = 0;
         for l in leaves {
@@ -4250,7 +4251,7 @@ impl<'a> Cx<'a> {
                 [.., t] => vec![Ident::plain(t.clone())],
                 [] => return None,
             };
-            let t = &cat.tables[table_position(Dialect::Tsql, cat, &parts)?];
+            let t = cat.table(&parts)?;
             n += usize::from(t.column(Dialect::Tsql, &Ident::plain(name)).is_some());
         }
         Some(n)
@@ -6109,7 +6110,7 @@ impl<'a> Cx<'a> {
     }
 
     fn routine_in<'c>(
-        cat: &'c sqldiff_equiv::catalog::Catalog,
+        cat: SourceReads<'c>,
         name: &str,
     ) -> Option<&'c sqldiff_equiv::catalog::Routine> {
         let parts: Vec<String> = name.split('.').map(tsql_unquote).collect();
@@ -6122,7 +6123,7 @@ impl<'a> Cx<'a> {
             s.filter(|s| !s.eq_ignore_ascii_case("dbo"))
                 .map(str::to_ascii_lowercase)
         };
-        let mut hits = cat.routines.iter().filter(|r| {
+        let mut hits = cat.routines().iter().filter(|r| {
             r.kind == sqldiff_equiv::catalog::RoutineKind::Procedure
                 && r.name.eq_ignore_ascii_case(&proc)
                 && norm(r.schema.as_deref()) == norm(schema.as_deref())
@@ -12866,13 +12867,14 @@ impl Num {
 impl Cx<'_> {
     /// The catalog column types come from: the tree's, or else one read
     /// from this input's own CREATE TABLE statements.
-    fn type_catalog(&self) -> Option<&sqldiff_equiv::catalog::Catalog> {
+    fn type_catalog(&self) -> Option<SourceReads<'_>> {
         if let Some(c) = self.catalog {
             return Some(c);
         }
-        self.local
-            .get_or_init(|| sqldiff_equiv::catalog::ddl::load(self.src, Dialect::Tsql, "input"))
-            .into()
+        let own = self
+            .local
+            .get_or_init(|| sqldiff_equiv::catalog::ddl::load(self.src, Dialect::Tsql, "input"));
+        Some(SourceReads::new(own, Dialect::Tsql))
     }
 
     /// Records a table variable or `#` table `name` with the column list
@@ -12895,7 +12897,7 @@ impl Cx<'_> {
 
     /// The catalog table of a scope entry whose columns are known.
     fn entry_table(&self, e: &ScopeEntry) -> Option<&sqldiff_equiv::catalog::Table> {
-        use sqldiff_equiv::catalog::{table_position, Ident};
+        use sqldiff_equiv::catalog::Ident;
         if !e.named {
             return None;
         }
@@ -12913,7 +12915,7 @@ impl Cx<'_> {
             [.., t] => vec![Ident::plain(t.clone())],
             [] => return None,
         };
-        let t = &cat.tables[table_position(Dialect::Tsql, cat, &parts)?];
+        let t = cat.table(&parts)?;
         t.columns_known.then_some(t)
     }
 

@@ -2351,7 +2351,7 @@ fn trigger_drop(
     let cat_t = t.1.catalog().ok_or("no catalog for the T-SQL side")?;
     let def_t = one(
         cat_t
-            .catalog()
+            .whole()
             .triggers_named(Dialect::Tsql, ts_schema, &ts_name.text),
         side_name(t.0).as_str(),
     )?;
@@ -2378,7 +2378,7 @@ fn trigger_drop(
     };
     let def_p = one(
         cat_p
-            .catalog()
+            .whole()
             .triggers
             .iter()
             .filter(|d| d.name == pname)
@@ -2410,7 +2410,7 @@ fn trigger_drop(
             func.join(".")
         ));
     }
-    if cat_p.catalog().triggers.iter().any(|d| {
+    if cat_p.whole().triggers.iter().any(|d| {
         *d != def_p && d.function.as_ref().map(|f| fkey(&names(f, true))) == Some(fkey(dropped))
     }) {
         return Err("another PostgreSQL trigger runs the same function".into());
