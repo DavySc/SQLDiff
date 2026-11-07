@@ -540,7 +540,9 @@ fn data_key_config() {
 
 // Regressions from the review of PR #12.
 
-const WORDS_PACK: &str = r#"deny_list = ["data", "obj", "06cc"]
+// A banned word must not be made of hex digits: redaction tokens are random hex, so a hex
+// word (like "06cc") can turn up in a token by chance and make this test flaky.
+const WORDS_PACK: &str = r#"deny_list = ["data", "obj", "ghij"]
 
 [pack]
 name = "p"
