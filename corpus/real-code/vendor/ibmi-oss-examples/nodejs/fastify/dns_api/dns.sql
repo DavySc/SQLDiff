@@ -11,4 +11,3 @@ select * from JSON_TABLE(QSYS2.HTTP_GET('http://localhost:8088/dns_adv/' CONCAT
             TTL VARCHAR(100) PATH 'lax $.ttl',
             TYPE VARCHAR(100) PATH 'lax $.type') ERROR ON ERROR
   ) X
-x
