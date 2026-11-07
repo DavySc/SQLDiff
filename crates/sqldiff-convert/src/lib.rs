@@ -389,6 +389,22 @@ impl Draft {
         &self.raw.text
     }
 
+    /// Whether every unit's source range lies in `input` and every output
+    /// range in the draft's text, on character boundaries, in the draft and
+    /// in its variant without exception blocks. A draft read back from a
+    /// store that fails this was damaged: using it would index outside its
+    /// text.
+    pub(crate) fn well_formed(&self, input: &str) -> bool {
+        let ok = |t: &str, (s, e): (usize, usize)| {
+            s <= e && e <= t.len() && t.is_char_boundary(s) && t.is_char_boundary(e)
+        };
+        self.raw
+            .units
+            .iter()
+            .all(|u| ok(input, u.src) && ok(&self.raw.text, u.out))
+            && self.plain.as_ref().map_or(true, |p| p.well_formed(input))
+    }
+
     /// The options the rules ran with.
     pub fn options(&self) -> RuleOptions {
         self.options
@@ -515,6 +531,21 @@ pub(crate) fn rewrite_in_tree(
     claims: Option<&table_vars::Claims>,
     options: RuleOptions,
 ) -> Draft {
+    rewrite_in_tree_plain(text, from, to, source, claims, options, &[])
+}
+
+/// [`rewrite_in_tree`] with the routines starting at the source offsets
+/// `plain_at` (sorted) converted without exception blocks and the rest as
+/// the rules write them: one variant, no second draft kept.
+pub(crate) fn rewrite_in_tree_plain(
+    text: &str,
+    from: Dialect,
+    to: Dialect,
+    source: Option<&sqldiff_core::catalog::Catalog>,
+    claims: Option<&table_vars::Claims>,
+    options: RuleOptions,
+    plain_at: &[usize],
+) -> Draft {
     let root = parse(text, from).syntax();
     let own;
     let claims = match claims {
@@ -536,6 +567,16 @@ pub(crate) fn rewrite_in_tree(
             _ => no_rules(&root, text, from, to),
         })
     };
+    if !plain_at.is_empty() {
+        let raw = tsql::with_plain_routines(plain_at, run);
+        return Draft {
+            from,
+            to,
+            options,
+            raw,
+            plain: None,
+        };
+    }
     let raw = run();
     let plain = raw
         .units
@@ -617,10 +658,40 @@ pub fn undecided(f: &sqldiff_core::Finding) -> bool {
 /// Check a draft: diff the input against the output, check the output on
 /// its own, and give every unit the worst of its rule notes and findings.
 pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
+    check_with(input, draft, opts, None)
+}
+
+/// Builds the draft again with the routines starting at the given source
+/// offsets (sorted) converted without exception blocks.
+pub(crate) type Rebuild<'a> = &'a (dyn Fn(&[usize]) -> Draft + Sync);
+
+/// The scores [`check`] ranks a conversion by: units with a difference
+/// found, then units still open.
+fn score_of<'a>(units: impl Iterator<Item = &'a Unit>) -> (usize, usize) {
+    let (mut differs, mut open) = (0, 0);
+    for u in units {
+        differs += usize::from(u.status == Status::Differs);
+        open += usize::from(!matches!(u.status, Status::Converted | Status::Assumptions));
+    }
+    (differs, open)
+}
+
+/// [`check`], and when the draft has a variant without exception blocks the
+/// variant is chosen for each routine on its own: a routine is its own unit
+/// of behaviour. With `rebuild`, a file whose routines do best in different
+/// variants is converted again with that mix and checked; the mix is kept
+/// only when its score beats the better of the two whole-file variants.
+pub(crate) fn check_with(
+    input: &str,
+    draft: Draft,
+    opts: &Options,
+    rebuild: Option<Rebuild>,
+) -> Conversion {
     let mut draft = draft;
     let Some(plain) = draft.plain.take() else {
         return check_one(input, draft, opts);
     };
+    let from = draft.from;
     let blocks = check_one(input, draft, opts);
     let without = check_one(input, *plain, opts);
     // Never the version the engine has shown wrong over the one it cannot
@@ -628,17 +699,43 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
     // open. (Both versions are the same code to run; only what the engine
     // can tie down differs, and a difference it found in the plain version,
     // T-SQL going on where PostgreSQL stops, is gone from the blocks.)
-    let score = |c: &Conversion| {
-        let open = |keep: fn(Status) -> bool| c.units.iter().filter(|u| keep(u.status)).count();
-        (
-            open(|s| s == Status::Differs),
-            open(|s| !matches!(s, Status::Converted | Status::Assumptions)),
-        )
-    };
-    if score(&blocks) < score(&without) {
-        blocks
-    } else {
-        without
+    let score = |c: &Conversion| score_of(c.units.iter());
+    let (sb, sw) = (score(&blocks), score(&without));
+    let mix = rebuild.and_then(|rebuild| {
+        // Each routine's score in each variant, by the units whose input
+        // statement lies in it.
+        let root = sqldiff_syntax::parse(input, from).syntax();
+        let mut plain_at = Vec::new();
+        let (mut blocks_better, mut plain_better) = (false, false);
+        for r in root
+            .descendants()
+            .filter(|n| n.kind() == sqldiff_syntax::SyntaxKind::ROUTINE)
+        {
+            let range = r.text_range();
+            let (rs, re) = (usize::from(range.start()), usize::from(range.end()));
+            let inside = |c: &Conversion| {
+                score_of(
+                    c.units
+                        .iter()
+                        .filter(|u| rs <= u.src.start && u.src.start < re),
+                )
+            };
+            let (rb, rw) = (inside(&blocks), inside(&without));
+            if rw <= rb {
+                plain_at.push(rs);
+            }
+            blocks_better |= rb < rw;
+            plain_better |= rw < rb;
+        }
+        // Only a file where one routine does better with the blocks and
+        // another does better without them can beat both whole-file variants.
+        let fresh = blocks_better && plain_better;
+        fresh.then(|| check_one(input, rebuild(&plain_at), opts))
+    });
+    let best = if sb < sw { blocks } else { without };
+    match mix {
+        Some(m) if score(&m) < score(&best) => m,
+        _ => best,
     }
 }
 
@@ -1267,5 +1364,86 @@ mod u16_index {
         }
         let empty = U16Index::new("");
         assert_eq!(empty.at("", 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod per_routine_variant {
+    use super::*;
+
+    const TABLES: &str = "CREATE TABLE dbo.A (Id int NOT NULL PRIMARY KEY, Qty int NOT NULL);
+CREATE TABLE dbo.B (Id int NOT NULL PRIMARY KEY, Qty int NOT NULL);
+";
+    const TWO: &str = "CREATE PROCEDURE dbo.First @Id int AS
+BEGIN
+    INSERT dbo.A (Id, Qty) VALUES (@Id, 1);
+    UPDATE dbo.B SET Qty = Qty + 1 WHERE Id = @Id;
+END;
+GO
+CREATE PROCEDURE dbo.Second @Id int AS
+BEGIN
+    INSERT dbo.B (Id, Qty) VALUES (@Id, 1);
+    UPDATE dbo.A SET Qty = Qty + 1 WHERE Id = @Id;
+END;
+";
+
+    fn draft(plain_at: &[usize]) -> Draft {
+        let mut cat = sqldiff_core::catalog::Catalog::default();
+        for f in [TABLES, TWO] {
+            let root = parse(f, Dialect::Tsql).syntax();
+            sqldiff_core::catalog::ddl::load_tree(&mut cat, &root, Dialect::Tsql);
+        }
+        rewrite_in_tree_plain(
+            TWO,
+            Dialect::Tsql,
+            Dialect::Postgres,
+            Some(&cat),
+            None,
+            RuleOptions::default(),
+            plain_at,
+        )
+    }
+
+    fn blocks(d: &Draft) -> usize {
+        d.output().matches("EXCEPTION WHEN").count()
+    }
+
+    #[test]
+    fn a_routine_can_be_written_without_blocks_on_its_own() {
+        let both = draft(&[]);
+        let second = TWO.find("CREATE PROCEDURE dbo.Second").unwrap();
+        let only_first = draft(&[second]);
+        let neither = draft(&[0, second]);
+        assert_eq!(blocks(&both), 4);
+        assert_eq!(blocks(&only_first), 2);
+        assert_eq!(blocks(&neither), 0);
+        assert_eq!(both.plain.as_ref().map(|p| blocks(p)), Some(0));
+        // The mixed draft keeps no second variant.
+        assert!(only_first.plain.is_none());
+    }
+
+    #[test]
+    fn a_mix_is_kept_only_when_it_scores_better() {
+        let opts = Options {
+            catalog_a: vec![Artifact::new("t.sql", Dialect::Tsql, TABLES)],
+            catalog_b: vec![Artifact::new(
+                "t.sql",
+                Dialect::Postgres,
+                rewrite_in(TABLES, Dialect::Tsql, Dialect::Postgres, None).output(),
+            )],
+            ..Options::default()
+        };
+        let second = TWO.find("CREATE PROCEDURE dbo.Second").unwrap();
+        let rebuild = |at: &[usize]| draft(at);
+        let with = check_with(TWO, draft(&[]), &opts, Some(&rebuild));
+        let without = check(TWO, draft(&[]), &opts);
+        // Whatever the engine says of the mix, the result is never worse
+        // than the whole-file choice, and equal to it when not better.
+        let score = |c: &Conversion| score_of(c.units.iter());
+        assert!(score(&with) <= score(&without));
+        if score(&with) == score(&without) {
+            assert_eq!(with.output, without.output);
+        }
+        let _ = second;
     }
 }

@@ -28,7 +28,7 @@
 //! target dialect), side B holds exactly that instead: nothing is converted
 //! or flagged, and a base object it lacks does not bind on side B.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -76,7 +76,7 @@ pub fn read_b(paths: &[PathBuf], a: &[PathBuf], no_catalog: bool) -> Result<Vec<
 }
 
 fn read_files(paths: &[PathBuf], flag: &str, side: &str) -> Result<Vec<File>, String> {
-    let mut seen = HashSet::new();
+    let mut seen = BTreeSet::new();
     let mut files = Vec::new();
     for p in paths {
         let path = p.display().to_string();
@@ -428,7 +428,7 @@ pub fn prepare(
     hooks: &crate::tree::Hooks,
     rules: crate::RuleOptions,
 ) -> Result<Base, String> {
-    let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let names = logical_names(files.len(), false);
     let source = crate::tree::catalog(
         files.iter().map(|f| f.text.as_str()),
         from,
@@ -437,7 +437,7 @@ pub fn prepare(
         jobs,
     );
     if !b.is_empty() {
-        let names_b: Vec<&str> = b.iter().map(|f| f.path.as_str()).collect();
+        let names_b = logical_names(b.len(), true);
         let target = crate::tree::catalog(
             b.iter().map(|f| f.text.as_str()),
             to,
@@ -546,7 +546,7 @@ pub fn prepare(
         node.defines.iter().map(|o| &o.key).chain(&node.touches)
     };
     let mut suspect: Vec<(Key, Seen)> = Vec::new();
-    let mut failed: HashSet<usize> = HashSet::new();
+    let mut failed: BTreeSet<usize> = BTreeSet::new();
     for (i, seen) in own.iter().enumerate() {
         if seen.status > Status::Assumptions {
             failed.insert(i);
@@ -634,7 +634,7 @@ pub fn prepare(
                     "{} `{}` ({} line {}: {})",
                     o.kind,
                     o.name,
-                    files[f].path,
+                    logical_names(files.len(), false)[f],
                     all[f][n].line,
                     seen.status.label()
                 ),
@@ -803,8 +803,19 @@ impl Base {
 /// What a side's catalog is called in binding reasons when base catalogs
 /// are used: `what` and the files.
 pub fn origin(what: &str, files: &[CatalogFile]) -> String {
-    let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let names = logical_names(files.len(), false);
     format!("{what} and base catalogs {}", names.join(", "))
+}
+
+/// What the base catalog files are called in reasons and keys: their
+/// position in the order given, never their path. A path is where the files
+/// happen to be on one machine; the content is in the keys already (the
+/// catalog digest), so the same catalogs moved to another folder, or checked
+/// out on another OS, give the same keys and the same reasons. The report
+/// lists the files by path, in the same order.
+fn logical_names(n: usize, target: bool) -> Vec<String> {
+    let side = if target { "target " } else { "" };
+    (1..=n).map(|i| format!("{side}#{i}")).collect()
 }
 
 /// The tree's objects (`texts`, loaded in order) over the `base` catalog: an
@@ -849,7 +860,7 @@ type Exact = (Option<String>, String);
 /// that is not `own`'s own.
 fn shadow(cat: &mut Catalog, own: &Catalog, d: Dialect) {
     let exact = |s: &Option<String>, n: &str| (s.as_deref().map(|s| key(d, s)), key(d, n));
-    let mut tables: HashMap<String, Vec<(Key, Exact)>> = HashMap::new();
+    let mut tables: BTreeMap<String, Vec<(Key, Exact)>> = BTreeMap::new();
     for t in &own.tables {
         let k = Key::new(d, false, t.schema.as_deref(), &t.name);
         tables
@@ -865,8 +876,8 @@ fn shadow(cat: &mut Catalog, own: &Catalog, d: Dialect) {
         let e = exact(&t.schema, &t.name);
         !list.iter().any(|(o, _)| o.same(&k)) || list.iter().any(|(_, oe)| *oe == e)
     });
-    let mut routines: HashMap<String, Vec<Key>> = HashMap::new();
-    let mut mine: HashSet<String> = HashSet::new();
+    let mut routines: BTreeMap<String, Vec<Key>> = BTreeMap::new();
+    let mut mine: BTreeSet<String> = BTreeSet::new();
     for r in &own.routines {
         let k = Key::new(d, true, r.schema.as_deref(), &r.name);
         routines.entry(k.name.clone()).or_default().push(k);

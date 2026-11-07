@@ -3,7 +3,7 @@
 //! over, so each is kept once and shared ([`Pool`]). A [`Shared`] reads,
 //! compares and serializes as the string it holds.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
@@ -134,7 +134,7 @@ impl<'de> Deserialize<'de> for Shared {
 /// Equal texts, kept once. One pool serves one conversion of a tree and
 /// is dropped with it: nothing outlives the texts in use.
 #[derive(Default)]
-pub struct Pool(Mutex<HashSet<Arc<str>>>);
+pub struct Pool(Mutex<BTreeSet<Arc<str>>>);
 
 impl Pool {
     /// `s`, as the copy the pool keeps of its text.

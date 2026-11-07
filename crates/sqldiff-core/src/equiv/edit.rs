@@ -555,6 +555,7 @@ impl<'x, 'a> Routine<'x, 'a> {
     }
 
     /// Facts about every parameter and variable, as seen at `at`.
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: names are inserted independently
     fn facts(&self, at: usize, node: &SyntaxNode) -> HashMap<String, VarFact> {
         let mut out = HashMap::new();
         let names: HashSet<&String> = self.params.keys().chain(self.locals.keys()).collect();
@@ -1553,6 +1554,7 @@ impl<'x, 'a> Routine<'x, 'a> {
     /// writes reaches changed code. The witness gives both versions the same
     /// inputs at `n` and runs the same code after it, so two edits that
     /// make up for each other would look like two differences.
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: set union; sorted before it reaches a witness; set union
     fn interacts(&self, n: &SyntaxNode, changed: &[Span], reach: &Reach) -> Option<String> {
         if changed.is_empty() {
             return None;
@@ -2722,6 +2724,7 @@ impl Hints<'_> {
 
 // ---- examination ------------------------------------------------------------------
 
+#[allow(clippy::disallowed_methods)] // hash order cannot reach an output: records are only tested with `contains`
 fn examine(
     ra: &Routine,
     rb: &Routine,
