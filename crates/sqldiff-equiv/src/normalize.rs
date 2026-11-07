@@ -357,7 +357,11 @@ fn lcs_row<T: Ord>(a: &[T], b: &[T], rev: bool) -> Vec<u32> {
     for i in 0..a.len() {
         let x = if rev { &a[a.len() - 1 - i] } else { &a[i] };
         // No match: the row does not change.
-        let Some(pos) = at.get(x) else { continue };
+        let Some((key, pos)) = at.get_key_value(x) else {
+            continue;
+        };
+        // The map matches by `Ord`, the table walk by `==`: they must agree.
+        debug_assert!(**key == *x, "Ord and == disagree on an alignment key");
         for &p in pos {
             mask[(p >> 6) as usize] |= 1u64 << (p & 63);
         }
@@ -626,6 +630,74 @@ mod lcs_tests {
                 assert_eq!(pairs, lcs_table(&a, &b, 0, 0));
             }
         }
+    }
+
+    /// Hirschberg takes the first best cut of `b` (`total > best`, not `>=`):
+    /// the pairs below are what that rule gives, and a later cut would pair
+    /// the second and third items of `a` further right.
+    #[test]
+    fn hirschberg_takes_the_first_best_cut() {
+        let a = [0u32, 1, 1];
+        let b = [0u32, 0, 1, 1, 0, 0, 1];
+        let mut out = Vec::new();
+        hirschberg_with(&a, &b, 0, 0, &mut out, 6, lcs_row);
+        assert_eq!(out, vec![(0, 0), (1, 2), (2, 3)]);
+    }
+
+    /// `Ord` agrees with `==` on the key types the callers align (the
+    /// Hirschberg rows match by `Ord`, the table walk by `==`).
+    #[test]
+    fn ord_equality_agrees_with_eq_for_the_key_types() {
+        fn agrees<T: Ord + std::fmt::Debug>(items: &[T]) {
+            for x in items {
+                for y in items {
+                    assert_eq!(x == y, x.cmp(y) == std::cmp::Ordering::Equal, "{x:?} {y:?}");
+                }
+            }
+        }
+        agrees(&["", "a", "A", "a ", "b", "select 1", "SELECT 1"]);
+        agrees(&[
+            String::new(),
+            "x".to_string(),
+            "X".to_string(),
+            "x ".to_string(),
+        ]);
+        agrees(&[
+            vec!["a".to_string()],
+            vec!["a".to_string(), "b".to_string()],
+            vec![],
+        ]);
+        agrees(&[
+            (Some("t".to_string()), "a".to_string()),
+            (None, "a".to_string()),
+            (Some("t".to_string()), "b".to_string()),
+        ]);
+        agrees(&[
+            (crate::classify::StmtKind::Select, "x".to_string()),
+            (crate::classify::StmtKind::Insert, "x".to_string()),
+            (crate::classify::StmtKind::Select, "y".to_string()),
+        ]);
+    }
+
+    /// A key whose `Ord` ignores part of what `==` compares trips the
+    /// debug assertion instead of silently pairing unequal items.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "Ord and == disagree")]
+    fn a_key_with_a_disagreeing_ord_is_caught_in_debug_builds() {
+        #[derive(PartialEq, Eq)]
+        struct K(u8, u8);
+        impl PartialOrd for K {
+            fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(o))
+            }
+        }
+        impl Ord for K {
+            fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+                self.0.cmp(&o.0)
+            }
+        }
+        lcs_row(&[K(1, 1)], &[K(1, 2)], false);
     }
 
     #[test]
