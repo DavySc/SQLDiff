@@ -209,6 +209,20 @@ impl LiveMap {
         self.0.iter().map(|&(i, l)| (i as usize, l))
     }
 
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The length of `{:?}` of the vector with one `Option<Live>` slot per
+    /// key (`[None, Some(Durable), ..]`) that this map stands for.
+    fn dense_debug_len(&self, nkeys: usize) -> usize {
+        6 * nkeys.max(1)
+            + self
+                .iter()
+                .map(|(_, l)| if l == Live::Undone { 8 } else { 9 })
+                .sum::<usize>()
+    }
+
     /// Whether the states of some key outside `spent` differ in `self` and `b`.
     fn differs_outside(&self, b: &LiveMap, spent: &[usize]) -> bool {
         let (mut x, mut y) = (self.0.iter().peekable(), b.0.iter().peekable());
@@ -516,7 +530,7 @@ impl State {
     /// an outcome. Two paths with equal keys at one node make equal outcomes
     /// from any continuation but for those. The fields are all listed, so a
     /// new one must be put on one side or the other.
-    fn run_key(&self) -> String {
+    fn run_key(&self, nkeys: usize) -> (String, usize) {
         use std::fmt::Write;
         let State {
             depth,
@@ -572,9 +586,10 @@ impl State {
         let mut seen: Vec<(&NodeId, &Vec<String>)> = loop_seen.iter().collect();
         seen.sort();
         let mut s = String::new();
+        let live_text = format!("{live:?}");
         let _ = write!(
             s,
-            "{depth},{caller_depth},{owner:?},{no_commit},{doomed},{xact_abort},{xact_abort_local},{implicit}|{live:?}|{log:?}|{temp:?}|{scopes:?}|{savepoints:?}|{resume:?}|{caught:?}|"
+            "{depth},{caller_depth},{owner:?},{no_commit},{doomed},{xact_abort},{xact_abort_local},{implicit}|{live_text}|{log:?}|{temp:?}|{scopes:?}|{savepoints:?}|{resume:?}|{caught:?}|"
         );
         let _ = write!(
             s,
@@ -584,7 +599,14 @@ impl State {
             s,
             "{partial:?}|{temp_reads:?}|{raised}|{imprecise:?}|{cut:?}|{rows:?}|{assumptions:?}|{untested:?}"
         );
-        s
+        // The size the gate on a key's length reads (`JOIN_KEY_BYTES`) is that
+        // of the key with the effects printed as one slot per key
+        // (`[None, Some(Durable), ..]`), as it was before they were kept as
+        // just those that ran: which states join must not depend on how the
+        // effects are held.
+        let dense_live = live.dense_debug_len(nkeys);
+        let size = s.len() - live_text.len() + dense_live;
+        (s, size)
     }
 
     /// Whether what `b` (a path of the fault-free run) had recorded is also
@@ -621,6 +643,9 @@ const MAX_STEPS: usize = 4000;
 const JOIN_TICKS: usize = 200_000;
 const JOIN_ENTRIES: usize = 10_000;
 const JOIN_KEY_BYTES: usize = 16 * 1024;
+/// An outcome keeps its effects as one slot per key unless the path ran at
+/// most one in this many of them (`Interp::finish`).
+const DENSE_SHARE: usize = 8;
 
 enum Step {
     Go(NodeId, Box<State>),
@@ -1734,7 +1759,7 @@ impl Interp<'_> {
         let Some((node, mut st)) = m.cur.take() else {
             return;
         };
-        if m.join.is_some() && Self::joins(m, node, &st) {
+        if m.join.is_some() && Self::joins(m, node, &st, self.keys.names.len()) {
             return;
         }
         st.steps += 1;
@@ -1780,7 +1805,7 @@ impl Interp<'_> {
     /// dropped because an earlier path in the same state has finished
     /// everything below `node` (see [`Join`]). Otherwise the arrival is
     /// remembered (when the memo is being made).
-    fn joins(m: &mut Machine, node: NodeId, st: &State) -> bool {
+    fn joins(m: &mut Machine, node: NodeId, st: &State, nkeys: usize) -> bool {
         let Machine {
             work, outs, join, ..
         } = m;
@@ -1800,9 +1825,9 @@ impl Interp<'_> {
         {
             return false;
         }
-        let text = st.run_key();
+        let (text, size) = st.run_key(nkeys);
         // A state this big (a long script's log) is not worth a memo entry.
-        if text.len() > JOIN_KEY_BYTES {
+        if size > JOIN_KEY_BYTES {
             return false;
         }
         let key = (node, Rc::<str>::from(text));
@@ -2831,6 +2856,12 @@ impl Interp<'_> {
                 st.raised = true;
             }
         }
+        // One slot per key when the path ran a good share of them (an outcome
+        // is compared and patched against the fault-free one as a whole
+        // array), else just the ones it ran: a routine of n statements then
+        // costs n per path only where its paths run most of them.
+        let nkeys = self.keys.names.len();
+        let sparse = st.live.len() * DENSE_SHARE <= nkeys;
         let (mut fates, mut open) = (Vec::new(), Vec::new());
         for (i, l) in st.live.iter() {
             let (fate, opened, committed) = self.fate_of(l, st.owner, st.doomed, raised_exit);
@@ -2851,13 +2882,31 @@ impl Interp<'_> {
         if unit_commit > 0 {
             st.assumptions.insert("ASM-CALLER-COMMITS".into());
         }
+        let (effects, open) = if sparse {
+            (
+                Effects::sparse(self.keys.names.clone(), self.keys.zeros.clone(), fates),
+                KeySet::sparse(self.keys.names.clone(), self.keys.zeros.clone(), open),
+            )
+        } else {
+            let (mut f, mut o) = (vec![0u8; nkeys], vec![0u8; nkeys]);
+            for (i, c) in fates {
+                f[i as usize] = c;
+            }
+            for i in open {
+                o[i as usize] = 1;
+            }
+            (
+                Effects::dense(self.keys.names.clone(), f),
+                KeySet::dense(self.keys.names.clone(), o),
+            )
+        };
         Outcome {
             exit,
             trace: Trace::new(st.trace),
             fault_index: st.fault_index,
             fault_route: st.fault_route,
-            effects: Effects::sparse(self.keys.names.clone(), self.keys.zeros.clone(), fates),
-            open: KeySet::sparse(self.keys.names.clone(), self.keys.zeros.clone(), open),
+            effects,
+            open,
             partial: st.partial,
             before_fault: st.before_fault.unwrap_or_default(),
             faulted: st.faulted,
@@ -2967,6 +3016,33 @@ mod live_map_tests {
                         "{a:?} against {b:?}, spent {spent:?}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn dense_debug_len_is_the_length_of_the_vector_it_replaces() {
+        let states = [
+            None,
+            Some(Live::Durable),
+            Some(Live::Pending),
+            Some(Live::Undone),
+        ];
+        for n in 1..6 {
+            for x in 0..states.len().pow(n as u32) {
+                let mut y = x;
+                let v: Vec<Option<Live>> = (0..n)
+                    .map(|_| {
+                        let s = states[y % states.len()];
+                        y /= states.len();
+                        s
+                    })
+                    .collect();
+                assert_eq!(
+                    build(&v).dense_debug_len(n),
+                    format!("{v:?}").len(),
+                    "{v:?}"
+                );
             }
         }
     }

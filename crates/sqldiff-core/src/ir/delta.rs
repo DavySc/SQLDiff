@@ -177,6 +177,15 @@ impl Dense {
 pub struct Effects(Dense);
 
 impl Effects {
+    pub(super) fn dense(names: Rc<Vec<Rc<str>>>, fates: Vec<u8>) -> Effects {
+        Effects(Dense {
+            names,
+            base: Rc::new(fates),
+            over: Vec::new(),
+            zero_base: false,
+        })
+    }
+
     /// The fates `fates` (by key index, ascending, none zero) over the
     /// all-zero array `zeros` (one slot per key).
     pub(super) fn sparse(
@@ -320,6 +329,15 @@ impl fmt::Debug for Effects {
 pub struct KeySet(Dense);
 
 impl KeySet {
+    pub(super) fn dense(names: Rc<Vec<Rc<str>>>, flags: Vec<u8>) -> KeySet {
+        KeySet(Dense {
+            names,
+            base: Rc::new(flags),
+            over: Vec::new(),
+            zero_base: false,
+        })
+    }
+
     /// The keys `flags` (by key index, ascending) over the all-zero array
     /// `zeros` (one slot per key).
     pub(super) fn sparse(names: Rc<Vec<Rc<str>>>, zeros: Rc<Vec<u8>>, flags: Vec<u32>) -> KeySet {
