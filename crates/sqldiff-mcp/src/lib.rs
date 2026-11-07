@@ -90,7 +90,32 @@ pub struct Server {
     trees: Vec<(String, tree::Tree)>,
     /// Trees converted in this session, for ids.
     tree_count: usize,
+    /// Background `convert_tree` runs, oldest first.
+    runs: Vec<Run>,
+    run_count: usize,
 }
+
+/// What a background run returns: the tree, and the report files written.
+type RunResult = Result<(tree::Tree, Option<(std::path::PathBuf, std::path::PathBuf)>), String>;
+
+/// A `convert_tree` running on its own thread. Collected by `run_status`,
+/// which reports it exactly as the foreground call would.
+struct Run {
+    id: String,
+    args: Value,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// (checked, total) files, from the engine's progress hook.
+    progress: std::sync::Arc<(
+        std::sync::atomic::AtomicUsize,
+        std::sync::atomic::AtomicUsize,
+    )>,
+    handle: Option<std::thread::JoinHandle<RunResult>>,
+    /// The final answer once collected: reported the same on every call.
+    done: Option<(String, Value)>,
+}
+
+/// Runs kept in a session, finished ones included.
+const RUN_LIMIT: usize = 8;
 
 impl Default for Server {
     fn default() -> Self {
@@ -122,6 +147,8 @@ impl Server {
             store,
             trees: Vec::new(),
             tree_count: 0,
+            runs: Vec::new(),
+            run_count: 0,
         }
     }
 
@@ -215,6 +242,19 @@ impl Server {
 
     /// Runs a tool; `None` when there is no tool of that name.
     fn tool(&mut self, name: &str, args: &Value) -> Option<Result<(String, Value), String>> {
+        // A run works on the store and the output tree: nothing else
+        // converts while one does.
+        if matches!(name, "convert_tree" | "conversion_queue" | "write_unit")
+            && self
+                .runs
+                .iter()
+                .any(|r| r.handle.as_ref().is_some_and(|h| !h.is_finished()))
+        {
+            return Some(Err(
+                "a background run is working: `run_status` shows it, `cancel_run` stops it"
+                    .to_string(),
+            ));
+        }
         Some(match name {
             "diff" => self.diff(args),
             "check" => self.check(args),
@@ -231,6 +271,8 @@ impl Server {
             "conversion_queue" => self.conversion_queue(args),
             "write_unit" => self.write_unit(args),
             "converted_file" => self.converted_file(args),
+            "run_status" => self.run_status(args),
+            "cancel_run" => self.cancel_run(args),
             _ => return None,
         })
     }
@@ -1143,59 +1185,6 @@ impl Server {
         Ok((text, structured))
     }
 
-    /// The increment `select` names (see `sqldiff convert --next` and
-    /// friends); empty checks the whole tree.
-    fn select_arg(&self, args: &Value) -> Result<sqldiff_convert::plan::Select, String> {
-        let Some(v) = args.get("select").filter(|v| !v.is_null()) else {
-            return Ok(Default::default());
-        };
-        Ok(sqldiff_convert::plan::Select {
-            next: v.get("next").and_then(Value::as_u64).map(|n| n as usize),
-            schemas: list_arg(v, "schemas")?,
-            objects: list_arg(v, "objects")?,
-            paths: list_arg(v, "paths")?,
-            changed: v.get("changed").and_then(Value::as_bool).unwrap_or(false),
-        })
-    }
-
-    /// Converts the tree as `sqldiff convert` does: with an `out`, each
-    /// file's checked result is kept in the store of `out` and reused when
-    /// its key matches, so a second call over an unchanged tree (a queue
-    /// read, a drafted unit) costs a lookup. Without `out` nothing is kept.
-    fn build_tree(
-        &self,
-        args: &Value,
-        a: &tree::Args,
-        inputs: &[tree::Input],
-        unreadable: Vec<String>,
-        out: Option<&std::path::Path>,
-    ) -> Result<tree::Tree, String> {
-        let fresh = args.get("fresh").and_then(Value::as_bool).unwrap_or(false);
-        let select = self.select_arg(args)?;
-        let Some(o) = out else {
-            if !select.is_empty() || fresh {
-                return Err("`select` and `fresh` need `out`: the store lives there".to_string());
-            }
-            return tree::convert(a, inputs, unreadable, None);
-        };
-        let t = tree::convert_increment(
-            a,
-            inputs,
-            unreadable,
-            o,
-            &tree::Hooks::default(),
-            fresh,
-            &select,
-        )?;
-        if !select.is_empty() {
-            sqldiff_convert::job::write_plan(
-                &sqldiff_convert::plan::Plan::build(inputs, a.from),
-                o,
-            )?;
-        }
-        Ok(t)
-    }
-
     /// The tree arguments `convert_tree` and `conversion_queue` share.
     fn tree_args(&self, args: &Value) -> Result<tree::Args, String> {
         let src = str_arg(args, "src").ok_or("`src` is required (a directory or one file)")?;
@@ -1259,7 +1248,15 @@ impl Server {
             .unwrap_or(DEFAULT_TREE_LIMIT);
         // Converted again in memory, so decisions recorded since count; nothing is written.
         let (inputs, unreadable) = tree::read(&a)?;
-        let mut t = self.build_tree(args, &a, &inputs, unreadable, Some(&out))?;
+        let mut t = build_tree(
+            args,
+            &a,
+            &inputs,
+            unreadable,
+            Some(&out),
+            &tree::Hooks::default(),
+            false,
+        )?;
         tree::review_in(&mut t, &inputs, &out)?;
         let q = queue::build(&t.report, inst.as_ref(), all);
         let listed: Vec<&queue::Item> = q
@@ -1339,7 +1336,15 @@ impl Server {
         tree::prepare_out(&a.src, &out, true)?;
         tree::guard_hand_edits(&out, false)?;
         let (inputs, unreadable) = tree::read(&a)?;
-        let t = self.build_tree(args, &a, &inputs, unreadable.clone(), Some(&out))?;
+        let t = build_tree(
+            args,
+            &a,
+            &inputs,
+            unreadable.clone(),
+            Some(&out),
+            &tree::Hooks::default(),
+            false,
+        )?;
         let r = tree::written_record(
             &t,
             &inputs,
@@ -1352,7 +1357,15 @@ impl Server {
             &sqldiff_review::time::now(),
         )?;
         review::append(&out, &r)?;
-        let mut t = self.build_tree(args, &a, &inputs, unreadable, Some(&out))?;
+        let mut t = build_tree(
+            args,
+            &a,
+            &inputs,
+            unreadable,
+            Some(&out),
+            &tree::Hooks::default(),
+            false,
+        )?;
         tree::review_in(&mut t, &inputs, &out)?;
         tree::write(&t, &out)?;
         queue::write(&queue::build(&t.report, None, false), &out)?;
@@ -1416,36 +1429,166 @@ impl Server {
 
     fn convert_tree(&mut self, args: &Value) -> Result<(String, Value), String> {
         let a = self.tree_args(args)?;
-        let out = str_arg(args, "out").map(std::path::PathBuf::from);
-        let overwrite = args
-            .get("overwrite")
+        if args
+            .get("background")
             .and_then(Value::as_bool)
-            .unwrap_or(false);
-        // The same steps as `sqldiff convert`, in the same order.
-        let (inputs, unreadable) = tree::read(&a)?;
-        if let Some(o) = &out {
-            tree::prepare_out(&a.src, o, overwrite)?;
-            let discard = args
-                .get("discard_edits")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            tree::guard_hand_edits(o, discard)?;
+            .unwrap_or(false)
+        {
+            return self.start_run(args, a);
         }
-        let mut t = self.build_tree(args, &a, &inputs, unreadable, out.as_deref())?;
-        // Review decisions committed next to the converted tree.
-        if let Some(o) = &out {
-            tree::review_in(&mut t, &inputs, o)?;
-        }
-        let written = match &out {
-            Some(o) => {
-                let w = tree::write(&t, o)?;
-                let q = sqldiff_convert::queue::build(&t.report, None, false);
-                sqldiff_convert::queue::write(&q, o)?;
-                Some(w)
-            }
-            None => None,
-        };
+        let (t, written) = run_tree(args, &a, &tree::Hooks::default())?;
+        self.report_tree(args, t, written)
+    }
 
+    /// Starts `convert_tree` on its own thread and returns at once with a
+    /// run id. One run works at a time, and never two on the same `out`.
+    /// The run stops only between checks (`cancel_run`), and writes its
+    /// output tree only after its last check, so a stopped run changes
+    /// nothing but the store.
+    fn start_run(&mut self, args: &Value, a: tree::Args) -> Result<(String, Value), String> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        if self
+            .runs
+            .iter()
+            .any(|r| r.handle.as_ref().is_some_and(|h| !h.is_finished()))
+        {
+            return Err(
+                "a run is still working: `run_status` shows it, `cancel_run` stops it".to_string(),
+            );
+        }
+        // A finished run not yet collected holds its tree; collect it first.
+        if self.runs.iter().any(|r| r.handle.is_some()) {
+            return Err("a finished run is waiting: read it with `run_status` first".to_string());
+        }
+        if self.runs.len() >= RUN_LIMIT {
+            self.runs.remove(0);
+        }
+        self.run_count += 1;
+        let id = format!("run-{}", self.run_count);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+        let hooks = tree::Hooks {
+            cancel: Some(cancel.clone()),
+            progress: Some({
+                let p = progress.clone();
+                Box::new(move |checked, total| {
+                    p.0.store(checked, Ordering::Relaxed);
+                    p.1.store(total, Ordering::Relaxed);
+                })
+            }),
+        };
+        let worker_args = args.clone();
+        let handle = std::thread::Builder::new()
+            .stack_size(sqldiff_core::ENGINE_STACK)
+            .spawn(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_tree(&worker_args, &a, &hooks)
+                }))
+                .unwrap_or_else(|_| Err("the engine panicked".to_string()))
+            })
+            .map_err(|e| format!("could not start the run: {e}"))?;
+        self.runs.push(Run {
+            id: id.clone(),
+            args: args.clone(),
+            cancel,
+            progress,
+            handle: Some(handle),
+            done: None,
+        });
+        let text = format!(
+            "[{id}] started; poll `run_status` with run `{id}`, stop it with `cancel_run`.\n"
+        );
+        Ok((text, json!({ "run": id, "state": "running" })))
+    }
+
+    fn run_index(&self, args: &Value) -> Result<usize, String> {
+        let id = str_arg(args, "run")
+            .ok_or("`run` is required (an id from `convert_tree` with `background`)")?;
+        self.runs
+            .iter()
+            .position(|r| r.id == id)
+            .ok_or_else(|| format!("no run `{id}` in this session (the last {RUN_LIMIT} are kept)"))
+    }
+
+    /// Where a run is; once it has finished, its report as `convert_tree`
+    /// returns it, and the same on every later call.
+    fn run_status(&mut self, args: &Value) -> Result<(String, Value), String> {
+        use std::sync::atomic::Ordering;
+        let k = self.run_index(args)?;
+        if let Some((t, s)) = &self.runs[k].done {
+            return Ok((t.clone(), s.clone()));
+        }
+        let r = &self.runs[k];
+        let id = r.id.clone();
+        if r.handle.as_ref().is_some_and(|h| !h.is_finished()) {
+            let (c, n) = (
+                r.progress.0.load(Ordering::Relaxed),
+                r.progress.1.load(Ordering::Relaxed),
+            );
+            let cancelling = r.cancel.load(Ordering::Relaxed);
+            let text = format!(
+                "[{id}] {} {c}/{n} checks\n",
+                if cancelling { "stopping" } else { "running" }
+            );
+            return Ok((
+                text,
+                json!({ "run": id, "state": if cancelling { "stopping" } else { "running" }, "checked": c, "total": n }),
+            ));
+        }
+        let handle = self.runs[k]
+            .handle
+            .take()
+            .expect("an uncollected run has its thread");
+        let run_args = self.runs[k].args.clone();
+        let answer = match handle.join().unwrap_or_else(|_| Err("the engine panicked".to_string())) {
+            Ok((t, written)) => {
+                let (text, mut structured) = self.report_tree(&run_args, t, written)?;
+                structured["run"] = json!(id);
+                structured["state"] = json!("finished");
+                (format!("[{id}] finished\n{text}"), structured)
+            }
+            Err(e) if e == tree::CANCELLED => (
+                format!("[{id}] cancelled: nothing was written to the output tree; the checks that finished are kept in the store.\n"),
+                json!({ "run": id, "state": "cancelled" }),
+            ),
+            Err(e) => (
+                format!("[{id}] failed: {e}\n"),
+                json!({ "run": id, "state": "failed", "error": e }),
+            ),
+        };
+        self.runs[k].done = Some(answer.clone());
+        Ok(answer)
+    }
+
+    /// Asks a running run to stop before its next check. A run that has
+    /// finished is not changed.
+    fn cancel_run(&mut self, args: &Value) -> Result<(String, Value), String> {
+        let k = self.run_index(args)?;
+        let r = &self.runs[k];
+        let running = r.handle.as_ref().is_some_and(|h| !h.is_finished());
+        if running {
+            r.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let id = r.id.clone();
+        let text = if running {
+            format!("[{id}] asked to stop; `run_status` shows when it has.\n")
+        } else {
+            format!("[{id}] is not running; `run_status` shows how it ended.\n")
+        };
+        Ok((
+            text,
+            json!({ "run": id, "state": if running { "stopping" } else { "not running" } }),
+        ))
+    }
+
+    /// The report of a converted tree, as `convert_tree` returns it.
+    fn report_tree(
+        &mut self,
+        args: &Value,
+        t: tree::Tree,
+        written: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    ) -> Result<(String, Value), String> {
         let statuses: Vec<sqldiff_convert::Status> = list_arg(args, "statuses")?;
         let folder = str_arg(args, "folder");
         let limit = args
@@ -1644,6 +1787,96 @@ fn status_label(s: queue::Status) -> &'static str {
         queue::Status::Confirmed => "confirmed in this session",
         queue::Status::Denied => "denied in this session",
     }
+}
+
+/// The increment `select` names (see `sqldiff convert --next` and
+/// friends); empty checks the whole tree. `next` must be a whole number.
+fn select_arg(args: &Value) -> Result<sqldiff_convert::plan::Select, String> {
+    let Some(v) = args.get("select").filter(|v| !v.is_null()) else {
+        return Ok(Default::default());
+    };
+    let next = match v.get("next").filter(|n| !n.is_null()) {
+        None => None,
+        Some(n) => Some(
+            n.as_u64()
+                .ok_or("`select.next` must be a whole number of groups (0 reports coverage)")?
+                as usize,
+        ),
+    };
+    Ok(sqldiff_convert::plan::Select {
+        next,
+        schemas: list_arg(v, "schemas")?,
+        objects: list_arg(v, "objects")?,
+        paths: list_arg(v, "paths")?,
+        changed: v.get("changed").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+/// Converts the tree as `sqldiff convert` does: with an `out`, each file's
+/// checked result is kept in the store of `out` and reused when its key
+/// matches, so a second call over an unchanged tree (a queue read, a
+/// drafted unit) costs a lookup. Without `out` nothing is kept. `fresh`
+/// and `select` belong to `convert_tree` alone (`incremental`): the queue
+/// and `write_unit` write nothing but the store.
+fn build_tree(
+    args: &Value,
+    a: &tree::Args,
+    inputs: &[tree::Input],
+    unreadable: Vec<String>,
+    out: Option<&std::path::Path>,
+    hooks: &tree::Hooks,
+    incremental: bool,
+) -> Result<tree::Tree, String> {
+    let fresh = args.get("fresh").and_then(Value::as_bool).unwrap_or(false);
+    let select = select_arg(args)?;
+    if !incremental && (fresh || !select.is_empty()) {
+        return Err("`fresh` and `select` belong to `convert_tree`".to_string());
+    }
+    let Some(o) = out else {
+        if !select.is_empty() || fresh {
+            return Err("`select` and `fresh` need `out`: the store lives there".to_string());
+        }
+        return tree::convert_with(a, inputs, unreadable, None, hooks);
+    };
+    let t = tree::convert_increment(a, inputs, unreadable, o, hooks, fresh, &select)?;
+    if !select.is_empty() {
+        sqldiff_convert::job::write_plan(&sqldiff_convert::plan::Plan::build(inputs, a.from), o)?;
+    }
+    Ok(t)
+}
+
+/// What `convert_tree` does before it reports: the steps of
+/// `sqldiff convert`, in the same order. Runs on the calling thread or, for
+/// a background run, on its worker.
+fn run_tree(
+    args: &Value,
+    a: &tree::Args,
+    hooks: &tree::Hooks,
+) -> Result<(tree::Tree, Option<(std::path::PathBuf, std::path::PathBuf)>), String> {
+    let out = str_arg(args, "out").map(std::path::PathBuf::from);
+    let flag = |k: &str| args.get(k).and_then(Value::as_bool).unwrap_or(false);
+    let (inputs, unreadable) = tree::read(a)?;
+    if let Some(o) = &out {
+        tree::prepare_out(&a.src, o, flag("overwrite"))?;
+        tree::guard_hand_edits(o, flag("discard_edits"))?;
+    }
+    let mut t = build_tree(args, a, &inputs, unreadable, out.as_deref(), hooks, true)?;
+    // Review decisions committed next to the converted tree.
+    if let Some(o) = &out {
+        tree::review_in(&mut t, &inputs, o)?;
+    }
+    // The last point a run stops at: from here on the output is written.
+    hooks.stop_if_cancelled()?;
+    let written = match &out {
+        Some(o) => {
+            let w = tree::write(&t, o)?;
+            let q = sqldiff_convert::queue::build(&t.report, None, false);
+            sqldiff_convert::queue::write(&q, o)?;
+            Some(w)
+        }
+        None => None,
+    };
+    Ok((t, written))
 }
 
 fn str_arg(args: &Value, k: &str) -> Option<String> {
@@ -1956,11 +2189,12 @@ fn tools() -> Value {
                     "parameters": { "type": "array", "items": { "type": "string" }, "description": "With `template`: the only placeholder names, besides the pack's known_parameters" },
                     "extensions": { "type": "array", "items": { "type": "string" }, "description": "File extensions to convert (default [\"sql\"])" },
                     "jobs": { "type": "integer", "minimum": 1, "description": "Parallel jobs (default: available cores)" },
+                    "background": { "type": "boolean", "description": "Return at once with a run id and convert on a worker thread; poll `run_status`, stop with `cancel_run`. One run works at a time, and no other conversion tool runs meanwhile. The finished run reports exactly as this call would" },
                     "temporal_historyless": { "type": "boolean", "description": "Rule option `--temporal-historyless` (ASM-TEMPORAL-HISTORYLESS), off by default. Give the same value to `conversion_queue` and `write_unit`" },
                     "recheck": { "type": "string", "enum": ["none", "sample", "all"], "description": "With `out`: how much of what is taken from the store is built again and compared (default sample). `none` trusts the store and the report says so; `all` verifies every stored result" },
                     "fresh": { "type": "boolean", "description": "With `out`: reuse no stored result; every file is checked again and stored" },
                     "select": { "type": "object", "description": "With `out`: check only this increment, as `sqldiff convert --next/--schema/--object/--path/--changed`; a file outside it is taken from the store or counted not converted", "properties": {
-                        "next": { "type": "integer", "minimum": 1 },
+                        "next": { "type": "integer", "minimum": 0, "description": "0 reports coverage" },
                         "schemas": { "type": "array", "items": { "type": "string" } },
                         "objects": { "type": "array", "items": { "type": "string" } },
                         "paths": { "type": "array", "items": { "type": "string" } },
@@ -1977,7 +2211,7 @@ fn tools() -> Value {
         {
             "name": "conversion_queue",
             "title": "Review queue of a converted tree",
-            "description": "What a person should review in a converted tree, worst first, by tier (never a score): 1 differs, not converted, rejected, a missing object many units fail to bind on (one item), templates whose instances differ; 2 not proven, instances unknown or not woven, templates no instance uses; 3 output an agent wrote that no person approved; 4 open decisions; 5 open assumptions (unverified vendor facts and template premises first); 6 (with `all`) plainly converted units nobody approved. Converts `src` again with the same arguments as `convert_tree` (each file's checked result is reused from the store in `out`, so an unchanged tree costs lookups) and applies the review-decisions.jsonl in `out`, so decisions recorded since count; writes nothing but that store. Reviewed units are not listed. Verdicts are recorded by people in the GUI or CLI, never by this server; `write_unit` only records an agent's draft.",
+            "description": "What a person should review in a converted tree, worst first, by tier (never a score): 1 differs, not converted, rejected, a missing object many units fail to bind on (one item), templates whose instances differ; 2 not proven, instances unknown or not woven, templates no instance uses; 3 output an agent wrote that no person approved; 4 open decisions; 5 open assumptions (unverified vendor facts and template premises first); 6 (with `all`) plainly converted units nobody approved. Converts `src` again with the same arguments as `convert_tree` (each file's checked result is reused from the store in `out`, so an unchanged tree costs lookups) and applies the review-decisions.jsonl in `out`, so decisions recorded since count; writes nothing but that store. Options that differ from the run that produced `out` (rules, catalogs) store other results and drop that run's from the store at the end of the call, so pass the same values. Reviewed units are not listed. Verdicts are recorded by people in the GUI or CLI, never by this server; `write_unit` only records an agent's draft.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2030,6 +2264,28 @@ fn tools() -> Value {
                 "required": ["src", "to", "out", "path", "unit", "text", "reason"],
             },
             "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false },
+        },
+        {
+            "name": "run_status",
+            "title": "Status of a background run",
+            "description": "Where a `convert_tree` started with `background` is: running (checks done of total), stopping, or finished. A finished run is reported here exactly as `convert_tree` reports (same arguments, same tree id for `converted_file`), cancelled, or failed; later calls return the same answer.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "run": { "type": "string", "description": "Run id from `convert_tree`" } },
+                "required": ["run"],
+            },
+            "annotations": ro,
+        },
+        {
+            "name": "cancel_run",
+            "title": "Stop a background run",
+            "description": "Asks a running background `convert_tree` to stop before its next check. A stopped run writes no output tree (the checks it finished stay in the store, so a rerun resumes); a run that already finished is not changed. Poll `run_status` to see it stop.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "run": { "type": "string", "description": "Run id from `convert_tree`" } },
+                "required": ["run"],
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
         },
         {
             "name": "converted_file",
