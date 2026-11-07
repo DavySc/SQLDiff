@@ -24,30 +24,30 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 
 | Id | Kind | Proof | Note | Used in |
 |---|---|---|---|---|
-| `advisory-lock/applock` | `idiom` | axiom: V21 | sp_getapplock against pg_advisory_xact_lock (ASM-APPLOCK-CHECK-RAISES) | `sqldiff-core/profiles/rules/idioms.rules` |
-| `cardinality/correlated-update-unrestricted` | `lint` | engine | a lint changes no output | `sqldiff-core/profiles/rules/lints.rules` |
-| `charindex/strpos` | `translate` | engine |  | `sqldiff-core/profiles/rules/tsql-pg.rules` |
-| `concurrency/insert-if-absent-race` | `lint` | engine | a lint changes no output | `sqldiff-core/profiles/rules/lints.rules` |
-| `concurrency/upsert-race` | `lint` | engine | a lint changes no output | `sqldiff-core/profiles/rules/lints.rules` |
-| `datediff-day/date-minus` | `translate` | engine |  | `sqldiff-core/profiles/rules/tsql-pg.rules` |
+| `advisory-lock/applock` | `idiom` | axiom: V21 | sp_getapplock against pg_advisory_xact_lock (ASM-APPLOCK-CHECK-RAISES) | `sqldiff-equiv/profiles/rules/idioms.rules` |
+| `cardinality/correlated-update-unrestricted` | `lint` | engine | a lint changes no output | `sqldiff-equiv/profiles/rules/lints.rules` |
+| `charindex/strpos` | `translate` | engine |  | `sqldiff-equiv/profiles/rules/tsql-pg.rules` |
+| `concurrency/insert-if-absent-race` | `lint` | engine | a lint changes no output | `sqldiff-equiv/profiles/rules/lints.rules` |
+| `concurrency/upsert-race` | `lint` | engine | a lint changes no output | `sqldiff-equiv/profiles/rules/lints.rules` |
+| `datediff-day/date-minus` | `translate` | engine |  | `sqldiff-equiv/profiles/rules/tsql-pg.rules` |
 | `db2.lob` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `db2.merge` | `converter` | axiom: V2 | MERGE kept in a procedure compiled with *CS; in a script ASM-FACT-V2 | `sqldiff-convert/src/tsql.rs` |
 | `db2.print` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `db2.proc-transaction` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `db2.sqlcode` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `db2.xact-abort` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
-| `dbo-schema` | `translate` | engine | C3a maps a table's `dbo.t` through the deployment under ASM-DBO-SCHEMA | `sqldiff-core/profiles/rules/tsql-pg.rules` |
-| `delete-orphans/anti-join` | `idiom` | engine |  | `sqldiff-core/profiles/rules/idioms.rules` |
+| `dbo-schema` | `translate` | engine | C3a maps a table's `dbo.t` through the deployment under ASM-DBO-SCHEMA | `sqldiff-equiv/profiles/rules/tsql-pg.rules` |
+| `delete-orphans/anti-join` | `idiom` | engine |  | `sqldiff-equiv/profiles/rules/idioms.rules` |
 | `idiom.rollback-rethrow` | `converter` | lemma: `Sqldiff.Mirror/C4 errors and transactions/The rollback-and-rethrow idiom` | PostgreSQL target, at the routine's top level around one transaction bracket (ASM-NO-CALLER-TXN); the Db2 for i `ROLLBACK; RESIGNAL` form engine | `sqldiff-convert/src/tsql.rs` |
-| `iif/case` | `translate` | engine | T-SQL IIF is outside the slice; the searched CASE it becomes is in it | `sqldiff-core/profiles/rules/tsql-pg.rules` |
-| `insert-identity/lastval` | `idiom` | engine | ASM-LASTVAL-SAME-INSERT | `sqldiff-core/profiles/rules/idioms.rules` |
-| `insert-identity/returning` | `idiom` | engine |  | `sqldiff-core/profiles/rules/idioms.rules` |
-| `insert-if-absent/if-not-exists` | `idiom` | engine |  | `sqldiff-core/profiles/rules/idioms.rules` |
-| `insert-if-absent/on-conflict` | `idiom` | engine |  | `sqldiff-core/profiles/rules/idioms.rules` |
-| `isnull/coalesce` | `translate` | lemma: `Sqldiff.Mirror/C2a operators/ISNULL` | int arguments (C2a), or a string variable or parameter with a fallback that fits it (C2b strings/ISNULL); other types engine (ASM-ISNULL-TYPE) | `sqldiff-core/profiles/rules/tsql-pg.rules` |
-| `len/length` | `translate` | lemma: `Sqldiff.Mirror/C2b strings/LEN` | `LEN(x)` against `length(rtrim(x))` on a string of the slice (ASM-TSQL-LEN-BMP) | `sqldiff-core/profiles/rules/tsql-pg.rules` |
-| `newid/gen-random-uuid` | `translate` | engine |  | `sqldiff-core/profiles/rules/tsql-pg.rules` |
-| `nolock/plain-read` | `translate` | engine |  | `sqldiff-core/profiles/rules/tsql-pg.rules` |
+| `iif/case` | `translate` | engine | T-SQL IIF is outside the slice; the searched CASE it becomes is in it | `sqldiff-equiv/profiles/rules/tsql-pg.rules` |
+| `insert-identity/lastval` | `idiom` | engine | ASM-LASTVAL-SAME-INSERT | `sqldiff-equiv/profiles/rules/idioms.rules` |
+| `insert-identity/returning` | `idiom` | engine |  | `sqldiff-equiv/profiles/rules/idioms.rules` |
+| `insert-if-absent/if-not-exists` | `idiom` | engine |  | `sqldiff-equiv/profiles/rules/idioms.rules` |
+| `insert-if-absent/on-conflict` | `idiom` | engine |  | `sqldiff-equiv/profiles/rules/idioms.rules` |
+| `isnull/coalesce` | `translate` | lemma: `Sqldiff.Mirror/C2a operators/ISNULL` | int arguments (C2a), or a string variable or parameter with a fallback that fits it (C2b strings/ISNULL); other types engine (ASM-ISNULL-TYPE) | `sqldiff-equiv/profiles/rules/tsql-pg.rules` |
+| `len/length` | `translate` | lemma: `Sqldiff.Mirror/C2b strings/LEN` | `LEN(x)` against `length(rtrim(x))` on a string of the slice (ASM-TSQL-LEN-BMP) | `sqldiff-equiv/profiles/rules/tsql-pg.rules` |
+| `newid/gen-random-uuid` | `translate` | engine |  | `sqldiff-equiv/profiles/rules/tsql-pg.rules` |
+| `nolock/plain-read` | `translate` | engine |  | `sqldiff-equiv/profiles/rules/tsql-pg.rules` |
 | `pg.bit-number` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `pg.lastval` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `pg.name-collision` | `converter` | engine |  | `sqldiff-convert/src/instances.rs` |
@@ -57,14 +57,14 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `pg.sqlstate` | `converter` | engine | ERROR_NUMBER() and SQLSTATE are outside the C4 spec wherever they stand ('Error functions') | `sqldiff-convert/src/tsql.rs` |
 | `pg.table-variable-rollback` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `pg.trigger-per-event` | `converter` | engine |  | `sqldiff-convert/src/tsql/trigger.rs` |
-| `plus/concat` | `translate` | lemma: `Sqldiff.Mirror/C2b strings/Concatenation` | both operands strings of the slice (ASM-TSQL-PLUS-IS-CONCAT) | `sqldiff-core/profiles/rules/tsql-pg.rules` |
-| `select-assign/into` | `translate` | engine | `SELECT e INTO v FROM ...` is outside C3b except `COUNT(*)` into an int variable (ASM-EXACTLY-ONE-ROW) | `sqldiff-core/profiles/rules/tsql-pg.rules` |
-| `select-assign2/into` | `translate` | engine | as select-assign/into | `sqldiff-core/profiles/rules/tsql-pg.rules` |
-| `semantic/top-without-order` | `lint` | engine | a lint changes no output | `sqldiff-core/profiles/rules/lints.rules` |
-| `string-agg/within-group` | `translate` | engine |  | `sqldiff-core/profiles/rules/tsql-pg.rules` |
-| `sysdatetime/statement-timestamp` | `translate` | axiom: V20 | once per statement on both sides (ASM-TSQL-SYSDATETIME-PER-STATEMENT); the T-SQL part of V20 is partial | `sqldiff-core/profiles/rules/tsql-pg.rules` |
-| `top-distinct/limit` | `translate` | engine |  | `sqldiff-core/profiles/rules/tsql-pg.rules` |
-| `top/limit` | `translate` | engine |  | `sqldiff-core/profiles/rules/tsql-pg.rules` |
+| `plus/concat` | `translate` | lemma: `Sqldiff.Mirror/C2b strings/Concatenation` | both operands strings of the slice (ASM-TSQL-PLUS-IS-CONCAT) | `sqldiff-equiv/profiles/rules/tsql-pg.rules` |
+| `select-assign/into` | `translate` | engine | `SELECT e INTO v FROM ...` is outside C3b except `COUNT(*)` into an int variable (ASM-EXACTLY-ONE-ROW) | `sqldiff-equiv/profiles/rules/tsql-pg.rules` |
+| `select-assign2/into` | `translate` | engine | as select-assign/into | `sqldiff-equiv/profiles/rules/tsql-pg.rules` |
+| `semantic/top-without-order` | `lint` | engine | a lint changes no output | `sqldiff-equiv/profiles/rules/lints.rules` |
+| `string-agg/within-group` | `translate` | engine |  | `sqldiff-equiv/profiles/rules/tsql-pg.rules` |
+| `sysdatetime/statement-timestamp` | `translate` | axiom: V20 | once per statement on both sides (ASM-TSQL-SYSDATETIME-PER-STATEMENT); the T-SQL part of V20 is partial | `sqldiff-equiv/profiles/rules/tsql-pg.rules` |
+| `top-distinct/limit` | `translate` | engine |  | `sqldiff-equiv/profiles/rules/tsql-pg.rules` |
+| `top/limit` | `translate` | engine |  | `sqldiff-equiv/profiles/rules/tsql-pg.rules` |
 | `tsql.*` | `converter` | engine | T-SQL global variables (`@@ROWCOUNT` is `tsql.rowcount`) and built-ins without a rule (`OBJECT_ID()` is `tsql.object_id`), both refused with the reason | `sqldiff-convert/src/tsql.rs` |
 | `tsql.assign.int-trunc` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.bit.arithmetic` | `converter` | engine |  | `sqldiff-convert/src/tsql/bits.rs` |
@@ -245,10 +245,10 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.type.varchar` | `converter` | lemma: `Sqldiff.Mirror/C2b strings/Types` | `varchar(n)` with 1 <= n <= 4000 against `varchar(n)`; `max`, no length and `char(n)` engine | `sqldiff-convert/src/tsql.rs` |
 | `tsql.unique-nulls` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.view-options` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
-| `upsert/if-exists` | `idiom` | engine |  | `sqldiff-core/profiles/rules/idioms.rules` |
-| `upsert/if-exists-locked` | `idiom` | engine |  | `sqldiff-core/profiles/rules/idioms.rules` |
-| `upsert/merge` | `idiom` | engine |  | `sqldiff-core/profiles/rules/idioms.rules` |
-| `upsert/on-conflict` | `idiom` | engine |  | `sqldiff-core/profiles/rules/idioms.rules` |
+| `upsert/if-exists` | `idiom` | engine |  | `sqldiff-equiv/profiles/rules/idioms.rules` |
+| `upsert/if-exists-locked` | `idiom` | engine |  | `sqldiff-equiv/profiles/rules/idioms.rules` |
+| `upsert/merge` | `idiom` | engine |  | `sqldiff-equiv/profiles/rules/idioms.rules` |
+| `upsert/on-conflict` | `idiom` | engine |  | `sqldiff-equiv/profiles/rules/idioms.rules` |
 
 ## Checker refusal reasons
 

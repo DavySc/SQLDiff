@@ -94,7 +94,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("sqldiff-model/src/profile.rs", &["OnceLock"]),
     ("sqldiff-core/src/lint.rs", &["OnceLock"]),
     ("sqldiff-core/src/rule_proofs.rs", &["OnceLock"]),
-    ("sqldiff-core/src/rules/rule.rs", &["OnceLock"]),
+    ("sqldiff-equiv/src/rules/rule.rs", &["OnceLock"]),
     ("sqldiff-model/src/target.rs", &["Mutex", "OnceLock"]),
 ];
 
