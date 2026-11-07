@@ -1,5 +1,5 @@
 {
-  "about": "Unmodified public SQL that runs on its target database. `sqldiff check` must report no `different` finding on any of it: each one would be a false positive a reviewer learns to ignore. Pinned commits keep the gate reproducible; bump them deliberately.",
+  "about": "Unmodified public SQL that runs on its target database. `sqldiff check` must report no `different` finding on any of it: each one would be a false positive a reviewer learns to ignore. Pinned commits keep the gate reproducible; bump them deliberately. ibmi-oss-examples is vendored (not fetched) because upstream stopped serving anonymous fetches; see its SOURCE.md.",
   "sources": [
     {
       "name": "pg_partman",
@@ -17,9 +17,15 @@
     },
     {
       "name": "ibmi-oss-examples",
-      "repo": "https://github.com/IBM/ibmi-oss-examples",
+      "local": "corpus/real-code/vendor/ibmi-oss-examples",
+      "upstream": "https://github.com/IBM/ibmi-oss-examples",
       "commit": "37f17dc6527e1f28314e055c050bb426f5cfe0f1",
       "license": "Apache-2.0",
+      "sha256": {
+        "camel/dtaq_to_kafka/banking_kafka_example.sql": "10dd4eefb6a2fc50b2e69a4bda4cacf0e9d2e33e2a8e9b8ff145f427505a25ad",
+        "camel/db2_bash/setup.sql": "50183976a01e058a997019f3254598a3ea03ab8563e85c99454134e57d4c642c",
+        "nodejs/fastify/dns_api/dns.sql": "f5baa1d0e029114ebf50a21b98be6202b4022a05ba8329d9a45c0f45a4891944"
+      },
       "paths": [{"path": ".", "dialect": "db2i"}]
     },
     {
