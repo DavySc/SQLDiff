@@ -209,6 +209,14 @@ enum Command {
         /// when everything its check reads is the same).
         #[arg(long)]
         fresh: bool,
+        /// How much of what is taken from that store is built again and
+        /// compared (`none`, `sample` or `all`). `sample` (the default)
+        /// checks one stored file in 50 each run, chosen from the tree and
+        /// the store's run count; `all` checks every stored result and
+        /// draft and the whole tree state; `none` trusts the store, and the
+        /// summary and report say the reuse was not verified.
+        #[arg(long, value_name = "MODE", default_value = "sample")]
+        recheck: sqldiff_convert::tree::Recheck,
         /// Only plan: read SRC, find which file defines and uses which
         /// object, order the files so that what a file uses comes first and
         /// write OUT/.sqldiff/plan.json. Nothing is converted.
@@ -721,6 +729,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             };
             review_status_cmd::run(review_status_cmd::Args {
                 tree: sqldiff_convert::tree::Args {
+                    recheck: Default::default(),
                     src,
                     from,
                     to,
@@ -751,6 +760,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             overwrite,
             discard_edits,
             fresh,
+            recheck,
             plan,
             next,
             schema,
@@ -786,6 +796,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 None
             };
             let tree = sqldiff_convert::tree::Args {
+                recheck,
                 src,
                 from,
                 to,

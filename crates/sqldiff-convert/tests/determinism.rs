@@ -60,6 +60,7 @@ impl Fixture {
                 to: Dialect::Postgres,
                 jobs: Some(jobs),
                 no_catalog: false,
+                recheck: Default::default(),
                 template: None,
                 extensions: tree::extensions(Vec::new()),
                 helpers: Vec::new(),
