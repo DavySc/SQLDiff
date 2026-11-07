@@ -1427,6 +1427,8 @@ impl<'x, 'a> Collector<'x, 'a> {
         };
         let mut c = cache.borrow_mut();
         if let Some(x) = c.iter().find(|x| *x.base_scenario() == env) {
+            // The run is already made; the work of making it counts again.
+            sqldiff_model::work::charge(&x.built());
             return x.clone();
         }
         // Paths of this side that reach the same state are joined when the
