@@ -10,6 +10,10 @@
 //! session's assumption flips and the review store, and feeds the review
 //! queue, assumption panel and provenance bar around the pair view.
 
+// Determinism guard (perf plan W0): iterating a hash map or set in a `for` loop is
+// as order-dependent as `.iter()`; each site needs a reasoned `#[allow]`.
+#![warn(clippy::iter_over_hash_type)]
+
 use serde::Serialize;
 use sqldiff_core::{Artifact, Options, Report};
 use sqldiff_syntax::template::Derived;

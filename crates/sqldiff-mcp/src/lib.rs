@@ -14,6 +14,9 @@
 //! reads files and the review store; it writes only when `convert_tree` is
 //! given an output directory, exactly what `sqldiff convert -o` writes.
 
+// Determinism guard (perf plan W0): iterating a hash map or set in a `for` loop is
+// as order-dependent as `.iter()`; each site needs a reasoned `#[allow]`.
+#![warn(clippy::iter_over_hash_type)]
 #![recursion_limit = "512"]
 
 use std::collections::BTreeMap;

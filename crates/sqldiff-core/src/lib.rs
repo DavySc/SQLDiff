@@ -4,6 +4,10 @@
 //! The engine never reports a false "equal": anything it cannot show to be
 //! equivalent is reported as "unknown" or "equal under assumptions".
 
+// Determinism guard (perf plan W0): iterating a hash map or set in a `for` loop is
+// as order-dependent as `.iter()`; each site needs a reasoned `#[allow]`.
+#![warn(clippy::iter_over_hash_type)]
+
 pub use sqldiff_model::artifact;
 pub use sqldiff_model::assumptions;
 pub mod bind;

@@ -11,6 +11,10 @@
 //! rules over the lossless CST; see `tsql`). Expression-level and behavioural conversion follow
 //! once expression trees and the semantic IR land.
 
+// Determinism guard (perf plan W0): iterating a hash map or set in a `for` loop is
+// as order-dependent as `.iter()`; each site needs a reasoned `#[allow]`.
+#![warn(clippy::iter_over_hash_type)]
+
 use serde::{Deserialize, Serialize};
 pub use shared::Shared;
 use sqldiff_core::{Artifact, Dialect, Options, Report};

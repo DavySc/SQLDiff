@@ -605,7 +605,7 @@ impl<'x, 'a> Routine<'x, 'a> {
     }
 
     /// Facts about every parameter and variable, as seen at `at`.
-    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: names are inserted independently
+    #[allow(clippy::disallowed_methods, clippy::iter_over_hash_type)] // hash order cannot reach an output: each name gets its own entry in `out`
     fn facts(&self, at: usize, node: &SyntaxNode) -> HashMap<String, VarFact> {
         let mut out = HashMap::new();
         let names: HashSet<&String> = self.params.keys().chain(self.locals.keys()).collect();
@@ -1673,6 +1673,7 @@ impl Taint {
 impl<'x, 'a> Routine<'x, 'a> {
     /// Names unit `n` (a statement) writes: assigned variables, written
     /// tables and everything a statement sets as a side effect.
+    #[allow(clippy::iter_over_hash_type)] // hash order cannot reach an output: names are only inserted into a set
     fn statement_writes(&self, n: &SyntaxNode) -> HashSet<String> {
         let (s, e) = cst::sig_range(n);
         let mut w: HashSet<String> = STATUS.iter().map(|x| x.to_string()).collect();
@@ -1760,6 +1761,7 @@ impl<'x, 'a> Routine<'x, 'a> {
                             writes.extend(self.statement_writes(&s));
                         }
                         let (ps, pe) = cst::sig_range(&p);
+                        #[allow(clippy::iter_over_hash_type)] // names are only inserted into a set
                         for (name, sites) in &self.sites {
                             if sites.iter().any(|x| ps <= x.start && x.start < pe) {
                                 writes.insert(name.trim_start_matches('@').to_string());
@@ -3702,7 +3704,7 @@ impl Hints<'_> {
 
 // ---- examination ------------------------------------------------------------------
 
-#[allow(clippy::disallowed_methods, clippy::too_many_arguments)] // hash order cannot reach an output: records are only tested with `contains`
+#[allow(clippy::disallowed_methods, clippy::too_many_arguments)] // hash order cannot reach an output: records are only tested with `contains`, and the variable facts are walked in sorted name order
 fn examine(
     ra: &Routine,
     rb: &Routine,
@@ -4853,10 +4855,17 @@ fn describe_inputs(f: &Found, d: Dialect) -> String {
             }
         }
     }
-    for (t, n) in &f.shape {
-        if *n == 0 {
-            parts.push(format!("{} has no rows", spell(t)));
-        }
+    // In name order: the witness text must not depend on the hash layout.
+    #[allow(clippy::disallowed_methods)] // sorted on the next line
+    let mut empty: Vec<&String> = f
+        .shape
+        .iter()
+        .filter(|(_, n)| **n == 0)
+        .map(|(t, _)| t)
+        .collect();
+    empty.sort();
+    for t in empty {
+        parts.push(format!("{} has no rows", spell(t)));
     }
     for (t, row, cols) in tables {
         let n = f.shape.get(&t).copied().unwrap_or(1);

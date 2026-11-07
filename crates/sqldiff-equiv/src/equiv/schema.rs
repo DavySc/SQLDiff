@@ -481,7 +481,7 @@ impl Schema {
 
     /// This schema with the tables `ddl` creates added; they replace tables
     /// of the same name.
-    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: set union / membership; set union
+    #[allow(clippy::disallowed_methods, clippy::iter_over_hash_type)] // hash order cannot reach an output: set union / membership; set union; each name gets its own entry
     pub fn with_ddl(&self, ddl: &str, d: Dialect) -> Schema {
         let mut cat = Catalog::default();
         ddl::load_tree(&mut cat, &parse(ddl, d).syntax(), d);

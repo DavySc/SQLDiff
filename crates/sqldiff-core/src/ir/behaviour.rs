@@ -122,6 +122,7 @@ impl<'x, 'a> SideIr<'x, 'a> {
                 }
             }
         }
+        #[allow(clippy::iter_over_hash_type)] // each value is sorted on its own
         for v in reads.values_mut() {
             v.sort_by_key(|&i| cfg.node(i).syntax.as_ref().map(|s| s.text_range().start()));
         }
