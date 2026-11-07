@@ -172,7 +172,7 @@ impl Allowance {
 
     /// Whether `n` more units may be spent.
     pub fn allows(&self, n: u64) -> bool {
-        self.left.get().is_none_or(|l| n <= l)
+        self.left.get().map_or(true, |l| n <= l)
     }
 
     /// Spends `n` units (saturating); nothing when the allowance is off.
