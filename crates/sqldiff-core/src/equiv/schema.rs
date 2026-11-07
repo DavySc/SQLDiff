@@ -327,7 +327,7 @@ impl Table {
 /// Tables by lower-cased unqualified name.
 #[derive(Debug, Clone, Default)]
 pub struct Schema {
-    tables: HashMap<String, Table>,
+    tables: std::sync::Arc<HashMap<String, Table>>,
     pub sources: Vec<String>,
     /// PostgreSQL: the system catalogs are known too.
     pg_system: bool,
@@ -337,15 +337,15 @@ pub struct Schema {
     /// routines, schemas, indexes and constraint names for calls and comments.
     view: Option<std::sync::Arc<CatalogView>>,
     /// Unqualified names of user tables in more than one schema.
-    ambiguous: std::collections::HashSet<String>,
+    ambiguous: std::sync::Arc<std::collections::HashSet<String>>,
     /// Lower-cased unqualified names of views defined with a `*` select
     /// list (`catalog::Table::star_outputs`): which columns of their sources
     /// they return is not modelled.
-    pub star_views: std::collections::HashSet<String>,
+    pub star_views: std::sync::Arc<std::collections::HashSet<String>>,
     /// PostgreSQL: the stored spellings of every catalog name (schemas,
     /// tables and views, columns, keys, indexes, routines), by lower case.
     /// Two spellings under one key are names that differ only in letter case.
-    spellings: HashMap<String, std::collections::BTreeSet<String>>,
+    spellings: std::sync::Arc<HashMap<String, std::collections::BTreeSet<String>>>,
     /// A `*` is compared as the columns it returns, listed from this
     /// schema's tables (hidden ones left out), not as one term: set on both
     /// sides of a comparison when either has a table with HIDDEN columns
@@ -454,8 +454,8 @@ impl Schema {
             let mut copy = t.clone();
             copy.schema = None;
             copy.name = name.to_string();
-            out.ambiguous.remove(name);
-            out.tables.insert(name.to_string(), copy);
+            std::sync::Arc::make_mut(&mut out.ambiguous).remove(name);
+            std::sync::Arc::make_mut(&mut out.tables).insert(name.to_string(), copy);
         }
         Some(out)
     }
@@ -467,19 +467,28 @@ impl Schema {
         ddl::load_tree(&mut cat, &parse(ddl, d).syntax(), d);
         let extra = Schema::from_view(&CatalogView::new(d, &[&cat]));
         let mut s = self.clone();
+        let (ambiguous, star_views, tables, spellings) = (
+            std::sync::Arc::make_mut(&mut s.ambiguous),
+            std::sync::Arc::make_mut(&mut s.star_views),
+            std::sync::Arc::make_mut(&mut s.tables),
+            std::sync::Arc::make_mut(&mut s.spellings),
+        );
         for n in extra.tables.keys() {
-            if s.tables
+            if tables
                 .get(n)
                 .is_some_and(|t| t.schema != extra.tables[n].schema)
             {
-                s.ambiguous.insert(n.clone());
+                ambiguous.insert(n.clone());
             }
         }
-        s.ambiguous.extend(extra.ambiguous);
-        s.star_views.extend(extra.star_views);
-        s.tables.extend(extra.tables);
-        for (k, v) in extra.spellings {
-            s.spellings.entry(k).or_default().extend(v);
+        ambiguous.extend(extra.ambiguous.iter().cloned());
+        star_views.extend(extra.star_views.iter().cloned());
+        tables.extend(extra.tables.iter().map(|(k, v)| (k.clone(), v.clone())));
+        for (k, v) in extra.spellings.iter() {
+            spellings
+                .entry(k.clone())
+                .or_default()
+                .extend(v.iter().cloned());
         }
         s
     }
@@ -505,10 +514,10 @@ impl Schema {
         }
         let key = key(t.schema.as_deref(), &t.name).to_lowercase();
         let extra = Schema::from_view(&CatalogView::new(d, &[&cat]));
-        let table = extra.tables.into_values().next()?;
+        let table = extra.tables.values().next()?.clone();
         let mut s = self.clone();
-        s.ambiguous.remove(&key);
-        s.tables.insert(key, table);
+        std::sync::Arc::make_mut(&mut s.ambiguous).remove(&key);
+        std::sync::Arc::make_mut(&mut s.tables).insert(key, table);
         Some(s)
     }
 
@@ -596,8 +605,8 @@ impl Schema {
                 })
             };
             if mirrored(self, other) && mirrored(other, self) {
-                self.star_views.clear();
-                other.star_views.clear();
+                self.star_views = Default::default();
+                other.star_views = Default::default();
             }
         }
     }
@@ -605,12 +614,24 @@ impl Schema {
     /// The facts equivalence needs from one side's catalog (DDL, bundles and
     /// adapter catalogs, as the binder sees them).
     pub fn from_view(view: &CatalogView) -> Schema {
+        Self::build(
+            view,
+            view.supplied.then(|| std::sync::Arc::new(view.clone())),
+        )
+    }
+
+    /// As `from_view`, keeping the shared view instead of copying it.
+    pub fn from_shared_view(view: &std::sync::Arc<CatalogView>) -> Schema {
+        Self::build(view, view.supplied.then(|| std::sync::Arc::clone(view)))
+    }
+
+    fn build(view: &CatalogView, shared: Option<std::sync::Arc<CatalogView>>) -> Schema {
         let d = view.dialect;
         let mut s = Schema {
             sources: view.origins.clone(),
             pg_system: d == Dialect::Postgres,
             tsql_system: d == Dialect::Tsql,
-            view: view.supplied.then(|| std::sync::Arc::new(view.clone())),
+            view: shared,
             ..Schema::default()
         };
         if d == Dialect::Postgres {
@@ -632,13 +653,13 @@ impl Schema {
                         .chain(t.indexes.iter().map(|i| &i.name))
                 }));
             for n in names {
-                s.spellings
+                std::sync::Arc::make_mut(&mut s.spellings)
                     .entry(n.to_lowercase())
                     .or_default()
                     .insert(n.clone());
             }
         }
-        s.star_views.extend(
+        std::sync::Arc::make_mut(&mut s.star_views).extend(
             view.catalog
                 .tables
                 .iter()
@@ -685,9 +706,9 @@ impl Schema {
                 .map(|x| x.to_lowercase())
                 .filter(|x| x != "dbo" && x != "public");
             if s.tables.get(&name).is_some_and(|o| o.schema != schema) {
-                s.ambiguous.insert(name.clone());
+                std::sync::Arc::make_mut(&mut s.ambiguous).insert(name.clone());
             }
-            s.tables.insert(
+            std::sync::Arc::make_mut(&mut s.tables).insert(
                 name.clone(),
                 Table {
                     schema,
