@@ -181,6 +181,15 @@ struct Routine<'x, 'a> {
     sql_set_result: bool,
     /// Statements and conditions with what they read and write, built on first use.
     units: std::cell::OnceCell<Vec<Unit>>,
+    /// The first unit or statement (in tree order) that starts at each byte
+    /// offset, built on first use: a file of thousands of routines is asked
+    /// once per edit, and a scan of the whole tree each time was quadratic.
+    starts: std::cell::OnceCell<std::collections::BTreeMap<usize, SyntaxNode>>,
+    /// Names in the spelling the routine writes them, built on first use
+    /// (see `learn_spelling`).
+    spelling: std::cell::OnceCell<std::rc::Rc<HashMap<String, String>>>,
+    /// Opening and closing parentheses of the whole routine (see `validity`).
+    parens: std::cell::OnceCell<(usize, usize)>,
 }
 
 impl<'x, 'a> Routine<'x, 'a> {
@@ -245,16 +254,28 @@ impl<'x, 'a> Routine<'x, 'a> {
                     && matches!(u.kind, lower::UnitKind::Proc | lower::UnitKind::Script),
             sql_set_result,
             units: std::cell::OnceCell::new(),
+            starts: std::cell::OnceCell::new(),
+            spelling: std::cell::OnceCell::new(),
+            parens: std::cell::OnceCell::new(),
         };
         r.scan();
         r
     }
 
     fn node_at(&self, offset: usize) -> Option<SyntaxNode> {
-        self.side.root.descendants().find(|n| {
-            (n.kind().is_unit() || n.kind() == SyntaxKind::STATEMENT)
-                && cst::sig_range(n).0 == offset
-        })
+        self.starts
+            .get_or_init(|| {
+                let mut m = std::collections::BTreeMap::new();
+                for n in self.side.root.descendants() {
+                    if n.kind().is_unit() || n.kind() == SyntaxKind::STATEMENT {
+                        // The first in tree order wins, as a `find` would.
+                        m.entry(cst::sig_range(&n).0).or_insert(n);
+                    }
+                }
+                m
+            })
+            .get(&offset)
+            .cloned()
     }
 
     /// Declarations, assignment sites and loops.
@@ -1409,6 +1430,36 @@ fn overlaps(a: Span, b: Span) -> bool {
     a.0 < b.1 && b.0 < a.1
 }
 
+/// A set of spans that answers "does any of them overlap this span" in
+/// logarithmic time (same answer as scanning them all with [`overlaps`]).
+struct SpanSet {
+    /// Spans by start.
+    spans: Vec<Span>,
+    /// `max_end[i]` is the largest end among `spans[..=i]`.
+    max_end: Vec<usize>,
+}
+
+impl SpanSet {
+    fn new(spans: &[Span]) -> SpanSet {
+        let mut spans = spans.to_vec();
+        spans.sort_unstable();
+        let mut max_end = Vec::with_capacity(spans.len());
+        let mut top = 0;
+        for s in &spans {
+            top = top.max(s.1);
+            max_end.push(top);
+        }
+        SpanSet { spans, max_end }
+    }
+
+    fn overlaps(&self, b: Span) -> bool {
+        // Only a span that starts before `b` ends can overlap it; among
+        // those, one overlaps when the furthest end is past `b`'s start.
+        let k = self.spans.partition_point(|s| s.0 < b.1);
+        k > 0 && b.0 < self.max_end[k - 1]
+    }
+}
+
 fn meets(a: &HashSet<String>, b: &HashSet<String>) -> bool {
     !a.is_empty() && !b.is_empty() && (a.contains(ANY) || b.contains(ANY) || !a.is_disjoint(b))
 }
@@ -1561,7 +1612,8 @@ impl<'x, 'a> Routine<'x, 'a> {
         }
         let here = cst::sig_range(n);
         let units = self.units();
-        let changed_unit = |u: &Unit| changed.iter().any(|c| overlaps(*c, (u.start, u.end)));
+        let changed_set = SpanSet::new(changed);
+        let changed_unit = |u: &Unit| changed_set.overlaps((u.start, u.end));
         let in_loop_with_n = |u: &Unit| {
             self.loops
                 .iter()
@@ -1650,7 +1702,8 @@ impl<'x, 'a> Routine<'x, 'a> {
         units: &[Unit],
         changed: &[Span],
     ) -> Option<usize> {
-        let changed_unit = |u: &Unit| changed.iter().any(|c| overlaps(*c, (u.start, u.end)));
+        let changed_set = SpanSet::new(changed);
+        let changed_unit = |u: &Unit| changed_set.overlaps((u.start, u.end));
         let after = |u: &Unit| {
             !overlaps((u.start, u.end), here)
                 && (u.start >= here.1
@@ -3646,7 +3699,7 @@ fn validity(
                 t.iter().filter(|x| x.kind == K::RParen).count(),
             )
         };
-        let (fo, fc) = count(&r.toks);
+        let (fo, fc) = *r.parens.get_or_init(|| count(&r.toks));
         let (open, close) = count(&tokens(n));
         (fo != fc && open != close && n.kind() == SyntaxKind::STATEMENT)
             .then(|| format!("{open} opening and {close} closing parentheses"))
@@ -3797,20 +3850,28 @@ fn what(x: &Shape, n: &SyntaxNode, d: Dialect) -> String {
 thread_local! {
     /// Original spelling of the names in the routine being examined, by
     /// lower-cased name, so witnesses show `@MinPrice` rather than `@minprice`.
-    static SPELLING: std::cell::RefCell<HashMap<String, String>> = Default::default();
+    static SPELLING: std::cell::RefCell<std::rc::Rc<HashMap<String, String>>> = Default::default();
 }
 
 fn learn_spelling(r: &Routine) {
-    let mut map = HashMap::new();
-    for t in &r.toks {
-        let name = match t.kind {
-            K::Var => t.text.trim_start_matches('@').to_string(),
-            K::Word => t.text.clone(),
-            K::Quoted => cst::unquote(&t.text).to_string(),
-            _ => continue,
-        };
-        map.entry(name.to_lowercase()).or_insert(name);
-    }
+    // Read from the routine's tokens once, not at every edit of a file that
+    // has thousands of them.
+    let map = r
+        .spelling
+        .get_or_init(|| {
+            let mut map = HashMap::new();
+            for t in &r.toks {
+                let name = match t.kind {
+                    K::Var => t.text.trim_start_matches('@').to_string(),
+                    K::Word => t.text.clone(),
+                    K::Quoted => cst::unquote(&t.text).to_string(),
+                    _ => continue,
+                };
+                map.entry(name.to_lowercase()).or_insert(name);
+            }
+            std::rc::Rc::new(map)
+        })
+        .clone();
     SPELLING.with(|s| *s.borrow_mut() = map);
 }
 
@@ -4495,5 +4556,36 @@ mod tests {
         );
         assert_eq!(eval::date_neighbour("99991231", 1), None);
         assert_eq!(eval::date_neighbour("hello", 1), None);
+    }
+
+    /// The span set answers as a scan with `overlaps` does, for spans that
+    /// nest, touch, repeat and lie in any order.
+    #[test]
+    fn a_span_set_answers_like_a_scan() {
+        // A small deterministic generator, no dependency.
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = |m: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % m as u64) as usize
+        };
+        for _ in 0..300 {
+            let n = next(8);
+            let spans: Vec<Span> = (0..n)
+                .map(|_| {
+                    let a = next(40);
+                    (a, a + next(12))
+                })
+                .collect();
+            let set = SpanSet::new(&spans);
+            for a in 0..45 {
+                for len in 0..8 {
+                    let q = (a, a + len);
+                    let scan = spans.iter().any(|c| overlaps(*c, q));
+                    assert_eq!(set.overlaps(q), scan, "{spans:?} {q:?}");
+                }
+            }
+        }
     }
 }
