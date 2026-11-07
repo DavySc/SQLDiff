@@ -91,7 +91,7 @@ pub fn apply_statement(cat: &mut Catalog, t: &[Tok], dialect: Dialect) {
 
 /// [`apply_statement`] with the catalog's index, which it keeps current: a
 /// load of many statements finds and replaces tables without scanning.
-fn apply_indexed(cat: &mut Catalog, ix: &mut NameIndex, t: &[Tok], dialect: Dialect) {
+pub(super) fn apply_indexed(cat: &mut Catalog, ix: &mut NameIndex, t: &[Tok], dialect: Dialect) {
     let Some(first) = t.first() else { return };
     if first.is_kw("CREATE") {
         let mut i = 1;
