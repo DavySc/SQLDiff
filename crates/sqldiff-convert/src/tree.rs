@@ -2311,7 +2311,7 @@ fn convert_templates(
             let present: Vec<(usize, usize)> = keys
                 .iter()
                 .enumerate()
-                .filter(|(_, k)| k.as_ref().is_some_and(|k| c.store.has(k)))
+                .filter(|(_, k)| k.as_ref().is_some_and(|k| c.store.whole_entry(k).is_some()))
                 .map(|(i, _)| (i, jobs_list[i].template.text.len()))
                 .collect();
             a.recheck.pick(&present, seed)
@@ -2335,7 +2335,7 @@ fn convert_templates(
             // A file is stored when its job is.
             let mut stored_file = vec![false; inputs.len()];
             for (j, k) in jobs_list.iter().zip(&keys) {
-                let here = !c.fresh && k.as_ref().is_some_and(|k| c.store.has(k));
+                let here = !c.fresh && k.as_ref().is_some_and(|k| c.store.whole_entry(k).is_some());
                 match j.target {
                     Target::File(f) => stored_file[f] = here,
                     Target::Pair(h, f) => {
@@ -2386,7 +2386,10 @@ fn convert_templates(
             Target::Pair(h, _) => inputs[h].rel.as_str(),
         };
         let stored = match (cache, key) {
-            (Some(c), Some(k)) if !c.fresh => c.store.get(k).map(|(r, ..)| (c, k, r)),
+            (Some(c), Some(k)) if !c.fresh => c
+                .store
+                .whole_entry(k)
+                .and_then(|e| c.store.get(&e).map(|(r, ..)| (c, e, r))),
             _ => None,
         };
         if let Some((_, k, conv)) = &stored {
@@ -2394,7 +2397,7 @@ fn convert_templates(
                 let mut conv = conv.clone();
                 finish.apply(&mut conv);
                 progress.tick();
-                return Some((Some((*k).clone()), conv, 0.0, true, false));
+                return Some((Some(k.clone()), conv, 0.0, true, false));
             }
         }
         if stored.is_none() && in_increment.as_ref().is_some_and(|m| !m[idx]) {
@@ -2413,20 +2416,37 @@ fn convert_templates(
             let mut old = old.clone();
             finish.share(&mut old);
             if !crate::store::compare(&old, &c) {
-                cc.store.bundle(k, &old, &c);
+                cc.store.bundle(&k.key, &old, &c);
                 mismatch.lock().unwrap().push(format!(
                     "{name}: the stored result {} differs from a fresh check of the same \
                      input; both are in {}/{}.json. The store is emptied: run again.",
-                    k.as_str(),
+                    k.key.as_str(),
                     crate::store::MISMATCH_DIR,
-                    k.as_str()
+                    k.key.as_str()
                 ));
             }
         }
         let mut in_store = None;
         if let (Some(cc), Some(k)) = (cache, key) {
-            match cc.store.put(k, &c, None, false) {
-                Ok(()) => in_store = Some(k.clone()),
+            // The key holds the catalogs' digests, so there is nothing to
+            // replay: an entry with an empty read set.
+            match cc.store.put(
+                k,
+                &c,
+                None,
+                false,
+                &sqldiff_core::catalog::record::Reads::default(),
+                cc.fresh,
+            ) {
+                Ok((e, crate::store::Put::Differs)) => {
+                    mismatch.lock().unwrap().push(format!(
+                        "{name}: a result is stored under {}/{} with other output than a \
+                         fresh check. The store is emptied: run again.",
+                        e.key.as_str(),
+                        e.id
+                    ));
+                }
+                Ok((e, _)) => in_store = Some(e),
                 Err(e) => eprintln!("sqldiff: result not stored: {e}"),
             }
         }
@@ -2442,7 +2462,7 @@ fn convert_templates(
         found.sort();
         return Err(found.join("\n"));
     }
-    let done: Vec<(Option<crate::store::Key>, Conversion, f64, bool, bool)> = done
+    let done: Vec<(Option<crate::store::EntryRef>, Conversion, f64, bool, bool)> = done
         .into_iter()
         .map(|d| d.ok_or_else(|| CANCELLED.to_string()))
         .collect::<Result<_, _>>()?;
@@ -2463,7 +2483,7 @@ fn convert_templates(
                 out[k] = Some((
                     match key {
                         Some(key) => Held::Stored {
-                            key,
+                            entry: key,
                             core: crate::Core::take(&mut c),
                         },
                         None => Held::Whole(Box::new(c)),

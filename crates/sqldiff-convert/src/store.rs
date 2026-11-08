@@ -587,6 +587,19 @@ impl Store {
         found
     }
 
+    /// The entry of a result whose key holds everything it read (a template
+    /// job: its key has the catalog digests, so its read set is empty and
+    /// always holds), if one is stored.
+    pub fn whole_entry(&self, key: &Key) -> Option<EntryRef> {
+        self.entries(key)
+            .into_iter()
+            .next()
+            .map(|(id, _)| EntryRef {
+                key: key.clone(),
+                id,
+            })
+    }
+
     /// The stored conversion of one entry. A file that does not read back
     /// whole, or does not name its own key and id, is a miss.
     pub fn get(&self, e: &EntryRef) -> Option<(Conversion, Option<crate::check::Mix>, bool)> {
