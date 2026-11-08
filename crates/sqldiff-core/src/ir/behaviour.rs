@@ -26,7 +26,7 @@ use std::rc::Rc;
 use sqldiff_syntax::{ast, Dialect, SyntaxNode};
 
 use super::cfg::{Cfg, Effect, NodeId};
-use super::delta::scan_differing;
+use super::delta::{scan_differing, KeyProbe};
 use super::interp::{
     Effects, Exit, Explorer, Fate, Fault, KeyUniverse, Outcome, Routed, Scenario, TempState,
 };
@@ -1690,9 +1690,13 @@ impl<'x, 'a> Collector<'x, 'a> {
         let (ca, cb) = (&self.sa.cfg, &self.sb.cfg);
         // Only paths that reach the failing statement belong to a fault
         // scenario.
-        let reached = |o: &Outcome| match sc {
-            Kind::Fault { key, .. } => o.fault_hit || o.effects.contains_key(key.as_str()),
-            _ => true,
+        let probe = match sc {
+            Kind::Fault { key, .. } => Some(KeyProbe::new(key.as_str())),
+            _ => None,
+        };
+        let reached = |o: &Outcome| match &probe {
+            Some(p) => o.fault_hit || o.effects.contains_probe(p),
+            None => true,
         };
         let mut pa = Self::explorer(&self.xa, &self.charged, "a", ca, cb, scen_a, &self.keys)
             .explore_where(ca, scen_a, &reached);
