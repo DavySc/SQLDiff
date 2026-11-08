@@ -15,6 +15,8 @@ use super::edits::{Edit, Model, Rng};
 pub struct Fixture {
     pub dir: PathBuf,
     pub to: Dialect,
+    /// Set by `write` from the model: the job checks without a catalog.
+    pub no_catalog: std::cell::Cell<bool>,
 }
 
 impl Fixture {
@@ -26,11 +28,16 @@ impl Fixture {
             std::env::temp_dir().join(format!("sqldiff-t1-{name}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        Fixture { dir, to }
+        Fixture {
+            dir,
+            to,
+            no_catalog: std::cell::Cell::new(false),
+        }
     }
 
     /// Writes the model's tree and base catalogs, replacing what was there.
     pub fn write(&self, m: &Model) {
+        self.no_catalog.set(m.no_catalog);
         let src = self.dir.join("src");
         let _ = std::fs::remove_dir_all(&src);
         for (p, text) in m.files() {
@@ -65,7 +72,7 @@ impl Fixture {
                 from: Dialect::Tsql,
                 to: self.to,
                 jobs: Some(2),
-                no_catalog: false,
+                no_catalog: self.no_catalog.get(),
                 recheck: Default::default(),
                 template: None,
                 extensions: tree::extensions(Vec::new()),
@@ -266,9 +273,15 @@ pub fn one(to: Dialect, seed: u64, edit: &Edit) -> Outcome {
 /// [`one`] that reports a resume that differs from a fresh run in `verdict`
 /// instead of panicking.
 pub fn try_one(to: Dialect, seed: u64, edit: &Edit) -> Outcome {
-    let tag = format!("{to:?}-{seed}-{edit:?}");
+    try_one_in(to, seed, edit, false)
+}
+
+/// [`try_one`] on a tree that has a system-versioned table from the start
+/// when `hidden`.
+pub fn try_one_in(to: Dialect, seed: u64, edit: &Edit, hidden: bool) -> Outcome {
+    let tag = format!("{to:?}-{seed}-{edit:?}-{hidden}");
     let f = Fixture::new(&tag, to);
-    let mut model = Model::generate(seed);
+    let mut model = Model::generate_with(seed, hidden);
     f.write(&model);
     f.run("res", false);
     let before = per_file(&f.dir.join("res"));

@@ -49,10 +49,22 @@ fn recheck_at_most(e: &Edit) -> usize {
         Edit::ViewBody | Edit::AddRoutine | Edit::DropRoutine | Edit::AddTrigger => 5,
         Edit::ChangeParameterType | Edit::AddSchemaTable | Edit::BaseDrop => 6,
         Edit::DropTrigger => 3,
-        Edit::VersioningOn => usize::MAX / 2,
+        Edit::VersioningOn
+        | Edit::DropAllTables
+        | Edit::NoProcedures
+        | Edit::DropFunctions
+        | Edit::CaseClash
+        | Edit::SourceLookalikes
+        | Edit::SourceOverrides
+        | Edit::TargetOverrides
+        | Edit::TargetLookalikes
+        | Edit::NoBaseA
+        | Edit::NoBaseB
+        | Edit::RetypeSide
+        | Edit::NoCatalog => usize::MAX / 2,
         Edit::BaseRetype => 5,
         Edit::BaseTable => 4,
-        Edit::SplitBase => 7,
+        Edit::SplitBase => 12,
     };
     measured.saturating_add(2)
 }
@@ -155,6 +167,23 @@ const EXEMPT: &[(Dialect, &str, &str)] = &[
         "DROP TRIGGER is compared only from T-SQL to PostgreSQL",
     ),
     (Dialect::Db2i, "DropTrigger", "same"),
+    (
+        Dialect::Postgres,
+        "TargetOverrides",
+        "a table of the tree shadows a base-catalog table of the same name on the target side as well: nothing a file reads changes (measured)",
+    ),
+    (Dialect::Db2i, "TargetOverrides", "same"),
+    (Dialect::Db2i, "SourceOverrides", "same, and DROP TRIGGER (the one file it changes on PostgreSQL) is not compared for Db2 for i"),
+    (
+        Dialect::Postgres,
+        "NoBaseB",
+        "the target base catalog only repeats ext.Ref in the target dialect; no file's output depends on that copy (measured)",
+    ),
+    (
+        Dialect::Db2i,
+        "RetypeSide",
+        "the trigger that reads the pseudo table is not converted to Db2 for i (`inserted`/`deleted` need a rewrite)",
+    ),
 ];
 
 #[test]
