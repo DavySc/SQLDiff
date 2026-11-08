@@ -288,6 +288,8 @@ pub struct Env {
     pub skip_witnesses: bool,
     /// Budgets lowered by `Options::work_budgets` (routine, file).
     pub work_budgets: Option<(u64, u64)>,
+    /// Work caps replaced by `Options::work_caps` (unit, file).
+    pub work_caps: Option<(u64, u64)>,
     /// The condition pairs (start offset on side A, on side B) the identity
     /// analysis proved to be the same fact about the input
     /// (`equiv::identity`, perf plan W6c E2). `None`: no analysis ran for
@@ -309,6 +311,7 @@ impl Env {
             commit_level: None,
             skip_witnesses: false,
             work_budgets: None,
+            work_caps: None,
             identified: None,
         }
     }
@@ -322,6 +325,7 @@ impl Env {
                 .and_then(|t| crate::ledger::declared_commit_level(t)),
             skip_witnesses: opts.skip_witnesses,
             work_budgets: opts.work_budgets,
+            work_caps: opts.work_caps,
             identified: None,
             ..Env::from_flips(&opts.flips)
         }
@@ -1106,6 +1110,27 @@ pub(crate) fn norm_cond(c: &str) -> String {
     out.join(" ")
 }
 
+/// Statements of a unit: the larger count of the two sides' statement nodes.
+fn statements_of(sa: &SideIr, sb: &SideIr) -> u64 {
+    let n = |s: &SideIr| s.cfg.nodes.iter().filter(|n| n.stmt().is_some()).count() as u64;
+    n(sa).max(n(sb))
+}
+
+/// `statements_of` for a routine pair before its collector exists (the file
+/// cap needs the largest unit cap first). Lowers both sides once more.
+fn pair_statements(
+    a: &Analyzed,
+    b: &Analyzed,
+    ra: Option<SyntaxNode>,
+    rb: Option<SyntaxNode>,
+) -> u64 {
+    let n = |x: &Analyzed, y: &Analyzed, r: Option<SyntaxNode>| {
+        let cfg = super::cfg::lower_routine(x, other_temps(x, y), r);
+        cfg.nodes.iter().filter(|n| n.stmt().is_some()).count() as u64
+    };
+    n(a, b, ra).max(n(b, a, rb))
+}
+
 /// T-SQL compared against PostgreSQL or Db2 for i: the other side's
 /// temporary tables, which a table variable may have been converted to.
 fn other_temps(x: &Analyzed, other: &Analyzed) -> HashSet<String> {
@@ -1356,17 +1381,65 @@ struct Collector<'x, 'a> {
     flip_spent: RefCell<BTreeMap<String, u64>>,
     /// While a flipped scenario is recomputed: the diffs it may still make.
     replay: Cell<Option<u64>>,
+    /// Keeps the unit open for the statement-level phase check.
+    _phase: sqldiff_model::work::UnitPhase,
     /// `diff` calls spent by this routine pair, and whether a budget ran out.
     spent: Cell<u64>,
     out_of_budget: Cell<bool>,
     /// Which work budget ran out first (`out_of_budget` says only that one
     /// did), for the witness of the `equiv.budget` findings.
-    cap_hit: Cell<Option<&'static str>>,
+    cap_hit: RefCell<Option<String>>,
     /// `diff` calls spent by the whole file so far (shared by its routine
     /// pairs), and the budgets in force (routine, file).
     file_spent: Rc<Cell<u64>>,
     budgets: (u64, u64),
+    /// The work caps (see `unit_work_cap`): this unit's allowance and where
+    /// its count started, and the file's.
+    unit_start: u64,
+    unit_cap: u64,
+    file_work: FileWork,
 }
+
+/// The metered-work allowance of one engine comparison's behaviour analysis
+/// (one `analyze` call, not the outermost meter: `convert` checks the same
+/// file in several comparisons and each gets a full allowance).
+#[derive(Clone, Copy)]
+struct FileWork {
+    /// The meter's total when the analysis began.
+    start: u64,
+    /// The file cap before the unit's own cap is taken into account.
+    cap: u64,
+}
+
+/// Work cap of one unit (a routine pair, or the statements outside any
+/// routine): `max(2^24, 2^15 x statements)`. The statement part keeps a long
+/// one-transaction script, whose fault replays are quadratic in its
+/// statements, below its cap up to the explorer's own step budget (Davy,
+/// 2026-11-07). One place, so the formula can change without touching the
+/// checks.
+pub const UNIT_WORK_FLOOR: u64 = 1 << 24;
+pub const UNIT_WORK_PER_STATEMENT: u64 = 1 << 15;
+pub fn unit_work_cap(statements: u64) -> u64 {
+    UNIT_WORK_FLOOR.max(UNIT_WORK_PER_STATEMENT.saturating_mul(statements))
+}
+
+/// Work cap of a file's analysis: `max(2^26, 2^20 x units)`, and never below
+/// the largest unit cap (otherwise a unit would be cut by the file before its
+/// own allowance).
+pub const FILE_WORK_FLOOR: u64 = 1 << 26;
+pub const FILE_WORK_PER_UNIT: u64 = 1 << 20;
+pub fn file_work_cap(units: u64, largest_unit_cap: u64) -> u64 {
+    FILE_WORK_FLOOR
+        .max(FILE_WORK_PER_UNIT.saturating_mul(units))
+        .max(largest_unit_cap)
+}
+
+/// What one check of the cap may overshoot by: an `outcomes` call can make two
+/// first-request explorer builds and two `explore` calls, each bounded by
+/// `MAX_PATHS` x `MAX_STEPS` plus `JOIN_TICKS` (about 0.7M steps), plus the
+/// unmetered `reads` and `pairs`. About 2.8M, 17% of the smallest unit cap.
+#[doc(hidden)]
+pub const CAP_OVERSHOOT: u64 = 2_800_000;
 
 /// The (rule, anchor) of divergences found.
 type Divergences = BTreeSet<(&'static str, String)>;
@@ -1408,6 +1481,7 @@ impl<'x, 'a> Collector<'x, 'a> {
         ra: Option<SyntaxNode>,
         rb: Option<SyntaxNode>,
         file_spent: Rc<Cell<u64>>,
+        file_work: FileWork,
     ) -> Self {
         let env_budgets = env.work_budgets.unwrap_or((ROUTINE_DIFFS, FILE_DIFFS));
         let (mut sa, mut sb) = (SideIr::new(a, b, ra), SideIr::new(b, a, rb));
@@ -1416,6 +1490,9 @@ impl<'x, 'a> Collector<'x, 'a> {
         }
         let keys = KeyUniverse::of(&[&sa.cfg, &sb.cfg]);
         let al = Align::new(&keys, &sa, &sb);
+        let unit_cap = env
+            .work_caps
+            .map_or_else(|| unit_work_cap(statements_of(&sa, &sb)), |c| c.0);
         let mut c = Collector {
             sa,
             sb,
@@ -1437,11 +1514,15 @@ impl<'x, 'a> Collector<'x, 'a> {
             charged: RefCell::new(BTreeSet::new()),
             flip_spent: RefCell::new(BTreeMap::new()),
             replay: Cell::new(None),
+            _phase: sqldiff_model::work::UnitPhase::open(),
             spent: Cell::new(0),
             out_of_budget: Cell::new(false),
-            cap_hit: Cell::new(None),
+            cap_hit: RefCell::new(None),
             file_spent,
             budgets: env_budgets,
+            unit_start: sqldiff_model::work::now().total(),
+            unit_cap,
+            file_work,
         };
         c.splits = splits(&c.sa, &c.sb, true);
         c.splits.extend(splits(&c.sb, &c.sa, false));
@@ -1449,17 +1530,73 @@ impl<'x, 'a> Collector<'x, 'a> {
     }
 
     /// Marks the routine as cut by a work budget, and remembers which one ran
-    /// out first (the routine's own before the file's).
+    /// out first, in a fixed order: the unit's metered work, the file's, the
+    /// routine's comparisons, the file's comparisons.
     fn note_cap(&self) {
         self.out_of_budget.set(true);
-        if self.cap_hit.get().is_none() {
-            self.cap_hit
-                .set(Some(if self.spent.get() >= self.budgets.0 {
-                    "routine work budget"
-                } else {
-                    "file work budget"
-                }));
+        let mut hit = self.cap_hit.borrow_mut();
+        if hit.is_some() {
+            return;
         }
+        let (total, file_total) = (self.unit_work(), self.file_work_done());
+        *hit = Some(if total >= self.unit_cap {
+            format!(
+                "unit work budget ({total} of {} units of work)",
+                self.unit_cap
+            )
+        } else if file_total >= self.file_cap() {
+            format!(
+                "file work budget ({file_total} of {} units of work, behaviour analysis only)",
+                self.file_cap()
+            )
+        } else if self.spent.get() >= self.budgets.0 {
+            format!(
+                "routine comparison budget ({} of {} outcome comparisons)",
+                self.spent.get(),
+                self.budgets.0
+            )
+        } else {
+            format!(
+                "file comparison budget ({} of {} outcome comparisons)",
+                self.file_spent.get(),
+                self.budgets.1
+            )
+        });
+    }
+
+    /// Metered work spent by this unit so far.
+    fn unit_work(&self) -> u64 {
+        sqldiff_model::work::now()
+            .total()
+            .saturating_sub(self.unit_start)
+    }
+
+    /// Metered work spent since this engine comparison's analysis began.
+    fn file_work_done(&self) -> u64 {
+        sqldiff_model::work::now()
+            .total()
+            .saturating_sub(self.file_work.start)
+    }
+
+    fn file_cap(&self) -> u64 {
+        match self.env.work_caps {
+            Some((_, f)) => f,
+            None => self.file_work.cap.max(self.unit_cap),
+        }
+    }
+
+    /// Whether a work cap (not a comparison budget) is used up. Never while
+    /// muted or recomputing a flipped scenario: that work was counted when it
+    /// was first done, and a cut there would depend on a cache.
+    fn work_cap_used(&self) -> bool {
+        // Defensive: no current replay path reaches this (a replay returns
+        // from `spend` first, and a cut run does not replay), so the guard
+        // is pinned by `cap_tests` and keeps a future path from letting a
+        // cache decide a cut.
+        if self.replay.get().is_some() || sqldiff_model::work::is_muted() {
+            return false;
+        }
+        self.unit_work() >= self.unit_cap || self.file_work_done() >= self.file_cap()
     }
 
     /// Spends one `diff` call; false (and the routine marked as cut by its
@@ -1478,7 +1615,7 @@ impl<'x, 'a> Collector<'x, 'a> {
         }
         let file = self.file_spent.get();
         let (routine_max, file_max) = self.budgets;
-        if self.spent.get() >= routine_max || file >= file_max {
+        if self.spent.get() >= routine_max || file >= file_max || self.work_cap_used() {
             self.note_cap();
             return false;
         }
@@ -1551,16 +1688,19 @@ impl<'x, 'a> Collector<'x, 'a> {
         scen_b: &Scenario,
     ) -> (Vec<Outcome>, Vec<Outcome>) {
         let (ca, cb) = (&self.sa.cfg, &self.sb.cfg);
+        // Only paths that reach the failing statement belong to a fault
+        // scenario.
+        let reached = |o: &Outcome| match sc {
+            Kind::Fault { key, .. } => o.fault_hit || o.effects.contains_key(key.as_str()),
+            _ => true,
+        };
         let mut pa = Self::explorer(&self.xa, &self.charged, "a", ca, cb, scen_a, &self.keys)
-            .explore(ca, scen_a);
+            .explore_where(ca, scen_a, &reached);
         let mut pb = Self::explorer(&self.xb, &self.charged, "b", cb, ca, scen_b, &self.keys)
-            .explore(cb, scen_b);
-        if let Kind::Fault { key, .. } = sc {
-            // Only paths that reach the failing statement belong to the scenario.
-            let reached = |o: &Outcome| o.fault_hit || o.effects.contains_key(key.as_str());
-            pa.retain(reached);
-            pb.retain(reached);
-        }
+            .explore_where(cb, scen_b, &reached);
+        // The replayed and full runs are filtered here; the others were.
+        pa.retain(reached);
+        pb.retain(reached);
         (pa, pb)
     }
 
@@ -1571,6 +1711,11 @@ impl<'x, 'a> Collector<'x, 'a> {
     /// findings that flip it (`flipped`): a scenario with many findings used
     /// to explore and compare every outcome pair again for each of them.
     fn persists(&self, sc: &Kind, scen_a: &Scenario, scen_b: &Scenario, d: &Div) -> bool {
+        // Cut by a budget: the conservative answer (the finding rests on its
+        // assumption), without computing or caching anything.
+        if self.out_of_budget.get() && self.replay.get().is_none() {
+            return false;
+        }
         let key = format!("{sc:?}|{scen_a:?}|{scen_b:?}");
         // The cache of flipped scenarios is a speed-up like the explorers':
         // a scenario's work is counted the first time it is asked for and not
@@ -1653,7 +1798,10 @@ impl<'x, 'a> Collector<'x, 'a> {
         // Nothing left to spend: the scenario is not even explored (that is
         // the other cost of a branchy routine), and the routine is reported
         // as not proven.
-        if self.spent.get() >= self.budgets.0 || self.file_spent.get() >= self.budgets.1 {
+        if self.spent.get() >= self.budgets.0
+            || self.file_spent.get() >= self.budgets.1
+            || self.work_cap_used()
+        {
             self.note_cap();
             return (Vec::new(), Vec::new());
         }
@@ -1942,10 +2090,9 @@ impl<'x, 'a> Collector<'x, 'a> {
                 .collect();
             nodes.sort_by_key(|n| n.text_range().start());
             nodes.dedup_by_key(|n| n.text_range());
-            let witness = match self.cap_hit.get() {
+            let witness = match self.cap_hit.borrow().as_deref() {
                 Some(cap) => format!(
-                    "Not proven: the behaviour model reached its {cap} ({} outcome comparisons for a routine, {} for a file) before it compared this statement in at least one scenario, so what happens when it fails and how its transaction goes are not compared.",
-                    self.budgets.0, self.budgets.1
+                    "Not proven: the behaviour model reached its {cap} before it compared this statement in at least one scenario, so what happens when it fails and how its transaction goes are not compared."
                 ),
                 None => "Not proven: the behaviour model stopped at its step or path budget before it ran or compared this statement in at least one scenario, so what happens when it fails and how its transaction goes are not compared.".to_string(),
             };
@@ -2229,9 +2376,21 @@ fn meet(a: &Analyzed, b: &Analyzed) -> Option<Meeting> {
 /// budgets. A routine that meets none is not analysed, and a transaction
 /// statement inside it stays unproven.
 pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
+    // The work caps read the meter, which counts nothing outside a scope: an
+    // entry that opened none would run uncapped.
+    debug_assert!(
+        sqldiff_model::work::in_scope(),
+        "behaviour::analyze needs an open work scope"
+    );
     // The `diff` calls all routine pairs of this file share.
     let file_spent = Rc::new(Cell::new(0));
+    let start = sqldiff_model::work::now().total();
     let Some(m) = meet(a, b) else {
+        // One unit: its own cap is the file's floor (taken in `file_cap`).
+        let file_work = FileWork {
+            start,
+            cap: file_work_cap(1, 0),
+        };
         // At most one routine on each side: `routines_of` picks it, so a
         // setup `DO` block beside it is not mistaken for it.
         let (ra, rb) = (routines_of(a), routines_of(b));
@@ -2244,6 +2403,7 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
             "",
             &HashSet::new(),
             &file_spent,
+            file_work,
         );
         // Transaction statements are compared only inside a routine both
         // sides hold exactly once.
@@ -2267,6 +2427,21 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
         }
         return out;
     };
+    // The file cap is a function of the file: its units and the largest unit
+    // cap, known before the first unit runs.
+    let largest = if env.work_caps.is_some() {
+        0
+    } else {
+        m.pairs
+            .iter()
+            .map(|(x, y)| unit_work_cap(pair_statements(a, b, Some(x.clone()), Some(y.clone()))))
+            .max()
+            .unwrap_or(0)
+    };
+    let file_work = FileWork {
+        start,
+        cap: file_work_cap(m.pairs.len().max(1) as u64, largest),
+    };
     let mut out = Behaviour::default();
     let mut prior: HashSet<String> = HashSet::new();
     let mut all_compared = m.only_a.is_empty() && m.only_b.is_empty();
@@ -2281,6 +2456,7 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
             &format!("{name}|"),
             &prior,
             &file_spent,
+            file_work,
         );
         prior.extend(r.findings.iter().map(|f| f.fingerprint.clone()));
         all_compared &= r.txn_compared;
@@ -2320,8 +2496,9 @@ fn analyze_pair(
     salt: &str,
     prior: &HashSet<String>,
     file_spent: &Rc<Cell<u64>>,
+    file_work: FileWork,
 ) -> Behaviour {
-    let mut c = Collector::new(a, b, env.clone(), ra, rb, file_spent.clone());
+    let mut c = Collector::new(a, b, env.clone(), ra, rb, file_spent.clone(), file_work);
     c.salt = salt.to_string();
     c.prior = prior.clone();
     c.faults();
@@ -2434,7 +2611,11 @@ pub fn what_if(
             }
         }
     };
-    let mut c = Collector::new(a, b, env.clone(), ra, rb, Rc::new(Cell::new(0)));
+    let file_work = FileWork {
+        start: sqldiff_model::work::now().total(),
+        cap: file_work_cap(1, 0),
+    };
+    let mut c = Collector::new(a, b, env.clone(), ra, rb, Rc::new(Cell::new(0)), file_work);
     let (this, other) = if on_a { (&c.sa, &c.sb) } else { (&c.sb, &c.sa) };
     let mut notes = Vec::new();
     let empty = |notes: Vec<String>, text: String| WhatIf {
@@ -2531,6 +2712,48 @@ pub fn what_if(
         findings: std::mem::take(&mut c.out.findings),
         witnesses: std::mem::take(&mut c.out.witnesses),
         notes,
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+    use crate::model::Side;
+
+    const SRC: &str =
+        "CREATE PROCEDURE dbo.p @p int AS\nBEGIN\nSET @p = @p + 1;\nSELECT @p;\nEND;\n";
+
+    /// The cap guard of `work_cap_used`: a collector whose unit cap is used
+    /// up reports it, except while recomputing a flipped scenario or muted.
+    #[test]
+    fn the_cap_guard_holds_off_in_a_replay_and_when_muted() {
+        let art = crate::Artifact::new("a.sql", Dialect::Tsql, SRC);
+        let (a, b) = (
+            Analyzed::new(&art, Side::A, 3),
+            Analyzed::new(&art, Side::B, 3),
+        );
+        let env = Env {
+            work_caps: Some((0, 0)),
+            ..Env::from_flips(&BTreeMap::new())
+        };
+        let file_work = FileWork {
+            start: sqldiff_model::work::now().total(),
+            cap: 0,
+        };
+        let (ra, rb) = (
+            routines_of(&a).first().cloned(),
+            routines_of(&b).first().cloned(),
+        );
+        let c = Collector::new(&a, &b, env, ra, rb, Rc::new(Cell::new(0)), file_work);
+        assert!(c.work_cap_used(), "a zero cap is used up");
+        c.replay.set(Some(5));
+        assert!(!c.work_cap_used(), "not while recomputing a scenario");
+        c.replay.set(None);
+        assert!(c.work_cap_used());
+        sqldiff_model::work::muted(|| {
+            assert!(!c.work_cap_used(), "not while muted");
+        });
+        assert!(c.work_cap_used());
     }
 }
 

@@ -53,9 +53,18 @@ pub enum Site {
     /// Outcome-pair comparisons of the behaviour model: the existing
     /// per-routine and per-file allowance (`Collector::spend`), kept as it is.
     BehaviourDiffs,
+    /// Similarity scores of a gap between two aligned lists
+    /// (`treediff::diff_gap`: the product of the two lengths).
+    GapScores,
+    /// Items built for a cross-dialect comparison or a refinement
+    /// (`equiv::items`: one per lowered statement or control marker).
+    ItemsBuilt,
+    /// Statement pairs compared (`compare_pair`): one unit per pair, in a
+    /// cross-dialect comparison or a refinement.
+    PairCompares,
 }
 
-const SITES: usize = 7;
+const SITES: usize = 10;
 
 const NAMES: [&str; SITES] = [
     "explorer_steps",
@@ -65,6 +74,9 @@ const NAMES: [&str; SITES] = [
     "edit_closure",
     "witness_tries",
     "behaviour_diffs",
+    "gap_scores",
+    "items_built",
+    "pair_compares",
 ];
 
 /// The counts of one scope.
@@ -111,6 +123,34 @@ thread_local! {
     static DEPTH: Cell<usize> = const { Cell::new(0) };
     /// Open [`muted`] sections: counts are dropped while it is above 0.
     static MUTED: Cell<usize> = const { Cell::new(0) };
+    /// Behaviour units open on this thread ([`UnitPhase`]).
+    static UNITS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Marks a behaviour unit as open while it lives. The statement-level
+/// [`Allowance`] and the behaviour model's caps count disjoint phases of a
+/// diff, so no statement-level spend may happen inside a unit: a debug
+/// assertion in [`Allowance`] checks it, and a later change cannot make one
+/// budget pay for the other's work unnoticed.
+#[derive(Debug)]
+pub struct UnitPhase(());
+
+impl UnitPhase {
+    pub fn open() -> UnitPhase {
+        UNITS.with(|u| u.set(u.get() + 1));
+        UnitPhase(())
+    }
+}
+
+impl Drop for UnitPhase {
+    fn drop(&mut self) {
+        UNITS.with(|u| u.set(u.get() - 1));
+    }
+}
+
+/// Whether a behaviour unit is open on this thread.
+pub fn unit_open() -> bool {
+    UNITS.with(|u| u.get() > 0)
 }
 
 /// Events counted with no scope open: an entry point nobody metered. Once a
@@ -147,6 +187,85 @@ pub fn now() -> Work {
     METER.with(|m| m.borrow().unwrap_or_default())
 }
 
+/// Whether counting is switched off here (inside [`muted`]). A work cap must
+/// not test while muted: that work was counted when it was first done.
+pub fn is_muted() -> bool {
+    MUTED.with(Cell::get) > 0
+}
+
+/// Whether a scope is open on this thread: a cap reads [`now`], which is zero
+/// outside one, so it would never fire.
+pub fn in_scope() -> bool {
+    METER.with(|m| m.borrow().is_some())
+}
+
+/// What the statement-level checker (alignment, tree diff) may still spend,
+/// passed down as a parameter so the functions that use it stay pure: a
+/// deterministic count, decremented in program order, never a time. Off (the
+/// default) it allows everything and changes nothing.
+#[derive(Debug, Default)]
+pub struct Allowance {
+    left: Cell<Option<u64>>,
+    cap: Option<u64>,
+}
+
+impl Allowance {
+    /// An allowance of `cap` units, or none (`None`).
+    pub fn new(cap: Option<u64>) -> Allowance {
+        Allowance {
+            left: Cell::new(cap),
+            cap,
+        }
+    }
+
+    /// Whether `n` more units may be spent.
+    pub fn allows(&self, n: u64) -> bool {
+        debug_assert!(
+            !unit_open() || !self.is_on(),
+            "a statement-level allowance was used inside a behaviour unit"
+        );
+        self.left.get().map_or(true, |l| n <= l)
+    }
+
+    /// Spends `n` units (saturating); nothing when the allowance is off.
+    pub fn take(&self, n: u64) {
+        debug_assert!(
+            !unit_open() || !self.is_on(),
+            "a statement-level allowance was used inside a behaviour unit"
+        );
+        if let Some(l) = self.left.get() {
+            self.left.set(Some(l.saturating_sub(n)));
+        }
+    }
+
+    pub fn is_on(&self) -> bool {
+        self.cap.is_some()
+    }
+
+    /// On, and nothing is left: the next unit of work is refused.
+    pub fn exhausted(&self) -> bool {
+        self.is_on() && !self.allows(1)
+    }
+
+    /// What is left (`None` when the allowance is off).
+    pub fn left(&self) -> Option<u64> {
+        self.left.get()
+    }
+
+    /// The whole allowance, for the witness of a cut.
+    pub fn cap(&self) -> Option<u64> {
+        self.cap
+    }
+
+    /// What has been spent so far.
+    pub fn spent(&self) -> u64 {
+        match (self.cap, self.left.get()) {
+            (Some(c), Some(l)) => c - l,
+            _ => 0,
+        }
+    }
+}
+
 /// Counts a recorded amount of work again, per site: what a cache or memo
 /// entry cost when it was made, charged when it is used instead, so that the
 /// total is what the algorithm does and not what its caches happened to save.
@@ -166,6 +285,9 @@ const SITE_LIST: [Site; SITES] = [
     Site::EditClosure,
     Site::WitnessTries,
     Site::BehaviourDiffs,
+    Site::GapScores,
+    Site::ItemsBuilt,
+    Site::PairCompares,
 ];
 
 /// Runs `f` without counting: work that only re-creates a state whose cost
@@ -263,5 +385,33 @@ mod tests {
         assert!(r.is_err());
         let (_, w) = scope("after", || ());
         assert_eq!(w.total(), 0);
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod phase_tests {
+    use super::*;
+
+    #[test]
+    fn an_allowance_that_is_off_is_fine_inside_a_unit() {
+        let _u = UnitPhase::open();
+        assert!(Allowance::new(None).allows(5));
+    }
+
+    #[test]
+    #[should_panic(expected = "inside a behaviour unit")]
+    fn a_statement_level_allowance_inside_a_unit_is_refused() {
+        let _u = UnitPhase::open();
+        Allowance::new(Some(10)).take(1);
+    }
+
+    #[test]
+    fn the_phase_closes_with_its_guard() {
+        {
+            let _u = UnitPhase::open();
+            assert!(unit_open());
+        }
+        assert!(!unit_open());
+        Allowance::new(Some(10)).take(1);
     }
 }

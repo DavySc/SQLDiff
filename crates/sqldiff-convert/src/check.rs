@@ -280,13 +280,15 @@ fn check_one(
         .collect();
 
     // Findings land on the unit they point into: output side first, else input side.
+    let (by_out, by_src) = (
+        SpanIndex::new(units.iter().map(|u| (u.out.start, u.out.end)).collect()),
+        SpanIndex::new(units.iter().map(|u| (u.src.start, u.src.end)).collect()),
+    );
     for (fi, f) in report.findings.iter().enumerate() {
         let hit = |loc: &Option<sqldiff_core::model::Location>, out_side: bool| {
             let loc = loc.as_ref()?;
-            units.iter().position(|u| {
-                let s = if out_side { u.out } else { u.src };
-                overlaps((s.start, s.end), (loc.byte_start, loc.byte_end))
-            })
+            let at = (loc.byte_start, loc.byte_end);
+            if out_side { &by_out } else { &by_src }.first_overlapping(at)
         };
         if let Some(ui) = hit(&f.b, true).or_else(|| hit(&f.a, false)) {
             let u = &mut units[ui];
@@ -325,13 +327,13 @@ fn check_one(
     // reason that names no unit's line keeps the whole file from counting.
     let mut unproven = Vec::new();
     for reason in &report.unknown_reasons {
-        let hits: Vec<usize> = match reason_line(reason) {
-            Some((out_side, line)) => units
+        let hits: Vec<usize> = match reason_range(reason) {
+            Some((out_side, first, last)) => units
                 .iter()
                 .enumerate()
                 .filter(|(_, u)| {
                     let s = if out_side { u.out } else { u.src };
-                    s.line <= line && line <= s.end_line
+                    s.line <= last && first <= s.end_line
                 })
                 .map(|(i, _)| i)
                 .collect(),
@@ -363,7 +365,8 @@ fn check_one(
                 })
             })
             .collect();
-        let hits = inner;
+        // A range is about everything in it: every unit it reaches.
+        let hits = if is_range(reason) { hits } else { inner };
         let text = format!(
             "The engine did not compare this with its conversion: {}",
             reason_text(reason)
@@ -560,23 +563,43 @@ pub(crate) const EVERY_PAIR: [&str; 4] = [
 /// Rule of the note on a unit the engine did not compare.
 pub const NOT_COMPARED: &str = "equiv.not-compared";
 
-/// `(output side, line)` of an engine reason `side A (T-SQL) line 12: ...`.
-fn reason_line(reason: &str) -> Option<(bool, usize)> {
+/// `(output side, first line, last line)` of an engine reason: one line
+/// (`side A (T-SQL) line 12: ...`) or a range (`side A (T-SQL) lines 3-20:
+/// ...`). A range reason is about everything in it, so it reaches every unit
+/// that overlaps it, not only the innermost ones.
+fn reason_range(reason: &str) -> Option<(bool, usize, usize)> {
     let rest = reason.strip_prefix("side ")?;
     let out_side = match rest.as_bytes().first()? {
         b'A' => false,
         b'B' => true,
         _ => return None,
     };
-    let (_, after) = rest.split_once(") line ")?;
-    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-    after[digits.len()..].starts_with(':').then_some(())?;
-    Some((out_side, digits.parse().ok()?))
+    if let Some((_, after)) = rest.split_once(") line ") {
+        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        after[digits.len()..].starts_with(':').then_some(())?;
+        let l = digits.parse().ok()?;
+        return Some((out_side, l, l));
+    }
+    let (_, after) = rest.split_once(") lines ")?;
+    let (a, b) = after.split_once('-')?;
+    let digits: String = b.chars().take_while(|c| c.is_ascii_digit()).collect();
+    b[digits.len()..].starts_with(':').then_some(())?;
+    Some((out_side, a.parse().ok()?, digits.parse().ok()?))
+}
+
+/// Whether the reason names a range of lines.
+fn is_range(reason: &str) -> bool {
+    reason_range(reason).is_some_and(|(_, a, b)| a != b) || reason.contains(") lines ")
+}
+
+/// `(output side, line)` of an engine reason `side A (T-SQL) line 12: ...`.
+fn reason_line(reason: &str) -> Option<(bool, usize)> {
+    reason_range(reason).map(|(o, a, _)| (o, a))
 }
 
 /// A reason without its `side A (T-SQL) line 12: ` prefix.
 fn reason_text(reason: &str) -> &str {
-    match reason_line(reason) {
+    match reason_range(reason) {
         Some(_) => reason.split_once(": ").map_or(reason, |(_, rest)| rest),
         None => reason,
     }
@@ -661,6 +684,69 @@ fn overlaps(a: (usize, usize), b: (usize, usize)) -> bool {
     a.0 < b.1.max(b.0 + 1) && b.0 < a.1
 }
 
+/// The first of a list of byte spans that overlaps a span (see
+/// [`overlaps`]), without testing every span: a segment tree over the list
+/// holds the smallest start and the largest end below each node, and the
+/// search goes left first into the nodes that could hold an overlapping
+/// span. The answer is the first index in list order, as a scan gives.
+struct SpanIndex {
+    spans: Vec<(usize, usize)>,
+    /// Node `i` covers a range of `spans`; children `2i + 1` and `2i + 2`.
+    /// (smallest start, largest end).
+    tree: Vec<(usize, usize)>,
+}
+
+impl SpanIndex {
+    fn new(spans: Vec<(usize, usize)>) -> SpanIndex {
+        let mut ix = SpanIndex {
+            tree: vec![(usize::MAX, 0); 4 * spans.len().max(1)],
+            spans,
+        };
+        if !ix.spans.is_empty() {
+            ix.build(0, 0, ix.spans.len());
+        }
+        ix
+    }
+
+    fn build(&mut self, node: usize, lo: usize, hi: usize) -> (usize, usize) {
+        let v = if hi - lo == 1 {
+            self.spans[lo]
+        } else {
+            let mid = lo + (hi - lo) / 2;
+            let (a, b) = (
+                self.build(2 * node + 1, lo, mid),
+                self.build(2 * node + 2, mid, hi),
+            );
+            (a.0.min(b.0), a.1.max(b.1))
+        };
+        self.tree[node] = v;
+        v
+    }
+
+    fn first_overlapping(&self, at: (usize, usize)) -> Option<usize> {
+        if self.spans.is_empty() {
+            return None;
+        }
+        self.find(0, 0, self.spans.len(), at)
+    }
+
+    fn find(&self, node: usize, lo: usize, hi: usize, at: (usize, usize)) -> Option<usize> {
+        // An overlapping span starts before the query's end and ends after
+        // its start, so a node where no start is early enough or no end is
+        // late enough holds none.
+        let (min_start, max_end) = self.tree[node];
+        if !(min_start < at.1.max(at.0 + 1) && at.0 < max_end) {
+            return None;
+        }
+        if hi - lo == 1 {
+            return overlaps(self.spans[lo], at).then_some(lo);
+        }
+        let mid = lo + (hi - lo) / 2;
+        self.find(2 * node + 1, lo, mid, at)
+            .or_else(|| self.find(2 * node + 2, mid, hi, at))
+    }
+}
+
 /// Byte offset to UTF-16 offset in `text` without re-encoding the text from
 /// its start for every span: the counts at char boundaries every
 /// [`U16Index::STEP`] bytes, then the rest of the way encoded.
@@ -724,5 +810,48 @@ mod u16_index {
         }
         let empty = U16Index::new("");
         assert_eq!(empty.at("", 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod span_index {
+    use super::*;
+
+    /// The first-match scan the index replaces.
+    fn scan(spans: &[(usize, usize)], at: (usize, usize)) -> Option<usize> {
+        spans.iter().position(|&s| overlaps(s, at))
+    }
+
+    #[test]
+    fn finds_what_a_scan_finds() {
+        // A fixed pseudo-random generator: sorted, nested, empty and equal
+        // spans, in and out of order.
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % m) as usize
+        };
+        for len in [0, 1, 2, 3, 7, 40, 200] {
+            for _ in 0..30 {
+                let spans: Vec<(usize, usize)> = (0..len)
+                    .map(|_| {
+                        let a = next(300);
+                        (a, a + next(40))
+                    })
+                    .collect();
+                let ix = SpanIndex::new(spans.clone());
+                for _ in 0..200 {
+                    let a = next(340);
+                    let at = (a, a + next(30));
+                    assert_eq!(
+                        ix.first_overlapping(at),
+                        scan(&spans, at),
+                        "{spans:?} {at:?}"
+                    );
+                }
+            }
+        }
     }
 }

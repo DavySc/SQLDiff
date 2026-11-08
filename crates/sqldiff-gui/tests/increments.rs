@@ -99,15 +99,6 @@ fn the_command_names_the_increment_as_the_cli_does() {
 }
 
 #[test]
-fn an_increment_is_refused_for_template_runs() {
-    let d = dir("tpl");
-    let src = tree(&d);
-    let mut s = spec(&src, &d.join("out"), next(1), false);
-    s.template = true;
-    assert!(command(&s, true).is_err());
-}
-
-#[test]
 fn the_plan_lists_the_groups_in_the_order_they_are_taken() {
     let d = dir("plan");
     let src = tree(&d);

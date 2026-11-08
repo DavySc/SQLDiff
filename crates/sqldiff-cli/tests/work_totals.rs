@@ -77,6 +77,7 @@ fn thread_count_folder_and_resume_never_change_a_files_work() {
     // The sampled re-check re-checks some files; if the store ever answered
     // them all this test would compare nothing.
     assert!(!again.is_empty(), "the resumed run checked nothing");
+    assert!(again.values().any(|&n| n > 0), "{again:?}");
     for (file, n) in &again {
         assert_eq!(a.get(file), Some(n), "{file}");
     }

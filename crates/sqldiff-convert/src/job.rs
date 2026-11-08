@@ -48,7 +48,7 @@ pub fn plan_into(
     out: &std::path::Path,
 ) -> Result<(crate::plan::Plan, PathBuf), String> {
     let (inputs, _) = tree::read(tree)?;
-    let plan = crate::plan::Plan::build(&inputs, tree.from);
+    let plan = crate::plan::Plan::build(&tree::plan_inputs(tree, &inputs), tree.from);
     let path = write_plan(&plan, out)?;
     Ok((plan, path))
 }
@@ -270,7 +270,10 @@ pub fn convert_into(job: &Job, hooks: &Hooks) -> Result<Written, String> {
         &job.select,
     )?;
     if !job.select.is_empty() {
-        write_plan(&crate::plan::Plan::build(&inputs, job.tree.from), &job.out)?;
+        write_plan(
+            &crate::plan::Plan::build(&tree::plan_inputs(&job.tree, &inputs), job.tree.from),
+            &job.out,
+        )?;
     }
     // Review decisions committed next to the converted tree.
     let not_applied = tree::review_in(&mut t, &inputs, &job.out)?;

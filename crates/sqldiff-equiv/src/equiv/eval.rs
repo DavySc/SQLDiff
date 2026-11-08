@@ -4955,6 +4955,10 @@ pub enum Miss {
     Unsupported(String),
     /// Every assignment tried agreed (or was ambiguous).
     NoWitness,
+    /// The search stopped at a statement-level work budget smaller than its
+    /// own: the assignments not tried say nothing, and this must not read as
+    /// "no witness found".
+    Budget,
 }
 
 const BUDGET: usize = 20_000;
@@ -4962,6 +4966,18 @@ const BUDGET: usize = 20_000;
 /// Searches for inputs under which `a` and `b` observably differ. `make`
 /// builds a fresh context (facts, hints, catalog) for each world shape.
 pub fn search<'s>(make: &dyn Fn() -> Ctx<'s>, a: &Probe, b: &Probe) -> Result<Found, Miss> {
+    search_within(make, a, b, None)
+}
+
+/// [`search`] with at most `limit` tries when that is fewer than its own
+/// budget (the rest of a statement-level allowance): a search that stops
+/// there ends in [`Miss::Budget`], not `NoWitness`.
+pub fn search_within<'s>(
+    make: &dyn Fn() -> Ctx<'s>,
+    a: &Probe,
+    b: &Probe,
+    limit: Option<u64>,
+) -> Result<Found, Miss> {
     // World shapes: one row per table first, then each table empty, then
     // each table with two rows.
     // Table functions and temporal reads must be the same reads on both
@@ -5004,7 +5020,15 @@ pub fn search<'s>(make: &dyn Fn() -> Ctx<'s>, a: &Probe, b: &Probe) -> Result<Fo
     if tables.len() >= 2 {
         shapes.push(tables.iter().map(|t| (t.clone(), 2)).collect());
     }
-    let mut budget = BUDGET;
+    let capped = limit.is_some_and(|l| l < BUDGET as u64);
+    let mut budget = limit.map_or(BUDGET, |l| l.min(BUDGET as u64) as usize);
+    let cut = |budget: usize, m: Miss| {
+        if capped && budget == 0 && m == Miss::NoWitness {
+            Miss::Budget
+        } else {
+            m
+        }
+    };
     let mut last_miss = Miss::NoWitness;
     // Limited discrepancy search: first every input at its first candidate,
     // then with one input elsewhere, then two, and so on. Witnesses rarely
@@ -5035,14 +5059,24 @@ pub fn search<'s>(make: &dyn Fn() -> Ctx<'s>, a: &Probe, b: &Probe) -> Result<Fo
             // Nothing was left out: this shape has no witness at all.
             done[k] = !pruned;
             if budget == 0 {
-                return Err(last_miss);
+                // Every shape searched to its end before the budget ran out
+                // is a complete "no witness".
+                return Err(if done.iter().all(|d| *d) {
+                    last_miss
+                } else {
+                    cut(budget, last_miss)
+                });
             }
         }
         if done.iter().all(|d| *d) {
             break;
         }
     }
-    Err(last_miss)
+    Err(if done.iter().all(|d| *d) {
+        last_miss
+    } else {
+        cut(budget, last_miss)
+    })
 }
 
 /// How many inputs may be away from their first candidate at most.
@@ -5062,6 +5096,8 @@ fn dfs(
     pruned: &mut bool,
 ) -> Result<Option<Found>, Miss> {
     if *budget == 0 {
+        // Not explored: this shape is not searched to its end.
+        *pruned = true;
         return Ok(None);
     }
     *budget -= 1;
@@ -5293,6 +5329,28 @@ mod tests {
             }
         }
         m(s.as_bytes(), p.as_bytes())
+    }
+
+    #[test]
+    fn a_search_cut_by_a_lower_limit_is_a_budget_miss_not_no_witness() {
+        use crate::equiv::schema::Schema;
+        let schema = Schema::default();
+        let make = || Ctx::new(Dialect::Tsql, &schema);
+        let p = Probe::Conds(Vec::new());
+        // One world, one try: a limit of 1 still finishes the search.
+        assert_eq!(
+            search_within(&make, &p, &p, Some(1)).err(),
+            Some(Miss::NoWitness)
+        );
+        assert_eq!(
+            search_within(&make, &p, &p, None).err(),
+            Some(Miss::NoWitness)
+        );
+        // Nothing may be tried: the answer says so.
+        assert_eq!(
+            search_within(&make, &p, &p, Some(0)).err(),
+            Some(Miss::Budget)
+        );
     }
 
     #[test]

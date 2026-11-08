@@ -140,6 +140,42 @@ impl CheckInput<'_> {
     }
 }
 
+/// Everything [`crate::check_template`] reads for one job of a template
+/// tree (a template, or a routine's opening and closing templates): the only
+/// argument a stored template result's key is made from, like
+/// [`CheckInput`] for a plain file.
+pub struct TemplateInput<'a> {
+    /// The check stage's fingerprint (`CHECK_FINGERPRINT`).
+    pub build: &'a str,
+    pub from: Dialect,
+    pub to: Dialect,
+    pub helpers: &'a [Helper],
+    /// [`crate::job_material`]: the template and how it was read.
+    pub job: &'a str,
+    /// `TemplateDraft::canonical`: the draft the check starts from.
+    pub draft: &'a str,
+    /// [`catalog_digest`] of the source and the target catalog (in stand-in
+    /// terms) the check binds against, when the run uses catalogs.
+    pub source: Option<&'a str>,
+    pub target: Option<&'a str>,
+}
+
+impl TemplateInput<'_> {
+    pub fn key(&self) -> Key {
+        let mut k = KeyBuilder::new();
+        k.field("format", b"template-1");
+        k.field("build", self.build.as_bytes());
+        k.field("from", self.from.id().as_bytes());
+        k.field("to", self.to.id().as_bytes());
+        k.field("helpers", format!("{:?}", self.helpers).as_bytes());
+        k.field("job", self.job.as_bytes());
+        k.field("draft", self.draft.as_bytes());
+        k.field("source", self.source.unwrap_or("none").as_bytes());
+        k.field("target", self.target.unwrap_or("none").as_bytes());
+        k.finish()
+    }
+}
+
 /// Everything a tree run builds before the first file is checked: the source
 /// catalog, the rules' draft of every file (hand-written output applied),
 /// the target catalog with the stand-in tables, and the stand-ins. Each of
@@ -1333,5 +1369,71 @@ mod note_table_tests {
         want.sort();
         assert_eq!(left, want);
         let _ = std::fs::remove_dir_all(&out);
+    }
+}
+
+#[cfg(test)]
+mod template_key_tests {
+    use super::*;
+
+    fn base<'a>(helpers: &'a [Helper]) -> TemplateInput<'a> {
+        TemplateInput {
+            build: "b",
+            from: Dialect::Tsql,
+            to: Dialect::Postgres,
+            helpers,
+            job: "job",
+            draft: "draft",
+            source: Some("s"),
+            target: Some("t"),
+        }
+    }
+
+    #[test]
+    fn every_input_of_a_template_job_is_in_its_key() {
+        let h: Vec<Helper> = Vec::new();
+        let k = base(&h).key();
+        assert_eq!(k, base(&h).key());
+        let others = [
+            TemplateInput {
+                build: "c",
+                ..base(&h)
+            },
+            TemplateInput {
+                from: Dialect::Postgres,
+                ..base(&h)
+            },
+            TemplateInput {
+                to: Dialect::Db2i,
+                ..base(&h)
+            },
+            TemplateInput {
+                job: "job2",
+                ..base(&h)
+            },
+            TemplateInput {
+                draft: "draft2",
+                ..base(&h)
+            },
+            TemplateInput {
+                source: Some("s2"),
+                ..base(&h)
+            },
+            TemplateInput {
+                source: None,
+                ..base(&h)
+            },
+            TemplateInput {
+                target: Some("t2"),
+                ..base(&h)
+            },
+            TemplateInput {
+                target: None,
+                ..base(&h)
+            },
+        ];
+        for o in others {
+            assert_ne!(k, o.key());
+        }
     }
 }

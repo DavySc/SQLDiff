@@ -109,11 +109,23 @@ pub struct Options {
     /// tests that need a budget to run out. The budgets are counts, never
     /// times, so a result stays a function of the input.
     pub work_budgets: Option<(u64, u64)>,
+    /// Replace the behaviour model's work caps (per unit, per file; see
+    /// `behaviour::unit_work_cap`) by fixed numbers; `None` keeps the
+    /// built-in ones. For tests that need a cap to bite. Counts of metered
+    /// work, never times, so a result stays a function of the input.
+    pub work_caps: Option<(u64, u64)>,
     /// Lower the bound of the exact statement alignment (cells, see
     /// `normalize::DEFAULT_ALIGNMENT_BOUND`); `None` keeps the built-in one.
     /// For tests that need to reach the bound with small inputs. A count,
     /// never a time, so a result stays a function of the input.
     pub alignment_bound: Option<usize>,
+    /// What the statement-level checker (alignments and gap pairings of the
+    /// same-dialect tree diff) may spend, in units of metered work
+    /// (`Site::AlignCells` and `Site::GapScores`); `None`, the default, is no
+    /// allowance and changes nothing. Past it the lists not yet aligned take
+    /// the `align.bound` exit with a work-budget witness. A count, never a
+    /// time, so a result stays a function of the input.
+    pub statement_work_cap: Option<u64>,
 }
 
 impl Default for Options {
@@ -133,7 +145,9 @@ impl Default for Options {
             historyless: false,
             skip_witnesses: false,
             work_budgets: None,
+            work_caps: None,
             alignment_bound: None,
+            statement_work_cap: None,
         }
     }
 }
@@ -402,11 +416,13 @@ fn diff_inner(
     let mut receipts = Vec::new();
 
     if same {
-        let mut td = treediff::diff(
+        let allowance = sqldiff_model::work::Allowance::new(opts.statement_work_cap);
+        let mut td = treediff::diff_within(
             &aa,
             &ab,
             opts.alignment_bound
                 .unwrap_or(crate::normalize::DEFAULT_ALIGNMENT_BOUND),
+            &allowance,
         );
         // An observer that does not read row counts does not see SET NOCOUNT,
         // unless the code reads them itself: SET resets @@ROWCOUNT (and
@@ -450,7 +466,15 @@ fn diff_inner(
             }
         }
         equiv::refine_modified(&aa, &ab, &schema_a, &schema_b, &mut td.findings, &mut eq);
-        equiv::edit::decide(&aa, &ab, &schema_a, &schema_b, &mut td.findings, &mut eq);
+        equiv::edit::decide(
+            &aa,
+            &ab,
+            &schema_a,
+            &schema_b,
+            &mut td.findings,
+            &mut eq,
+            &allowance,
+        );
         findings.extend(td.findings);
         receipts.append(&mut td.receipts);
         receipts.append(&mut eq.receipts);
@@ -508,7 +532,8 @@ fn diff_inner(
                 findings.push(rules::analysis::to_finding(side, &h, Verdict::Unknown));
             }
         }
-        eq = equiv::compare(&aa, &ab, &schema_a, &schema_b, &opts.anchors);
+        let allowance = sqldiff_model::work::Allowance::new(opts.statement_work_cap);
+        eq = equiv::compare_within(&aa, &ab, &schema_a, &schema_b, &opts.anchors, &allowance);
         findings.append(&mut eq.findings);
         // Rows-affected counts across dialects (decision 1, observer profile).
         let (ca, cb) = (
@@ -686,7 +711,12 @@ pub fn what_if(
         let eq = compare_sides(&aa, &ab, opts);
         env.identified = Some(std::sync::Arc::new(identified_pairs(&eq)));
     }
-    crate::ir::behaviour::what_if(&aa, &ab, side, line, kind, &env)
+    // One scenario, bounded by the explorer's own caps; the scope makes the
+    // work caps readable here too.
+    sqldiff_model::work::scope("what_if", || {
+        crate::ir::behaviour::what_if(&aa, &ab, side, line, kind, &env)
+    })
+    .0
 }
 
 /// Measurement only (perf plan W6): how many lockstep pair-states the

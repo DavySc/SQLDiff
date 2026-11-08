@@ -2111,7 +2111,10 @@ fn build_tree(
     };
     let t = tree::convert_increment(a, inputs, unreadable, o, hooks, fresh, &select)?;
     if !select.is_empty() {
-        sqldiff_convert::job::write_plan(&sqldiff_convert::plan::Plan::build(inputs, a.from), o)?;
+        sqldiff_convert::job::write_plan(
+            &sqldiff_convert::plan::Plan::build(&tree::plan_inputs(a, inputs), a.from),
+            o,
+        )?;
     }
     Ok(t)
 }

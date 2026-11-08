@@ -341,6 +341,52 @@ pub fn lcs_pairs_bounded<T: Ord>(a: &[T], b: &[T], work: usize) -> (Vec<(usize, 
     (out, exact)
 }
 
+/// [`lcs_pairs_bounded`] under a statement-level allowance: the cells the
+/// alignment would fill (the whole product while the table is built in one
+/// piece, the middle once the common start and end are matched past that) must
+/// fit the allowance, tested before any table is filled. When they do not,
+/// the common start and end are matched and the middle stays unmatched
+/// (`exact` false), the same exit as the bound. With the allowance off this is
+/// [`lcs_pairs_bounded`] exactly. What the call spends is taken from the
+/// allowance, so the next call sees the rest. The third value says the
+/// allowance, not the bound, made the alignment inexact.
+pub fn lcs_pairs_allowed<T: Ord>(
+    a: &[T],
+    b: &[T],
+    work: usize,
+    allowance: &sqldiff_model::work::Allowance,
+) -> (Vec<(usize, usize)>, bool, bool) {
+    if !allowance.is_on() {
+        let (p, exact) = lcs_pairs_bounded(a, b, work);
+        return (p, exact, false);
+    }
+    let (n, m) = (a.len(), b.len());
+    let pre = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let suf = a[pre..]
+        .iter()
+        .rev()
+        .zip(b[pre..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let middle = ((n - pre - suf) as u64).saturating_mul((m - pre - suf) as u64);
+    let cost = if n.saturating_mul(m) <= LCS_CELLS {
+        (n as u64).saturating_mul(m as u64)
+    } else {
+        middle
+    };
+    if !allowance.allows(cost) {
+        let mut out: Vec<(usize, usize)> = (0..pre).map(|i| (i, i)).collect();
+        out.extend((0..suf).map(|k| (n - suf + k, m - suf + k)));
+        return (out, false, true);
+    }
+    let r = lcs_pairs_bounded(a, b, work);
+    // Past the exact-alignment bound nothing was filled.
+    if r.1 {
+        allowance.take(cost);
+    }
+    (r.0, r.1, false)
+}
+
 /// [`lcs_pairs_checked`] for callers that only show the pairs: past the
 /// bound they get the partial alignment.
 pub fn lcs_pairs<T: Ord>(a: &[T], b: &[T]) -> Vec<(usize, usize)> {

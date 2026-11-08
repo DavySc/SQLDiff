@@ -8334,6 +8334,45 @@ impl<'a> Cx<'a> {
         name
     }
 
+    /// What the column operand at `j` (`c`, `t.c` or `s.t.c`) is for `+`,
+    /// by the catalog; None when `j` is not a column reference.
+    fn col_kind(&self, ts: &[T], j: usize) -> Option<ColKind> {
+        if !matches!(ts[j].k, IDENT | QUOTED_IDENT) || ts[j].s.starts_with('@') {
+            return None;
+        }
+        let (mut a, mut b) = (j, j);
+        while let Some(d) = prev_sig(ts, a).filter(|&d| ts[d].k == DOT) {
+            a = prev_sig(ts, d).filter(|&q| matches!(ts[q].k, IDENT | QUOTED_IDENT))?;
+        }
+        while let Some(d) = next_sig(ts, b).filter(|&d| ts[d].k == DOT) {
+            b = next_sig(ts, d).filter(|&q| matches!(ts[q].k, IDENT | QUOTED_IDENT))?;
+        }
+        if next_sig(ts, b).is_some_and(|n| ts[n].k == L_PAREN) {
+            return None;
+        }
+        let Some(dt) = self.column_dt(&ts[a..=b]) else {
+            return Some(ColKind::Unknown);
+        };
+        Some(match dt {
+            // bit ranks above the strings: T-SQL adds it.
+            Dt::Int | Dt::BigInt | Dt::Fraction | Dt::Money | Dt::Bit => ColKind::Num,
+            Dt::Text => {
+                let base = self
+                    .column_type(&ts[a..=b])
+                    .map(|t| tsql_unquote(&t.base).to_ascii_uppercase());
+                // CHAR keeps its padding in T-SQL and Db2 `||`; PostgreSQL
+                // casts it to text and strips it. TEXT and NTEXT have no `+`.
+                let plain = match base.as_deref() {
+                    Some("VARCHAR" | "NVARCHAR" | "CHARACTER VARYING" | "SYSNAME") => true,
+                    Some("CHAR" | "NCHAR" | "CHARACTER") => self.db2(),
+                    _ => false,
+                };
+                ColKind::Text { plain }
+            }
+            _ => ColKind::Other,
+        })
+    }
+
     fn operand_kind(&self, ts: &[T], j: Option<usize>) -> (bool, bool) {
         let Some(j) = j else { return (false, false) };
         let t = &ts[j];
@@ -8348,6 +8387,12 @@ impl<'a> Cx<'a> {
             IDENT if next_sig(ts, j).is_some_and(|n| ts[n].k == L_PAREN) => {
                 (string_builtin(ts, j), false)
             }
+            // A column, written `c`, `t.c` or `s.t.c`.
+            IDENT | QUOTED_IDENT if !t.s.starts_with('@') => match self.col_kind(ts, j) {
+                Some(ColKind::Text { .. }) => (true, false),
+                Some(ColKind::Num) => (false, true),
+                _ => (false, false),
+            },
             R_PAREN => {
                 let open = (0..j)
                     .rev()
@@ -8359,11 +8404,113 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// `CROSS APPLY (subquery) alias` is `CROSS JOIN LATERAL (subquery)
+    /// alias`; `OUTER APPLY (subquery) alias` is `LEFT JOIN LATERAL
+    /// (subquery) alias ON TRUE` (PostgreSQL); a function call after APPLY
+    /// (`CROSS APPLY f(x) alias`) the same way. Any APPLY not rewritten
+    /// (Db2 for i has none, or the shape is not one of these) refuses the
+    /// statement.
+    fn apply_edits(&mut self, ts: &[T], e: &mut bits::BitEdits) {
+        for i in sig(ts) {
+            let outer = ts[i].k == IDENT && ts[i].is("OUTER");
+            if !(outer || ts[i].k == IDENT && ts[i].is("CROSS")) {
+                continue;
+            }
+            let Some(ap) = next_sig(ts, i).filter(|&a| ts[a].is("APPLY")) else {
+                continue;
+            };
+            if let Some(end) = self.apply_end(ts, ap, outer) {
+                e.rep
+                    .insert(i, if outer { "LEFT JOIN" } else { "CROSS JOIN" }.into());
+                e.rep.insert(ap, "LATERAL".into());
+                if outer {
+                    e.post.insert(end, " ON TRUE".into());
+                }
+                e.steps.push(("tsql.from.apply", i, ap));
+            } else {
+                let to = self.to.display_name();
+                self.note(Status::NotConverted, "tsql.from.apply-refused", &format!("{} APPLY has no rule for {to}: {to} {}. Rewrite it with a lateral join by hand.", if outer { "OUTER" } else { "CROSS" }, if self.db2() { "has no APPLY" } else { "gets it only for a subquery or a function call in the FROM clause" }));
+            }
+        }
+    }
+
+    /// For the APPLY at `ap`: the last token of its table expression (and
+    /// alias, for OUTER APPLY, which needs `ON TRUE` after it) when this
+    /// is a subquery or a function call that PostgreSQL takes as LATERAL.
+    fn apply_end(&self, ts: &[T], ap: usize, outer: bool) -> Option<usize> {
+        if self.to != Dialect::Postgres {
+            return None;
+        }
+        let first = next_sig(ts, ap)?;
+        let open = if ts[first].k == L_PAREN {
+            first
+        } else {
+            // `f(…)`, `s.f(…)`: a possibly qualified function name.
+            let mut n = first;
+            while matches!(ts[n].k, IDENT | QUOTED_IDENT) {
+                let nx = next_sig(ts, n)?;
+                match ts[nx].k {
+                    L_PAREN => break,
+                    DOT => n = next_sig(ts, nx)?,
+                    _ => return None,
+                }
+            }
+            next_sig(ts, n).filter(|&o| ts[o].k == L_PAREN)?
+        };
+        let close = matching(ts, open)?;
+        let mut end = close;
+        if outer {
+            // The alias and column list, before ON TRUE.
+            let mut n = next_sig(ts, end);
+            if n.is_some_and(|a| ts[a].is("AS")) {
+                n = n.and_then(|a| next_sig(ts, a));
+            }
+            // A bare alias is a name, not a word that continues the query
+            // (T-SQL allows no alias after a function call).
+            const NOT_AN_ALIAS: [&str; 22] = [
+                "ORDER",
+                "GROUP",
+                "HAVING",
+                "UNION",
+                "EXCEPT",
+                "INTERSECT",
+                "INNER",
+                "LEFT",
+                "RIGHT",
+                "FULL",
+                "CROSS",
+                "OUTER",
+                "JOIN",
+                "WHERE",
+                "ON",
+                "FOR",
+                "OPTION",
+                "WINDOW",
+                "PIVOT",
+                "UNPIVOT",
+                "TABLESAMPLE",
+                "WITH",
+            ];
+            if let Some(a) = n.filter(|&a| {
+                matches!(ts[a].k, IDENT | QUOTED_IDENT)
+                    && !is_clause_word(&ts[a].s)
+                    && !(ts[a].k == IDENT && NOT_AN_ALIAS.iter().any(|w| ts[a].is(w)))
+            }) {
+                end = a;
+                if let Some(l) = next_sig(ts, a).filter(|&l| ts[l].k == L_PAREN) {
+                    end = matching(ts, l).unwrap_or(a);
+                }
+            }
+        }
+        Some(end)
+    }
+
     fn expr(&mut self, ts: &[T]) -> String {
         let paged = self.paging(ts);
         let ts: &[T] = &paged;
         let mut edits = self.bit_edits(ts);
         self.geography_edits(ts, &mut edits);
+        self.apply_edits(ts, &mut edits);
         if let Some(outer) = self.bit_outer.take() {
             edits.wrap(outer);
         }
@@ -8569,7 +8716,34 @@ impl<'a> Cx<'a> {
                 // string (int has the higher precedence: `'1' + 1` is 2), so
                 // it stays `+` and fails on the target instead of becoming
                 // a different value.
-                if !unary && (l.0 || r.0) && !(l.1 || r.1) {
+                let (lk, rk) = (
+                    prev_sig(ts, i).and_then(|p| self.col_kind(ts, p)),
+                    next_sig(ts, i).and_then(|n| self.col_kind(ts, n)),
+                );
+                // A column of a known type that is no plain string blocks
+                // `||`; so does one of unknown type next to another column
+                // (a string literal beside it makes the sum a concatenation
+                // as before).
+                let blocked = |k: Option<ColKind>, other: Option<ColKind>| match k {
+                    Some(ColKind::Other | ColKind::Text { plain: false }) => true,
+                    Some(ColKind::Unknown) => other.is_some(),
+                    _ => false,
+                };
+                // A column of a known type that neither concatenates nor
+                // adds as PostgreSQL does: the `+` stays, the unit is refused.
+                let mixed = |k: Option<ColKind>| {
+                    matches!(k, Some(ColKind::Other | ColKind::Text { plain: false }))
+                };
+                if !unary && (mixed(lk) || mixed(rk)) && !(l.1 || r.1) {
+                    self.step_ts("tsql.expr.plus-mixed", &ts[i..=i]);
+                    self.note(Status::NotConverted, "tsql.expr.plus-mixed", "`+` is kept: an operand is a column whose type (CHAR on PostgreSQL, TEXT, a date or time, uniqueidentifier, binary) makes `||` give another value than T-SQL's `+`, or an error. Write the conversion by hand, casting the operands as intended.");
+                    o.push('+');
+                } else if !unary
+                    && (l.0 || r.0)
+                    && !(l.1 || r.1)
+                    && !blocked(lk, rk)
+                    && !blocked(rk, lk)
+                {
                     self.note(Status::Assumptions, "ASM-CONCAT-NULL", "String + becomes ||; both give NULL when an operand is NULL (CONCAT_NULL_YIELDS_NULL ON, the default).");
                     self.step_ts("tsql.expr.concat", &ts[i..=i]);
                     o.push_str("||");
@@ -12335,6 +12509,19 @@ fn collapse_spaces(s: &str) -> String {
         );
     }
     out
+}
+
+/// What a column is for the `+` rule.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColKind {
+    /// A string; `plain` when `||` gives the value `+` gives.
+    Text { plain: bool },
+    /// A number (a bit too: it ranks above the strings).
+    Num,
+    /// A known type `+` neither adds nor concatenates alike on the target.
+    Other,
+    /// The catalog does not give its type.
+    Unknown,
 }
 
 /// A T-SQL type, as far as DATEADD needs it: the date argument decides the

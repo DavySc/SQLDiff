@@ -1700,7 +1700,9 @@ mod tests {
             historyless,
             skip_witnesses,
             work_budgets,
+            work_caps,
             alignment_bound,
+            statement_work_cap,
         } = Options::default();
         let base = Options {
             excerpt_lines,
@@ -1717,7 +1719,9 @@ mod tests {
             historyless,
             skip_witnesses,
             work_budgets,
+            work_caps,
             alignment_bound,
+            statement_work_cap,
         };
         let artifact = || Artifact::new("schema.sql", Dialect::Tsql, "CREATE TABLE t (id int);");
         let changes: Vec<Change<Options>> = vec![
@@ -1775,7 +1779,12 @@ mod tests {
             ("historyless", Box::new(|o| o.historyless = true)),
             ("skip_witnesses", Box::new(|o| o.skip_witnesses = true)),
             ("work_budgets", Box::new(|o| o.work_budgets = Some((1, 1)))),
+            ("work_caps", Box::new(|o| o.work_caps = Some((1, 1)))),
             ("alignment_bound", Box::new(|o| o.alignment_bound = Some(1))),
+            (
+                "statement_work_cap",
+                Box::new(|o| o.statement_work_cap = Some(1)),
+            ),
             (
                 "proof mode",
                 Box::new(|o| o.proof.mode = sqldiff_core::proof::Mode::Require),

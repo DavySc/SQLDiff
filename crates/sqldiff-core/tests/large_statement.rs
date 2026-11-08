@@ -115,6 +115,30 @@ fn past_the_alignment_bound_the_script_is_unknown_not_guessed() {
     assert_eq!(r.verdict(), Verdict::Unknown);
 }
 
+/// The "could not align" finding marks the whole stretch it skipped, not its
+/// first statement: a change elsewhere is judged against what the edit checker
+/// takes as changed, and a skipped statement outside the mark would count as
+/// unchanged.
+#[test]
+fn the_alignment_bound_finding_covers_the_whole_skipped_stretch() {
+    let r = script_report_with(Some(1_000_000));
+    let f = r
+        .findings
+        .iter()
+        .find(|f| f.rule == "align.bound")
+        .expect("one align.bound finding");
+    for loc in [f.a.as_ref(), f.b.as_ref()] {
+        let loc = loc.expect("a location on each side");
+        assert!(
+            loc.end_line > loc.start_line + 1000,
+            "the mark is {}..{}",
+            loc.start_line,
+            loc.end_line
+        );
+        assert!(loc.byte_end > loc.byte_start + 10_000);
+    }
+}
+
 /// A statement that moves into a stretch too large to align is not said to
 /// have no counterpart: it may be there. The gap is 2 100 x 2 101
 /// statements, past the bound of the similarity pairing, with no test hook.
@@ -149,4 +173,54 @@ fn a_statement_moved_into_an_unaligned_stretch_is_not_called_removed() {
         assert_ne!(f.verdict, Verdict::Different, "{} {}", f.rule, f.witness);
     }
     assert_eq!(r.verdict(), Verdict::Unknown);
+}
+
+/// The edit checker must not prove a difference by assuming that the
+/// statements of a stretch that was not aligned are unchanged. Here the edit
+/// `SET @y = @x * 2` against `(@x - 1) * 2` is compensated by an edit inside
+/// the unaligned stretch (`@x` is one larger), so both sides return the same
+/// `@y`. With only the first statement of the stretch marked, the checker
+/// proved `equiv.edit` Different ("when @x is 2: A sets @y to 4 and B to 2").
+#[test]
+fn an_edit_after_an_unaligned_stretch_is_not_proven_different_by_assuming_it_unchanged() {
+    let src = |b: bool| {
+        let mut s = String::from(
+            "CREATE PROCEDURE dbo.p @p int AS\nBEGIN\nDECLARE @x int, @y int, @z int;\n",
+        );
+        for i in 0..2_100 {
+            if i == 7 {
+                s += if b {
+                    "SET @x = @p + 2;\n"
+                } else {
+                    "SET @x = @p + 1;\n"
+                };
+            } else {
+                s += &format!("PRINT {};\n", if b { i + 100_000 } else { i });
+            }
+        }
+        s += "SELECT 1 AS k;\n";
+        s += if b {
+            "SET @y = (@x - 1) * 2;\n"
+        } else {
+            "SET @y = @x * 2;\n"
+        };
+        s += "SELECT @y AS y;\nEND;\n";
+        s
+    };
+    let r = diff(
+        &Artifact::new("a.sql", Dialect::Tsql, src(false)),
+        &Artifact::new("b.sql", Dialect::Tsql, src(true)),
+        &Options {
+            alignment_bound: Some(1_000_000),
+            ..Options::default()
+        },
+    );
+    assert!(r.findings.iter().any(|f| f.rule == "align.bound"));
+    let proven: Vec<_> = r
+        .findings
+        .iter()
+        .filter(|f| f.rule == "equiv.edit" && f.verdict == Verdict::Different)
+        .map(|f| f.witness.clone())
+        .collect();
+    assert!(proven.is_empty(), "{proven:?}");
 }

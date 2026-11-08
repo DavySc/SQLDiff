@@ -92,6 +92,20 @@ pub fn alignment_bound_finding(
     a: Option<crate::model::Location>,
     b: Option<crate::model::Location>,
 ) -> Finding {
+    alignment_cut_finding(object, what, na, nb, a, b, "are past the alignment bound")
+}
+
+/// [`alignment_bound_finding`] with the reason the lists were not aligned
+/// (the bound, or the statement-level work budget: "N of CAP").
+pub fn alignment_cut_finding(
+    object: &str,
+    what: &str,
+    na: usize,
+    nb: usize,
+    a: Option<crate::model::Location>,
+    b: Option<crate::model::Location>,
+    reason: &str,
+) -> Finding {
     let class = ChangeClass::Semantic;
     let rule = "align.bound";
     let anchor = format!("{what}:{na}x{nb}");
@@ -108,7 +122,7 @@ pub fn alignment_bound_finding(
         severity: class.default_severity(),
         verdict: Verdict::Unknown,
         witness: format!(
-            "{na} {what} on side A and {nb} on side B could not be aligned: the two lists are past the alignment bound. What lies between the parts that matched is not paired and not reported as added, removed or moved. Equivalence is not established."
+            "{na} {what} on side A and {nb} on side B could not be aligned: the two lists {reason}. What lies between the parts that matched is not paired and not reported as added, removed or moved. Equivalence is not established."
         ),
         a,
         b,
@@ -117,6 +131,20 @@ pub fn alignment_bound_finding(
 }
 
 pub fn diff(a: &Analyzed, b: &Analyzed, work: usize) -> TreeDiff {
+    diff_within(a, b, work, &sqldiff_model::work::Allowance::new(None))
+}
+
+/// [`diff`] under a statement-level allowance (`Options::statement_work_cap`):
+/// past it the lists that are not aligned take the same exit as the alignment
+/// bound (`align.bound`, their hashes in the skipped sets). An allowance that
+/// is off is `diff`. The caller keeps the allowance, so what the tree diff
+/// spent is not available again to the checks that run after it.
+pub fn diff_within(
+    a: &Analyzed,
+    b: &Analyzed,
+    work: usize,
+    allowance: &sqldiff_model::work::Allowance,
+) -> TreeDiff {
     sqldiff_model::work::spend(sqldiff_model::work::Site::DiffCalls, 1);
     let ua: Vec<Unit> = ast::structural_children(&a.root)
         .into_iter()
@@ -143,6 +171,7 @@ pub fn diff(a: &Analyzed, b: &Analyzed, work: usize) -> TreeDiff {
         skipped_a: HashSet::new(),
         skipped_b: HashSet::new(),
         work,
+        allowance,
     };
     ctx.diff_lists(&ua, &ub);
     ctx.resolve_unpaired();
@@ -166,6 +195,8 @@ struct Ctx<'x, 'a> {
     skipped_b: HashSet<String>,
     /// The exact-alignment bound ([`crate::normalize::lcs_pairs_bounded`]).
     work: usize,
+    /// What the alignments and gap pairings of this diff may still spend.
+    allowance: &'x sqldiff_model::work::Allowance,
 }
 
 fn all_hashes(units: &[Unit]) -> HashSet<String> {
@@ -186,7 +217,8 @@ impl Ctx<'_, '_> {
     fn diff_lists(&mut self, a: &[Unit], b: &[Unit]) {
         let ka: Vec<&str> = a.iter().map(|u| u.full.as_str()).collect();
         let kb: Vec<&str> = b.iter().map(|u| u.full.as_str()).collect();
-        let (anchors, exact) = crate::normalize::lcs_pairs_bounded(&ka, &kb, self.work);
+        let (anchors, exact, by_allowance) =
+            crate::normalize::lcs_pairs_allowed(&ka, &kb, self.work, self.allowance);
         let (mut ai, mut bj) = (0, 0);
         for (i, j) in anchors
             .into_iter()
@@ -194,23 +226,57 @@ impl Ctx<'_, '_> {
         {
             let (ga, gb) = (&a[ai..i], &b[bj..j]);
             // A gap with units on both sides is not paired when the
-            // alignment is partial or the gap is too large to score.
-            if !ga.is_empty()
-                && !gb.is_empty()
-                && (!exact || ga.len().saturating_mul(gb.len()) > GAP_BOUND)
-            {
-                let loc = |x: &Analyzed, us: &[Unit]| us.first().map(|u| x.node_location(&u.node));
-                let f = alignment_bound_finding(
-                    self.object(),
-                    "statements",
-                    ga.len(),
-                    gb.len(),
-                    loc(self.a, ga),
-                    loc(self.b, gb),
-                );
-                self.out.findings.push(f);
-                self.skipped_a.extend(all_hashes(ga));
-                self.skipped_b.extend(all_hashes(gb));
+            // alignment is partial, the gap is too large to score, or the
+            // statement-level allowance cannot pay for scoring it. That is
+            // decided once, here, for the whole gap: nothing inside `diff_gap`
+            // reads the allowance, because a statement left unpaired by a cut
+            // in the middle would be reported as added or removed.
+            if !ga.is_empty() && !gb.is_empty() {
+                let scores = (ga.len() as u64).saturating_mul(gb.len() as u64);
+                let cut_by_allowance = exact
+                    && ga.len().saturating_mul(gb.len()) <= GAP_BOUND
+                    && !self.allowance.allows(scores);
+                if !exact || ga.len().saturating_mul(gb.len()) > GAP_BOUND || cut_by_allowance {
+                    // The whole stretch, from its first statement's start to
+                    // its last statement's end: a finding that marked only the
+                    // first statement would let the edit checker treat the
+                    // others as unchanged.
+                    let loc = |x: &Analyzed, us: &[Unit]| {
+                        let first = x.node_location(&us.first()?.node);
+                        let last = x.node_location(&us.last()?.node);
+                        Some(crate::model::Location {
+                            end_line: last.end_line,
+                            end_col: last.end_col,
+                            byte_end: last.byte_end,
+                            ..first
+                        })
+                    };
+                    let reason = match self.allowance.cap() {
+                        Some(cap) if cut_by_allowance || by_allowance => {
+                            format!(
+                                "are past the statement-level work budget ({} of {cap} units of work)",
+                                self.allowance.spent()
+                            )
+                        }
+                        _ => "are past the alignment bound".to_string(),
+                    };
+                    let f = alignment_cut_finding(
+                        self.object(),
+                        "statements",
+                        ga.len(),
+                        gb.len(),
+                        loc(self.a, ga),
+                        loc(self.b, gb),
+                        &reason,
+                    );
+                    self.out.findings.push(f);
+                    self.skipped_a.extend(all_hashes(ga));
+                    self.skipped_b.extend(all_hashes(gb));
+                } else {
+                    sqldiff_model::work::spend(sqldiff_model::work::Site::GapScores, scores);
+                    self.allowance.take(scores);
+                    self.diff_gap(ga, gb);
+                }
             } else {
                 self.diff_gap(ga, gb);
             }
