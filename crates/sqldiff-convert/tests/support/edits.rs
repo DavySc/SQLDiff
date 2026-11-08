@@ -116,6 +116,9 @@ pub struct Model {
     pub extra: Vec<(String, String)>,
     /// Text appended to a file by a no-op edit.
     pub notes: Vec<(String, String)>,
+    /// The base catalog is given as two files (reasons name the catalogs by
+    /// their number, so every reason that names the catalog changes).
+    pub split_base: bool,
 }
 
 /// The three tables the fixed dependents use.
@@ -239,6 +242,7 @@ impl Model {
             base,
             extra: Vec::new(),
             notes: Vec::new(),
+            split_base: false,
         }
     }
 
@@ -286,6 +290,15 @@ impl Model {
 
     /// The base catalog as DDL in `d`: the source dialect for `--catalog`,
     /// the target dialect for `--catalog-b`.
+    /// The base catalog as files, in the order given on the command line.
+    pub fn base_files(&self, d: Dialect) -> Vec<String> {
+        let mut v = vec![self.base_catalog(d)];
+        if self.split_base {
+            v.push("-- a second, empty catalog file\n".to_string());
+        }
+        v
+    }
+
     pub fn base_catalog(&self, d: Dialect) -> String {
         self.base
             .iter()
@@ -556,6 +569,8 @@ pub enum Edit {
     AddRoutine,
     DropRoutine,
     ChangeParameterType,
+    /// The base catalog is two files instead of one.
+    SplitBase,
     /// A table in a schema that did not exist (schema appears).
     AddSchemaTable,
     AddTrigger,
@@ -595,6 +610,7 @@ pub const ALL_EDITS: &[Edit] = &[
     Edit::BaseRetype,
     Edit::BaseTable,
     Edit::BaseDrop,
+    Edit::SplitBase,
 ];
 
 impl Edit {
@@ -696,9 +712,12 @@ impl Edit {
                 format!("toggle unique index on {tname}.C1")
             }
             Edit::ViewBody => {
-                let vi = r.below(m.views.len());
-                m.views[vi].star ^= true;
-                format!("view {} body", m.views[vi].name)
+                // Both views, so some dependent of each sees it.
+                let _ = r.below(m.views.len());
+                for v in &mut m.views {
+                    v.star ^= true;
+                }
+                "view bodies".to_string()
             }
             Edit::AddRoutine => {
                 m.routines.push(Routine {
@@ -766,6 +785,10 @@ impl Edit {
                     versioned: false,
                 });
                 "base catalog: ext.More appears".into()
+            }
+            Edit::SplitBase => {
+                m.split_base = true;
+                "the base catalog is two files".into()
             }
             Edit::BaseDrop => {
                 m.base.clear();

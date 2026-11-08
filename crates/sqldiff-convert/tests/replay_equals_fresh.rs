@@ -52,6 +52,7 @@ fn recheck_at_most(e: &Edit) -> usize {
         Edit::VersioningOn => usize::MAX / 2,
         Edit::BaseRetype => 5,
         Edit::BaseTable => 4,
+        Edit::SplitBase => 7,
     };
     measured.saturating_add(2)
 }
@@ -186,7 +187,7 @@ fn every_edit_changes_the_input_unless_it_is_a_no_op() {
             let inputs = |m: &Model| {
                 (
                     m.files(),
-                    [Dialect::Tsql, Dialect::Postgres, Dialect::Db2i].map(|d| m.base_catalog(d)),
+                    [Dialect::Tsql, Dialect::Postgres, Dialect::Db2i].map(|d| m.base_files(d)),
                 )
             };
             if matches!(e, Edit::NoOpReorderTables) {

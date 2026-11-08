@@ -39,9 +39,22 @@ impl Fixture {
             std::fs::write(f, text).unwrap();
         }
         let base = self.dir.join("base");
+        let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
-        std::fs::write(base.join("a.sql"), m.base_catalog(Dialect::Tsql)).unwrap();
-        std::fs::write(base.join("b.sql"), m.base_catalog(self.to)).unwrap();
+        for (i, t) in m.base_files(Dialect::Tsql).iter().enumerate() {
+            std::fs::write(base.join(format!("a{i}.sql")), t).unwrap();
+        }
+        for (i, t) in m.base_files(self.to).iter().enumerate() {
+            std::fs::write(base.join(format!("b{i}.sql")), t).unwrap();
+        }
+    }
+
+    /// The base catalog files of one side that `write` made, in order.
+    fn catalogs(&self, side: &str) -> Vec<PathBuf> {
+        (0..)
+            .map(|i| self.dir.join(format!("base/{side}{i}.sql")))
+            .take_while(|p| p.is_file())
+            .collect()
     }
 
     pub fn job(&self, out: &str, fresh: bool) -> Job {
@@ -58,8 +71,8 @@ impl Fixture {
                 extensions: tree::extensions(Vec::new()),
                 helpers: Vec::new(),
                 deployment: Default::default(),
-                catalogs: vec![self.dir.join("base/a.sql")],
-                catalogs_b: vec![self.dir.join("base/b.sql")],
+                catalogs: self.catalogs("a"),
+                catalogs_b: self.catalogs("b"),
             },
             out: self.dir.join(out),
             overwrite: true,
