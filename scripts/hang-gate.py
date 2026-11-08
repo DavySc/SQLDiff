@@ -36,7 +36,7 @@ OVERRIDES = {}
 # (alignment, the edit checker, witness search) is not capped until step B (a later PR);
 # one alignment can still use up to LCS_WORK cells.
 KNOWN_OPEN = {
-    "j_branches_16": "R1: nested IF/ELSE is 2^depth through the alignment; depth 14 takes 70 s and 1 GB (guarded in the normal run)",
+    "j_branches_16": "the input doubles per depth (10.5 MB, 131k statements in one routine): 125 s and 3.3 GB, over the 120 s and 2 GB limits; depth 14 (26 s, 0.9 GB) is guarded in the normal run",
     "a_procs_200x20": (
         "R1: 0.6 s per routine of 20 IF-guarded writes, 118 s for 200 routines",
         60,
