@@ -59,9 +59,8 @@ pub enum Site {
     /// Items built for a cross-dialect comparison or a refinement
     /// (`equiv::items`: one per lowered statement or control marker).
     ItemsBuilt,
-    /// Statement pairs of a cross-dialect comparison: each pair compared
-    /// (twice: the count of unequal ones and the comparison itself) and the
-    /// identity analysis over the items and pairs.
+    /// Statement pairs compared (`compare_pair`): one unit per pair, in a
+    /// cross-dialect comparison or a refinement.
     PairCompares,
 }
 

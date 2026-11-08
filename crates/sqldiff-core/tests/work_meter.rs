@@ -234,3 +234,46 @@ mod fixed {
         assert_eq!(off, on);
     }
 }
+
+fn counts(a: Artifact, b: Artifact) -> (u64, u64) {
+    let ((), w) = scope("test", || {
+        let _ = diff(&a, &b, &Options::default());
+    });
+    (w.get(Site::ItemsBuilt), w.get(Site::PairCompares))
+}
+
+// The statement-level sites count exactly: a cross-dialect routine of n
+// statements builds 2n items (n per side) and compares n pairs.
+#[test]
+fn cross_dialect_items_and_pairs_are_counted_exactly() {
+    for n in [1usize, 3, 6] {
+        let ts: String = (0..n)
+            .map(|k| format!("  INSERT INTO dbo.t (a) VALUES ({k});\n"))
+            .collect();
+        let pg: String = (0..n)
+            .map(|k| format!("  INSERT INTO t (a) VALUES ({k});\n"))
+            .collect();
+        let a = format!("CREATE PROCEDURE dbo.p AS\nBEGIN\n{ts}END\n");
+        let b = format!("CREATE PROCEDURE p() LANGUAGE plpgsql AS $$\nBEGIN\n{pg}END;\n$$;\n");
+        let (items, pairs) = counts(
+            Artifact::new("a.sql", Dialect::Tsql, a.as_str()),
+            Artifact::new("b.sql", Dialect::Postgres, b.as_str()),
+        );
+        assert_eq!(items, 2 * n as u64);
+        assert_eq!(pairs, n as u64);
+    }
+}
+
+// A same-dialect diff with an Unknown stmt.modified finding refines it, which
+// builds items too.
+#[test]
+fn the_refinement_of_a_modified_statement_is_counted() {
+    let (a, b) = pair();
+    let (items, pairs) = counts(
+        Artifact::new("a.sql", Dialect::Tsql, a.as_str()),
+        Artifact::new("b.sql", Dialect::Tsql, b.as_str()),
+    );
+    // Only the refinement builds items and compares pairs in a same-dialect
+    // diff: 64 items over both sides, one modified statement compared.
+    assert_eq!((items, pairs), (64, 1));
+}

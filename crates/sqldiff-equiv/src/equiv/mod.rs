@@ -5325,10 +5325,10 @@ fn pair_items(
             wit.map(|w| (w, [&oa[..], &ob[..]])),
             out,
         );
-        // One unit for the pair: its comparison is mostly unmetered, and an
-        // allowance that only saw the meter would never run out between two
-        // pairs. The metered work of the whole unit is taken when the unit
-        // ends (`compare_units`), not again here.
+        // One unit for the pair, so that the allowance runs out between two
+        // pairs even where the meter sees little. `compare_pair` also spends
+        // one `PairCompares` unit, which the end of `compare_units` takes
+        // too: a pair therefore costs 2 in all.
         allowance.take(1);
     }
     pairs
