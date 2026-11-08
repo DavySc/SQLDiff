@@ -217,6 +217,17 @@ impl Effects {
         self.get(k).is_some()
     }
 
+    /// `get(probe.key)`, resolving the key's index once per distinct `names`
+    /// array instead of searching by string for every outcome.
+    pub(super) fn get_probe(&self, probe: &KeyProbe) -> Option<&Fate> {
+        code_fate(self.0.at(probe.index_in(&self.0.names)?))
+    }
+
+    /// `contains_key(probe.key)`.
+    pub(super) fn contains_probe(&self, probe: &KeyProbe) -> bool {
+        self.get_probe(probe).is_some()
+    }
+
     pub fn get_key_value(&self, k: &str) -> Option<(&Rc<str>, &Fate)> {
         let i = self.0.index(k)?;
         code_fate(self.0.at(i)).map(|f| (&self.0.names[i], f))
@@ -279,6 +290,38 @@ impl Effects {
         out.sort_unstable();
         out.dedup();
         Some(out)
+    }
+}
+
+/// An effect key with its index in the last `names` array it was resolved
+/// against. Outcomes of one exploration mostly share one `names` array; one
+/// over another array is resolved again (the cache holds the array, so its
+/// address cannot be reused while the cache points at it).
+type ResolvedIn = (Rc<Vec<Rc<str>>>, Option<usize>);
+
+pub(super) struct KeyProbe<'a> {
+    key: &'a str,
+    cache: std::cell::RefCell<Option<ResolvedIn>>,
+}
+
+impl<'a> KeyProbe<'a> {
+    pub(super) fn new(key: &'a str) -> KeyProbe<'a> {
+        KeyProbe {
+            key,
+            cache: std::cell::RefCell::new(None),
+        }
+    }
+
+    fn index_in(&self, names: &Rc<Vec<Rc<str>>>) -> Option<usize> {
+        let mut c = self.cache.borrow_mut();
+        if let Some((n, i)) = c.as_ref() {
+            if Rc::ptr_eq(n, names) {
+                return *i;
+            }
+        }
+        let i = names.binary_search_by(|n| (**n).cmp(self.key)).ok();
+        *c = Some((names.clone(), i));
+        i
     }
 }
 
@@ -434,5 +477,31 @@ impl Eq for BeforeFault {}
 impl fmt::Debug for BeforeFault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_set().entries(self.iter()).finish()
+    }
+}
+
+#[cfg(test)]
+mod key_probe_tests {
+    use super::*;
+
+    fn names(v: &[&str]) -> Rc<Vec<Rc<str>>> {
+        Rc::new(v.iter().map(|s| Rc::<str>::from(*s)).collect())
+    }
+
+    #[test]
+    fn probe_agrees_with_string_lookup() {
+        let n1 = names(&["a", "b", "c"]);
+        let n2 = names(&["b", "c", "d", "e"]);
+        let e1 = Effects::dense(n1.clone(), vec![1, 2, 0]);
+        let e1b = Effects::dense(n1, vec![0, 3, 4]);
+        let e2 = Effects::dense(n2, vec![4, 0, 1, 2]);
+        for key in ["a", "b", "c", "d", "e", "zz", ""] {
+            let probe = KeyProbe::new(key);
+            // Alternate arrays so the cache is re-resolved and reused.
+            for e in [&e1, &e1b, &e2, &e2, &e1, &e1b] {
+                assert_eq!(e.get_probe(&probe), e.get(key), "key {key:?}");
+                assert_eq!(e.contains_probe(&probe), e.contains_key(key));
+            }
+        }
     }
 }
