@@ -50,7 +50,11 @@ const DIALECTS: &[Dialect] = &[Dialect::Postgres, Dialect::Db2i];
 /// Sites killed by some generated edit.
 const KILLED: &[&str] = &[
     "crates/sqldiff-core/src/bind/query.rs::resolve_call#0",
+    "crates/sqldiff-core/src/bind/query.rs::resolve_call#2",
     "crates/sqldiff-core/src/bind/query.rs::table_ref#0",
+    "crates/sqldiff-core/src/bind/query.rs::table_ref#2",
+    "crates/sqldiff-core/src/bind/query.rs::table_ref#4",
+    "crates/sqldiff-core/src/bind/query.rs::unresolved_bare#0",
     "crates/sqldiff-core/src/engine.rs::diff_inner#0",
 ];
 
@@ -80,13 +84,9 @@ const REDUNDANT: &[&str] = &[
 const GAP: &[&str] = &[
     "crates/sqldiff-core/src/bind/query.rs::lookup_table_silent#0",
     "crates/sqldiff-core/src/bind/query.rs::resolve_call#1",
-    "crates/sqldiff-core/src/bind/query.rs::resolve_call#2",
     "crates/sqldiff-core/src/bind/query.rs::table_ref#1",
-    "crates/sqldiff-core/src/bind/query.rs::table_ref#2",
     "crates/sqldiff-core/src/bind/query.rs::table_ref#3",
-    "crates/sqldiff-core/src/bind/query.rs::table_ref#4",
     "crates/sqldiff-core/src/bind/query.rs::unknown_column_in#0",
-    "crates/sqldiff-core/src/bind/query.rs::unresolved_bare#0",
     "crates/sqldiff-core/src/engine.rs::check_recorded#0",
     "crates/sqldiff-core/src/engine.rs::diff_inner#2",
     "crates/sqldiff-equiv/src/equiv/call.rs::case_check#0",
