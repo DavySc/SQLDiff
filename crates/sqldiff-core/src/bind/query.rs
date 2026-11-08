@@ -13,7 +13,7 @@ use sqldiff_syntax::{Dialect, SyntaxKind};
 use super::{Binder, CallArg, CallStyle, DeclKind, Issue, RefKind, Resolution, Target};
 use crate::catalog::builtins::{self, Availability};
 use crate::catalog::ddl::{self, OutputCol};
-use crate::catalog::{CatalogView, DataType, Ident, Lookup, RoutineKind, Table, TableKind};
+use crate::catalog::{DataType, Ident, Lookup, RoutineKind, Table, TableKind};
 use crate::model::{ChangeClass, Severity};
 use crate::tokens::{self, close_paren, split_commas, Tok};
 
@@ -73,6 +73,8 @@ struct Shape {
     clause: Vec<bool>,
     /// Kind of the innermost paren around each token.
     inner: Vec<Option<Paren>>,
+    /// Length of `chain(g)` for each group, made once.
+    depth: Vec<usize>,
 }
 
 const SET_OPS: &[&str] = &["UNION", "EXCEPT", "INTERSECT", "MINUS"];
@@ -203,11 +205,19 @@ fn shape(t: &[Tok]) -> Shape {
         clause.push(at_query);
         inner.push(stack.last().map(|s| s.0));
     }
+    // A parent is always made before its children.
+    let mut depth = vec![1usize; parent.len()];
+    for g in 0..parent.len() {
+        if let Some(p) = parent[g] {
+            depth[g] = depth[p] + 1;
+        }
+    }
     Shape {
         group,
         parent,
         clause,
         inner,
+        depth,
     }
 }
 
@@ -1034,7 +1044,7 @@ impl<'a> Binder<'a> {
                 return tb;
             }
         }
-        let local = CatalogView::new(d, &[&self.local]);
+        let local = &self.local;
         if let Lookup::Found(tb) = local.table(parts) {
             let tb = tb.clone();
             self.add_ref(
@@ -1177,7 +1187,7 @@ impl<'a> Binder<'a> {
         if d == Dialect::Tsql {
             if let Some(tr) = self.trigger.clone() {
                 let view = self.input.view;
-                let local = CatalogView::new(d, &[&self.local]);
+                let local = &self.local;
                 let tb = match local.table(&tr.table) {
                     Lookup::Found(x) => Some(x.clone()),
                     _ => match view.table(&tr.table) {
@@ -1473,7 +1483,7 @@ impl<'a> Binder<'a> {
                             "FOR",
                             "WINDOW",
                         ]))
-                        || (sh.group[k] != g && sh.chain(sh.group[k]).len() < sh.chain(g).len())
+                        || (sh.group[k] != g && sh.depth[sh.group[k]] < sh.depth[g])
                         || t[k].is(SyntaxKind::SEMICOLON)
                 })
                 .unwrap_or(t.len());
@@ -1881,7 +1891,7 @@ impl<'a> Binder<'a> {
         } else {
             RefKind::Routine
         };
-        let local = CatalogView::new(d, &[&self.local]);
+        let local = &self.local;
         let view = self.input.view;
         let found = match local.routines(parts) {
             Lookup::Found(r) => Some(r.into_iter().cloned().collect::<Vec<_>>()),
@@ -2114,7 +2124,7 @@ impl<'a> Binder<'a> {
             return None;
         }
         let d = self.d;
-        let later = CatalogView::new(d, &[&self.later]);
+        let later = &self.later;
         let Lookup::Found(rs) = later.routines(parts) else {
             return None;
         };
@@ -2392,7 +2402,7 @@ impl<'a> Binder<'a> {
     }
 
     fn lookup_table_silent(&self, parts: &[Ident]) -> Option<Table> {
-        let local = CatalogView::new(self.d, &[&self.local]);
+        let local = &self.local;
         match local.table(parts) {
             Lookup::Found(x) => Some(x.clone()),
             _ => match self.input.view.table(parts) {
@@ -3026,7 +3036,7 @@ impl<'a> Binder<'a> {
             }
             _ => tb.columns_known = false,
         }
-        self.local.put_table(self.d, tb);
+        self.local.put_table(tb);
     }
 }
 

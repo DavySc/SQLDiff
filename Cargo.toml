@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sqldiff-syntax", "crates/sqldiff-core", "crates/sqldiff-source", "crates/sqldiff-review", "crates/sqldiff-convert", "crates/sqldiff-cli", "crates/sqldiff-mcp", "crates/sqldiff-gui", "crates/sqldiff-corpus"]
+members = ["crates/sqldiff-syntax", "crates/sqldiff-catalog", "crates/sqldiff-model", "crates/sqldiff-equiv", "crates/sqldiff-core", "crates/sqldiff-source", "crates/sqldiff-review", "crates/sqldiff-units", "crates/sqldiff-draft", "crates/sqldiff-convert", "crates/sqldiff-cli", "crates/sqldiff-mcp", "crates/sqldiff-gui", "crates/sqldiff-corpus"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,9 +10,14 @@ publish = false
 
 [workspace.dependencies]
 sqldiff-syntax = { path = "crates/sqldiff-syntax" }
+sqldiff-model = { path = "crates/sqldiff-model" }
+sqldiff-catalog = { path = "crates/sqldiff-catalog" }
+sqldiff-equiv = { path = "crates/sqldiff-equiv" }
 sqldiff-core = { path = "crates/sqldiff-core" }
 sqldiff-source = { path = "crates/sqldiff-source" }
 sqldiff-review = { path = "crates/sqldiff-review" }
+sqldiff-units = { path = "crates/sqldiff-units" }
+sqldiff-draft = { path = "crates/sqldiff-draft" }
 sqldiff-convert = { path = "crates/sqldiff-convert" }
 rowan = "0.15"
 serde = { version = "1", features = ["derive"] }
@@ -21,6 +26,7 @@ sha2 = "0.10"
 toml = "0.8"
 toml_edit = "0.22"
 clap = { version = "4", features = ["derive"] }
+mimalloc = { version = "0.1", default-features = false }
 regex = "1"
 
 # The hashed leak scan (sqldiff pack scan) hashes every substring of the tree.

@@ -223,7 +223,7 @@ fn every_assumption_id_in_the_sources_is_registered_and_every_registered_id_is_u
     let mut problems = Vec::new();
     for (id, files) in &scan.unknown {
         problems.push(format!(
-            "{id} is used but not registered ({}); add it to crates/sqldiff-core/profiles/assumptions.toml",
+            "{id} is used but not registered ({}); add it to crates/sqldiff-model/profiles/assumptions.toml",
             files.iter().cloned().collect::<Vec<_>>().join(", ")
         ));
     }

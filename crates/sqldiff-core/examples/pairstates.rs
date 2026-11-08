@@ -70,7 +70,7 @@ fn main() {
                     "nodes_a": r.nodes_a, "nodes_b": r.nodes_b,
                     "decisions_a": r.decisions_a, "decisions_b": r.decisions_b,
                     "matched_a": r.matched_a, "matched_b": r.matched_b,
-                    "prod_paths_a": r.prod_paths_a, "prod_paths_b": r.prod_paths_b, "prod_cut": r.prod_cut,
+                    "prod_paths_a": r.prod_paths_a, "prod_paths_b": r.prod_paths_b, "prod_cut": r.prod_cut, "join_paths_a": r.join_paths_a, "join_paths_b": r.join_paths_b, "joined_a": r.joined_a, "joined_b": r.joined_b, "join_cut": r.join_cut, "gate_a": r.gate_a, "gate_b": r.gate_b,
                     "variants": ms, "self_a": js(&r.self_a), "self_b": js(&r.self_b),
                 })
             );

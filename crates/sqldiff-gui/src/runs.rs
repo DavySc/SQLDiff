@@ -1215,6 +1215,7 @@ impl Runs {
                 p.0.store(checked, Ordering::Relaxed);
             })),
             cancel: None,
+            ..Default::default()
         };
         let r = Arc::clone(run);
         std::thread::Builder::new()
@@ -1813,7 +1814,8 @@ impl PlanView {
 pub fn plan_view(spec: &ConvertSpec, isolated: bool) -> Result<PlanView, String> {
     let (job, _, _, _) = prepare(spec, isolated)?;
     let (inputs, _) = tree::read(&job.tree)?;
-    let plan = sqldiff_convert::plan::Plan::build(&inputs, job.tree.from);
+    let plan =
+        sqldiff_convert::plan::Plan::build(&tree::plan_inputs(&job.tree, &inputs), job.tree.from);
     let first = plan
         .groups
         .iter()
@@ -2228,9 +2230,6 @@ fn prepare(
         None => None,
     };
     let select = spec.increment.select();
-    if !select.is_empty() && spec.template {
-        return Err("an increment is not for template runs".into());
-    }
     let parameters = names(&spec.parameters);
     if !spec.template && !parameters.is_empty() {
         return Err("parameters are for template runs".into());
@@ -2256,6 +2255,7 @@ fn prepare(
             to,
             jobs: None,
             no_catalog: false,
+            recheck: Default::default(),
             template,
             extensions: tree::extensions(names(&spec.extensions)),
             helpers: cfg.options().helpers,
@@ -2300,9 +2300,12 @@ fn reopen(
     };
     // Stored after the review is shown: compressing takes a moment.
     let keep = match (&opened, &stored) {
-        (Ok(review), Some((st, extra))) if fresh => {
-            Some((Arc::clone(st), review.stored_key(extra), review.tree_json()))
-        }
+        (Ok(review), Some((st, extra))) if fresh => Some((
+            st.pending(),
+            Arc::clone(st),
+            review.stored_key(extra),
+            review.tree_json(),
+        )),
         _ => None,
     };
     {
@@ -2317,7 +2320,7 @@ fn reopen(
             Err(e) => *opening = Some(Opening::Failed(e)),
         }
     }
-    if let Some((st, key, json)) = keep {
+    if let Some((_pending, st, key, json)) = keep {
         st.put(&key, &json);
     }
 }
@@ -2354,6 +2357,7 @@ fn execute(run: &Arc<Run>, work: Work, stored: Option<&Arc<Stored>>) -> State {
             r.checked.store(checked, Ordering::Relaxed);
         })),
         cancel: Some(Arc::clone(&run.cancel)),
+        ..Default::default()
     };
     let finished = sqldiff_review::time::now;
     let stopped = |e: String| match e == tree::CANCELLED {
@@ -2452,6 +2456,7 @@ fn execute(run: &Arc<Run>, work: Work, stored: Option<&Arc<Stored>>) -> State {
         Ok(review) => {
             let keep = extra.map(|(st, extra)| {
                 (
+                    st.pending(),
                     Arc::clone(st),
                     review.stored_key(&extra),
                     review.tree_json(),
@@ -2460,10 +2465,13 @@ fn execute(run: &Arc<Run>, work: Work, stored: Option<&Arc<Stored>>) -> State {
             *run.review.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(Arc::new(Mutex::new(review)));
             // Compressing a large tree takes a moment: not on the run's time.
-            if let Some((st, key, json)) = keep {
+            if let Some((pending, st, key, json)) = keep {
                 let _ = std::thread::Builder::new()
                     .name(format!("sqldiff-store-{}", run.id))
-                    .spawn(move || st.put(&key, &json));
+                    .spawn(move || {
+                        st.put(&key, &json);
+                        drop(pending);
+                    });
             }
         }
         // Written all the same: the review can be opened from the command line.

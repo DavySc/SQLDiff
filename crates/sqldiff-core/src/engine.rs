@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::artifact::{exact_hash, Analyzed, Artifact};
 use crate::bind::{self, BindInput, Bindings};
 use crate::catalog::builtins::Helper;
+use crate::catalog::record::{NoSink, ReadSink, RecordingView, Side as ReadSide};
 use crate::catalog::{ddl, Catalog, CatalogView};
 use crate::classify::pairing_key;
 use crate::equiv;
@@ -15,9 +16,44 @@ use crate::model::{
     fingerprint, Assumption, ChangeClass, Finding, FingerprintInput, Location, NoiseCounts, Report,
     Severity, Side, Verdict,
 };
-use crate::normalize::lcs_pairs;
 use crate::rules;
 use crate::treediff;
+
+/// Structured catalog facts handed to the engine. Opaque on purpose: only the
+/// engine opens it (to build a side's view), so a read of the catalog in the
+/// check cannot go around the recorded queries (performance plan W4.3, R2.2).
+/// A caller that needs the catalog itself keeps its own `Arc<Catalog>`.
+#[derive(Debug, Clone)]
+pub struct Facts(Arc<Catalog>);
+
+impl Facts {
+    pub fn new(catalog: Arc<Catalog>) -> Facts {
+        Facts(catalog)
+    }
+
+    /// The facts as JSON, for the key of a cache outside the check (the review
+    /// cache). Not a read the check can record: nothing in a check calls it.
+    pub fn serialized(&self) -> Vec<u8> {
+        serde_json::to_vec(self.0.as_ref()).unwrap_or_default()
+    }
+
+    /// The catalog, for the engine's own side construction.
+    fn open(&self) -> &Arc<Catalog> {
+        &self.0
+    }
+}
+
+impl From<Arc<Catalog>> for Facts {
+    fn from(c: Arc<Catalog>) -> Facts {
+        Facts(c)
+    }
+}
+
+impl From<Catalog> for Facts {
+    fn from(c: Catalog) -> Facts {
+        Facts(Arc::new(c))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -31,9 +67,9 @@ pub struct Options {
     /// Catalog DDL for side B.
     pub catalog_b: Vec<Artifact>,
     /// Structured catalog facts for side A (adapter `get_catalog`, snapshot bundles).
-    pub facts_a: Vec<Arc<Catalog>>,
+    pub facts_a: Vec<Facts>,
     /// Structured catalog facts for side B.
-    pub facts_b: Vec<Arc<Catalog>>,
+    pub facts_b: Vec<Facts>,
     /// Pack-supplied helper functions, added to the built-in catalog.
     pub helpers: Vec<Helper>,
     /// Session assumption flips (id → holds). Flips of scenario assumptions
@@ -71,6 +107,23 @@ pub struct Options {
     /// tests that need a budget to run out. The budgets are counts, never
     /// times, so a result stays a function of the input.
     pub work_budgets: Option<(u64, u64)>,
+    /// Replace the behaviour model's work caps (per unit, per file; see
+    /// `behaviour::unit_work_cap`) by fixed numbers; `None` keeps the
+    /// built-in ones. For tests that need a cap to bite. Counts of metered
+    /// work, never times, so a result stays a function of the input.
+    pub work_caps: Option<(u64, u64)>,
+    /// Lower the bound of the exact statement alignment (cells, see
+    /// `normalize::DEFAULT_ALIGNMENT_BOUND`); `None` keeps the built-in one.
+    /// For tests that need to reach the bound with small inputs. A count,
+    /// never a time, so a result stays a function of the input.
+    pub alignment_bound: Option<usize>,
+    /// What the statement-level checker (alignments and gap pairings of the
+    /// same-dialect tree diff) may spend, in units of metered work
+    /// (`Site::AlignCells` and `Site::GapScores`); `None`, the default, is no
+    /// allowance and changes nothing. Past it the lists not yet aligned take
+    /// the `align.bound` exit with a work-budget witness. A count, never a
+    /// time, so a result stays a function of the input.
+    pub statement_work_cap: Option<u64>,
 }
 
 impl Default for Options {
@@ -90,6 +143,9 @@ impl Default for Options {
             historyless: false,
             skip_witnesses: false,
             work_budgets: None,
+            work_caps: None,
+            alignment_bound: None,
+            statement_work_cap: None,
         }
     }
 }
@@ -140,6 +196,22 @@ fn ddl_catalog(dialect: sqldiff_syntax::Dialect, ddl: &[Artifact]) -> Arc<Catalo
 /// The catalog one side binds against, and the equivalence schema read from
 /// it, built once and shared by every file compared against the same
 /// catalogs (a tree run compares hundreds of files against two).
+/// A side's view as a check reads it. Nothing is recorded until the series'
+/// PR 3 passes each check's sink here; this is where a side's `CatalogView`
+/// is turned into the only thing the check crates can hold.
+fn reading<'a>(
+    view: &'a CatalogView,
+    side: ReadSide,
+    sink: &'a (dyn ReadSink + Send),
+) -> RecordingView<'a> {
+    RecordingView::new(view, side, sink)
+}
+
+/// A sink that keeps nothing: every run that is not a recorded check.
+fn unrecorded() -> Arc<dyn ReadSink + Send> {
+    Arc::new(NoSink)
+}
+
 struct BoundSide {
     view: Arc<CatalogView>,
     schema: equiv::schema::Schema,
@@ -151,23 +223,23 @@ struct BoundSide {
 struct SideKey {
     dialect: sqldiff_syntax::Dialect,
     ddl: String,
-    held: Vec<Arc<Catalog>>,
+    held: Vec<Facts>,
 }
 
 impl SideKey {
-    fn is(&self, dialect: sqldiff_syntax::Dialect, ddl: &str, facts: &[Arc<Catalog>]) -> bool {
+    fn is(&self, dialect: sqldiff_syntax::Dialect, ddl: &str, facts: &[Facts]) -> bool {
         self.dialect == dialect
             && self.ddl == ddl
             && self.held.len() == facts.len()
-            && self.held.iter().zip(facts).all(|(a, b)| Arc::ptr_eq(a, b))
+            && self
+                .held
+                .iter()
+                .zip(facts)
+                .all(|(a, b)| Arc::ptr_eq(a.open(), b.open()))
     }
 }
 
-fn side(
-    dialect: sqldiff_syntax::Dialect,
-    ddl: &[Artifact],
-    facts: &[Arc<Catalog>],
-) -> Arc<BoundSide> {
+fn side(dialect: sqldiff_syntax::Dialect, ddl: &[Artifact], facts: &[Facts]) -> Arc<BoundSide> {
     type Cache = Mutex<Vec<(SideKey, Arc<BoundSide>)>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
     const MAX_ENTRIES: usize = 4;
@@ -189,7 +261,11 @@ fn side(
         return s;
     }
     let loaded = (!ddl.is_empty()).then(|| ddl_catalog(dialect, ddl));
-    let sources: Vec<&Catalog> = loaded.iter().chain(facts).map(|c| c.as_ref()).collect();
+    let sources: Vec<&Catalog> = loaded
+        .iter()
+        .chain(facts.iter().map(Facts::open))
+        .map(|c| c.as_ref())
+        .collect();
     let view = Arc::new(CatalogView::new(dialect, &sources));
     let schema = equiv::schema::Schema::from_shared_view(&view);
     let built = Arc::new(BoundSide { view, schema });
@@ -217,6 +293,30 @@ pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Compare two artifacts. Same dialect: version review (UC2). Different
 /// dialects: drift and conversion review (UC1, UC3).
 pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
+    diff_recorded(a, b, opts, unrecorded())
+}
+
+/// [`diff`] with every read of a catalog going to `sink`: side A's catalog is
+/// filed as `Side::Source`, side B's as `Side::Target`. The roles are the
+/// caller's to name, because the cached side serves whichever role a check
+/// gives it (performance plan W4.3).
+pub fn diff_recorded(
+    a: &Artifact,
+    b: &Artifact,
+    opts: &Options,
+    sink: Arc<dyn ReadSink + Send>,
+) -> Report {
+    // Counts the work of this comparison (see `sqldiff_model::work`); inside
+    // a file's check it shares the file's meter.
+    sqldiff_model::work::scope("diff", || diff_inner(a, b, opts, sink)).0
+}
+
+fn diff_inner(
+    a: &Artifact,
+    b: &Artifact,
+    opts: &Options,
+    sink: Arc<dyn ReadSink + Send>,
+) -> Report {
     let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
     let ab = Analyzed::new(b, Side::B, opts.excerpt_lines);
     let same = a.dialect == b.dialect;
@@ -234,16 +334,27 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     let side_a = side(a.dialect, &opts.catalog_a, &opts.facts_a);
     let side_b = side(b.dialect, &opts.catalog_b, &opts.facts_b);
     let (view_a, view_b) = (&side_a.view, &side_b.view);
-    let mut schema_a = side_a.schema.clone();
-    let mut schema_b = side_b.schema.clone();
+    let mut schema_a = side_a.schema.for_check(ReadSide::Source, sink.clone());
+    let mut schema_b = side_b.schema.for_check(ReadSide::Target, sink.clone());
     schema_a.list_stars_with(&mut schema_b);
+    let (read_a, read_b) = (
+        reading(view_a, ReadSide::Source, &*sink),
+        reading(view_b, ReadSide::Target, &*sink),
+    );
     let mut eq = equiv::Outcome::default();
     let mut txn_unknown = Vec::new();
     // What the same-dialect comparison vouches for (`coverage::unreceipted`).
     let mut receipts = Vec::new();
 
     if same {
-        let mut td = treediff::diff(&aa, &ab);
+        let allowance = sqldiff_model::work::Allowance::new(opts.statement_work_cap);
+        let mut td = treediff::diff_within(
+            &aa,
+            &ab,
+            opts.alignment_bound
+                .unwrap_or(crate::normalize::DEFAULT_ALIGNMENT_BOUND),
+            &allowance,
+        );
         // An observer that does not read row counts does not see SET NOCOUNT,
         // unless the code reads them itself: SET resets @@ROWCOUNT (and
         // ROWCOUNT_BIG()) to 0, so an added SET NOCOUNT before
@@ -286,7 +397,15 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
             }
         }
         equiv::refine_modified(&aa, &ab, &schema_a, &schema_b, &mut td.findings, &mut eq);
-        equiv::edit::decide(&aa, &ab, &schema_a, &schema_b, &mut td.findings, &mut eq);
+        equiv::edit::decide(
+            &aa,
+            &ab,
+            &schema_a,
+            &schema_b,
+            &mut td.findings,
+            &mut eq,
+            &allowance,
+        );
         findings.extend(td.findings);
         receipts.append(&mut td.receipts);
         receipts.append(&mut eq.receipts);
@@ -328,7 +447,13 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
             findings.push(rules::analysis::to_finding(&ab, &h, v));
         }
     } else {
-        findings.extend(pair_writes(&aa, &ab, opts.historyless));
+        findings.extend(pair_writes(
+            &aa,
+            &ab,
+            opts.historyless,
+            opts.alignment_bound
+                .unwrap_or(crate::normalize::DEFAULT_ALIGNMENT_BOUND),
+        ));
         for (side, schema) in [(&aa, &schema_a), (&ab, &schema_b)] {
             for h in lint::all_hits(side) {
                 findings.push(lint::to_finding(side, &h));
@@ -338,7 +463,8 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
                 findings.push(rules::analysis::to_finding(side, &h, Verdict::Unknown));
             }
         }
-        eq = equiv::compare(&aa, &ab, &schema_a, &schema_b, &opts.anchors);
+        let allowance = sqldiff_model::work::Allowance::new(opts.statement_work_cap);
+        eq = equiv::compare_within(&aa, &ab, &schema_a, &schema_b, &opts.anchors, &allowance);
         findings.append(&mut eq.findings);
         // Rows-affected counts across dialects (decision 1, observer profile).
         let (ca, cb) = (
@@ -377,20 +503,20 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     let bound_a = bind::bind(
         &aa,
         &BindInput {
-            view: view_a,
+            view: read_a,
             helpers: &opts.helpers,
         },
     );
     let bound_b = bind::bind(
         &ab,
         &BindInput {
-            view: view_b,
+            view: read_b,
             helpers: &opts.helpers,
         },
     );
     let (bindf, binda) = bind::binding_findings(&Bindings {
-        a: (&aa, &bound_a, view_a.supplied),
-        b: Some((&ab, &bound_b, view_b.supplied)),
+        a: (&aa, &bound_a, read_a.supplied()),
+        b: Some((&ab, &bound_b, read_b.supplied())),
     });
     absorb_residue(&mut findings, &bindf);
     findings.extend(bindf);
@@ -399,11 +525,17 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
             assumptions.push(x);
         }
     }
-    if view_a.supplied || view_b.supplied {
+    if read_a.supplied() || read_b.supplied() {
         normalizations.push("names bound against the catalog".to_string());
     }
 
-    let env = crate::ir::behaviour::Env::from_options(opts);
+    let mut env = crate::ir::behaviour::Env::from_options(opts);
+    // Cross-dialect: a condition text matches across the sides only where
+    // the identity analysis proved it the same fact (W6c, E2). Same-dialect
+    // diffs do not run that analysis and keep matching by text.
+    if !same {
+        env.identified = Some(std::sync::Arc::new(identified_pairs(&eq)));
+    }
     let beh = crate::ir::behaviour::analyze(&aa, &ab, &env);
     // A transaction statement between data statements is compared when the
     // behaviour model compared the routine that holds it, on its side.
@@ -453,28 +585,41 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         ));
     }
 
-    let mut report = finish(Report {
-        tool_version: TOOL_VERSION.to_string(),
-        verdict: Verdict::Equal,
-        a: aa.info(),
-        b: Some(ab.info()),
-        findings,
-        noise,
-        normalizations,
-        assumptions,
-        unknown_reasons,
-        suppressed: Vec::new(),
-        verdict_before_suppression: None,
-        refinements,
-        equivalent: None,
-        proof: None,
-        verdict_before_proof: None,
-        diagnostics,
-        witnesses,
-        discharged,
-    });
+    let mut report = Report::draft(TOOL_VERSION.to_string(), aa.info(), Some(ab.info()));
+    report.findings = findings;
+    report.noise = noise;
+    report.normalizations = normalizations;
+    report.assumptions = assumptions;
+    report.unknown_reasons = unknown_reasons;
+    report.refinements = refinements;
+    report.diagnostics = diagnostics;
+    report.witnesses = witnesses;
+    report.discharged = discharged;
+    let mut report = finish(report);
     crate::proof::apply(&mut report, &aa, &ab, &opts.proof);
     report
+}
+
+/// The statement-equivalence comparison of two analysed artifacts, as `diff`
+/// runs it for different dialects.
+fn compare_sides(aa: &Analyzed, ab: &Analyzed, opts: &Options) -> equiv::Outcome {
+    let side_a = side(aa.artifact.dialect, &opts.catalog_a, &opts.facts_a);
+    let side_b = side(ab.artifact.dialect, &opts.catalog_b, &opts.facts_b);
+    let mut schema_a = side_a.schema.for_check(ReadSide::Source, unrecorded());
+    let mut schema_b = side_b.schema.for_check(ReadSide::Target, unrecorded());
+    schema_a.list_stars_with(&mut schema_b);
+    equiv::compare(aa, ab, &schema_a, &schema_b, &opts.anchors)
+}
+
+/// The condition pairs (start offsets) the identity analysis proved to be
+/// the same fact about the input.
+fn identified_pairs(eq: &equiv::Outcome) -> std::collections::BTreeSet<(usize, usize)> {
+    eq.identity
+        .iter()
+        .flat_map(|r| &r.rows)
+        .filter(|c| c.class.identified())
+        .map(|c| (c.a_start, c.b_start))
+        .collect()
 }
 
 /// "What if this statement fails?" (design §6.1 `what_if`): the statement
@@ -490,8 +635,19 @@ pub fn what_if(
 ) -> crate::ir::witness::WhatIf {
     let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
     let ab = Analyzed::new(b, Side::B, opts.excerpt_lines);
-    let env = crate::ir::behaviour::Env::from_options(opts);
-    crate::ir::behaviour::what_if(&aa, &ab, side, line, kind, &env)
+    let mut env = crate::ir::behaviour::Env::from_options(opts);
+    // The same condition matching as `diff` (see there), so the failure it
+    // replays is one `diff` explored.
+    if a.dialect != b.dialect {
+        let eq = compare_sides(&aa, &ab, opts);
+        env.identified = Some(std::sync::Arc::new(identified_pairs(&eq)));
+    }
+    // One scenario, bounded by the explorer's own caps; the scope makes the
+    // work caps readable here too.
+    sqldiff_model::work::scope("what_if", || {
+        crate::ir::behaviour::what_if(&aa, &ab, side, line, kind, &env)
+    })
+    .0
 }
 
 /// Measurement only (perf plan W6): how many lockstep pair-states the
@@ -509,6 +665,32 @@ pub fn pair_states(
     crate::ir::behaviour::pair_states(&aa, &ab, &env, max_states)
 }
 
+/// Report only (perf plan W6c, aligned merging step 1): which conditions of
+/// the routines of `a` and `b` are the same fact about the input
+/// (`equiv::identity`). Nothing calls this on the diff path.
+pub fn identity(a: &Artifact, b: &Artifact, opts: &Options) -> Vec<equiv::identity::UnitReport> {
+    let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
+    let ab = Analyzed::new(b, Side::B, opts.excerpt_lines);
+    let side_a = side(a.dialect, &opts.catalog_a, &opts.facts_a);
+    let side_b = side(b.dialect, &opts.catalog_b, &opts.facts_b);
+    let mut schema_a = side_a.schema.for_check(ReadSide::Source, unrecorded());
+    let mut schema_b = side_b.schema.for_check(ReadSide::Target, unrecorded());
+    schema_a.list_stars_with(&mut schema_b);
+    equiv::compare(&aa, &ab, &schema_a, &schema_b, &[]).identity
+}
+
+/// Report only (E2): the conditions the explorer treats as one decision
+/// because their folded text is equal (`ir::behaviour::SharedText`).
+pub fn shared_conditions(
+    a: &Artifact,
+    b: &Artifact,
+    opts: &Options,
+) -> Vec<crate::ir::behaviour::SharedText> {
+    let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
+    let ab = Analyzed::new(b, Side::B, opts.excerpt_lines);
+    crate::ir::behaviour::shared_conditions(&aa, &ab)
+}
+
 /// Transaction overlay brackets of both sides (design §6.2).
 pub fn overlay(a: &Artifact, b: &Artifact) -> crate::ir::overlay::Overlay {
     let aa = Analyzed::new(a, Side::A, 1);
@@ -518,9 +700,23 @@ pub fn overlay(a: &Artifact, b: &Artifact) -> crate::ir::overlay::Overlay {
 
 /// Lint one artifact on its own.
 pub fn check(a: &Artifact, opts: &Options) -> Report {
+    check_recorded(a, opts, ReadSide::Source, unrecorded())
+}
+
+/// [`check`] with the catalog of `opts.catalog_a` / `opts.facts_a` filed as
+/// `side` (the role it plays in the caller's check) and every read going to
+/// `sink`.
+pub fn check_recorded(
+    a: &Artifact,
+    opts: &Options,
+    side_role: ReadSide,
+    sink: Arc<dyn ReadSink + Send>,
+) -> Report {
     let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
     let side_a = side(a.dialect, &opts.catalog_a, &opts.facts_a);
-    let (view, schema) = (&side_a.view, side_a.schema.clone());
+    let view = &side_a.view;
+    let read = reading(view, side_role, &*sink);
+    let schema = side_a.schema.for_check(side_role, sink.clone());
     let mut findings: Vec<Finding> = lint::all_hits(&aa)
         .iter()
         .map(|h| lint::to_finding(&aa, h))
@@ -531,12 +727,12 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
     let bound = bind::bind(
         &aa,
         &BindInput {
-            view,
+            view: read,
             helpers: &opts.helpers,
         },
     );
     let (bindf, assumptions) = bind::binding_findings(&Bindings {
-        a: (&aa, &bound, view.supplied),
+        a: (&aa, &bound, read.supplied()),
         b: None,
     });
     absorb_residue(&mut findings, &bindf);
@@ -546,26 +742,12 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
     if !diagnostics.is_empty() {
         unknown_reasons.push(format!("{} parse problem(s)", diagnostics.len()));
     }
-    finish(Report {
-        tool_version: TOOL_VERSION.to_string(),
-        verdict: Verdict::Equal,
-        a: aa.info(),
-        b: None,
-        findings,
-        noise: NoiseCounts::default(),
-        normalizations: Vec::new(),
-        assumptions,
-        unknown_reasons,
-        suppressed: Vec::new(),
-        verdict_before_suppression: None,
-        refinements: Vec::new(),
-        equivalent: None,
-        proof: None,
-        verdict_before_proof: None,
-        diagnostics,
-        witnesses: Vec::new(),
-        discharged: Vec::new(),
-    })
+    let mut report = Report::draft(TOOL_VERSION.to_string(), aa.info(), None);
+    report.findings = findings;
+    report.assumptions = assumptions;
+    report.unknown_reasons = unknown_reasons;
+    report.diagnostics = diagnostics;
+    finish(report)
 }
 
 /// A proven binding error (`GETDATE()` in PostgreSQL fails to bind) says more
@@ -621,13 +803,13 @@ fn in_error_handler(node: &sqldiff_syntax::SyntaxNode) -> bool {
 /// EXCEPTION block that records a failure covers several CATCH blocks that
 /// each record it, so how often and in what order they occur is not compared
 /// here (the behavioural diff compares the error paths themselves).
-fn pair_writes(a: &Analyzed, b: &Analyzed, historyless: bool) -> Vec<Finding> {
+fn pair_writes(a: &Analyzed, b: &Analyzed, historyless: bool, work: usize) -> Vec<Finding> {
     // A T-SQL trigger for several events became one PostgreSQL function per
     // event, each with the trigger's writes: pair them per function.
     if let Some(fns) = crate::equiv::trigger_functions(a, b) {
         let mut out: Vec<Finding> = Vec::new();
         for f in &fns {
-            for x in pair_writes_in(a, b, Some(f), historyless) {
+            for x in pair_writes_in(a, b, Some(f), historyless, work) {
                 if !out.iter().any(|y| y.fingerprint == x.fingerprint) {
                     out.push(x);
                 }
@@ -635,7 +817,7 @@ fn pair_writes(a: &Analyzed, b: &Analyzed, historyless: bool) -> Vec<Finding> {
         }
         return out;
     }
-    pair_writes_in(a, b, None, historyless)
+    pair_writes_in(a, b, None, historyless, work)
 }
 
 /// `pair_writes` with side B's writes limited to those inside `within`.
@@ -644,6 +826,7 @@ fn pair_writes_in(
     b: &Analyzed,
     within: Option<&sqldiff_syntax::SyntaxNode>,
     historyless: bool,
+    work: usize,
 ) -> Vec<Finding> {
     // MERGE and INSERT ... ON CONFLICT are both upserts.
     let key = |w: &facts::Write| {
@@ -721,7 +904,17 @@ fn pair_writes_in(
     };
     const SAME_TABLE: &str = "the same table is written by a different kind of statement";
 
-    let pairs = lcs_pairs(&ka, &kb);
+    let Some(pairs) = crate::normalize::lcs_pairs_exact(&ka, &kb, work) else {
+        // Too many writes to align: none is called unpaired.
+        return vec![crate::treediff::alignment_bound_finding(
+            &a.object,
+            "writes",
+            ka.len(),
+            kb.len(),
+            None,
+            None,
+        )];
+    };
     let matched_a: HashSet<usize> = pairs.iter().map(|p| p.0).collect();
     let matched_b: HashSet<usize> = pairs.iter().map(|p| p.1).collect();
     // Lookups built once: keys, targets and the normal-path writes left over

@@ -97,6 +97,7 @@ impl<'x, 'a> SideIr<'x, 'a> {
     /// Lowers one side and indexes its effects and reads: the scenarios
     /// look keys up for every outcome pair, so a scan per lookup made large
     /// routines cubic.
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: sorts each entry independently
     fn new(a: &'x Analyzed<'a>, other: &Analyzed, routine: Option<SyntaxNode>) -> Self {
         let cfg = super::cfg::lower_routine(a, other_temps(a, other), routine);
         let mut at = HashMap::new();
@@ -121,6 +122,7 @@ impl<'x, 'a> SideIr<'x, 'a> {
                 }
             }
         }
+        #[allow(clippy::iter_over_hash_type)] // each value is sorted on its own
         for v in reads.values_mut() {
             v.sort_by_key(|&i| cfg.node(i).syntax.as_ref().map(|s| s.text_range().start()));
         }
@@ -286,6 +288,15 @@ pub struct Env {
     pub skip_witnesses: bool,
     /// Budgets lowered by `Options::work_budgets` (routine, file).
     pub work_budgets: Option<(u64, u64)>,
+    /// Work caps replaced by `Options::work_caps` (unit, file).
+    pub work_caps: Option<(u64, u64)>,
+    /// The condition pairs (start offset on side A, on side B) the identity
+    /// analysis proved to be the same fact about the input
+    /// (`equiv::identity`, perf plan W6c E2). `None`: no analysis ran for
+    /// this pair of files, and equal condition text is matched as before.
+    /// `Some`: `pairs()` and `feasible()` match a condition's text across
+    /// the sides only when every condition with that text is in such a pair.
+    pub identified: Option<std::sync::Arc<BTreeSet<(usize, usize)>>>,
 }
 
 /// Assumptions whose flip changes the scenarios (and so is re-run, not relabelled).
@@ -300,6 +311,8 @@ impl Env {
             commit_level: None,
             skip_witnesses: false,
             work_budgets: None,
+            work_caps: None,
+            identified: None,
         }
     }
 
@@ -312,6 +325,8 @@ impl Env {
                 .and_then(|t| crate::ledger::declared_commit_level(t)),
             skip_witnesses: opts.skip_witnesses,
             work_budgets: opts.work_budgets,
+            work_caps: opts.work_caps,
+            identified: None,
             ..Env::from_flips(&opts.flips)
         }
     }
@@ -921,7 +936,7 @@ fn path_text(o: &Outcome) -> String {
         .map(|(c, b)| {
             format!(
                 "`{}` is {}",
-                c.to_lowercase(),
+                super::interp::plain_cond(c).to_lowercase(),
                 if *b { "true" } else { "false" }
             )
         })
@@ -975,7 +990,7 @@ fn scenario_info(sa: &SideIr, sb: &SideIr, sc: &Kind, env: &Env, oa: &Outcome) -
             .signature
             .iter()
             .map(|(c, v)| PathStep {
-                condition: c.to_lowercase(),
+                condition: super::interp::plain_cond(c).to_lowercase(),
                 value: *v,
             })
             .collect(),
@@ -1095,6 +1110,27 @@ pub(crate) fn norm_cond(c: &str) -> String {
     out.join(" ")
 }
 
+/// Statements of a unit: the larger count of the two sides' statement nodes.
+fn statements_of(sa: &SideIr, sb: &SideIr) -> u64 {
+    let n = |s: &SideIr| s.cfg.nodes.iter().filter(|n| n.stmt().is_some()).count() as u64;
+    n(sa).max(n(sb))
+}
+
+/// `statements_of` for a routine pair before its collector exists (the file
+/// cap needs the largest unit cap first). Lowers both sides once more.
+fn pair_statements(
+    a: &Analyzed,
+    b: &Analyzed,
+    ra: Option<SyntaxNode>,
+    rb: Option<SyntaxNode>,
+) -> u64 {
+    let n = |x: &Analyzed, y: &Analyzed, r: Option<SyntaxNode>| {
+        let cfg = super::cfg::lower_routine(x, other_temps(x, y), r);
+        cfg.nodes.iter().filter(|n| n.stmt().is_some()).count() as u64
+    };
+    n(a, b, ra).max(n(b, a, rb))
+}
+
 /// T-SQL compared against PostgreSQL or Db2 for i: the other side's
 /// temporary tables, which a table variable may have been converted to.
 fn other_temps(x: &Analyzed, other: &Analyzed) -> HashSet<String> {
@@ -1105,6 +1141,86 @@ fn other_temps(x: &Analyzed, other: &Analyzed) -> HashSet<String> {
     }
 }
 
+/// The unknown tests of a graph by folded condition text (`norm_cond`), with
+/// the start offset of each.
+fn tests_by_text(c: &Cfg) -> BTreeMap<String, Vec<usize>> {
+    let mut m: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for n in &c.nodes {
+        if let super::cfg::Op::Test {
+            test: super::cfg::Test::Unknown(t),
+            ..
+        } = &n.op
+        {
+            // A test with no source position cannot be identified.
+            let at = n
+                .syntax
+                .as_ref()
+                .map_or(usize::MAX, |s| sqldiff_syntax::ast::sig_range(s).0);
+            m.entry(norm_cond(t)).or_default().push(at);
+        }
+    }
+    m
+}
+
+/// Perf plan W6c, E2: `pairs()` and `feasible()` treat two conditions with
+/// the same folded text as one decision. That is only right when the text is
+/// the same fact about the input on both sides. A text keeps matching only
+/// if every condition with it, on either side, is in a pair `done` holds
+/// with a condition of the same text on the other side; the tests of every
+/// other text are marked (`opaque_cond`), so no signature of A equals one of
+/// B by them: the exact pairing falls back to all combinations (the verdict
+/// is then capped unless all combinations agree) and `feasible` keeps the
+/// pair. Verdicts only get stricter.
+fn mark_unidentified(a: &mut Cfg, b: &mut Cfg, done: &BTreeSet<(usize, usize)>) {
+    let (ta, tb) = (tests_by_text(a), tests_by_text(b));
+    // Which tests (by start offset and text) have a counterpart in `done`
+    // with the same text: read off `done` once, not searched for per test.
+    fn by_pos(t: &BTreeMap<String, Vec<usize>>) -> BTreeMap<usize, Vec<&String>> {
+        let mut m: BTreeMap<usize, Vec<&String>> = BTreeMap::new();
+        for (text, xs) in t {
+            for &x in xs {
+                m.entry(x).or_default().push(text);
+            }
+        }
+        m
+    }
+    let (pa, pb) = (by_pos(&ta), by_pos(&tb));
+    let mut covered_a: BTreeSet<(usize, &String)> = BTreeSet::new();
+    let mut covered_b: BTreeSet<(usize, &String)> = BTreeSet::new();
+    for &(x, y) in done {
+        let (Some(tx), Some(ty)) = (pa.get(&x), pb.get(&y)) else {
+            continue;
+        };
+        for text in tx.iter().filter(|t| ty.contains(t)) {
+            covered_a.insert((x, text));
+            covered_b.insert((y, text));
+        }
+    }
+    let ident: BTreeSet<&String> = ta
+        .iter()
+        .filter(|(text, xs)| {
+            tb.get(*text).is_some_and(|ys| {
+                xs.iter().all(|x| covered_a.contains(&(*x, *text)))
+                    && ys.iter().all(|y| covered_b.contains(&(*y, *text)))
+            })
+        })
+        .map(|(t, _)| t)
+        .collect();
+    for (cfg, is_a) in [(a, true), (b, false)] {
+        for n in &mut cfg.nodes {
+            if let super::cfg::Op::Test {
+                test: super::cfg::Test::Unknown(t),
+                ..
+            } = &mut n.op
+            {
+                if !ident.contains(&norm_cond(t)) {
+                    *t = super::interp::opaque_cond(t, is_a);
+                }
+            }
+        }
+    }
+}
+
 /// Pairs the outcomes of both sides: by path signature when both sides
 /// branch on the same conditions, otherwise every combination (and the
 /// verdict is capped at unknown unless all combinations agree).
@@ -1112,10 +1228,18 @@ fn pairs(pa: &[Outcome], pb: &[Outcome]) -> (Vec<(usize, usize)>, bool) {
     if pa.len() == 1 && pb.len() == 1 {
         return (vec![(0, 0)], true);
     }
+    // The paths of one side share most conditions: each text is folded once.
+    let folded: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
     let sig = |o: &Outcome| -> Vec<(String, bool)> {
         o.signature
             .iter()
-            .map(|(c, b)| (norm_cond(c), *b))
+            .map(|(c, b)| {
+                let mut f = folded.borrow_mut();
+                if !f.contains_key(c) {
+                    f.insert(c.clone(), norm_cond(c));
+                }
+                (f[c].clone(), *b)
+            })
             .collect()
     };
     let (siga, sigb): (Vec<_>, Vec<_>) =
@@ -1137,10 +1261,14 @@ fn pairs(pa: &[Outcome], pb: &[Outcome]) -> (Vec<(usize, usize)>, bool) {
     }
     // Not the same set of paths: every pair of outcomes except those no input
     // can produce (see `feasible`).
+    let (fa, fb): (Vec<_>, Vec<_>) = (
+        siga.iter().map(|x| once_flags(x)).collect(),
+        sigb.iter().map(|y| once_flags(y)).collect(),
+    );
     let mut v = Vec::new();
     for (i, x) in siga.iter().enumerate() {
         for (j, y) in sigb.iter().enumerate() {
-            if feasible(x, y) {
+            if feasible_with(x, &fa[i], y, &fb[j]) {
                 v.push((i, j));
             }
         }
@@ -1162,13 +1290,26 @@ fn pairs(pa: &[Outcome], pb: &[Outcome]) -> (Vec<(usize, usize)>, bool) {
 /// pairing does, that the same text has the same truth value on both sides.
 /// A row-count test after a failed statement is named with the dialect, since
 /// its value after an error differs between dialects.
+#[cfg(test)]
 fn feasible(a: &[(String, bool)], b: &[(String, bool)]) -> bool {
-    // A condition decided more than once on a path (a loop test, or the same
-    // text at two places) can have different values each time: its values
-    // say nothing about the other side's.
-    let once = |p: &[(String, bool)], c: &str| p.iter().filter(|x| x.0 == c).count() == 1;
-    for (x, y) in a.iter().zip(b) {
-        if x.0 != y.0 || !once(a, &x.0) || !once(b, &x.0) {
+    feasible_with(a, &once_flags(a), b, &once_flags(b))
+}
+
+/// For each decision of a path: whether its condition is decided only there
+/// on the path.
+#[allow(clippy::disallowed_methods)] // hash order cannot reach an output: counts looked up by key
+fn once_flags(p: &[(String, bool)]) -> Vec<bool> {
+    let mut count: HashMap<&str, usize> = HashMap::new();
+    for x in p {
+        *count.entry(x.0.as_str()).or_default() += 1;
+    }
+    p.iter().map(|x| count[x.0.as_str()] == 1).collect()
+}
+
+/// [`feasible`] with the paths' `once_flags` made once, not for every pair.
+fn feasible_with(a: &[(String, bool)], fa: &[bool], b: &[(String, bool)], fb: &[bool]) -> bool {
+    for (k, (x, y)) in a.iter().zip(b).enumerate() {
+        if x.0 != y.0 || !fa[k] || !fb[k] {
             return true;
         }
         if x.1 != y.1 {
@@ -1230,20 +1371,99 @@ struct Collector<'x, 'a> {
     /// The divergences of a scenario with a default flipped (`persists`),
     /// by scenario.
     flipped: RefCell<HashMap<String, Rc<Divergences>>>,
+    /// What the work count has been charged for already (see
+    /// `Collector::explorer`): the first request for an explorer or a flipped
+    /// scenario is counted, repeats are not, so the count does not depend on
+    /// whether a cache answered.
+    charged: RefCell<BTreeSet<String>>,
+    /// Diffs the first computation of each flipped scenario spent (see
+    /// `persists`).
+    flip_spent: RefCell<BTreeMap<String, u64>>,
+    /// While a flipped scenario is recomputed: the diffs it may still make.
+    replay: Cell<Option<u64>>,
+    /// Keeps the unit open for the statement-level phase check.
+    _phase: sqldiff_model::work::UnitPhase,
     /// `diff` calls spent by this routine pair, and whether a budget ran out.
     spent: Cell<u64>,
     out_of_budget: Cell<bool>,
+    /// Which work budget ran out first (`out_of_budget` says only that one
+    /// did), for the witness of the `equiv.budget` findings.
+    cap_hit: RefCell<Option<String>>,
     /// `diff` calls spent by the whole file so far (shared by its routine
     /// pairs), and the budgets in force (routine, file).
     file_spent: Rc<Cell<u64>>,
     budgets: (u64, u64),
+    /// The work caps (see `unit_work_cap`): this unit's allowance and where
+    /// its count started, and the file's.
+    unit_start: u64,
+    unit_cap: u64,
+    file_work: FileWork,
 }
+
+/// The metered-work allowance of one engine comparison's behaviour analysis
+/// (one `analyze` call, not the outermost meter: `convert` checks the same
+/// file in several comparisons and each gets a full allowance).
+#[derive(Clone, Copy)]
+struct FileWork {
+    /// The meter's total when the analysis began.
+    start: u64,
+    /// The file cap before the unit's own cap is taken into account.
+    cap: u64,
+}
+
+/// Work cap of one unit (a routine pair, or the statements outside any
+/// routine): `max(2^24, 2^15 x statements)`. The statement part keeps a long
+/// one-transaction script, whose fault replays are quadratic in its
+/// statements, below its cap up to the explorer's own step budget (Davy,
+/// 2026-11-07). One place, so the formula can change without touching the
+/// checks.
+pub const UNIT_WORK_FLOOR: u64 = 1 << 24;
+pub const UNIT_WORK_PER_STATEMENT: u64 = 1 << 15;
+pub fn unit_work_cap(statements: u64) -> u64 {
+    UNIT_WORK_FLOOR.max(UNIT_WORK_PER_STATEMENT.saturating_mul(statements))
+}
+
+/// Work cap of a file's analysis: `max(2^26, 2^20 x units)`, and never below
+/// the largest unit cap (otherwise a unit would be cut by the file before its
+/// own allowance).
+pub const FILE_WORK_FLOOR: u64 = 1 << 26;
+pub const FILE_WORK_PER_UNIT: u64 = 1 << 20;
+pub fn file_work_cap(units: u64, largest_unit_cap: u64) -> u64 {
+    FILE_WORK_FLOOR
+        .max(FILE_WORK_PER_UNIT.saturating_mul(units))
+        .max(largest_unit_cap)
+}
+
+/// What one check of the cap may overshoot by: an `outcomes` call can make two
+/// first-request explorer builds and two `explore` calls, each bounded by
+/// `MAX_PATHS` x `MAX_STEPS` plus `JOIN_TICKS` (about 0.7M steps), plus the
+/// unmetered `reads` and `pairs`. About 2.8M, 17% of the smallest unit cap.
+#[doc(hidden)]
+pub const CAP_OVERSHOOT: u64 = 2_800_000;
 
 /// The (rule, anchor) of divergences found.
 type Divergences = BTreeSet<(&'static str, String)>;
 
 /// Flipped scenarios kept before the cache starts over (time only).
 const FLIPPED_MAX: usize = 4096;
+
+thread_local! {
+    /// Test hook: answer every request without the explorer and flipped
+    /// caches. It changes no result and no work count (see
+    /// `Collector::explorer`); the work-meter tests use it to show that.
+    static CACHES_OFF: Cell<bool> = const { Cell::new(false) };
+}
+
+fn caches_off() -> bool {
+    CACHES_OFF.with(Cell::get)
+}
+
+/// Turns the behaviour model's caches off (or on) on this thread. A test
+/// hook: results and work counts must be the same either way.
+#[doc(hidden)]
+pub fn set_caches_off_for_tests(off: bool) {
+    CACHES_OFF.with(|c| c.set(off));
+}
 
 /// How many outcome-pair comparisons (`diff` calls) one routine pair may
 /// spend, and one file's check in all. A count, never a time: the same
@@ -1261,11 +1481,18 @@ impl<'x, 'a> Collector<'x, 'a> {
         ra: Option<SyntaxNode>,
         rb: Option<SyntaxNode>,
         file_spent: Rc<Cell<u64>>,
+        file_work: FileWork,
     ) -> Self {
         let env_budgets = env.work_budgets.unwrap_or((ROUTINE_DIFFS, FILE_DIFFS));
-        let (sa, sb) = (SideIr::new(a, b, ra), SideIr::new(b, a, rb));
+        let (mut sa, mut sb) = (SideIr::new(a, b, ra), SideIr::new(b, a, rb));
+        if let Some(done) = &env.identified {
+            mark_unidentified(&mut sa.cfg, &mut sb.cfg, done);
+        }
         let keys = KeyUniverse::of(&[&sa.cfg, &sb.cfg]);
         let al = Align::new(&keys, &sa, &sb);
+        let unit_cap = env
+            .work_caps
+            .map_or_else(|| unit_work_cap(statements_of(&sa, &sb)), |c| c.0);
         let mut c = Collector {
             sa,
             sb,
@@ -1284,27 +1511,117 @@ impl<'x, 'a> Collector<'x, 'a> {
             cut_a: BTreeSet::new(),
             cut_b: BTreeSet::new(),
             flipped: RefCell::new(HashMap::new()),
+            charged: RefCell::new(BTreeSet::new()),
+            flip_spent: RefCell::new(BTreeMap::new()),
+            replay: Cell::new(None),
+            _phase: sqldiff_model::work::UnitPhase::open(),
             spent: Cell::new(0),
             out_of_budget: Cell::new(false),
+            cap_hit: RefCell::new(None),
             file_spent,
             budgets: env_budgets,
+            unit_start: sqldiff_model::work::now().total(),
+            unit_cap,
+            file_work,
         };
         c.splits = splits(&c.sa, &c.sb, true);
         c.splits.extend(splits(&c.sb, &c.sa, false));
         c
     }
 
+    /// Marks the routine as cut by a work budget, and remembers which one ran
+    /// out first, in a fixed order: the unit's metered work, the file's, the
+    /// routine's comparisons, the file's comparisons.
+    fn note_cap(&self) {
+        self.out_of_budget.set(true);
+        let mut hit = self.cap_hit.borrow_mut();
+        if hit.is_some() {
+            return;
+        }
+        let (total, file_total) = (self.unit_work(), self.file_work_done());
+        *hit = Some(if total >= self.unit_cap {
+            format!(
+                "unit work budget ({total} of {} units of work)",
+                self.unit_cap
+            )
+        } else if file_total >= self.file_cap() {
+            format!(
+                "file work budget ({file_total} of {} units of work, behaviour analysis only)",
+                self.file_cap()
+            )
+        } else if self.spent.get() >= self.budgets.0 {
+            format!(
+                "routine comparison budget ({} of {} outcome comparisons)",
+                self.spent.get(),
+                self.budgets.0
+            )
+        } else {
+            format!(
+                "file comparison budget ({} of {} outcome comparisons)",
+                self.file_spent.get(),
+                self.budgets.1
+            )
+        });
+    }
+
+    /// Metered work spent by this unit so far.
+    fn unit_work(&self) -> u64 {
+        sqldiff_model::work::now()
+            .total()
+            .saturating_sub(self.unit_start)
+    }
+
+    /// Metered work spent since this engine comparison's analysis began.
+    fn file_work_done(&self) -> u64 {
+        sqldiff_model::work::now()
+            .total()
+            .saturating_sub(self.file_work.start)
+    }
+
+    fn file_cap(&self) -> u64 {
+        match self.env.work_caps {
+            Some((_, f)) => f,
+            None => self.file_work.cap.max(self.unit_cap),
+        }
+    }
+
+    /// Whether a work cap (not a comparison budget) is used up. Never while
+    /// muted or recomputing a flipped scenario: that work was counted when it
+    /// was first done, and a cut there would depend on a cache.
+    fn work_cap_used(&self) -> bool {
+        // Defensive: no current replay path reaches this (a replay returns
+        // from `spend` first, and a cut run does not replay), so the guard
+        // is pinned by `cap_tests` and keeps a future path from letting a
+        // cache decide a cut.
+        if self.replay.get().is_some() || sqldiff_model::work::is_muted() {
+            return false;
+        }
+        self.unit_work() >= self.unit_cap || self.file_work_done() >= self.file_cap()
+    }
+
     /// Spends one `diff` call; false (and the routine marked as cut by its
     /// budget) when the routine's or the file's allowance is used up.
     fn spend(&self) -> bool {
+        // A flipped scenario recomputed (a cache that is off, or was cleared)
+        // gets exactly the diffs its first computation spent, from a local
+        // allowance: the routine's and the file's budget are not touched, so
+        // the budget does not depend on whether a cache answered.
+        if let Some(left) = self.replay.get() {
+            if left == 0 {
+                return false;
+            }
+            self.replay.set(Some(left - 1));
+            return true;
+        }
         let file = self.file_spent.get();
         let (routine_max, file_max) = self.budgets;
-        if self.spent.get() >= routine_max || file >= file_max {
-            self.out_of_budget.set(true);
+        if self.spent.get() >= routine_max || file >= file_max || self.work_cap_used() {
+            self.note_cap();
             return false;
         }
         self.spent.set(self.spent.get() + 1);
         self.file_spent.set(file + 1);
+        sqldiff_model::work::spend(sqldiff_model::work::Site::BehaviourDiffs, 1);
         true
     }
 
@@ -1321,9 +1638,19 @@ impl<'x, 'a> Collector<'x, 'a> {
 
     /// The fault-free run of `cfg` under the environment of `sc` (the
     /// scenario without its faults), made once per environment.
+    ///
+    /// The cache is a speed-up and is not part of the work count: the first
+    /// request for an environment is counted (the run is made and its steps
+    /// are spent), a later one counts nothing, whether it hits the cache or,
+    /// with the caches off, makes the run again (not counted). So the total
+    /// is the same with the cache on or off. `charged` is the ledger of
+    /// what was counted.
     fn explorer(
         cache: &RefCell<Vec<Rc<Explorer>>>,
+        charged: &RefCell<BTreeSet<String>>,
+        side: &str,
         cfg: &Cfg,
+        other: &Cfg,
         sc: &Scenario,
         keys: &KeyUniverse,
     ) -> Rc<Explorer> {
@@ -1331,12 +1658,26 @@ impl<'x, 'a> Collector<'x, 'a> {
             faults: Vec::new(),
             ..sc.clone()
         };
+        let first = charged.borrow_mut().insert(format!("{side}|{env:?}"));
+        let on = !caches_off();
         let mut c = cache.borrow_mut();
-        if let Some(x) = c.iter().find(|x| *x.base_scenario() == env) {
-            return x.clone();
+        if on {
+            if let Some(x) = c.iter().find(|x| *x.base_scenario() == env) {
+                return x.clone();
+            }
         }
-        let x = Rc::new(Explorer::in_universe(cfg, &env, keys));
-        c.push(x.clone());
+        // Paths of this side that reach the same state are joined when the
+        // other side makes no decision (see `interp::decision_free`).
+        let join = crate::ir::interp::decision_free(other);
+        let build = || Rc::new(Explorer::in_universe_joined(cfg, &env, keys, join));
+        let x = if first {
+            build()
+        } else {
+            sqldiff_model::work::muted(build)
+        };
+        if on {
+            c.push(x.clone());
+        }
         x
     }
 
@@ -1347,14 +1688,19 @@ impl<'x, 'a> Collector<'x, 'a> {
         scen_b: &Scenario,
     ) -> (Vec<Outcome>, Vec<Outcome>) {
         let (ca, cb) = (&self.sa.cfg, &self.sb.cfg);
-        let mut pa = Self::explorer(&self.xa, ca, scen_a, &self.keys).explore(ca, scen_a);
-        let mut pb = Self::explorer(&self.xb, cb, scen_b, &self.keys).explore(cb, scen_b);
-        if let Kind::Fault { key, .. } = sc {
-            // Only paths that reach the failing statement belong to the scenario.
-            let reached = |o: &Outcome| o.fault_hit || o.effects.contains_key(key.as_str());
-            pa.retain(reached);
-            pb.retain(reached);
-        }
+        // Only paths that reach the failing statement belong to a fault
+        // scenario.
+        let reached = |o: &Outcome| match sc {
+            Kind::Fault { key, .. } => o.fault_hit || o.effects.contains_key(key.as_str()),
+            _ => true,
+        };
+        let mut pa = Self::explorer(&self.xa, &self.charged, "a", ca, cb, scen_a, &self.keys)
+            .explore_where(ca, scen_a, &reached);
+        let mut pb = Self::explorer(&self.xb, &self.charged, "b", cb, ca, scen_b, &self.keys)
+            .explore_where(cb, scen_b, &reached);
+        // The replayed and full runs are filtered here; the others were.
+        pa.retain(reached);
+        pb.retain(reached);
         (pa, pb)
     }
 
@@ -1365,17 +1711,49 @@ impl<'x, 'a> Collector<'x, 'a> {
     /// findings that flip it (`flipped`): a scenario with many findings used
     /// to explore and compare every outcome pair again for each of them.
     fn persists(&self, sc: &Kind, scen_a: &Scenario, scen_b: &Scenario, d: &Div) -> bool {
+        // Cut by a budget: the conservative answer (the finding rests on its
+        // assumption), without computing or caching anything.
+        if self.out_of_budget.get() && self.replay.get().is_none() {
+            return false;
+        }
         let key = format!("{sc:?}|{scen_a:?}|{scen_b:?}");
-        let known = self.flipped.borrow().get(&key).cloned();
+        // The cache of flipped scenarios is a speed-up like the explorers':
+        // a scenario's work is counted the first time it is asked for and not
+        // again, hit or recomputed (see `explorer`).
+        let first = self.charged.borrow_mut().insert(format!("flip|{key}"));
+        let known = if caches_off() {
+            None
+        } else {
+            self.flipped.borrow().get(&key).cloned()
+        };
         let set = match known {
             Some(set) => set,
             None => {
-                let set = Rc::new(self.divergences_of(sc, scen_a, scen_b));
-                let mut c = self.flipped.borrow_mut();
-                if c.len() >= FLIPPED_MAX {
-                    c.clear();
+                let set = if first {
+                    let before = self.spent.get();
+                    let set = Rc::new(self.divergences_of(sc, scen_a, scen_b));
+                    self.flip_spent
+                        .borrow_mut()
+                        .insert(key.clone(), self.spent.get() - before);
+                    set
+                } else {
+                    // Same pairs in the same order, the same number of diffs,
+                    // none of them from the budget or the work count.
+                    let allowed = self.flip_spent.borrow().get(&key).copied().unwrap_or(0);
+                    self.replay.set(Some(allowed));
+                    let set = sqldiff_model::work::muted(|| {
+                        Rc::new(self.divergences_of(sc, scen_a, scen_b))
+                    });
+                    self.replay.set(None);
+                    set
+                };
+                if !caches_off() {
+                    let mut c = self.flipped.borrow_mut();
+                    if c.len() >= FLIPPED_MAX {
+                        c.clear();
+                    }
+                    c.insert(key, set.clone());
                 }
-                c.insert(key, set.clone());
                 set
             }
         };
@@ -1420,8 +1798,11 @@ impl<'x, 'a> Collector<'x, 'a> {
         // Nothing left to spend: the scenario is not even explored (that is
         // the other cost of a branchy routine), and the routine is reported
         // as not proven.
-        if self.spent.get() >= self.budgets.0 || self.file_spent.get() >= self.budgets.1 {
-            self.out_of_budget.set(true);
+        if self.spent.get() >= self.budgets.0
+            || self.file_spent.get() >= self.budgets.1
+            || self.work_cap_used()
+        {
+            self.note_cap();
             return (Vec::new(), Vec::new());
         }
         let (pa, pb) = self.outcomes(&sc, &scen_a, &scen_b);
@@ -1709,6 +2090,12 @@ impl<'x, 'a> Collector<'x, 'a> {
                 .collect();
             nodes.sort_by_key(|n| n.text_range().start());
             nodes.dedup_by_key(|n| n.text_range());
+            let witness = match self.cap_hit.borrow().as_deref() {
+                Some(cap) => format!(
+                    "Not proven: the behaviour model reached its {cap} before it compared this statement in at least one scenario, so what happens when it fails and how its transaction goes are not compared."
+                ),
+                None => "Not proven: the behaviour model stopped at its step or path budget before it ran or compared this statement in at least one scenario, so what happens when it fails and how its transaction goes are not compared.".to_string(),
+            };
             let mut seen: HashMap<String, usize> = HashMap::new();
             for n in nodes {
                 let words = ast::first_words(n, 3).join(" ");
@@ -1728,7 +2115,7 @@ impl<'x, 'a> Collector<'x, 'a> {
                     class: ChangeClass::Transactional,
                     severity: Severity::Medium,
                     verdict: Verdict::Unknown,
-                    witness: "Not proven: the behaviour model stopped at its step, path or work budget before it ran or compared this statement in at least one scenario, so what happens when it fails and how its transaction goes are not compared.".to_string(),
+                    witness: witness.clone(),
                     a: on_a.then(|| loc.clone()),
                     b: (!on_a).then_some(loc),
                     assumptions: Vec::new(),
@@ -1989,9 +2376,21 @@ fn meet(a: &Analyzed, b: &Analyzed) -> Option<Meeting> {
 /// budgets. A routine that meets none is not analysed, and a transaction
 /// statement inside it stays unproven.
 pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
+    // The work caps read the meter, which counts nothing outside a scope: an
+    // entry that opened none would run uncapped.
+    debug_assert!(
+        sqldiff_model::work::in_scope(),
+        "behaviour::analyze needs an open work scope"
+    );
     // The `diff` calls all routine pairs of this file share.
     let file_spent = Rc::new(Cell::new(0));
+    let start = sqldiff_model::work::now().total();
     let Some(m) = meet(a, b) else {
+        // One unit: its own cap is the file's floor (taken in `file_cap`).
+        let file_work = FileWork {
+            start,
+            cap: file_work_cap(1, 0),
+        };
         // At most one routine on each side: `routines_of` picks it, so a
         // setup `DO` block beside it is not mistaken for it.
         let (ra, rb) = (routines_of(a), routines_of(b));
@@ -2004,6 +2403,7 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
             "",
             &HashSet::new(),
             &file_spent,
+            file_work,
         );
         // Transaction statements are compared only inside a routine both
         // sides hold exactly once.
@@ -2027,6 +2427,21 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
         }
         return out;
     };
+    // The file cap is a function of the file: its units and the largest unit
+    // cap, known before the first unit runs.
+    let largest = if env.work_caps.is_some() {
+        0
+    } else {
+        m.pairs
+            .iter()
+            .map(|(x, y)| unit_work_cap(pair_statements(a, b, Some(x.clone()), Some(y.clone()))))
+            .max()
+            .unwrap_or(0)
+    };
+    let file_work = FileWork {
+        start,
+        cap: file_work_cap(m.pairs.len().max(1) as u64, largest),
+    };
     let mut out = Behaviour::default();
     let mut prior: HashSet<String> = HashSet::new();
     let mut all_compared = m.only_a.is_empty() && m.only_b.is_empty();
@@ -2041,6 +2456,7 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
             &format!("{name}|"),
             &prior,
             &file_spent,
+            file_work,
         );
         prior.extend(r.findings.iter().map(|f| f.fingerprint.clone()));
         all_compared &= r.txn_compared;
@@ -2080,8 +2496,9 @@ fn analyze_pair(
     salt: &str,
     prior: &HashSet<String>,
     file_spent: &Rc<Cell<u64>>,
+    file_work: FileWork,
 ) -> Behaviour {
-    let mut c = Collector::new(a, b, env.clone(), ra, rb, file_spent.clone());
+    let mut c = Collector::new(a, b, env.clone(), ra, rb, file_spent.clone(), file_work);
     c.salt = salt.to_string();
     c.prior = prior.clone();
     c.faults();
@@ -2194,7 +2611,11 @@ pub fn what_if(
             }
         }
     };
-    let mut c = Collector::new(a, b, env.clone(), ra, rb, Rc::new(Cell::new(0)));
+    let file_work = FileWork {
+        start: sqldiff_model::work::now().total(),
+        cap: file_work_cap(1, 0),
+    };
+    let mut c = Collector::new(a, b, env.clone(), ra, rb, Rc::new(Cell::new(0)), file_work);
     let (this, other) = if on_a { (&c.sa, &c.sb) } else { (&c.sb, &c.sa) };
     let mut notes = Vec::new();
     let empty = |notes: Vec<String>, text: String| WhatIf {
@@ -2295,6 +2716,48 @@ pub fn what_if(
 }
 
 #[cfg(test)]
+mod cap_tests {
+    use super::*;
+    use crate::model::Side;
+
+    const SRC: &str =
+        "CREATE PROCEDURE dbo.p @p int AS\nBEGIN\nSET @p = @p + 1;\nSELECT @p;\nEND;\n";
+
+    /// The cap guard of `work_cap_used`: a collector whose unit cap is used
+    /// up reports it, except while recomputing a flipped scenario or muted.
+    #[test]
+    fn the_cap_guard_holds_off_in_a_replay_and_when_muted() {
+        let art = crate::Artifact::new("a.sql", Dialect::Tsql, SRC);
+        let (a, b) = (
+            Analyzed::new(&art, Side::A, 3),
+            Analyzed::new(&art, Side::B, 3),
+        );
+        let env = Env {
+            work_caps: Some((0, 0)),
+            ..Env::from_flips(&BTreeMap::new())
+        };
+        let file_work = FileWork {
+            start: sqldiff_model::work::now().total(),
+            cap: 0,
+        };
+        let (ra, rb) = (
+            routines_of(&a).first().cloned(),
+            routines_of(&b).first().cloned(),
+        );
+        let c = Collector::new(&a, &b, env, ra, rb, Rc::new(Cell::new(0)), file_work);
+        assert!(c.work_cap_used(), "a zero cap is used up");
+        c.replay.set(Some(5));
+        assert!(!c.work_cap_used(), "not while recomputing a scenario");
+        c.replay.set(None);
+        assert!(c.work_cap_used());
+        sqldiff_model::work::muted(|| {
+            assert!(!c.work_cap_used(), "not while muted");
+        });
+        assert!(c.work_cap_used());
+    }
+}
+
+#[cfg(test)]
 mod pairing_tests {
     use super::feasible;
 
@@ -2366,6 +2829,16 @@ pub struct PairRow {
     pub prod_paths_a: usize,
     pub prod_paths_b: usize,
     pub prod_cut: bool,
+    /// The same with path joining switched on for the side (whatever the
+    /// other side is): paths left, paths joined, whether a budget still cuts.
+    pub join_paths_a: usize,
+    pub join_paths_b: usize,
+    pub joined_a: usize,
+    pub joined_b: usize,
+    pub join_cut: bool,
+    /// The other side makes no decision, so joining is used in production.
+    pub gate_a: bool,
+    pub gate_b: bool,
     /// Perfect-alignment bound: each side against a copy of itself, with the
     /// `agree` key (every decision matches, nothing is solo): what pair-state
     /// merging needs when the conditions pair up completely.
@@ -2398,6 +2871,72 @@ pub const PAIR_VARIANTS: [super::interp::pairs::Variant; 6] = {
         v(true, false, true, true, true),
     ]
 };
+
+/// The conditions the explorer treats as one decision because their folded
+/// text is equal (`norm_cond`; `pairs()` and `feasible()`), per routine pair:
+/// the start offsets of the `Test::Unknown` nodes on each side that carry it.
+/// Report only (perf plan W6c, E2): nothing in `analyze` calls it.
+#[derive(Debug, Clone)]
+pub struct SharedText {
+    pub routine: String,
+    pub text: String,
+    pub a: Vec<usize>,
+    pub b: Vec<usize>,
+}
+
+pub fn shared_conditions(a: &Analyzed, b: &Analyzed) -> Vec<SharedText> {
+    let pairs: Vec<(Option<SyntaxNode>, Option<SyntaxNode>, String)> = match meet(a, b) {
+        None => vec![(
+            routines_of(a).first().cloned(),
+            routines_of(b).first().cloned(),
+            String::new(),
+        )],
+        Some(m) => m
+            .pairs
+            .iter()
+            .map(|(x, y)| {
+                (
+                    Some(x.clone()),
+                    Some(y.clone()),
+                    sqldiff_syntax::ast::routine_name(x).unwrap_or_default(),
+                )
+            })
+            .collect(),
+    };
+    let tests = |c: &Cfg| -> BTreeMap<String, Vec<usize>> {
+        let mut m: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for n in &c.nodes {
+            if let super::cfg::Op::Test {
+                test: super::cfg::Test::Unknown(t),
+                ..
+            } = &n.op
+            {
+                if let Some(s) = &n.syntax {
+                    m.entry(norm_cond(t))
+                        .or_default()
+                        .push(sqldiff_syntax::ast::sig_range(s).0);
+                }
+            }
+        }
+        m
+    };
+    let mut out = Vec::new();
+    for (ra, rb, name) in pairs {
+        let (sa, sb) = (SideIr::new(a, b, ra), SideIr::new(b, a, rb));
+        let (ta, tb) = (tests(&sa.cfg), tests(&sb.cfg));
+        for (text, xs) in ta {
+            if let Some(ys) = tb.get(&text) {
+                out.push(SharedText {
+                    routine: name.clone(),
+                    text,
+                    a: xs,
+                    b: ys.clone(),
+                });
+            }
+        }
+    }
+    out
+}
 
 /// Measures the lockstep pair-state counts of every routine pair of `a` and
 /// `b` (the pairs `analyze` would analyse). On demand only: nothing in
@@ -2477,7 +3016,19 @@ pub fn pair_states(a: &Analyzed, b: &Analyzed, env: &Env, max_states: usize) -> 
                 Explorer::in_universe(&sb.cfg, &sc, &keys),
             );
             let cut = xa.base().iter().chain(xb.base()).any(|o| !o.cut.is_empty());
+            let (ja, jb) = (
+                Explorer::in_universe_joined(&sa.cfg, &sc, &keys, true),
+                Explorer::in_universe_joined(&sb.cfg, &sc, &keys, true),
+            );
+            let join_cut = ja.base().iter().chain(jb.base()).any(|o| !o.cut.is_empty());
             rows.push(PairRow {
+                join_paths_a: ja.base().len(),
+                join_paths_b: jb.base().len(),
+                joined_a: ja.joined(),
+                joined_b: jb.joined(),
+                join_cut,
+                gate_a: super::interp::decision_free(&sb.cfg),
+                gate_b: super::interp::decision_free(&sa.cfg),
                 matched_a: [
                     matched(&sa.cfg, &sb.cfg, false),
                     matched(&sa.cfg, &sb.cfg, true),

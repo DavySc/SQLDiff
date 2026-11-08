@@ -20,7 +20,18 @@
 //!   the tree run (reading sources, writing the output, timing the report)
 //!   and the build hash of `instances.rs`; `store.rs` reads and writes the
 //!   result store and seeds the sampled re-check, none of which the check sees; timings are kept out of the
-//!   bytes a stored result is compared by.
+//!   bytes a stored result is compared by; `tree.rs` also memoises the tree
+//!   claims (derived from the inputs) in a `OnceLock` for the per-routine rebuild.
+//! - `behaviour.rs` (`sqldiff-core`) holds a test-only switch that turns its
+//!   explorer and flipped-scenario caches off; results and work counts are
+//!   the same either way.
+//! - `work.rs` (`sqldiff-model`): the per-file work meter, a thread-local
+//!   counter of deterministic events; `SQLDIFF_WORK` only prints it. It
+//!   counts and never changes a result.
+//! - `record.rs` (`sqldiff-catalog`): the recorder collects the check's own reads
+//!   (a write-only sink; nothing the check computes depends on it).
+//! - `abstract_syntax.rs` (`sqldiff-syntax`) keeps a bounded per-thread cache of the
+//!   tokens of a node (`tokens_shared`), a pure function of the node.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -37,6 +48,11 @@ const PATTERNS: &[&str] = &[
     "OnceLock",
     "OnceCell",
     "Mutex",
+    // Nothing the check computes may depend on a per-process hash seed or
+    // on which thread runs it.
+    "DefaultHasher",
+    "RandomState",
+    "thread::current",
 ];
 
 const ALLOWED: &[(&str, &[&str])] = &[
@@ -50,40 +66,47 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("sqldiff-convert/src/job.rs", &["fs::"]),
     ("sqldiff-convert/src/queue.rs", &["fs::"]),
     ("sqldiff-convert/src/review.rs", &["fs::"]),
-    ("sqldiff-convert/src/shared.rs", &["Mutex"]),
-    ("sqldiff-convert/src/store.rs", &["SystemTime", "fs::"]),
+    ("sqldiff-units/src/shared.rs", &["Mutex"]),
+    ("sqldiff-convert/src/store.rs", &["fs::", "thread::current"]),
     (
         "sqldiff-convert/src/tree.rs",
-        &["Instant::now", "Mutex", "fs::"],
+        &["Instant::now", "Mutex", "OnceLock", "fs::"],
     ),
-    (
-        "sqldiff-convert/src/tsql.rs",
-        &["OnceCell", "thread_local!"],
-    ),
-    ("sqldiff-core/src/assumptions.rs", &["OnceLock"]),
-    ("sqldiff-core/src/catalog/builtins.rs", &["OnceLock"]),
-    ("sqldiff-core/src/catalog/ddl.rs", &["fs::"]),
+    ("sqldiff-draft/src/tsql.rs", &["OnceCell", "thread_local!"]),
+    ("sqldiff-model/src/assumptions.rs", &["OnceLock"]),
+    ("sqldiff-syntax/src/abstract_syntax.rs", &["thread_local!"]),
+    ("sqldiff-catalog/src/builtins.rs", &["OnceLock"]),
+    ("sqldiff-catalog/src/ddl.rs", &["fs::"]),
+    // The read recorder (W4.3): a sink the check writes to, not a source it reads from.
+    ("sqldiff-catalog/src/record.rs", &["Mutex"]),
     ("sqldiff-core/src/engine.rs", &["Mutex", "OnceLock"]),
     (
-        "sqldiff-core/src/equiv/canon.rs",
+        "sqldiff-equiv/src/equiv/canon.rs",
         &["Mutex", "OnceLock", "thread_local!"],
     ),
-    ("sqldiff-core/src/equiv/compare.rs", &["thread_local!"]),
+    ("sqldiff-equiv/src/equiv/compare.rs", &["thread_local!"]),
     (
-        "sqldiff-core/src/equiv/edit.rs",
+        "sqldiff-equiv/src/equiv/edit.rs",
         &["OnceCell", "env::var", "thread_local!"],
     ),
-    ("sqldiff-core/src/equiv/eval.rs", &["env::var"]),
-    ("sqldiff-core/src/equiv/geography.rs", &["env::var", "fs::"]),
-    ("sqldiff-core/src/equiv/mod.rs", &["OnceCell", "env::var"]),
-    ("sqldiff-core/src/equiv/schema.rs", &["OnceLock", "fs::"]),
+    ("sqldiff-equiv/src/equiv/eval.rs", &["env::var"]),
+    (
+        "sqldiff-equiv/src/equiv/geography.rs",
+        &["env::var", "fs::"],
+    ),
+    ("sqldiff-equiv/src/equiv/mod.rs", &["OnceCell", "env::var"]),
+    ("sqldiff-equiv/src/equiv/schema.rs", &["OnceLock", "fs::"]),
     ("sqldiff-core/src/format/tests.rs", &["fs::"]),
-    ("sqldiff-core/src/ir/behaviour.rs", &["OnceCell"]),
-    ("sqldiff-core/src/ir/profile.rs", &["OnceLock"]),
+    (
+        "sqldiff-core/src/ir/behaviour.rs",
+        &["OnceCell", "thread_local!"],
+    ),
+    ("sqldiff-model/src/profile.rs", &["OnceLock"]),
     ("sqldiff-core/src/lint.rs", &["OnceLock"]),
     ("sqldiff-core/src/rule_proofs.rs", &["OnceLock"]),
-    ("sqldiff-core/src/rules/rule.rs", &["OnceLock"]),
-    ("sqldiff-core/src/target.rs", &["Mutex", "OnceLock"]),
+    ("sqldiff-equiv/src/rules/rule.rs", &["OnceLock"]),
+    ("sqldiff-model/src/target.rs", &["Mutex", "OnceLock"]),
+    ("sqldiff-model/src/work.rs", &["env::var", "thread_local!"]),
 ];
 
 fn scan(dir: &Path, root: &Path, out: &mut BTreeMap<String, BTreeSet<&'static str>>) {
@@ -116,7 +139,16 @@ fn scan(dir: &Path, root: &Path, out: &mut BTreeMap<String, BTreeSet<&'static st
 fn the_check_reads_nothing_outside_its_arguments() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut found = BTreeMap::new();
-    for krate in ["sqldiff-core", "sqldiff-convert", "sqldiff-syntax"] {
+    for krate in [
+        "sqldiff-core",
+        "sqldiff-convert",
+        "sqldiff-syntax",
+        "sqldiff-model",
+        "sqldiff-catalog",
+        "sqldiff-equiv",
+        "sqldiff-units",
+        "sqldiff-draft",
+    ] {
         scan(&root.join(krate).join("src"), &root, &mut found);
     }
     let allowed: BTreeMap<&str, BTreeSet<&str>> = ALLOWED

@@ -12,6 +12,10 @@
 //! - [`cache`]: per-content-hash cache of analysis results in the data directory.
 //! - [`crypto`]: optional encryption at rest for the store and the cache.
 
+// Determinism guard (perf plan W0): iterating a hash map or set in a `for` loop is
+// as order-dependent as `.iter()`; each site needs a reasoned `#[allow]`.
+#![warn(clippy::iter_over_hash_type)]
+
 pub mod branch;
 pub mod cache;
 pub mod crypto;

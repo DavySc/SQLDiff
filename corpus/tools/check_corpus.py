@@ -24,6 +24,7 @@ import tomllib
 from pathlib import Path
 
 CORPUS = Path(__file__).resolve().parent.parent
+VENDOR = CORPUS / "real-code" / "vendor"
 
 DIALECTS = {"tsql", "pg", "db2i"}
 VERDICTS = {"equal", "equal-under-assumptions", "different", "unknown"}
@@ -274,7 +275,10 @@ def main():
     args = ap.parse_args()
 
     for path in sorted(CORPUS.rglob("*")):
-        if path.is_file() and path.suffix in {".sql", ".toml", ".md", ".py"}:
+        # Vendored third-party files must stay byte-identical to upstream (the
+        # real-code gate pins their sha256), so house style does not apply.
+        if (path.is_file() and path.suffix in {".sql", ".toml", ".md", ".py"}
+                and VENDOR not in path.parents):
             check_text(path)
 
     cases = {}

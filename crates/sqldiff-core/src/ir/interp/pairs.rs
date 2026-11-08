@@ -117,7 +117,7 @@ impl Interp<'_> {
                     st = s;
                 }
                 Step::Done(o) => return Side::Done(o),
-                Step::Fork(_) => unreachable!("only a decision forks"),
+                Step::Fork(_) | Step::Pruned(..) => unreachable!("only a decision forks"),
             }
         }
     }
@@ -150,9 +150,11 @@ impl Interp<'_> {
             }
             Step::Go(n, s) => Err(self.to_decision(n, s, ticks)),
             Step::Done(o) => Err(Side::Done(o)),
+            Step::Pruned(..) => unreachable!("`step` always has room"),
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: sorted right after
     fn side_key(
         &self,
         node: NodeId,
@@ -448,14 +450,30 @@ pub fn measure(
                                         let _ = write!(key, "{:?}{:?}|", x.log, y.log);
                                     }
                                 }
-                                for (p, q) in x.live.iter().zip(&y.live) {
+                                // Slot by slot over the keys either side ran
+                                // (the others are `None` on both sides and
+                                // equal).
+                                let (mut ix, mut iy) =
+                                    (x.live.iter().peekable(), y.live.iter().peekable());
+                                loop {
+                                    let k = match (ix.peek(), iy.peek()) {
+                                        (None, None) => break,
+                                        (Some(&(i, _)), Some(&(j, _))) => i.min(j),
+                                        (Some(&(i, _)), None) => i,
+                                        (None, Some(&(j, _))) => j,
+                                    };
+                                    let p = ix.next_if(|&(i, _)| i == k).map(|(_, l)| l);
+                                    let q = iy.next_if(|&(j, _)| j == k).map(|(_, l)| l);
+                                    // Only the slots that are not plainly equal are
+                                    // written, with their index: a slot equal on both
+                                    // sides (or `None` on both) says nothing.
                                     if (matches!(p, Some(Live::Pending))
                                         || matches!(q, Some(Live::Pending)))
                                         && !(la && p == q)
                                     {
-                                        let _ = write!(key, "{p:?}/{q:?},");
-                                    } else {
-                                        let _ = write!(key, "{}", u8::from(p == q));
+                                        let _ = write!(key, "{k}:{p:?}/{q:?},");
+                                    } else if p != q {
+                                        let _ = write!(key, "{k}:0,");
                                     }
                                 }
                             }

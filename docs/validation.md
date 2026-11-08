@@ -48,7 +48,8 @@ Milestones M5a/M5b (behavioural diff) are proved by
 `scripts/real-code-gate.py` checks out pinned commits of public SQL that runs on its
 target database (pg_partman, pgmq, IBM i examples, sakila, Ola Hallengren's
 maintenance solution, WideWorldImporters) and runs `sqldiff check` on every `.sql`
-file. Any finding with verdict "different" fails the gate: on code that runs, it is a
+file. The IBM i examples are vendored in `corpus/real-code/vendor/` (upstream no
+longer serves anonymous fetches) and checked against pinned sha256 values. Any finding with verdict "different" fails the gate: on code that runs, it is a
 false positive. Files that are not UTF-8 are skipped and counted.
 
 ```

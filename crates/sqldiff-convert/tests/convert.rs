@@ -713,8 +713,14 @@ fn output_check_findings_quote_the_template() {
     };
     let tdraft = rewrite_template(&table, Dialect::Tsql, Dialect::Postgres, &stand, None);
     let opts = sqldiff_core::Options {
-        facts_a: vec![catalog(&template_fragment(&table, &stand), Dialect::Tsql)],
-        facts_b: vec![catalog(tdraft.output(), Dialect::Postgres)],
+        facts_a: vec![sqldiff_core::Facts::from(catalog(
+            &template_fragment(&table, &stand),
+            Dialect::Tsql,
+        ))],
+        facts_b: vec![sqldiff_core::Facts::from(catalog(
+            tdraft.output(),
+            Dialect::Postgres,
+        ))],
         ..Default::default()
     };
     let d = rewrite_template(&proc, Dialect::Tsql, Dialect::Postgres, &stand, None);
@@ -1427,4 +1433,28 @@ fn a_trigger_passes_a_scratch_variable_for_the_callees_return_code() {
     );
     assert!(o.contains("rc_scratch integer;"), "{o}");
     assert!(!o.contains("return_code => NULL"), "{o}");
+}
+
+/// A statement refused inside a routine says the source line it stood on
+/// (found by index, whatever the line ends).
+#[test]
+fn refused_statements_in_a_routine_name_their_source_line() {
+    for eol in ["\n", "\r\n"] {
+        let src = [
+            "CREATE PROCEDURE dbo.p AS",
+            "BEGIN",
+            "  SELECT 1;",
+            "  MERGE t USING s ON t.id = s.id WHEN MATCHED THEN DELETE;",
+            "  SELECT 2;",
+            "  MERGE t USING s ON t.id = s.id WHEN MATCHED THEN DELETE;",
+            "END",
+            "",
+        ]
+        .join(eol);
+        let c = tsql(&src);
+        for line in [4, 6] {
+            let want = format!("statement at source line {line} was not converted");
+            assert!(c.output.contains(&want), "{eol:?} {want}\n{}", c.output);
+        }
+    }
 }

@@ -1,6 +1,6 @@
 # Cast and literal-type probes
 
-These are the engine checks behind the "casts and implicit conversions" section of `crates/sqldiff-core/src/equiv/canon.rs`, the literal types in `Canon::num_lit`, the cast explanations in `equiv/compare.rs` (`explain_conv`) and the converter's `trunc()` rewrite in `crates/sqldiff-convert/src/tsql/bits.rs` (`cast_pg`). They were run on SQL Server 2022 and PostgreSQL 18 on 2026-10-26.
+These are the engine checks behind the "casts and implicit conversions" section of `crates/sqldiff-equiv/src/equiv/canon.rs`, the literal types in `Canon::num_lit`, the cast explanations in `equiv/compare.rs` (`explain_conv`) and the converter's `trunc()` rewrite in `crates/sqldiff-draft/src/tsql/bits.rs` (`cast_pg`). They were run on SQL Server 2022 and PostgreSQL 18 on 2026-10-26.
 
 - `mssql.sql` / `postgres.sql`: explicit casts. Decimal, float, money and strings to integers and decimals; numbers and times to text; literal types (`1234567e0`, `2147483648`, `0x1F`, `N'..'`, `$12.34`); date and time casts; integer and decimal arithmetic; comparisons that mix types. Outputs in `mssql.out` and `postgres.out`.
 - `assign-mssql.sql` / `assign-postgres.sql`: the same conversions when a value is stored in a column, assigned to a variable or passed to a parameter.

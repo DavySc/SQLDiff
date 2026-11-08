@@ -4,36 +4,43 @@
 //! The engine never reports a false "equal": anything it cannot show to be
 //! equivalent is reported as "unknown" or "equal under assumptions".
 
-pub mod artifact;
-pub mod assumptions;
+// Determinism guard (perf plan W0): iterating a hash map or set in a `for` loop is
+// as order-dependent as `.iter()`; each site needs a reasoned `#[allow]`.
+#![warn(clippy::iter_over_hash_type)]
+
+pub use sqldiff_model::artifact;
+pub use sqldiff_model::assumptions;
 pub mod bind;
-pub mod catalog;
-pub mod classify;
+pub use sqldiff_catalog as catalog;
+pub use sqldiff_equiv::classify;
 pub mod composition;
-pub mod coverage;
+pub use sqldiff_equiv::coverage;
 mod engine;
-pub mod equiv;
+pub use sqldiff_equiv::equiv;
 pub mod facts;
 pub mod format;
 pub mod hooks;
 pub mod ir;
 pub mod ledger;
 pub mod lint;
-pub mod model;
-pub mod normalize;
+pub use sqldiff_equiv::normalize;
+pub use sqldiff_model::model;
 pub mod observer;
 pub mod phrase;
-pub mod proof;
+pub use sqldiff_model::proof;
 pub mod render;
 pub mod rule_proofs;
-pub mod rules;
-pub mod session;
-pub mod target;
-pub mod tokens;
-pub mod treediff;
+pub use sqldiff_catalog::tokens;
+pub use sqldiff_equiv::rules;
+pub use sqldiff_equiv::treediff;
+pub use sqldiff_model::session;
+pub use sqldiff_model::target;
 
 pub use artifact::Artifact;
-pub use engine::{check, diff, overlay, pair_states, what_if, Options, TOOL_VERSION};
+pub use engine::{
+    check, check_recorded, diff, diff_recorded, identity, overlay, pair_states, shared_conditions,
+    what_if, Facts, Options, TOOL_VERSION,
+};
 pub use model::{ChangeClass, Finding, Report, Severity, Verdict};
 pub use sqldiff_syntax::Dialect;
 

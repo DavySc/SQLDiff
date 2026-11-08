@@ -11,6 +11,7 @@ name = "sqldiff-gui"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc.workspace = true
 sqldiff-syntax.workspace = true
 sqldiff-core.workspace = true
 sqldiff-convert.workspace = true

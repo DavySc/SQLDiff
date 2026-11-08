@@ -37,6 +37,7 @@ impl Fixture {
             to: Dialect::Postgres,
             jobs: Some(1),
             no_catalog: true,
+            recheck: Default::default(),
             template: Some(TemplateMode::new(&def, None).unwrap()),
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),

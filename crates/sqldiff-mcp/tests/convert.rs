@@ -20,6 +20,12 @@ fn write(p: &Path, text: &str) {
 
 /// Send each request and collect its response.
 fn session(messages: &[Value]) -> Vec<Value> {
+    session_paced(messages, 0)
+}
+
+/// [`session`] waiting `pause_ms` before each request after the second, so
+/// a background run has time to work between polls.
+fn session_paced(messages: &[Value], pause_ms: u64) -> Vec<Value> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_sqldiff-mcp"))
         .arg("--isolated")
         .env(
@@ -33,7 +39,10 @@ fn session(messages: &[Value]) -> Vec<Value> {
     let mut stdin = child.stdin.take().unwrap();
     let mut out = BufReader::new(child.stdout.take().unwrap());
     let mut responses = Vec::new();
-    for m in messages {
+    for (i, m) in messages.iter().enumerate() {
+        if i > 2 {
+            std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+        }
         writeln!(stdin, "{m}").unwrap();
         stdin.flush().unwrap();
         let mut line = String::new();
@@ -554,5 +563,329 @@ fn convert_tree_binds_against_base_catalogs_as_the_cli_does() {
     let report = std::fs::read_to_string(mcp_out.join("conversion-report.json")).unwrap();
     assert!(report.contains("\"base_catalogs\""), "{report}");
     assert!(!mcp_out.join("orders.sql").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn convert_tree_keeps_and_reuses_the_result_store() {
+    let d = scratch("store");
+    let src = d.join("src");
+    write(&src.join("a.sql"), "CREATE TABLE t (id int NOT NULL);\n");
+    write(&src.join("b.sql"), "SELECT id FROM t;\n");
+    let out = d.join("out");
+    let r = session(&[
+        call(
+            1,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": out }),
+        ),
+        // The same tree again: reused from the store, then verified in full.
+        call(
+            2,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": out, "overwrite": true, "recheck": "all" }),
+        ),
+        call(
+            3,
+            "conversion_queue",
+            json!({ "src": src, "to": "postgres", "out": out, "recheck": "none" }),
+        ),
+        call(
+            4,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "recheck": "sometimes" }),
+        ),
+        call(
+            5,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "select": { "paths": ["a.sql"] } }),
+        ),
+        call(
+            6,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": d.join("out2"), "select": { "paths": ["a.sql"] } }),
+        ),
+    ]);
+    let first = result(&r[0]);
+    let second = result(&r[1]);
+    assert!(out.join(".sqldiff").exists());
+    assert_eq!(first["files"], second["files"]);
+    result(&r[2]);
+    assert_eq!(r[3]["result"]["isError"], true, "{}", r[3]);
+    assert_eq!(r[4]["result"]["isError"], true, "{}", r[4]);
+    // An increment is planned: the plan is written beside the store.
+    result(&r[5]);
+    assert!(d.join("out2").join(".sqldiff/plan.json").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_background_run_reports_like_the_foreground_call_and_can_be_stopped() {
+    let d = scratch("background");
+    let src = d.join("src");
+    write(&src.join("a.sql"), "CREATE TABLE t (id int NOT NULL);\n");
+    write(&src.join("b.sql"), "SELECT id FROM t;\n");
+    let polls: Vec<Value> = (10..70)
+        .map(|i| call(i, "run_status", json!({ "run": "run-1" })))
+        .collect();
+    let mut msgs = vec![
+        call(
+            1,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": d.join("fg") }),
+        ),
+        call(
+            2,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": d.join("bg"), "background": true }),
+        ),
+        // Nothing else converts while it works; either refused or it was fast.
+        call(
+            3,
+            "conversion_queue",
+            json!({ "src": src, "to": "postgres", "out": d.join("bg") }),
+        ),
+    ];
+    msgs.extend(polls);
+    let r = session_paced(&msgs, 50);
+    let fg = result(&r[0]);
+    assert_eq!(result(&r[1])["state"], "running");
+    let fin = r[3..]
+        .iter()
+        .map(result)
+        .find(|v| v["state"] != "running" && v["state"] != "stopping")
+        .expect("the run finishes");
+    assert_eq!(fin["state"], "finished", "{fin}");
+    assert_eq!(fin["files"], fg["files"]);
+    assert_eq!(fin["run"], "run-1");
+
+    // Stopped at once: either cancelled with no output tree, or finished first.
+    let r = session(&[
+        call(
+            1,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": d.join("c"), "background": true }),
+        ),
+        call(2, "cancel_run", json!({ "run": "run-1" })),
+        call(3, "run_status", json!({ "run": "run-9" })),
+    ]);
+    result(&r[1]);
+    assert_eq!(r[2]["result"]["isError"], true);
+    let r = session(&[
+        call(
+            1,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": d.join("c2"), "background": true }),
+        ),
+        call(2, "cancel_run", json!({ "run": "run-1" })),
+        call(3, "run_status", json!({ "run": "run-1" })),
+    ]);
+    let s = result(&r[2]);
+    match s["state"].as_str().unwrap() {
+        "cancelled" => assert!(!d.join("c2/conversion-report.json").exists()),
+        "finished" | "running" | "stopping" => {}
+        other => panic!("{other}: {s}"),
+    }
+    // Argument checks.
+    let r = session(&[
+        call(
+            1,
+            "conversion_queue",
+            json!({ "src": src, "to": "postgres", "out": d.join("fg"), "select": { "paths": ["a.sql"] } }),
+        ),
+        call(
+            2,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": d.join("n"), "select": { "next": "two" } }),
+        ),
+    ]);
+    assert_eq!(r[0]["result"]["isError"], true);
+    assert_eq!(r[1]["result"]["isError"], true);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn the_server_waits_for_a_background_run_when_its_input_ends() {
+    let d = scratch("eof");
+    let src = d.join("src");
+    for i in 0..40 {
+        write(
+            &src.join(format!("f{i}.sql")),
+            &format!("CREATE TABLE t{i} (id int NOT NULL);\nSELECT id FROM t{i};\n"),
+        );
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sqldiff-mcp"))
+        .arg("--isolated")
+        .env(
+            "SQLDIFF_DATA_DIR",
+            std::env::temp_dir().join(format!("sqldiff-mcp-data-{}", std::process::id())),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let m = call(
+        1,
+        "convert_tree",
+        json!({ "src": src, "to": "postgres", "out": d.join("o"), "background": true }),
+    );
+    writeln!(stdin, "{m}").unwrap();
+    stdin.flush().unwrap();
+    let mut line = String::new();
+    out.read_line(&mut line).unwrap();
+    // The client goes away while the run works.
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    // Stopped before writing, or written whole: never a cut-off report.
+    let report = d.join("o/conversion-report.json");
+    if report.exists() {
+        let text = std::fs::read_to_string(&report).unwrap();
+        serde_json::from_str::<Value>(&text).expect("a whole report");
+    }
+    let r = session(&[call(
+        1,
+        "convert_tree",
+        json!({ "src": src, "to": "postgres", "out": d.join("o"), "overwrite": true }),
+    )]);
+    result(&r[0]);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn compare_runs_lists_what_changed_between_two_conversions() {
+    let d = scratch("compare");
+    let (s1, s2) = (d.join("s1"), d.join("s2"));
+    write(&s1.join("x.sql"), "CREATE TABLE t (id int NOT NULL);\n");
+    write(
+        &s2.join("x.sql"),
+        "CREATE TABLE t (id int NOT NULL);\nCREATE TABLE u (id int NOT NULL);\n",
+    );
+    write(&s2.join("y.sql"), "CREATE TABLE v (id int NOT NULL);\n");
+    let (o1, o2) = (d.join("o1"), d.join("o2"));
+    let r = session(&[
+        call(
+            1,
+            "convert_tree",
+            json!({ "src": s1, "to": "postgres", "out": o1 }),
+        ),
+        call(
+            2,
+            "convert_tree",
+            json!({ "src": s2, "to": "postgres", "out": o2 }),
+        ),
+        call(3, "compare_runs", json!({ "a": "tree-1", "b": "tree-2" })),
+        call(4, "compare_runs", json!({ "a": "tree-1", "b": "tree-1" })),
+        // A baseline from a report on disk gives the same answer.
+        call(5, "compare_runs", json!({ "a": o1, "b": "tree-2" })),
+        call(6, "compare_runs", json!({ "a": "tree-9", "b": "tree-2" })),
+        // Conversions to different dialects have nothing to compare.
+        call(7, "convert_tree", json!({ "src": s1, "to": "db2i" })),
+        call(8, "compare_runs", json!({ "a": "tree-1", "b": "tree-3" })),
+    ]);
+    let c = result(&r[2]);
+    assert_eq!(c["new"], 2, "{c:#}");
+    assert_eq!(c["gone"], 0);
+    assert_eq!(c["regressed"], 0);
+    assert_eq!(c["unchanged"], 1);
+    assert_eq!(c["rows"][0]["change"], "new");
+    assert_eq!(c["rows"][0]["path"], "x.sql");
+    let same = result(&r[3]);
+    assert_eq!(same["unchanged"], 1);
+    assert_eq!(same["rows"].as_array().unwrap().len(), 0);
+    assert_eq!(result(&r[4])["rows"], c["rows"]);
+    assert_eq!(r[5]["result"]["isError"], true);
+    assert_eq!(r[7]["result"]["isError"], true, "{}", r[7]);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// One server process the test talks to a request at a time, so it can edit
+/// files between requests.
+struct Live {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    out: BufReader<std::process::ChildStdout>,
+    id: u64,
+}
+
+impl Live {
+    fn start(config: &Path) -> Live {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_sqldiff-mcp"))
+            .arg("--isolated")
+            .arg("--config")
+            .arg(config)
+            .env("SQLDIFF_DATA_DIR", config.parent().unwrap().join("data"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let out = BufReader::new(child.stdout.take().unwrap());
+        Live {
+            child,
+            stdin,
+            out,
+            id: 0,
+        }
+    }
+
+    fn call(&mut self, name: &str, args: Value) -> Value {
+        self.id += 1;
+        writeln!(self.stdin, "{}", call(self.id, name, args)).unwrap();
+        self.stdin.flush().unwrap();
+        let mut line = String::new();
+        self.out.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    fn finish(mut self) {
+        drop(self.stdin);
+        assert!(self.child.wait().unwrap().success());
+    }
+}
+
+#[test]
+fn engine_reports_fingerprints_and_reload_config_picks_up_an_edit() {
+    let d = scratch("reload");
+    let cfg = d.join("sqldiff.toml");
+    write(&cfg, "excerpt_lines = 3\n");
+    let mut s = Live::start(&cfg);
+    let e1 = s.call("engine", json!({}));
+    let e1 = result(&e1).clone();
+    let fp = e1["engine_fingerprint"].as_str().unwrap();
+    let check = e1["check_fingerprint"].as_str().unwrap();
+    assert!(!fp.is_empty() && !check.is_empty() && fp != check);
+    assert_eq!(e1["can_reload_config"], true);
+
+    // Nothing edited: nothing changed.
+    let r = s.call("reload_config", json!({}));
+    assert_eq!(result(&r)["changed"], false, "{r}");
+
+    // An edit shows up in the layer hash, and the next engine call sees it.
+    write(&cfg, "excerpt_lines = 5\n");
+    let r = s.call("reload_config", json!({}));
+    assert_eq!(result(&r)["changed"], true, "{r}");
+    let e2 = s.call("engine", json!({}));
+    assert_ne!(result(&e2)["config"], e1["config"]);
+    assert_eq!(result(&e2)["engine_fingerprint"], e1["engine_fingerprint"]);
+
+    // A configuration that does not load changes nothing.
+    write(&cfg, "excerpt_lines = [not valid\n");
+    let r = s.call("reload_config", json!({}));
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    let e3 = s.call("engine", json!({}));
+    assert_eq!(result(&e3)["config"], result(&e2)["config"]);
+
+    // A data key that does not resolve is refused like at startup, and nothing changes.
+    write(
+        &cfg,
+        "excerpt_lines = 7\ndata_key = \"env:SQLDIFF_TEST_KEY_THAT_IS_NOT_SET\"\n",
+    );
+    let r = s.call("reload_config", json!({}));
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    let e4 = s.call("engine", json!({}));
+    assert_eq!(result(&e4)["config"], result(&e2)["config"]);
+    s.finish();
     let _ = std::fs::remove_dir_all(&d);
 }

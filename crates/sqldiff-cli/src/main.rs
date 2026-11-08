@@ -3,6 +3,9 @@
 //! Exit codes: 0 equal (or equal under assumptions), 1 different or
 //! unknown, 2 usage or I/O error.
 
+// Determinism guard (perf plan W0): see the other crates.
+#![warn(clippy::iter_over_hash_type)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -209,6 +212,14 @@ enum Command {
         /// when everything its check reads is the same).
         #[arg(long)]
         fresh: bool,
+        /// How much of what is taken from that store is built again and
+        /// compared (`none`, `sample` or `all`). `sample` (the default)
+        /// checks one stored file in 50 each run, chosen from the tree and
+        /// the store's run count; `all` checks every stored result and
+        /// draft and the whole tree state; `none` trusts the store, and the
+        /// summary and both reports say the reuse was not verified.
+        #[arg(long, value_name = "MODE", default_value = "sample")]
+        recheck: sqldiff_convert::tree::Recheck,
         /// Only plan: read SRC, find which file defines and uses which
         /// object, order the files so that what a file uses comes first and
         /// write OUT/.sqldiff/plan.json. Nothing is converted.
@@ -509,6 +520,10 @@ fn emit(report: Report, format: Format, pipe: &mut Pipeline) -> Result<(), Strin
     Ok(())
 }
 
+// mimalloc: the engine allocates heavily; measured 17-39% faster conversions than the system allocator.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let code = match sqldiff_core::with_engine_stack(|| run(cli)) {
@@ -721,6 +736,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             };
             review_status_cmd::run(review_status_cmd::Args {
                 tree: sqldiff_convert::tree::Args {
+                    recheck: Default::default(),
                     src,
                     from,
                     to,
@@ -751,6 +767,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             overwrite,
             discard_edits,
             fresh,
+            recheck,
             plan,
             next,
             schema,
@@ -786,6 +803,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 None
             };
             let tree = sqldiff_convert::tree::Args {
+                recheck,
                 src,
                 from,
                 to,

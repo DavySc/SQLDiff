@@ -88,6 +88,7 @@ fn reviews_the_changed_files_most_severe_first() {
     let hooks = Hooks {
         progress: Some(Box::new(move |n, total| s.lock().unwrap().push((n, total)))),
         cancel: None,
+        ..Default::default()
     };
     let r = branch::review(&scope(&repo), &pipe, &hooks).unwrap();
     assert_eq!(r.verdict(), Verdict::Different);
@@ -119,6 +120,7 @@ fn a_cancel_stops_before_the_next_file() {
             }
         })),
         cancel: Some(cancel),
+        ..Default::default()
     };
     let e = branch::review(&scope(&repo), &pipe, &hooks).err().unwrap();
     assert_eq!(e, CANCELLED);

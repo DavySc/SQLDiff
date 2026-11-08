@@ -1,0 +1,35 @@
+name: hang-gate
+
+# Adversarial inputs (scripts/gen-adversarial.py: synthetic shapes and the
+# audit repros) converted under a time limit and a memory ceiling: nothing may
+# be killed, run out of memory or crash. Shapes still open are listed in
+# scripts/hang-gate.py (KNOWN_OPEN); a second job runs only those and fails
+# when one now passes, so the PR that fixes a hang must delete its entry.
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p sqldiff-cli
+      - run: python3 scripts/hang-gate.py
+
+  known-open:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p sqldiff-cli
+      # A short limit: a fixed shape finishes in seconds, a still-open one is
+      # killed. (A shape that gets faster but stays over the limit is caught
+      # by the weekly run with the full limit, determinism.yml.)
+      - run: python3 scripts/hang-gate.py --known-open --timeout 30

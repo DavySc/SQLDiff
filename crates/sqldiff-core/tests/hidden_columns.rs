@@ -32,8 +32,8 @@ fn catalog(dialect: Dialect, files: &[&str]) -> Arc<Catalog> {
 
 fn run(tsql_tables: &[&str], pg_tables: &[&str], a: &str, b: &str) -> Report {
     let opts = Options {
-        facts_a: vec![catalog(T, tsql_tables)],
-        facts_b: vec![catalog(P, pg_tables)],
+        facts_a: vec![sqldiff_core::Facts::new(catalog(T, tsql_tables))],
+        facts_b: vec![sqldiff_core::Facts::new(catalog(P, pg_tables))],
         ..Options::default()
     };
     diff(

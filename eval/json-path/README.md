@@ -1,6 +1,6 @@
 # JSON_QUERY and JSON_VALUE probes
 
-These probes check the PostgreSQL rule for a computed column `JSON_QUERY(col, '$.key')` or `JSON_VALUE(col, '$.key')`, `TRY_CONVERT(datetime2, …, 126)` of one, and ISJSON in a CHECK: `computed_json`, `computed_iso126` in `crates/sqldiff-convert/src/tsql.rs` and `pg_json_path` / `json_path` in `crates/sqldiff-core/src/equiv/canon.rs`. They were run on SQL Server 2022 and PostgreSQL 18.6 on 2026-10-29 (`cases-mssql`) and 2026-10-30 (the rest).
+These probes check the PostgreSQL rule for a computed column `JSON_QUERY(col, '$.key')` or `JSON_VALUE(col, '$.key')`, `TRY_CONVERT(datetime2, …, 126)` of one, and ISJSON in a CHECK: `computed_json`, `computed_iso126` in `crates/sqldiff-draft/src/tsql.rs` and `pg_json_path` / `json_path` in `crates/sqldiff-equiv/src/equiv/canon.rs`. They were run on SQL Server 2022 and PostgreSQL 18.6 on 2026-10-29 (`cases-mssql`) and 2026-10-30 (the rest).
 
 The PostgreSQL form uses the `json` type, not `jsonb`, because `json` keeps the text as written:
 

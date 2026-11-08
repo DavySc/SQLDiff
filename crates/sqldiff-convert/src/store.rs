@@ -39,6 +39,9 @@ pub const TREE_DIR: &str = ".sqldiff/tree";
 /// killed in pass 1 and are dropped once the whole tree state is stored.
 pub const DRAFTS_DIR: &str = ".sqldiff/drafts";
 
+/// The stand-in flags of each stored result: `<result key>/<flags key>.json`.
+pub const FLAGS_DIR: &str = ".sqldiff/flags";
+
 pub const MISMATCH_DIR: &str = ".sqldiff/mismatch";
 
 /// A 256-bit content hash, in hex.
@@ -88,7 +91,7 @@ pub fn catalog_digest(c: &Catalog) -> String {
 /// Everything [`crate::check`] reads for one file of a tree: the only
 /// argument a stored result's key is made from.
 pub struct CheckInput<'a> {
-    /// The engine fingerprint (`ENGINE_FINGERPRINT`): another engine may check differently.
+    /// The check stage's fingerprint (`CHECK_FINGERPRINT`): another check may decide differently.
     pub build: &'a str,
     pub from: Dialect,
     pub to: Dialect,
@@ -109,7 +112,7 @@ pub struct CheckInput<'a> {
 impl CheckInput<'_> {
     pub fn key(&self) -> Key {
         let mut k = KeyBuilder::new();
-        k.field("format", b"2");
+        k.field("format", b"4");
         k.field("build", self.build.as_bytes());
         k.field("from", self.from.id().as_bytes());
         k.field("to", self.to.id().as_bytes());
@@ -120,6 +123,42 @@ impl CheckInput<'_> {
         // draft of the other mode is never reused.
         k.field("rules", format!("{:?}", self.draft.options()).as_bytes());
         k.field("draft", self.draft.canonical().as_bytes());
+        k.field("source", self.source.unwrap_or("none").as_bytes());
+        k.field("target", self.target.unwrap_or("none").as_bytes());
+        k.finish()
+    }
+}
+
+/// Everything [`crate::check_template`] reads for one job of a template
+/// tree (a template, or a routine's opening and closing templates): the only
+/// argument a stored template result's key is made from, like
+/// [`CheckInput`] for a plain file.
+pub struct TemplateInput<'a> {
+    /// The check stage's fingerprint (`CHECK_FINGERPRINT`).
+    pub build: &'a str,
+    pub from: Dialect,
+    pub to: Dialect,
+    pub helpers: &'a [Helper],
+    /// [`crate::job_material`]: the template and how it was read.
+    pub job: &'a str,
+    /// `TemplateDraft::canonical`: the draft the check starts from.
+    pub draft: &'a str,
+    /// [`catalog_digest`] of the source and the target catalog (in stand-in
+    /// terms) the check binds against, when the run uses catalogs.
+    pub source: Option<&'a str>,
+    pub target: Option<&'a str>,
+}
+
+impl TemplateInput<'_> {
+    pub fn key(&self) -> Key {
+        let mut k = KeyBuilder::new();
+        k.field("format", b"template-1");
+        k.field("build", self.build.as_bytes());
+        k.field("from", self.from.id().as_bytes());
+        k.field("to", self.to.id().as_bytes());
+        k.field("helpers", format!("{:?}", self.helpers).as_bytes());
+        k.field("job", self.job.as_bytes());
+        k.field("draft", self.draft.as_bytes());
         k.field("source", self.source.unwrap_or("none").as_bytes());
         k.field("target", self.target.unwrap_or("none").as_bytes());
         k.finish()
@@ -174,7 +213,7 @@ impl Default for TreeKeyBuilder {
 impl TreeKeyBuilder {
     pub fn new() -> Self {
         let mut k = KeyBuilder::new();
-        k.field("format", b"tree-1");
+        k.field("format", b"tree-2");
         TreeKeyBuilder(k)
     }
 
@@ -197,6 +236,38 @@ struct Entry {
     key: String,
     pool: Vec<String>,
     conversion: serde_json::Value,
+    /// The mix of the two variants of the draft that was built for this
+    /// result, whether or not it won ([`crate::check::Mix`]). The draft code
+    /// is not part of a result's fingerprint, so a reuse builds the mix again
+    /// and compares.
+    mix: Option<crate::check::Mix>,
+    /// Whether a mix could be tried when the result was made: not in a run
+    /// under a review ledger, where the draft is not built again. A result
+    /// stored without a try says nothing about a mix, so a run that can try
+    /// one does not take it.
+    mix_tried: bool,
+}
+
+/// The body of a result file: the file is the SHA-256 of its body in hex, a
+/// newline, then the body. A file edited after it was written (even into
+/// other valid JSON) does not match its digest and is a miss, so it is
+/// converted again instead of trusted.
+fn verified_body(raw: &[u8]) -> Option<&[u8]> {
+    let (digest, body) = (raw.get(..64)?, raw.get(65..)?);
+    if raw[64] != b'\n' || digest != hex(&Sha256::digest(body)).as_bytes() {
+        return None;
+    }
+    Some(body)
+}
+
+/// A stored file as written: the SHA-256 of `body` in hex, a newline, then
+/// the body. Every file of the store has this frame (see [`verified_body`]).
+pub(crate) fn framed(body: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(body.len() + 65);
+    bytes.extend_from_slice(hex(&Sha256::digest(body)).as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(body);
+    bytes
 }
 
 /// A result file is named by its key: 64 hex digits.
@@ -228,7 +299,7 @@ const POOL_MIN: usize = 40;
 /// Starts a marker. A real string starting with it is written with one more.
 const MARK: char = '\u{1}';
 
-fn count(v: &serde_json::Value, seen: &mut std::collections::HashMap<String, usize>) {
+fn count(v: &serde_json::Value, seen: &mut std::collections::BTreeMap<String, usize>) {
     match v {
         serde_json::Value::String(s) if s.len() >= POOL_MIN => {
             *seen.entry(s.clone()).or_default() += 1;
@@ -239,7 +310,7 @@ fn count(v: &serde_json::Value, seen: &mut std::collections::HashMap<String, usi
     }
 }
 
-fn replace(v: &mut serde_json::Value, index: &std::collections::HashMap<&str, usize>) {
+fn replace(v: &mut serde_json::Value, index: &std::collections::BTreeMap<&str, usize>) {
     match v {
         serde_json::Value::String(s) => {
             if let Some(i) = index.get(s.as_str()) {
@@ -256,7 +327,7 @@ fn replace(v: &mut serde_json::Value, index: &std::collections::HashMap<&str, us
 
 /// Moves the strings that repeat into a pool. Object keys are not touched.
 fn intern(mut v: serde_json::Value) -> (Vec<String>, serde_json::Value) {
-    let mut seen = std::collections::HashMap::new();
+    let mut seen = std::collections::BTreeMap::new();
     count(&v, &mut seen);
     let mut pool: Vec<String> = seen
         .into_iter()
@@ -264,7 +335,7 @@ fn intern(mut v: serde_json::Value) -> (Vec<String>, serde_json::Value) {
         .map(|(s, _)| s)
         .collect();
     pool.sort();
-    let index: std::collections::HashMap<&str, usize> = pool
+    let index: std::collections::BTreeMap<&str, usize> = pool
         .iter()
         .enumerate()
         .map(|(i, s)| (s.as_str(), i))
@@ -285,7 +356,7 @@ fn share_notes(v: &mut serde_json::Value) {
         return;
     };
     let mut table: Vec<serde_json::Value> = Vec::new();
-    let mut at: std::collections::HashMap<String, usize> = Default::default();
+    let mut at: std::collections::BTreeMap<String, usize> = Default::default();
     for u in units.iter_mut() {
         let Some(notes) = u.get_mut("notes").and_then(|n| n.as_array_mut()) else {
             continue;
@@ -371,30 +442,42 @@ impl Store {
 
     /// The stored conversion. A file that does not read back whole, or does
     /// not name its own key, is a miss.
-    pub fn get(&self, key: &Key) -> Option<Conversion> {
+    pub fn get(&self, key: &Key) -> Option<(Conversion, Option<crate::check::Mix>, bool)> {
         let path = crate::tree::dest_under(&self.out, &Self::rel(key)).ok()?;
-        let mut e: Entry = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        let raw = std::fs::read(path).ok()?;
+        let body = verified_body(&raw)?;
+        let mut e: Entry = serde_json::from_slice(body).ok()?;
         if e.key != key.0 {
             return None;
         }
         expand(&mut e.conversion, &e.pool)?;
         unshare_notes(&mut e.conversion)?;
-        serde_json::from_value(e.conversion).ok()
+        let conversion = serde_json::from_value(e.conversion).ok()?;
+        Some((conversion, e.mix, e.mix_tried))
     }
 
     /// Stores a result: written beside its name and renamed into place,
     /// retried a few times because a virus scanner on Windows can hold the
     /// file for a moment.
-    pub fn put(&self, key: &Key, c: &Conversion) -> Result<(), String> {
+    pub fn put(
+        &self,
+        key: &Key,
+        c: &Conversion,
+        mix: Option<&crate::check::Mix>,
+        mix_tried: bool,
+    ) -> Result<(), String> {
         let mut value = serde_json::to_value(c).map_err(|e| e.to_string())?;
         share_notes(&mut value);
         let (pool, conversion) = intern(value);
-        let bytes = serde_json::to_vec(&Entry {
+        let body = serde_json::to_vec(&Entry {
             key: key.0.clone(),
             pool,
             conversion,
+            mix: mix.cloned(),
+            mix_tried,
         })
         .map_err(|e| e.to_string())?;
+        let bytes = framed(&body);
         let dest = crate::tree::dest_under(&self.out, &Self::rel(key))?;
         if let Some(p) = dest.parent() {
             std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
@@ -421,7 +504,7 @@ impl Store {
 
     /// Empties the store (after a mismatch).
     pub fn clear(&self) {
-        for d in [DIR, TREE_DIR, DRAFTS_DIR] {
+        for d in [DIR, TREE_DIR, DRAFTS_DIR, FLAGS_DIR] {
             if let Ok(p) = crate::tree::dest_under(&self.out, d) {
                 let _ = std::fs::remove_dir_all(p);
             }
@@ -433,7 +516,7 @@ impl Store {
     /// program, which no later run of this tree can use. Files that are not
     /// results are left alone, except a temporary file of a killed write
     /// older than an hour. Returns how many were removed.
-    pub fn gc(&self, live: &std::collections::HashSet<String>) -> usize {
+    pub fn gc(&self, live: &std::collections::BTreeSet<String>) -> usize {
         let Ok(dir) = crate::tree::dest_under(&self.out, DIR) else {
             return 0;
         };
@@ -458,7 +541,73 @@ impl Store {
                 removed += 1;
             }
         }
+        // The flags of results that are gone go with them.
+        if let Ok(dir) = crate::tree::dest_under(&self.out, FLAGS_DIR) {
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if is_key(&name) && !live.contains(&name) {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+        }
         removed
+    }
+
+    /// The key of the flags of file `fi` for the result `result`: the flags
+    /// are a function of the result, the stand-ins, the file's place in the
+    /// tree and the dialects ([`crate::refused::StandIns::flags_of`]).
+    pub fn flags_key(
+        result: &Key,
+        stand_ins_digest: &str,
+        fi: usize,
+        from: Dialect,
+        to: Dialect,
+    ) -> Key {
+        let mut k = KeyBuilder::new();
+        k.field("format", b"flags-2");
+        k.field("result", result.0.as_bytes());
+        k.field("stand-ins", stand_ins_digest.as_bytes());
+        k.field("file", &(fi as u64).to_le_bytes());
+        k.field("from", from.id().as_bytes());
+        k.field("to", to.id().as_bytes());
+        k.finish()
+    }
+
+    fn flags_rel(result: &Key, flags: &Key) -> String {
+        format!("{FLAGS_DIR}/{}/{}.json", result.0, flags.0)
+    }
+
+    /// The stored flags, or a miss (also for a file that does not read back
+    /// whole).
+    pub fn get_flags(&self, result: &Key, flags: &Key) -> Option<Vec<crate::refused::UnitFlag>> {
+        let path = crate::tree::dest_under(&self.out, &Self::flags_rel(result, flags)).ok()?;
+        let raw = std::fs::read(path).ok()?;
+        serde_json::from_slice(verified_body(&raw)?).ok()
+    }
+
+    /// Stores flags (best effort: a flag set that is not stored is computed
+    /// again next time).
+    pub fn put_flags(&self, result: &Key, flags: &Key, v: &[crate::refused::UnitFlag]) {
+        let Ok(dest) = crate::tree::dest_under(&self.out, &Self::flags_rel(result, flags)) else {
+            return;
+        };
+        let Ok(body) = serde_json::to_vec(v) else {
+            return;
+        };
+        let bytes = framed(&body);
+        if let Some(p) = dest.parent() {
+            if std::fs::create_dir_all(p).is_err() {
+                return;
+            }
+        }
+        let tmp = dest.with_extension(format!(
+            "tmp{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        if std::fs::write(&tmp, &bytes).is_err() || std::fs::rename(&tmp, &dest).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 
     fn tree_rel(key: &TreeKey) -> String {
@@ -469,11 +618,11 @@ impl Store {
     /// does not name its own key, is a miss.
     pub fn get_tree(&self, key: &TreeKey) -> Option<TreeState> {
         let path = crate::tree::dest_under(&self.out, &Self::tree_rel(key)).ok()?;
-        let packed = std::fs::read(path).ok()?;
+        let raw = std::fs::read(path).ok()?;
+        let packed = verified_body(&raw)?;
         let mut json = Vec::new();
-        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&packed[..]), &mut json)
-            .ok()?;
-        drop(packed);
+        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(packed), &mut json).ok()?;
+        drop(raw);
         let st: TreeState = serde_json::from_slice(&json).ok()?;
         drop(json);
         (st.key == key.0).then_some(st)
@@ -492,11 +641,12 @@ impl Store {
             flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()),
         );
         serde_json::to_writer(&mut enc, st).map_err(|e| e.to_string())?;
-        let bytes = enc
-            .into_inner()
-            .map_err(|e| e.into_error().to_string())?
-            .finish()
-            .map_err(|e| e.to_string())?;
+        let bytes = framed(
+            &enc.into_inner()
+                .map_err(|e| e.into_error().to_string())?
+                .finish()
+                .map_err(|e| e.to_string())?,
+        );
         let dest = crate::tree::dest_under(&self.out, &Self::tree_rel(key))?;
         if let Some(p) = dest.parent() {
             let _ = std::fs::remove_dir_all(p);
@@ -521,7 +671,8 @@ impl Store {
     /// miss.
     pub fn get_draft(&self, key: &TreeKey, rel: &str) -> Option<crate::Draft> {
         let path = crate::tree::dest_under(&self.out, &Self::draft_rel(key, rel)).ok()?;
-        let e: DraftEntry = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        let raw = std::fs::read(path).ok()?;
+        let e: DraftEntry = serde_json::from_slice(verified_body(&raw)?).ok()?;
         (e.key == key.0 && e.rel == rel).then_some(e.draft)
     }
 
@@ -534,9 +685,10 @@ impl Store {
             rel,
             draft,
         };
-        let Ok(bytes) = serde_json::to_vec(&e) else {
+        let Ok(body) = serde_json::to_vec(&e) else {
             return;
         };
+        let bytes = framed(&body);
         let Ok(dest) = crate::tree::dest_under(&self.out, &Self::draft_rel(key, rel)) else {
             return;
         };
@@ -571,6 +723,27 @@ impl Store {
             if let Some(d) = p.parent() {
                 let _ = std::fs::remove_dir(d);
             }
+        }
+    }
+
+    /// Writes what a stand-in flags mismatch found: the flags the store held
+    /// and the ones computed again for the same result.
+    pub fn bundle_flags(
+        &self,
+        result: &Key,
+        flags: &Key,
+        stored: &[crate::refused::UnitFlag],
+        fresh: &[crate::refused::UnitFlag],
+    ) {
+        let rel = format!("{MISMATCH_DIR}/flags-{}.json", flags.0);
+        let body = serde_json::json!({
+            "result": result.0,
+            "flags": flags.0,
+            "stored": stored,
+            "fresh": fresh,
+        });
+        if let Ok(b) = serde_json::to_vec_pretty(&body) {
+            let _ = crate::tree::write_under(&self.out, &rel, &b);
         }
     }
 
@@ -697,6 +870,36 @@ mod tests {
     }
 
     #[test]
+    fn a_framed_file_is_read_back_only_whole() {
+        let body = b"[1,2,3]";
+        let f = framed(body);
+        assert_eq!(verified_body(&f), Some(&body[..]));
+        let mut edited = f.clone();
+        *edited.last_mut().unwrap() = b'4';
+        assert_eq!(verified_body(&edited), None, "edited body");
+        assert_eq!(verified_body(&f[..40]), None, "truncated digest");
+        assert_eq!(verified_body(&f[65..]), None, "no digest");
+        assert_eq!(verified_body(b""), None);
+    }
+
+    #[test]
+    fn stored_flags_with_a_wrong_digest_are_a_miss() {
+        let out = std::env::temp_dir().join(format!("sqldiff-flags-digest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        let store = Store::of(&out);
+        let (r, k) = (Key("r".repeat(64)), Key("f".repeat(64)));
+        store.put_flags(&r, &k, &[]);
+        assert!(store.get_flags(&r, &k).is_some_and(|v| v.is_empty()));
+        let path = out.join(Store::flags_rel(&r, &k));
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.truncate(65);
+        bytes.extend_from_slice(b"[]  "); // still valid JSON, not what was written
+        std::fs::write(&path, bytes).unwrap();
+        assert!(store.get_flags(&r, &k).is_none());
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn the_sample_reaches_the_largest_file() {
         // 99 small files and one huge one: the sample is drawn by count, so
         // the huge file is picked for some seeds and every file has the same
@@ -766,5 +969,71 @@ mod note_table_tests {
         // An index outside the table is a miss, not a panic.
         let mut bad = json!({"units": [{"notes": [3]}], NOTE_TABLE: []});
         assert!(unshare_notes(&mut bad).is_none());
+    }
+}
+
+#[cfg(test)]
+mod template_key_tests {
+    use super::*;
+
+    fn base<'a>(helpers: &'a [Helper]) -> TemplateInput<'a> {
+        TemplateInput {
+            build: "b",
+            from: Dialect::Tsql,
+            to: Dialect::Postgres,
+            helpers,
+            job: "job",
+            draft: "draft",
+            source: Some("s"),
+            target: Some("t"),
+        }
+    }
+
+    #[test]
+    fn every_input_of_a_template_job_is_in_its_key() {
+        let h: Vec<Helper> = Vec::new();
+        let k = base(&h).key();
+        assert_eq!(k, base(&h).key());
+        let others = [
+            TemplateInput {
+                build: "c",
+                ..base(&h)
+            },
+            TemplateInput {
+                from: Dialect::Postgres,
+                ..base(&h)
+            },
+            TemplateInput {
+                to: Dialect::Db2i,
+                ..base(&h)
+            },
+            TemplateInput {
+                job: "job2",
+                ..base(&h)
+            },
+            TemplateInput {
+                draft: "draft2",
+                ..base(&h)
+            },
+            TemplateInput {
+                source: Some("s2"),
+                ..base(&h)
+            },
+            TemplateInput {
+                source: None,
+                ..base(&h)
+            },
+            TemplateInput {
+                target: Some("t2"),
+                ..base(&h)
+            },
+            TemplateInput {
+                target: None,
+                ..base(&h)
+            },
+        ];
+        for o in others {
+            assert_ne!(k, o.key());
+        }
     }
 }

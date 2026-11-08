@@ -376,7 +376,7 @@ fn the_target_catalog_binds_names_from_other_files() {
     ddl::load_tree(&mut ok, &good, Dialect::Postgres);
 
     let opts = |c: sqldiff_core::catalog::Catalog| Options {
-        facts_b: vec![std::sync::Arc::new(c)],
+        facts_b: vec![sqldiff_core::Facts::from(std::sync::Arc::new(c))],
         ..Options::default()
     };
     // Only the other table exists: the UPDATE does not bind.

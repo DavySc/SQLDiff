@@ -13,6 +13,9 @@ sha2.workspace = true
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 sqldiff-syntax.workspace = true
 sqldiff-core.workspace = true
+sqldiff-model.workspace = true
+sqldiff-units.workspace = true
+sqldiff-draft.workspace = true
 rowan.workspace = true
 serde.workspace = true
 serde_json.workspace = true

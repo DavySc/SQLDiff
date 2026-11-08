@@ -1,0 +1,14 @@
+[package]
+name = "sqldiff-catalog"
+description = "Schema catalog, DDL replay and built-in type/function tables for SQLDiff"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sqldiff-syntax.workspace = true
+rowan.workspace = true
+serde.workspace = true
+sha2.workspace = true
+toml.workspace = true
