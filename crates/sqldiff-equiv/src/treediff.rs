@@ -131,13 +131,20 @@ pub fn alignment_cut_finding(
 }
 
 pub fn diff(a: &Analyzed, b: &Analyzed, work: usize) -> TreeDiff {
-    diff_within(a, b, work, None)
+    diff_within(a, b, work, &sqldiff_model::work::Allowance::new(None))
 }
 
 /// [`diff`] under a statement-level allowance (`Options::statement_work_cap`):
 /// past it the lists that are not aligned take the same exit as the alignment
-/// bound (`align.bound`, their hashes in the skipped sets). `None` is `diff`.
-pub fn diff_within(a: &Analyzed, b: &Analyzed, work: usize, cap: Option<u64>) -> TreeDiff {
+/// bound (`align.bound`, their hashes in the skipped sets). An allowance that
+/// is off is `diff`. The caller keeps the allowance, so what the tree diff
+/// spent is not available again to the checks that run after it.
+pub fn diff_within(
+    a: &Analyzed,
+    b: &Analyzed,
+    work: usize,
+    allowance: &sqldiff_model::work::Allowance,
+) -> TreeDiff {
     sqldiff_model::work::spend(sqldiff_model::work::Site::DiffCalls, 1);
     let ua: Vec<Unit> = ast::structural_children(&a.root)
         .into_iter()
@@ -164,7 +171,7 @@ pub fn diff_within(a: &Analyzed, b: &Analyzed, work: usize, cap: Option<u64>) ->
         skipped_a: HashSet::new(),
         skipped_b: HashSet::new(),
         work,
-        allowance: sqldiff_model::work::Allowance::new(cap),
+        allowance,
     };
     ctx.diff_lists(&ua, &ub);
     ctx.resolve_unpaired();
@@ -189,7 +196,7 @@ struct Ctx<'x, 'a> {
     /// The exact-alignment bound ([`crate::normalize::lcs_pairs_bounded`]).
     work: usize,
     /// What the alignments and gap pairings of this diff may still spend.
-    allowance: sqldiff_model::work::Allowance,
+    allowance: &'x sqldiff_model::work::Allowance,
 }
 
 fn all_hashes(units: &[Unit]) -> HashSet<String> {
@@ -211,7 +218,7 @@ impl Ctx<'_, '_> {
         let ka: Vec<&str> = a.iter().map(|u| u.full.as_str()).collect();
         let kb: Vec<&str> = b.iter().map(|u| u.full.as_str()).collect();
         let (anchors, exact, by_allowance) =
-            crate::normalize::lcs_pairs_allowed(&ka, &kb, self.work, &self.allowance);
+            crate::normalize::lcs_pairs_allowed(&ka, &kb, self.work, self.allowance);
         let (mut ai, mut bj) = (0, 0);
         for (i, j) in anchors
             .into_iter()

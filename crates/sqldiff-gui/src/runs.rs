@@ -1814,7 +1814,8 @@ impl PlanView {
 pub fn plan_view(spec: &ConvertSpec, isolated: bool) -> Result<PlanView, String> {
     let (job, _, _, _) = prepare(spec, isolated)?;
     let (inputs, _) = tree::read(&job.tree)?;
-    let plan = sqldiff_convert::plan::Plan::build(&inputs, job.tree.from);
+    let plan =
+        sqldiff_convert::plan::Plan::build(&tree::plan_inputs(&job.tree, &inputs), job.tree.from);
     let first = plan
         .groups
         .iter()
@@ -2229,9 +2230,6 @@ fn prepare(
         None => None,
     };
     let select = spec.increment.select();
-    if !select.is_empty() && spec.template {
-        return Err("an increment is not for template runs".into());
-    }
     let parameters = names(&spec.parameters);
     if !spec.template && !parameters.is_empty() {
         return Err("parameters are for template runs".into());

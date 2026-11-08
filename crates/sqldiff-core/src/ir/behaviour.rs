@@ -1381,6 +1381,8 @@ struct Collector<'x, 'a> {
     flip_spent: RefCell<BTreeMap<String, u64>>,
     /// While a flipped scenario is recomputed: the diffs it may still make.
     replay: Cell<Option<u64>>,
+    /// Keeps the unit open for the statement-level phase check.
+    _phase: sqldiff_model::work::UnitPhase,
     /// `diff` calls spent by this routine pair, and whether a budget ran out.
     spent: Cell<u64>,
     out_of_budget: Cell<bool>,
@@ -1512,6 +1514,7 @@ impl<'x, 'a> Collector<'x, 'a> {
             charged: RefCell::new(BTreeSet::new()),
             flip_spent: RefCell::new(BTreeMap::new()),
             replay: Cell::new(None),
+            _phase: sqldiff_model::work::UnitPhase::open(),
             spent: Cell::new(0),
             out_of_budget: Cell::new(false),
             cap_hit: RefCell::new(None),
@@ -1685,16 +1688,19 @@ impl<'x, 'a> Collector<'x, 'a> {
         scen_b: &Scenario,
     ) -> (Vec<Outcome>, Vec<Outcome>) {
         let (ca, cb) = (&self.sa.cfg, &self.sb.cfg);
+        // Only paths that reach the failing statement belong to a fault
+        // scenario.
+        let reached = |o: &Outcome| match sc {
+            Kind::Fault { key, .. } => o.fault_hit || o.effects.contains_key(key.as_str()),
+            _ => true,
+        };
         let mut pa = Self::explorer(&self.xa, &self.charged, "a", ca, cb, scen_a, &self.keys)
-            .explore(ca, scen_a);
+            .explore_where(ca, scen_a, &reached);
         let mut pb = Self::explorer(&self.xb, &self.charged, "b", cb, ca, scen_b, &self.keys)
-            .explore(cb, scen_b);
-        if let Kind::Fault { key, .. } = sc {
-            // Only paths that reach the failing statement belong to the scenario.
-            let reached = |o: &Outcome| o.fault_hit || o.effects.contains_key(key.as_str());
-            pa.retain(reached);
-            pb.retain(reached);
-        }
+            .explore_where(cb, scen_b, &reached);
+        // The replayed and full runs are filtered here; the others were.
+        pa.retain(reached);
+        pb.retain(reached);
         (pa, pb)
     }
 

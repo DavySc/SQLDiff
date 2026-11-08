@@ -587,6 +587,13 @@ note = "both operands strings of the slice, `+` against `||` (ASM-CONCAT-NULL); 
 sites = ["sqldiff-draft/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.expr.plus-mixed"
+kind = "converter"
+proof = "engine"
+note = "`+` kept and the unit refused when an operand column is CHAR (PostgreSQL), TEXT, a date or time, uniqueidentifier or binary"
+sites = ["sqldiff-draft/src/tsql.rs"]
+
+[[rule]]
 id = "tsql.expr.datetime-literal"
 kind = "converter"
 proof = "axiom:V33"
