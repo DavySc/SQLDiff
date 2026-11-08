@@ -743,6 +743,20 @@ proof = "engine"
 sites = ["sqldiff-draft/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.from.apply-refused"
+kind = "converter"
+proof = "engine"
+note = "an APPLY with no LATERAL rewrite (any on Db2 for i, which has no APPLY; a shape other than a subquery or function call on PostgreSQL) is refused, the original kept as a comment"
+sites = ["sqldiff-draft/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.from.apply"
+kind = "converter"
+proof = "engine"
+note = "CROSS APPLY (q or f(x)) to CROSS JOIN LATERAL; OUTER APPLY to LEFT JOIN LATERAL … ON TRUE (PostgreSQL). The engine does not model LATERAL yet, so the unit stays not proven (equiv.unsupported)"
+sites = ["sqldiff-draft/src/tsql.rs"]
+
+[[rule]]
 id = "tsql.geography.from-wkb"
 kind = "converter"
 proof = "engine"

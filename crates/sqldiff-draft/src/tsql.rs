@@ -8404,11 +8404,113 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// `CROSS APPLY (subquery) alias` is `CROSS JOIN LATERAL (subquery)
+    /// alias`; `OUTER APPLY (subquery) alias` is `LEFT JOIN LATERAL
+    /// (subquery) alias ON TRUE` (PostgreSQL); a function call after APPLY
+    /// (`CROSS APPLY f(x) alias`) the same way. Any APPLY not rewritten
+    /// (Db2 for i has none, or the shape is not one of these) refuses the
+    /// statement.
+    fn apply_edits(&mut self, ts: &[T], e: &mut bits::BitEdits) {
+        for i in sig(ts) {
+            let outer = ts[i].k == IDENT && ts[i].is("OUTER");
+            if !(outer || ts[i].k == IDENT && ts[i].is("CROSS")) {
+                continue;
+            }
+            let Some(ap) = next_sig(ts, i).filter(|&a| ts[a].is("APPLY")) else {
+                continue;
+            };
+            if let Some(end) = self.apply_end(ts, ap, outer) {
+                e.rep
+                    .insert(i, if outer { "LEFT JOIN" } else { "CROSS JOIN" }.into());
+                e.rep.insert(ap, "LATERAL".into());
+                if outer {
+                    e.post.insert(end, " ON TRUE".into());
+                }
+                e.steps.push(("tsql.from.apply", i, ap));
+            } else {
+                let to = self.to.display_name();
+                self.note(Status::NotConverted, "tsql.from.apply-refused", &format!("{} APPLY has no rule for {to}: {to} {}. Rewrite it with a lateral join by hand.", if outer { "OUTER" } else { "CROSS" }, if self.db2() { "has no APPLY" } else { "gets it only for a subquery or a function call in the FROM clause" }));
+            }
+        }
+    }
+
+    /// For the APPLY at `ap`: the last token of its table expression (and
+    /// alias, for OUTER APPLY, which needs `ON TRUE` after it) when this
+    /// is a subquery or a function call that PostgreSQL takes as LATERAL.
+    fn apply_end(&self, ts: &[T], ap: usize, outer: bool) -> Option<usize> {
+        if self.to != Dialect::Postgres {
+            return None;
+        }
+        let first = next_sig(ts, ap)?;
+        let open = if ts[first].k == L_PAREN {
+            first
+        } else {
+            // `f(…)`, `s.f(…)`: a possibly qualified function name.
+            let mut n = first;
+            while matches!(ts[n].k, IDENT | QUOTED_IDENT) {
+                let nx = next_sig(ts, n)?;
+                match ts[nx].k {
+                    L_PAREN => break,
+                    DOT => n = next_sig(ts, nx)?,
+                    _ => return None,
+                }
+            }
+            next_sig(ts, n).filter(|&o| ts[o].k == L_PAREN)?
+        };
+        let close = matching(ts, open)?;
+        let mut end = close;
+        if outer {
+            // The alias and column list, before ON TRUE.
+            let mut n = next_sig(ts, end);
+            if n.is_some_and(|a| ts[a].is("AS")) {
+                n = n.and_then(|a| next_sig(ts, a));
+            }
+            // A bare alias is a name, not a word that continues the query
+            // (T-SQL allows no alias after a function call).
+            const NOT_AN_ALIAS: [&str; 22] = [
+                "ORDER",
+                "GROUP",
+                "HAVING",
+                "UNION",
+                "EXCEPT",
+                "INTERSECT",
+                "INNER",
+                "LEFT",
+                "RIGHT",
+                "FULL",
+                "CROSS",
+                "OUTER",
+                "JOIN",
+                "WHERE",
+                "ON",
+                "FOR",
+                "OPTION",
+                "WINDOW",
+                "PIVOT",
+                "UNPIVOT",
+                "TABLESAMPLE",
+                "WITH",
+            ];
+            if let Some(a) = n.filter(|&a| {
+                matches!(ts[a].k, IDENT | QUOTED_IDENT)
+                    && !is_clause_word(&ts[a].s)
+                    && !(ts[a].k == IDENT && NOT_AN_ALIAS.iter().any(|w| ts[a].is(w)))
+            }) {
+                end = a;
+                if let Some(l) = next_sig(ts, a).filter(|&l| ts[l].k == L_PAREN) {
+                    end = matching(ts, l).unwrap_or(a);
+                }
+            }
+        }
+        Some(end)
+    }
+
     fn expr(&mut self, ts: &[T]) -> String {
         let paged = self.paging(ts);
         let ts: &[T] = &paged;
         let mut edits = self.bit_edits(ts);
         self.geography_edits(ts, &mut edits);
+        self.apply_edits(ts, &mut edits);
         if let Some(outer) = self.bit_outer.take() {
             edits.wrap(outer);
         }
