@@ -552,10 +552,16 @@ fn compare_units_within(
         for (side, u) in [(a, ua), (b, ub)] {
             let name = side_name(side);
             let (hs, he) = u.header_at;
-            let mut lines: Vec<(usize, &str)> = vec![(
-                side.location(hs, he).start_line,
-                "the routine header and signature",
-            )];
+            // A script segment has no routine header (`header_at` is empty).
+            let has_header = (hs, he) != (0, 0);
+            let mut lines: Vec<(usize, &str)> = if has_header {
+                vec![(
+                    side.location(hs, he).start_line,
+                    "the routine header and signature",
+                )]
+            } else {
+                Vec::new()
+            };
             lines.extend(u.stmts.iter().map(|s| (side.line_of(&s.node), "statement")));
             lines.extend(u.tables.iter().map(|(n, _)| (side.line_of(n), "table")));
             lines.extend(
@@ -585,26 +591,31 @@ fn compare_units_within(
                     .iter()
                     .map(|(n, _)| (side.line_of(n), "construct")),
             );
-            // The whole range of the unit, first construct to last end:
-            // IF, WHILE, DECLARE, TRY and CATCH lines, a transaction inside
-            // a TRY, and every conversion unit in it are covered even when
-            // no list above names them.
-            // The routine around the header, when there is one: its end is
-            // the end of the unit (the lines after the last statement, like
-            // END TRY and CATCH, belong to it).
-            let routine = side
-                .root
-                .descendants()
-                .filter(|n| {
-                    n.kind() == sqldiff_syntax::SyntaxKind::ROUTINE && {
+            // The unit's own lines, as ranges: the enclosing routine when
+            // there is one (the lines after the last statement, like END
+            // TRY and CATCH, belong to it), and each construct of a script
+            // segment. IF, WHILE, DECLARE, TRY and CATCH lines, a
+            // transaction inside a TRY, and every conversion unit in them
+            // are reached even when no list above names them. Overlapping
+            // ranges merge; a range never starts anywhere but at a
+            // construct of this unit, so the routines between the batches
+            // of a script keep their own status.
+            let routine = if has_header {
+                side.root
+                    .descendants()
+                    .filter(|n| {
+                        n.kind() == sqldiff_syntax::SyntaxKind::ROUTINE && {
+                            let (rs, re) = cst::sig_range(n);
+                            rs <= hs && hs < re
+                        }
+                    })
+                    .min_by_key(|n| {
                         let (rs, re) = cst::sig_range(n);
-                        rs <= hs && hs < re
-                    }
-                })
-                .min_by_key(|n| {
-                    let (rs, re) = cst::sig_range(n);
-                    re - rs
-                });
+                        re - rs
+                    })
+            } else {
+                None
+            };
             let nodes: Vec<&SyntaxNode> = u
                 .stmts
                 .iter()
@@ -618,16 +629,42 @@ fn compare_units_within(
                 .chain(u.uncovered.iter().map(|(n, _)| n))
                 .chain(routine.as_ref())
                 .collect();
-            let mut first = lines.iter().map(|(l, _)| *l).min().unwrap_or(0);
-            let mut last = side.location(hs, he).end_line.max(first);
-            for n in nodes {
-                let loc = side.node_location(n);
-                first = first.min(loc.start_line);
-                last = last.max(loc.end_line);
+            // In a script segment a construct stands for the whole top-level
+            // statement it sits in (a WHILE or IF with its body, a TRY with
+            // its CATCH), never for the routines or batches around it.
+            let top = |n: &SyntaxNode| -> SyntaxNode {
+                if has_header {
+                    return n.clone();
+                }
+                n.ancestors()
+                    .filter(|x| x.kind().is_unit())
+                    .last()
+                    .unwrap_or_else(|| n.clone())
+            };
+            let mut spans: Vec<(usize, usize)> = nodes
+                .into_iter()
+                .map(|n| {
+                    let loc = side.node_location(&top(n));
+                    (loc.start_line, loc.end_line)
+                })
+                .collect();
+            if has_header {
+                let h = side.location(hs, he);
+                spans.push((h.start_line, h.end_line));
             }
-            out.unknown_reasons.push(format!(
-                "{name} lines {first}-{last}: everything in the routine or script segment is {why}"
-            ));
+            spans.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::new();
+            for (f, l) in spans {
+                match merged.last_mut() {
+                    Some(m) if f <= m.1 => m.1 = m.1.max(l),
+                    _ => merged.push((f, l)),
+                }
+            }
+            for (first, last) in merged {
+                out.unknown_reasons.push(format!(
+                    "{name} lines {first}-{last}: everything in the routine or script segment is {why}"
+                ));
+            }
             let mut seen = std::collections::BTreeSet::new();
             for (l, what) in lines {
                 if seen.insert((l, what)) {
