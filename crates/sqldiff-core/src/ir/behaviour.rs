@@ -1080,7 +1080,7 @@ fn side_outcome(s: &SideIr, o: &Outcome) -> SideOutcome {
     let mut path: Vec<usize> = o.trace.iter().filter_map(|n| s.line_no(*n)).collect();
     path.dedup();
     so.path = path;
-    so.not_proven = o.imprecise.clone();
+    so.not_proven = o.imprecise.iter().map(|i| i.to_string()).collect();
     so.not_proven.extend(o.durability_unknown.iter().cloned());
     so
 }
@@ -1214,7 +1214,7 @@ fn mark_unidentified(a: &mut Cfg, b: &mut Cfg, done: &BTreeSet<(usize, usize)>) 
             } = &mut n.op
             {
                 if !ident.contains(&norm_cond(t)) {
-                    *t = super::interp::opaque_cond(t, is_a);
+                    *t = super::interp::opaque_cond(t, is_a).into();
                 }
             }
         }
@@ -1241,13 +1241,13 @@ fn pairs(pa: &[Outcome], pb: &[Outcome]) -> (Vec<(usize, usize)>, bool) {
         o.signature
             .iter()
             .map(|(c, b)| {
-                let id = match raw_ids.get(c.as_str()) {
+                let id = match raw_ids.get(&**c) {
                     Some(&id) => id,
                     None => {
                         let f = norm_cond(c);
                         let next = folded_ids.len() as u32;
                         let id = *folded_ids.entry(f).or_insert(next);
-                        raw_ids.insert(c.as_str(), id);
+                        raw_ids.insert(&**c, id);
                         id
                     }
                 };
@@ -1986,7 +1986,7 @@ impl<'x, 'a> Collector<'x, 'a> {
             d.text
         );
         let mut caveats: Vec<String> = Vec::new();
-        caveats.extend(oa.imprecise.iter().chain(&ob.imprecise).cloned());
+        caveats.extend(oa.imprecise().chain(ob.imprecise()).map(str::to_string));
         if durability_unknown {
             caveats.extend(
                 oa.durability_unknown
@@ -2840,7 +2840,7 @@ mod pairing_tests {
 
     fn outcome(x: &[(&str, bool)]) -> Outcome {
         let mut o = Outcome::empty();
-        o.signature = p(x);
+        o.signature = p(x).into_iter().map(|(c, b)| (c.into(), b)).collect();
         o
     }
 
@@ -2879,7 +2879,7 @@ mod pairing_tests {
                 .map(|o| {
                     let mut o = o.clone();
                     for (c, _) in &mut o.signature {
-                        *c = c.to_uppercase();
+                        *c = c.to_uppercase().into();
                     }
                     o
                 })

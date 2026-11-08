@@ -24,7 +24,7 @@ fn proc_of(body: &str) -> String {
 fn stripped(o: &Outcome) -> String {
     let mut o = o.clone();
     o.trace = ir::interp::Trace::default();
-    o.signature.clear();
+    o.clear_signature();
     o.fault_index = None;
     format!("{o:?}")
 }
