@@ -56,9 +56,16 @@ pub enum Site {
     /// Similarity scores of a gap between two aligned lists
     /// (`treediff::diff_gap`: the product of the two lengths).
     GapScores,
+    /// Items built for a cross-dialect comparison or a refinement
+    /// (`equiv::items`: one per lowered statement or control marker).
+    ItemsBuilt,
+    /// Statement pairs of a cross-dialect comparison: each pair compared
+    /// (twice: the count of unequal ones and the comparison itself) and the
+    /// identity analysis over the items and pairs.
+    PairCompares,
 }
 
-const SITES: usize = 8;
+const SITES: usize = 10;
 
 const NAMES: [&str; SITES] = [
     "explorer_steps",
@@ -69,6 +76,8 @@ const NAMES: [&str; SITES] = [
     "witness_tries",
     "behaviour_diffs",
     "gap_scores",
+    "items_built",
+    "pair_compares",
 ];
 
 /// The counts of one scope.
@@ -278,6 +287,8 @@ const SITE_LIST: [Site; SITES] = [
     Site::WitnessTries,
     Site::BehaviourDiffs,
     Site::GapScores,
+    Site::ItemsBuilt,
+    Site::PairCompares,
 ];
 
 /// Runs `f` without counting: work that only re-creates a state whose cost
