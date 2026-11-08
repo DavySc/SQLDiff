@@ -1228,34 +1228,69 @@ fn pairs(pa: &[Outcome], pb: &[Outcome]) -> (Vec<(usize, usize)>, bool) {
     if pa.len() == 1 && pb.len() == 1 {
         return (vec![(0, 0)], true);
     }
-    // The paths of one side share most conditions: each text is folded once.
-    let folded: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
-    let sig = |o: &Outcome| -> Vec<(String, bool)> {
+    // Each distinct condition text is folded once and each folded text gets
+    // an id, so two ids are equal exactly when the folded texts are. Ids
+    // only serve equality and lookups here; nothing is ordered by them.
+    let mut raw_ids: HashMap<&str, u32> = HashMap::new();
+    let mut folded_ids: HashMap<String, u32> = HashMap::new();
+    fn sig_of<'a>(
+        o: &'a Outcome,
+        raw_ids: &mut HashMap<&'a str, u32>,
+        folded_ids: &mut HashMap<String, u32>,
+    ) -> Vec<(u32, bool)> {
         o.signature
             .iter()
             .map(|(c, b)| {
-                let mut f = folded.borrow_mut();
-                if !f.contains_key(c) {
-                    f.insert(c.clone(), norm_cond(c));
-                }
-                (f[c].clone(), *b)
+                let id = match raw_ids.get(c.as_str()) {
+                    Some(&id) => id,
+                    None => {
+                        let f = norm_cond(c);
+                        let next = folded_ids.len() as u32;
+                        let id = *folded_ids.entry(f).or_insert(next);
+                        raw_ids.insert(c.as_str(), id);
+                        id
+                    }
+                };
+                (id, *b)
             })
             .collect()
+    }
+    let siga: Vec<Vec<(u32, bool)>> = pa
+        .iter()
+        .map(|o| sig_of(o, &mut raw_ids, &mut folded_ids))
+        .collect();
+    let sigb: Vec<Vec<(u32, bool)>> = pb
+        .iter()
+        .map(|o| sig_of(o, &mut raw_ids, &mut folded_ids))
+        .collect();
+    // Outcome indices ordered by (signature, index): the first outcome with a
+    // signature is found by binary search, and equal sets by a dedup walk.
+    let order = |s: &[Vec<(u32, bool)>]| -> Vec<usize> {
+        let mut ix: Vec<usize> = (0..s.len()).collect();
+        ix.sort_unstable_by(|&x, &y| s[x].cmp(&s[y]).then(x.cmp(&y)));
+        ix
     };
-    let (siga, sigb): (Vec<_>, Vec<_>) =
-        (pa.iter().map(sig).collect(), pb.iter().map(sig).collect());
-    let sb: HashSet<_> = sigb.iter().collect();
-    let sa: HashSet<_> = siga.iter().collect();
-    if sa == sb {
-        // The first outcome of B with each signature.
-        let mut first: HashMap<&Vec<(String, bool)>, usize> = HashMap::new();
-        for (j, s) in sigb.iter().enumerate() {
-            first.entry(s).or_insert(j);
+    let (oa, ob) = (order(&siga), order(&sigb));
+    let distinct = |s: &[Vec<(u32, bool)>], o: &[usize]| -> Vec<usize> {
+        let mut d: Vec<usize> = Vec::new();
+        for &i in o {
+            match d.last() {
+                Some(&l) if s[l] == s[i] => {}
+                _ => d.push(i),
+            }
         }
+        d
+    };
+    let (da, db) = (distinct(&siga, &oa), distinct(&sigb, &ob));
+    if da.len() == db.len() && da.iter().zip(&db).all(|(&i, &j)| siga[i] == sigb[j]) {
+        // The first outcome of B with each signature.
         let v = siga
             .iter()
             .enumerate()
-            .filter_map(|(i, s)| first.get(s).map(|&j| (i, j)))
+            .map(|(i, s)| {
+                let at = ob.partition_point(|&j| sigb[j] < *s);
+                (i, ob[at])
+            })
             .collect();
         return (v, true);
     }
@@ -1297,17 +1332,16 @@ fn feasible(a: &[(String, bool)], b: &[(String, bool)]) -> bool {
 
 /// For each decision of a path: whether its condition is decided only there
 /// on the path.
-#[allow(clippy::disallowed_methods)] // hash order cannot reach an output: counts looked up by key
-fn once_flags(p: &[(String, bool)]) -> Vec<bool> {
-    let mut count: HashMap<&str, usize> = HashMap::new();
-    for x in p {
-        *count.entry(x.0.as_str()).or_default() += 1;
-    }
-    p.iter().map(|x| count[x.0.as_str()] == 1).collect()
+fn once_flags<K: Ord>(p: &[(K, bool)]) -> Vec<bool> {
+    let mut keys: Vec<&K> = p.iter().map(|x| &x.0).collect();
+    keys.sort_unstable();
+    p.iter()
+        .map(|x| keys.partition_point(|k| **k <= x.0) - keys.partition_point(|k| **k < x.0) == 1)
+        .collect()
 }
 
 /// [`feasible`] with the paths' `once_flags` made once, not for every pair.
-fn feasible_with(a: &[(String, bool)], fa: &[bool], b: &[(String, bool)], fb: &[bool]) -> bool {
+fn feasible_with<K: Eq>(a: &[(K, bool)], fa: &[bool], b: &[(K, bool)], fb: &[bool]) -> bool {
     for (k, (x, y)) in a.iter().zip(b).enumerate() {
         if x.0 != y.0 || !fa[k] || !fb[k] {
             return true;
@@ -2759,7 +2793,96 @@ mod cap_tests {
 
 #[cfg(test)]
 mod pairing_tests {
-    use super::feasible;
+    use super::{feasible, norm_cond, pairs, Outcome};
+    use std::collections::{HashMap, HashSet};
+
+    /// The string-signature implementation `pairs` replaced.
+    fn pairs_reference(pa: &[Outcome], pb: &[Outcome]) -> (Vec<(usize, usize)>, bool) {
+        if pa.len() == 1 && pb.len() == 1 {
+            return (vec![(0, 0)], true);
+        }
+        let sig = |o: &Outcome| -> Vec<(String, bool)> {
+            o.signature
+                .iter()
+                .map(|(c, b)| (norm_cond(c), *b))
+                .collect()
+        };
+        let (siga, sigb): (Vec<_>, Vec<_>) =
+            (pa.iter().map(sig).collect(), pb.iter().map(sig).collect());
+        let sb: HashSet<_> = sigb.iter().collect();
+        let sa: HashSet<_> = siga.iter().collect();
+        if sa == sb {
+            let mut first: HashMap<&Vec<(String, bool)>, usize> = HashMap::new();
+            for (j, s) in sigb.iter().enumerate() {
+                first.entry(s).or_insert(j);
+            }
+            let v = siga
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| first.get(s).map(|&j| (i, j)))
+                .collect();
+            return (v, true);
+        }
+        let mut v = Vec::new();
+        for (i, x) in siga.iter().enumerate() {
+            for (j, y) in sigb.iter().enumerate() {
+                if feasible(x, y) {
+                    v.push((i, j));
+                }
+            }
+        }
+        (v, false)
+    }
+
+    fn outcome(x: &[(&str, bool)]) -> Outcome {
+        let mut o = Outcome::empty();
+        o.signature = p(x);
+        o
+    }
+
+    #[test]
+    fn pairs_match_the_string_signature_reference() {
+        // Spellings that fold alike ("[X] = 1", "x = 1"), repeated
+        // conditions, duplicate paths, equal and unequal path sets.
+        let conds = ["x = 1", "[X] = 1", "y > 2", "Y  >  2", "z", "w"];
+        let seed = std::cell::Cell::new(12345u64);
+        let next = |n: usize| {
+            seed.set(
+                seed.get()
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407),
+            );
+            ((seed.get() >> 33) as usize) % n
+        };
+        for _ in 0..400 {
+            let side = |len: usize| -> Vec<Outcome> {
+                (0..len)
+                    .map(|_| {
+                        let n = next(4);
+                        let path: Vec<(&str, bool)> =
+                            (0..n).map(|_| (conds[next(6)], next(2) == 0)).collect();
+                        outcome(&path)
+                    })
+                    .collect()
+            };
+            let (la, lb) = (1 + next(5), 1 + next(5));
+            let (pa, mut pb) = (side(la), side(lb));
+            assert_eq!(pairs(&pa, &pb), pairs_reference(&pa, &pb));
+            // Same set of paths, spelled differently and reordered.
+            pb = pa
+                .iter()
+                .rev()
+                .map(|o| {
+                    let mut o = o.clone();
+                    for (c, _) in &mut o.signature {
+                        *c = c.to_uppercase();
+                    }
+                    o
+                })
+                .collect();
+            assert_eq!(pairs(&pa, &pb), pairs_reference(&pa, &pb));
+        }
+    }
 
     fn p(x: &[(&str, bool)]) -> Vec<(String, bool)> {
         x.iter().map(|(c, v)| (c.to_string(), *v)).collect()
