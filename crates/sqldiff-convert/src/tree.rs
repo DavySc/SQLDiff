@@ -2679,7 +2679,8 @@ fn annotate(c: &Conversion) -> (String, Vec<usize>) {
         .iter()
         .zip(&starts)
         .map(|(u, &at)| {
-            u.out.line + usize::from(header) + marks.iter().filter(|m| m.0 <= at).count()
+            // `marks` is sorted by position.
+            u.out.line + usize::from(header) + marks.partition_point(|m| m.0 <= at)
         })
         .collect();
     (text, lines)
