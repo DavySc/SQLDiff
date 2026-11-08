@@ -22,7 +22,7 @@ fn cfg_of(d: Dialect, sql: &str) -> ir::Cfg {
 fn stripped(o: &Outcome) -> String {
     let mut o = o.clone();
     o.trace = ir::interp::Trace::default();
-    o.signature.clear();
+    o.clear_signature();
     o.fault_index = None;
     format!("{o:?}")
 }

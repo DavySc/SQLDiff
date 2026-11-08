@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
+use std::rc::Rc;
 
 use sqldiff_syntax::{ast, Dialect, SyntaxKind, SyntaxNode, SyntaxToken};
 
@@ -133,7 +134,9 @@ pub enum Test {
     XactStateCommittable,
     /// Data-dependent; both branches are explored. The text identifies the
     /// condition so paths of two versions can be matched.
-    Unknown(String),
+    ///
+    /// Held as `Rc<str>` so each decision's signature entry is a pointer copy.
+    Unknown(Rc<str>),
 }
 
 #[derive(Debug, Clone)]
@@ -1087,7 +1090,7 @@ impl Lowerer {
                 }
             }
         }
-        Test::Unknown(text)
+        Test::Unknown(text.into())
     }
 
     fn branches(&mut self, n: &SyntaxNode, next: NodeId, ctx: &Ctx) -> NodeId {
@@ -1147,7 +1150,7 @@ impl Lowerer {
         };
         let test = self.add(
             Op::Test {
-                test: Test::Unknown(text),
+                test: Test::Unknown(text.into()),
                 is_loop: true,
             },
             cond.clone().or_else(|| Some(n.clone())),
@@ -1247,7 +1250,7 @@ impl Lowerer {
                         let text: Vec<String> = toks[i + 1..].iter().map(upper).collect();
                         let t = self.add(
                             Op::Test {
-                                test: Test::Unknown(text.join(" ")),
+                                test: Test::Unknown(text.join(" ").into()),
                                 is_loop: false,
                             },
                             Some(n.clone()),

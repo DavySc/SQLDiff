@@ -144,7 +144,7 @@ impl Interp<'_> {
                     .1
                     .signature
                     .last()
-                    .map(|x| x.0.clone())
+                    .map(|x| x.0.to_string())
                     .unwrap_or_default();
                 Ok((c, v))
             }

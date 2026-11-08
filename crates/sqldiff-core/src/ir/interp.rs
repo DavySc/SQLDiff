@@ -118,8 +118,8 @@ pub struct Outcome {
     pub left_open: bool,
     pub doomed: bool,
     /// Decisions on conditions the interpreter could not evaluate.
-    pub signature: Vec<(String, bool)>,
-    pub imprecise: Vec<String>,
+    pub(crate) signature: Vec<(Rc<str>, bool)>,
+    pub(crate) imprecise: Vec<Rc<str>>,
     /// Where the exploration stopped short of this path's end: the statement
     /// the step budget cut the path before, and the first statements of the
     /// branches the path budget dropped. What the path could still have run
@@ -140,6 +140,24 @@ pub struct Outcome {
 }
 
 impl Outcome {
+    /// The decisions this path took on conditions the interpreter could not
+    /// evaluate: the condition text and the branch taken, in order.
+    pub fn signature(&self) -> impl ExactSizeIterator<Item = (&str, bool)> {
+        self.signature.iter().map(|(c, b)| (&**c, *b))
+    }
+
+    /// Forgets the decisions taken (for tests that compare outcomes by what
+    /// they did, not by how the exploration reached them).
+    #[doc(hidden)]
+    pub fn clear_signature(&mut self) {
+        self.signature.clear();
+    }
+
+    /// Why this path is imprecise (budgets hit, unmodelled actions, ...).
+    pub fn imprecise(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.imprecise.iter().map(|i| &**i)
+    }
+
     /// An outcome of a run that did nothing (for findings that need no run).
     pub fn empty() -> Outcome {
         Outcome {
@@ -382,8 +400,8 @@ struct State {
     raising: Option<ErrorKind>,
     /// Shared between forked paths (`Rc::make_mut` copies on change).
     loop_seen: Rc<HashMap<NodeId, Vec<String>>>,
-    signature: Hist<(String, bool)>,
-    imprecise: Hist<String>,
+    signature: Hist<(Rc<str>, bool)>,
+    imprecise: Hist<Rc<str>>,
     cut: Vec<NodeId>,
     durability_unknown: Option<String>,
     rows: BTreeSet<String>,
@@ -757,7 +775,7 @@ impl Join {
                 e.done_at = Some(self.tick);
                 e.step_cut = outs[e.outs_from..]
                     .iter()
-                    .any(|o| o.imprecise.iter().any(|i| i == STEP_CUT));
+                    .any(|o| o.imprecise.iter().any(|i| &**i == STEP_CUT));
             }
         }
     }
@@ -2123,10 +2141,10 @@ impl Interp<'_> {
                 // recorded as "no rows from it", so the two sides' tests
                 // (`@@ROWCOUNT = 0`, `NOT FOUND`, `FOUND` on the other
                 // branch) agree on what the value means.
-                let (text, tv) = match test {
-                    Test::Unknown(x) => (x.clone(), true),
-                    Test::NoRows(b) => (self.rows_text(&st), *b),
-                    _ => (String::new(), true),
+                let (text, tv): (Rc<str>, bool) = match test {
+                    Test::Unknown(x) => (Rc::clone(x), true),
+                    Test::NoRows(b) => (self.rows_text(&st).into(), *b),
+                    _ => ("".into(), true),
                 };
                 if *is_loop {
                     let digest = self.digest(&st);
@@ -2135,10 +2153,13 @@ impl Interp<'_> {
                     let n = seen.len();
                     if n > 2 {
                         if seen[n - 1] != seen[n - 2] {
-                            st.imprecise.push(format!(
-                                "loop `{}` summarized after two iterations",
-                                plain_cond(&text)
-                            ));
+                            st.imprecise.push(
+                                format!(
+                                    "loop `{}` summarized after two iterations",
+                                    plain_cond(&text)
+                                )
+                                .into(),
+                            );
                         }
                         Rc::make_mut(&mut st.loop_seen).remove(&id);
                         return Step::Go(f, st);
@@ -2331,7 +2352,7 @@ impl Interp<'_> {
             Action::Call(_) => {
                 st.assumptions.insert("ASM-CALLEES-NO-TXN-CONTROL".into());
             }
-            Action::Opaque(what) => st.imprecise.push(format!("{what} is not modelled")),
+            Action::Opaque(what) => st.imprecise.push(format!("{what} is not modelled").into()),
             Action::Report => {
                 st.raised = true;
                 st.assumptions.insert("ASM-ERROR-CONTINUES-WARNING".into());
@@ -2702,7 +2723,8 @@ impl Interp<'_> {
             );
         }
         let Some(rule) = rule else {
-            st.imprecise.push(format!("no profile row for {kind:?}"));
+            st.imprecise
+                .push(format!("no profile row for {kind:?}").into());
             st.raising = Some(kind);
             st.scopes.clear();
             return Step::Go(super::cfg::EXIT_ERR, st);
