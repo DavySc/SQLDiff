@@ -125,6 +125,11 @@ pub struct Model {
     /// The target base catalog also holds names that differ from the
     /// tree's only in letter case (PostgreSQL, Db2 for i).
     pub case_clash: bool,
+    /// Only index names / only column names have another spelling in the
+    /// target base catalog (so the checks that stop at the first clash get
+    /// further).
+    pub clash_index: bool,
+    pub clash_column: bool,
     /// Tables of other schemas with the names the tree uses are in the
     /// source base catalog / the target base catalog.
     pub look_a: bool,
@@ -169,6 +174,7 @@ impl Model {
         let mut m = Model::generate(seed);
         if hidden {
             m.tables[2].versioned = true;
+            m.tables[2].index = Some(2);
         }
         m
     }
@@ -292,6 +298,8 @@ impl Model {
             split_base: false,
             no_procs: false,
             case_clash: false,
+            clash_index: false,
+            clash_column: false,
             look_a: false,
             look_b: false,
             over_a: false,
@@ -435,6 +443,26 @@ impl Model {
             }
             if d == Dialect::Tsql {
                 s.push_str("\nCREATE TRIGGER dbo.Tr0 ON dbo.X0 AFTER INSERT AS\nBEGIN\n  SET NOCOUNT ON;\n  INSERT INTO dbo.X0 (Id) SELECT Id FROM inserted;\nEND\nGO\n");
+            }
+        }
+        if (self.clash_index || self.clash_column) && d != Dialect::Tsql {
+            let other = |n: &str| match d {
+                Dialect::Postgres => format!("\"{}\"", n.to_uppercase()),
+                _ => format!("\"{n}\""),
+            };
+            if self.clash_index {
+                s.push_str("\nCREATE TABLE ext.holder (hid int PRIMARY KEY);\n");
+                for n in ["IX_Idx_1", "IX_T0_2", "IX_T1_2", "IX_T2_2"] {
+                    s.push_str(&format!("CREATE INDEX {} ON ext.holder (hid);\n", other(n)));
+                }
+            }
+            if self.clash_column {
+                s.push_str(&format!(
+                    "\nCREATE TABLE ext.holder2 ({} int PRIMARY KEY, {} int, {} int);\n",
+                    other("C0"),
+                    other("C1"),
+                    other("C2"),
+                ));
             }
         }
         if self.case_clash && d != Dialect::Tsql {
@@ -784,6 +812,10 @@ pub enum Edit {
     DropFunctions,
     /// The target base catalog gains other spellings of the tree's names.
     CaseClash,
+    /// Only index names have another spelling there.
+    CaseClashIndex,
+    /// Only column names have another spelling there.
+    CaseClashColumn,
     /// The source base catalog defines the tree's tables again, shaped
     /// differently.
     SourceOverrides,
@@ -834,6 +866,8 @@ pub const ALL_EDITS: &[Edit] = &[
     Edit::NoProcedures,
     Edit::DropFunctions,
     Edit::CaseClash,
+    Edit::CaseClashIndex,
+    Edit::CaseClashColumn,
     Edit::SourceOverrides,
     Edit::TargetOverrides,
     Edit::SourceLookalikes,
@@ -1068,6 +1102,14 @@ impl Edit {
                 let x = m.tables.iter_mut().find(|t| t.name == "X0").unwrap();
                 x.cols[1].ty = "int".into();
                 "X0.C0 becomes int".into()
+            }
+            Edit::CaseClashIndex => {
+                m.clash_index = true;
+                "index names have other spellings in the target base catalog".into()
+            }
+            Edit::CaseClashColumn => {
+                m.clash_column = true;
+                "column names have other spellings in the target base catalog".into()
             }
             Edit::CaseClash => {
                 m.case_clash = true;

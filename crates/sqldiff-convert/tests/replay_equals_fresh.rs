@@ -54,6 +54,8 @@ fn recheck_at_most(e: &Edit) -> usize {
         | Edit::NoProcedures
         | Edit::DropFunctions
         | Edit::CaseClash
+        | Edit::CaseClashIndex
+        | Edit::CaseClashColumn
         | Edit::SourceLookalikes
         | Edit::SourceOverrides
         | Edit::TargetOverrides
@@ -179,6 +181,12 @@ const EXEMPT: &[(Dialect, &str, &str)] = &[
         "NoBaseB",
         "the target base catalog only repeats ext.Ref in the target dialect; no file's output depends on that copy (measured)",
     ),
+    (
+        Dialect::Db2i,
+        "CaseClashColumn",
+        "the column and index spelling checks guard conversions to PostgreSQL that fold case; no Db2 for i conversion reads them in another file (measured)",
+    ),
+    (Dialect::Db2i, "CaseClashIndex", "same"),
     (
         Dialect::Db2i,
         "RetypeSide",

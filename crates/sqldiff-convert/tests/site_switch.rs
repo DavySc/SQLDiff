@@ -73,7 +73,9 @@ const KILLED: &[&str] = &[
     "crates/sqldiff-equiv/src/equiv/canon.rs::col_ty@.table(Self::base_table(table))",
     "crates/sqldiff-equiv/src/equiv/canon.rs::fold_check@(Some(x), None) => schema.case_check(x, false)?,",
     "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(&c.name), false)?;",
+    "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(&i.name), false)?;",
     "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(n), false)?;",
+    "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(n), true)?;",
     "crates/sqldiff-equiv/src/equiv/schema.rs::list_stars_with@b.ask_table(n);",
     "crates/sqldiff-equiv/src/equiv/table.rs::case_check@schema.case_check(&stored(n), false)?;",
 ];
@@ -98,15 +100,13 @@ const REDUNDANT: &[&str] = &[
     "crates/sqldiff-equiv/src/equiv/xwit.rs::types@.and_then(|t| side.schema.table(t))",
 ];
 
-/// Sites whose read sets change but that no generated edit kills: work for
-/// the generator.
-const GAP: &[&str] = &[
+/// Sites whose recorded reads are covered by others in every tree, by the
+/// rule in [`twin_holds`].
+const DOMINATED: &[&str] = &[
     "crates/sqldiff-core/src/bind/query.rs::lookup_table_silent@_ => match self.input.view.table(parts) {",
     "crates/sqldiff-equiv/src/equiv/canon.rs::all_columns@None => self.schema.table_exact(",
     "crates/sqldiff-equiv/src/equiv/canon.rs::visible_star@.table(Self::base_table(&b.table))",
     "crates/sqldiff-equiv/src/equiv/canon.rs::visible_star@b.derived.is_none() && self.schema.is_star_view(&lc(Self::base_table(&b.table)))",
-    "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(&i.name), false)?;",
-    "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(n), true)?;",
     "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(n), true)?;#2",
     "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(n), x.kind == \"TABLE\")?;",
     "crates/sqldiff-equiv/src/equiv/mod.rs::col_facts@let t = schema.table_exact(want.0.as_deref(), &want.1)?;",
@@ -116,6 +116,10 @@ const GAP: &[&str] = &[
     "crates/sqldiff-equiv/src/equiv/trigger.rs::pairs_for@.with_images(&tr.table, &names)",
     "crates/sqldiff-equiv/src/equiv/trigger.rs::pairs_for@let sa2 = sa.with_images(&table, &names).unwrap_or_else(|| sa.clone());",
 ];
+
+/// Sites whose read sets change but that no generated edit kills: work for
+/// the generator.
+const GAP: &[&str] = &[];
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -222,7 +226,7 @@ fn run_tree_with_reads(
             let n = e.file_name().to_string_lossy().into_owned();
             if n.ends_with(".reads") {
                 let id = format!("{}/{n}", k.file_name().to_string_lossy());
-                if std::env::var("SQLDIFF_T3_ONLY").is_ok() {
+                {
                     // framed JSON: digest, newline, body
                     let raw = std::fs::read_to_string(e.path()).unwrap_or_default();
                     let v: serde_json::Value =
@@ -258,18 +262,105 @@ fn base_sites() -> BTreeSet<site_switch::Site> {
     all
 }
 
+/// The reads of each file (its store key) in one run, as `side query` text.
+fn per_key(qs: &BTreeMap<String, Vec<String>>) -> BTreeMap<String, BTreeSet<String>> {
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (id, reads) in qs {
+        let key = id.split('/').next().unwrap_or_default().to_string();
+        out.entry(key).or_default().extend(reads.iter().cloned());
+    }
+    out
+}
+
+/// The lower-case name in the last part of a `Table` query's parts.
+fn table_name(q: &str) -> Option<String> {
+    let rest = q.strip_prefix("{\"Table\":")?;
+    let at = rest.rfind("[\"")? + 2;
+    let end = rest[at..].find('"')?;
+    Some(rest[at..at + end].to_lowercase())
+}
+
+/// The name in a `{"SchemaTables":"n"}` or `{"StarView":"n"}` query.
+fn by_name(q: &str) -> Option<&str> {
+    let rest = q
+        .strip_prefix("{\"SchemaTables\":\"")
+        .or_else(|| q.strip_prefix("{\"StarView\":\""))?;
+    rest.strip_suffix("\"}")
+}
+
+/// The rule that makes a vanished read dominated. A read `v` that is gone
+/// when its site is skipped is covered when `kept`, the other reads of the
+/// same file in the skipped run, hold one of:
+///
+/// 1. target side (`Target`, `OwnTarget`): the same query on the source side,
+///    for a table or view of the tree (`names`). A table the tree defines is the same on both sides: a base-catalog
+///    table of the same name does not change either (shadowing, tested by
+///    the `SourceOverrides` and `TargetOverrides` edits), so the target
+///    side's copy is a function of the source side's.
+/// 2. target side: the whole-catalog digest of the same side, which holds
+///    every answer of it.
+/// 3. a by-name question (`SchemaTables`, `StarView`) of either side about a
+///    table or view of the tree: the source side's `Table` read of a table of that name (the digest of the
+///    table the file binds).
+/// 5. a source-side `SchemaTables` question about a table of the tree: the
+///    target side's question of the same name. The target table is the
+///    conversion of the source one, and a base-catalog table of another
+///    schema with the name (what the source side's answer adds) changes
+///    nothing the file reads (`SourceLookalikes`).
+/// 4. the source side's whole-catalog digest: the target side's, which a
+///    change of the source catalog reaches through the converted tree (the
+///    edit `SourceOverrides` re-checks the file with this site skipped).
+fn twin_holds(v: &str, kept: &BTreeSet<String>, names: &BTreeSet<String>) -> bool {
+    let Some((side, q)) = v.split_once(' ') else {
+        return false;
+    };
+    let source = |q: &str| kept.contains(&format!("\"Source\" {q}"));
+    let source_table = |n: &str| {
+        kept.iter().any(|k| {
+            k.strip_prefix("\"Source\" ")
+                .and_then(table_name)
+                .is_some_and(|t| t == n)
+        })
+    };
+    // The tables rules 1 and 3 speak of are the tree's own.
+    let ours = |q: &str| {
+        table_name(q)
+            .or_else(|| by_name(q).map(str::to_string))
+            .is_some_and(|n| names.contains(&n))
+    };
+    match side {
+        "\"Target\"" | "\"OwnTarget\"" => {
+            kept.contains(&format!("{side} \"WholeCatalog\""))
+                || (ours(q) && (source(q) || table_name(q).is_some_and(|n| source_table(&n))))
+                || (ours(q) && by_name(q).is_some_and(source_table))
+        }
+        "\"Source\"" => {
+            if q == "\"WholeCatalog\"" {
+                kept.contains("\"Target\" \"WholeCatalog\"")
+            } else {
+                ours(q)
+                    && (by_name(q).is_some_and(source_table)
+                        || (q.starts_with("{\"SchemaTables\"")
+                            && kept.contains(&format!("\"Target\" {q}"))))
+            }
+        }
+        _ => false,
+    }
+}
+
 #[test]
 fn every_site_the_base_tree_reads_from_is_classified_and_the_classified_sites_exist() {
     let known: BTreeSet<&str> = KILLED
         .iter()
         .chain(REDUNDANT)
         .chain(GAP)
+        .chain(DOMINATED)
         .chain(KEYED)
         .copied()
         .collect();
     assert_eq!(
         known.len(),
-        KILLED.len() + REDUNDANT.len() + GAP.len() + KEYED.len(),
+        KILLED.len() + REDUNDANT.len() + GAP.len() + DOMINATED.len() + KEYED.len(),
         "a site is in two classes"
     );
     let keys = keys_of(&base_sites());
@@ -331,19 +422,25 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
         })
         .collect();
     // The reference run of each tree: the sites it reads from, the read sets.
-    let mut reference: Vec<(BTreeSet<String>, BTreeSet<site_switch::Site>)> = Vec::new();
+    type Reference = (
+        BTreeSet<String>,
+        BTreeSet<site_switch::Site>,
+        BTreeMap<String, Vec<String>>,
+    );
+    let mut reference: Vec<Reference> = Vec::new();
     let mut all: BTreeSet<site_switch::Site> = BTreeSet::new();
     for (d, h, e) in &trees {
         site_switch::discover();
-        let (ids, seen) = run_tree(*d, *h, *e);
+        let (ids, seen, qs) = run_tree_with_reads(*d, *h, *e);
         site_switch::off();
         let seen: BTreeSet<_> = seen.into_iter().collect();
         all.extend(seen.iter().cloned());
-        reference.push((ids, seen));
+        reference.push((ids, seen, qs));
     }
     let keys = keys_of(&all);
     assert!(all.len() >= 20, "only {} sites seen", all.len());
-    let (mut killed, mut redundant, mut gap) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut killed, mut redundant, mut gap, mut dom) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for site in &all {
         let name = keys[site].clone();
         if only
@@ -359,7 +456,7 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
         // Redundant: the read sets are the same on every tree the site reads
         // from (and, by construction, on the others it is never reached).
         let mut is_redundant = true;
-        for ((d, h, e), (ids, seen)) in trees.iter().zip(&reference) {
+        for ((d, h, e), (ids, seen, _)) in trees.iter().zip(&reference) {
             if !seen.contains(site) {
                 continue;
             }
@@ -398,7 +495,7 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
             if !trees
                 .iter()
                 .zip(&reference)
-                .any(|((td, th, _), (_, s))| *td == d && *th == hidden && s.contains(site))
+                .any(|((td, th, _), (_, s, _))| *td == d && *th == hidden && s.contains(site))
             {
                 continue;
             }
@@ -408,9 +505,8 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
                 site_switch::off();
                 if only.is_some() && std::env::var("SQLDIFF_T3_VERBOSE").is_ok() {
                     println!(
-                        "    {d:?} hidden={hidden} {e:?}: reused {:?}, changed {}",
-                        o.reused,
-                        o.dependents_changed.len()
+                        "    {d:?} hidden={hidden} {e:?}: reused {:?}, changed {:?}, again {:?}",
+                        o.reused, o.dependents_changed, o.again
                     );
                 }
                 if o.verdict.is_err() {
@@ -419,18 +515,59 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
                 }
             }
         }
-        match by {
-            Some(b) => {
-                println!("{name}: KILLED by {b}");
-                killed.push(name);
+        if let Some(b) = by {
+            println!("{name}: KILLED by {b}");
+            killed.push(name);
+            continue;
+        }
+        // Dominated: on every tree the site reads from, every read that
+        // vanishes when it is skipped has its twin among the reads that
+        // remain in the same file (see [`twin_holds`]).
+        let mut dominated = true;
+        'dom: for ((d, h, e), (_, seen, rq)) in trees.iter().zip(&reference) {
+            // `--no-catalog` changes every file's store key (the supplied
+            // bit; `a_changed_supplied_bit_finds_nothing_stored`): nothing is
+            // reused across it, whatever the read sets hold.
+            if !seen.contains(site) || matches!(e, Some(Edit::NoCatalog)) {
+                continue;
             }
-            None => {
-                println!("{name}: GAP");
-                gap.push(name);
+            site_switch::skip(site.clone());
+            let (_, _, sq) = run_tree_with_reads(*d, *h, *e);
+            site_switch::off();
+            let (rk, sk) = (per_key(rq), per_key(&sq));
+            // The tree's tables and views before and after the edit.
+            let names: BTreeSet<String> = [model_with(None, *h), model_with(*e, *h)]
+                .iter()
+                .flat_map(|m| {
+                    m.tables
+                        .iter()
+                        .map(|t| t.name.to_lowercase())
+                        .chain(m.views.iter().map(|v| v.name.to_lowercase()))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            for (k, reads) in &rk {
+                let kept = sk.get(k).cloned().unwrap_or_default();
+                for v in reads.difference(&kept) {
+                    if !twin_holds(v, &kept, &names) {
+                        println!("  {name}: {d:?} hidden={h} {e:?}: no twin for {v}");
+                        dominated = false;
+                        break 'dom;
+                    }
+                }
             }
         }
+        if dominated {
+            println!("{name}: DOMINATED");
+            dom.push(name);
+        } else {
+            println!("{name}: GAP");
+            gap.push(name);
+        }
     }
-    println!("KILLED = {killed:#?}\nREDUNDANT = {redundant:#?}\nGAP = {gap:#?}");
+    println!(
+        "KILLED = {killed:#?}\nREDUNDANT = {redundant:#?}\nDOMINATED = {dom:#?}\nGAP = {gap:#?}"
+    );
     if only.is_some() {
         return;
     }
@@ -444,6 +581,8 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
     gap.sort();
     assert_eq!(killed, sorted(KILLED), "killed sites");
     assert_eq!(redundant, sorted(REDUNDANT), "redundant sites");
+    dom.sort();
+    assert_eq!(dom, sorted(DOMINATED), "dominated sites");
     assert_eq!(gap, sorted(GAP), "gap sites");
 }
 
@@ -512,10 +651,20 @@ fn reads() {
         return;
     };
     let e = ALL_EDITS.iter().find(|e| format!("{e:?}") == edit).unwrap();
+    // `SQLDIFF_T3_SKIP`: a part of a site's name to switch off.
+    let skip = std::env::var("SQLDIFF_T3_SKIP").ok().and_then(|part| {
+        let sites = base_sites();
+        let keys = keys_of(&sites);
+        sites.into_iter().find(|s| keys[s].contains(&part))
+    });
     for (label, ed) in [("before", None), ("after", Some(e))] {
         let f = Fixture::new("reads", Dialect::Postgres);
         f.write(&model_with(ed, false));
+        if let Some(s) = &skip {
+            site_switch::skip(s.clone());
+        }
         f.run("res", false);
+        site_switch::off();
         let results = f.dir.join("res/.sqldiff/results");
         for k in std::fs::read_dir(results).unwrap().flatten() {
             for en in std::fs::read_dir(k.path()).unwrap().flatten() {
@@ -533,7 +682,12 @@ fn reads() {
                     serde_json::from_str(raw.get(65..).unwrap_or("null")).unwrap_or_default();
                 println!("{label} {}:", en.path().display());
                 for r in v["reads"].as_array().into_iter().flatten() {
-                    println!("   {} {}", r[0], r[1]);
+                    println!(
+                        "   {} {} {}",
+                        r[0],
+                        r[1],
+                        r[2].to_string().chars().take(16).collect::<String>()
+                    );
                 }
             }
         }
