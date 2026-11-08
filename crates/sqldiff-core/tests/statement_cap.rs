@@ -277,3 +277,103 @@ fn a_witness_search_cut_by_the_allowance_does_not_read_as_no_witness() {
     let (r, _) = run_lookalike(Some(tries * 4));
     assert_eq!(json(&r), json(&full), "a large allowance");
 }
+
+/// A conversion pair read from the corpus: T-SQL against PostgreSQL.
+fn pair(dir: &str) -> (String, String) {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../corpus/pairs")
+        .join(dir);
+    let read = |f: &str| {
+        std::fs::read_to_string(root.join(f))
+            .unwrap()
+            .replace("\r\n", "\n")
+    };
+    (read("tsql.sql"), read("pg.sql"))
+}
+
+fn run_cross(a: &str, b: &str, cap: Option<u64>) -> (Report, u64) {
+    let (r, w) = scope("t", || {
+        diff(
+            &Artifact::new("a.sql", Dialect::Tsql, a),
+            &Artifact::new("b.sql", Dialect::Postgres, b),
+            &Options {
+                statement_work_cap: cap,
+                ..Options::default()
+            },
+        )
+    });
+    (r, w.total())
+}
+
+fn says_budget(r: &Report) -> bool {
+    r.findings
+        .iter()
+        .any(|f| f.witness.contains("statement-level work budget"))
+        || r.unknown_reasons
+            .iter()
+            .any(|u| u.contains("statement-level work budget"))
+}
+
+/// A routine of `n` inserts, in T-SQL and in PostgreSQL.
+fn long_pair(n: usize) -> (String, String) {
+    let rows = |i: usize| format!("INSERT INTO t (id, v) VALUES ({i}, {});\n", i * 3);
+    let body: String = (0..n).map(rows).collect();
+    (
+        format!("CREATE PROCEDURE dbo.p AS\nBEGIN\n{body}END;\n"),
+        format!("CREATE PROCEDURE p() LANGUAGE plpgsql AS $$\nBEGIN\n{body}END;\n$$;\n"),
+    )
+}
+
+#[test]
+fn a_cross_dialect_cut_inside_a_routine_names_the_statements_after_it() {
+    let (a, b) = long_pair(40);
+    let (full, _) = run_cross(&a, &b, None);
+    let mut partial = false;
+    // One unit per statement pair, so the allowance runs out inside the
+    // routine for every cap below the number of pairs.
+    for cap in 0..=45u64 {
+        let (r, _) = run_cross(&a, &b, Some(cap));
+        if json(&r) == json(&full) {
+            continue;
+        }
+        assert!(says_budget(&r), "cap {cap}");
+        assert_ne!(r.verdict(), Verdict::Equal, "cap {cap}");
+        partial |= r
+            .unknown_reasons
+            .iter()
+            .any(|u| u.contains("statement is not compared"))
+            && !r
+                .unknown_reasons
+                .iter()
+                .any(|u| u.contains("routine or script segment"));
+    }
+    assert!(partial, "no allowance cut between two statement pairs");
+}
+
+#[test]
+fn a_cross_dialect_cut_names_every_statement_it_did_not_compare() {
+    for dir in ["p01-move-stock", "p02-upsert-price", "p09-error-rollback"] {
+        let (a, b) = pair(dir);
+        let (full, total) = run_cross(&a, &b, None);
+        assert!(!says_budget(&full), "{dir}");
+        let mut cut_seen = false;
+        for cap in (0..=total + 1).step_by(((total / 60).max(1)) as usize) {
+            let (r, _) = run_cross(&a, &b, Some(cap));
+            let ctx = format!("{dir} at cap {cap} of {total}");
+            if json(&r) == json(&full) {
+                continue;
+            }
+            assert!(says_budget(&r), "{ctx}: a changed report says why");
+            cut_seen = true;
+            // Nothing moves toward equal: a verdict that was not Equal is
+            // not Equal, and a cut that skipped statements is never Equal.
+            if full.verdict() != Verdict::Equal {
+                assert_ne!(r.verdict(), Verdict::Equal, "{ctx}");
+            }
+            assert_ne!(r.verdict(), Verdict::Equal, "{ctx}: a cut report");
+        }
+        assert!(cut_seen, "{dir}: no allowance cut anything");
+        let (r, _) = run_cross(&a, &b, Some(total + 1));
+        assert_eq!(json(&r), json(&full), "{dir}: a large allowance");
+    }
+}

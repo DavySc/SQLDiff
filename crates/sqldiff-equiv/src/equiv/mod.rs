@@ -43,6 +43,7 @@ use crate::model::{
 use canon::{asm, Canon, Item};
 use lower::{Unit, UnitKind};
 use schema::Schema;
+use sqldiff_model::work::Allowance;
 use term::{a, n, Term};
 
 /// Result of comparing two artifacts statement by statement.
@@ -327,18 +328,39 @@ pub fn compare(
     sb: &Schema,
     anchors: &[Anchor],
 ) -> Outcome {
+    compare_within(a, b, sa, sb, anchors, &Allowance::new(None))
+}
+
+/// [`compare`] under a statement-level allowance: past it the statements not
+/// yet compared are each named as not compared (an explicit Unknown reason),
+/// never left silent, because in a cross-dialect comparison silence means
+/// equal. What each unit's comparison spent (the meter's delta) is taken
+/// from the allowance after it ran, and each statement pair costs one unit
+/// besides. The overshoot is one unit's setup plus the pre-pass over its
+/// pairs (`pair_items` compares every pair once to count the unequal ones
+/// before the first check), then at most one pair. Outside a meter scope the
+/// meter reads zero, so only the one unit per pair counts; that is
+/// deterministic too. An allowance that is off is `compare`.
+pub fn compare_within(
+    a: &Analyzed,
+    b: &Analyzed,
+    sa: &Schema,
+    sb: &Schema,
+    anchors: &[Anchor],
+    allowance: &Allowance,
+) -> Outcome {
     let mut out = Outcome::default();
     if let Some(pairs) = trigger::pairs(a, b, sa, sb, &mut out) {
         for (mut ua, mut ub, sa, sb) in pairs {
             tv_names(a, b, &mut ua, &mut ub);
-            compare_units(a, b, &ua, &ub, &sa, &sb, anchors, &mut out);
+            compare_units(a, b, &ua, &ub, &sa, &sb, anchors, allowance, &mut out);
         }
         return out;
     }
     if let Some(e) = trigger::embedded(a, b, sa, sb, &mut out) {
         for (mut ua, mut ub, sa, sb) in e.pairs {
             tv_names(a, b, &mut ua, &mut ub);
-            compare_units(a, b, &ua, &ub, &sa, &sb, anchors, &mut out);
+            compare_units(a, b, &ua, &ub, &sa, &sb, anchors, allowance, &mut out);
         }
         // The rest of the artifacts, with the triggers and what was written
         // for them blanked out (same offsets and lines).
@@ -350,10 +372,10 @@ pub fn compare(
             Analyzed::new(&xa, a.side, a.excerpt_lines),
             Analyzed::new(&xb, b.side, b.excerpt_lines),
         );
-        compare_rest(&ra, &rb, sa, sb, anchors, &mut out);
+        compare_rest(&ra, &rb, sa, sb, anchors, allowance, &mut out);
         return out;
     }
-    compare_rest(a, b, sa, sb, anchors, &mut out);
+    compare_rest(a, b, sa, sb, anchors, allowance, &mut out);
     out
 }
 
@@ -382,6 +404,7 @@ fn compare_rest(
     sa: &Schema,
     sb: &Schema,
     anchors: &[Anchor],
+    allowance: &Allowance,
     out: &mut Outcome,
 ) {
     let mut pairs = script::segment_pairs(a, b, anchors, out).unwrap_or_else(|| {
@@ -401,7 +424,7 @@ fn compare_rest(
     for (mut ua, mut ub) in pairs {
         script::name_locals(&mut ua, &mut ub);
         tv_names(a, b, &mut ua, &mut ub);
-        compare_units(a, b, &ua, &ub, sa, sb, anchors, out);
+        compare_units(a, b, &ua, &ub, sa, sb, anchors, allowance, out);
     }
 }
 
@@ -484,8 +507,174 @@ fn compare_units(
     sa: &Schema,
     sb: &Schema,
     anchors: &[Anchor],
+    allowance: &Allowance,
     out: &mut Outcome,
 ) {
+    let before = sqldiff_model::work::now().total();
+    compare_units_within(a, b, ua, ub, sa, sb, anchors, allowance, out);
+    allowance.take(sqldiff_model::work::now().total().saturating_sub(before));
+}
+
+/// The text of an explicit Unknown for work the statement-level allowance
+/// did not allow.
+fn budget_reason(allowance: &Allowance) -> String {
+    format!(
+        "not compared: past the statement-level work budget ({} of {} units of work)",
+        allowance.spent(),
+        allowance.cap().unwrap_or(0)
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compare_units_within(
+    a: &Analyzed,
+    b: &Analyzed,
+    ua: &Unit,
+    ub: &Unit,
+    sa: &Schema,
+    sb: &Schema,
+    anchors: &[Anchor],
+    allowance: &Allowance,
+    out: &mut Outcome,
+) {
+    if allowance.exhausted() {
+        // A unit not compared at all. Everything `compare_units` would have
+        // reported for it is named on both sides, on its own line: the
+        // header and signature, the statements, and the tables, DDL, calls,
+        // dynamic SQL, table variables, transaction statements and
+        // uncovered constructs it carries. One line-less reason besides
+        // keeps the whole file from counting as converted, whatever a line
+        // maps to.
+        let why = budget_reason(allowance);
+        out.unknown_reasons.push(format!(
+            "a routine or script segment is {why}: it and everything in it is not proven"
+        ));
+        for (side, u) in [(a, ua), (b, ub)] {
+            let name = side_name(side);
+            let (hs, he) = u.header_at;
+            // A script segment has no routine header (`header_at` is empty).
+            let has_header = (hs, he) != (0, 0);
+            let mut lines: Vec<(usize, &str)> = if has_header {
+                vec![(
+                    side.location(hs, he).start_line,
+                    "the routine header and signature",
+                )]
+            } else {
+                Vec::new()
+            };
+            lines.extend(u.stmts.iter().map(|s| (side.line_of(&s.node), "statement")));
+            lines.extend(u.tables.iter().map(|(n, _)| (side.line_of(n), "table")));
+            lines.extend(
+                u.ddl
+                    .iter()
+                    .map(|(n, _)| (side.line_of(n), "DDL statement")),
+            );
+            lines.extend(u.calls.iter().map(|(n, _)| (side.line_of(n), "call")));
+            lines.extend(
+                u.dynamic
+                    .iter()
+                    .map(|(n, _)| (side.line_of(n), "dynamic SQL")),
+            );
+            lines.extend(
+                u.table_vars
+                    .iter()
+                    .chain(&u.temp_drops)
+                    .map(|(n, _)| (side.line_of(n), "temporary table statement")),
+            );
+            lines.extend(
+                u.txn_stmts
+                    .iter()
+                    .map(|(n, _)| (side.line_of(n), "transaction statement")),
+            );
+            lines.extend(
+                u.uncovered
+                    .iter()
+                    .map(|(n, _)| (side.line_of(n), "construct")),
+            );
+            // The unit's own lines, as ranges: the enclosing routine when
+            // there is one (the lines after the last statement, like END
+            // TRY and CATCH, belong to it), and each construct of a script
+            // segment. IF, WHILE, DECLARE, TRY and CATCH lines, a
+            // transaction inside a TRY, and every conversion unit in them
+            // are reached even when no list above names them. Overlapping
+            // ranges merge; a range never starts anywhere but at a
+            // construct of this unit, so the routines between the batches
+            // of a script keep their own status.
+            let routine = if has_header {
+                side.root
+                    .descendants()
+                    .filter(|n| {
+                        n.kind() == sqldiff_syntax::SyntaxKind::ROUTINE && {
+                            let (rs, re) = cst::sig_range(n);
+                            rs <= hs && hs < re
+                        }
+                    })
+                    .min_by_key(|n| {
+                        let (rs, re) = cst::sig_range(n);
+                        re - rs
+                    })
+            } else {
+                None
+            };
+            let nodes: Vec<&SyntaxNode> = u
+                .stmts
+                .iter()
+                .map(|s| &s.node)
+                .chain(u.tables.iter().map(|(n, _)| n))
+                .chain(u.ddl.iter().map(|(n, _)| n))
+                .chain(u.calls.iter().map(|(n, _)| n))
+                .chain(u.dynamic.iter().map(|(n, _)| n))
+                .chain(u.table_vars.iter().chain(&u.temp_drops).map(|(n, _)| n))
+                .chain(u.txn_stmts.iter().map(|(n, _)| n))
+                .chain(u.uncovered.iter().map(|(n, _)| n))
+                .chain(routine.as_ref())
+                .collect();
+            // In a script segment a construct stands for the whole top-level
+            // statement it sits in (a WHILE or IF with its body, a TRY with
+            // its CATCH), never for the routines or batches around it.
+            let top = |n: &SyntaxNode| -> SyntaxNode {
+                if has_header {
+                    return n.clone();
+                }
+                n.ancestors()
+                    .filter(|x| x.kind().is_unit())
+                    .last()
+                    .unwrap_or_else(|| n.clone())
+            };
+            let mut spans: Vec<(usize, usize)> = nodes
+                .into_iter()
+                .map(|n| {
+                    let loc = side.node_location(&top(n));
+                    (loc.start_line, loc.end_line)
+                })
+                .collect();
+            if has_header {
+                let h = side.location(hs, he);
+                spans.push((h.start_line, h.end_line));
+            }
+            spans.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::new();
+            for (f, l) in spans {
+                match merged.last_mut() {
+                    Some(m) if f <= m.1 => m.1 = m.1.max(l),
+                    _ => merged.push((f, l)),
+                }
+            }
+            for (first, last) in merged {
+                out.unknown_reasons.push(format!(
+                    "{name} lines {first}-{last}: everything in the routine or script segment is {why}"
+                ));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for (l, what) in lines {
+                if seen.insert((l, what)) {
+                    out.unknown_reasons
+                        .push(format!("{name} line {l}: {what} is {why}"));
+                }
+            }
+        }
+        return;
+    }
     let (la, lb) = (local_schema(sa, ua), local_schema(sb, ub));
     let (sa, sb) = (la.as_ref(), lb.as_ref());
     let (na, nb) = (side_name(a), side_name(b));
@@ -622,7 +811,7 @@ fn compare_units(
         certain: ia.len() == 1 && ib.len() == 1 && !ua.txn_control && !ub.txn_control,
     });
     let gaps = [gaps(a, ua, &ia), gaps(b, ub, &ib)];
-    let pairs = pair_items(a, b, &ia, &ib, &gaps, anchors, wit.as_ref(), out);
+    let pairs = pair_items(a, b, &ia, &ib, &gaps, anchors, wit.as_ref(), allowance, out);
     out.identity
         .push(identity::analyze(a, b, ua, ub, &ia, &ib, &pairs));
     calls(a, b, ua, ub, sa, sb, anchors, ((&ia, &ib), &pairs), out);
@@ -4974,6 +5163,7 @@ fn pair_items(
     gaps: &[Vec<Gap>; 2],
     anchors: &[Anchor],
     wit: Option<&Witnessing>,
+    allowance: &Allowance,
     out: &mut Outcome,
 ) -> Vec<(usize, usize)> {
     let ka: Vec<String> = ia.iter().map(|x| key(&x.term)).collect();
@@ -5102,7 +5292,22 @@ fn pair_items(
         })
         .count();
     let wit = wit.filter(|_| all_paired && unequal == 1);
-    for &(i, j) in &pairs {
+    for (n, &(i, j)) in pairs.iter().enumerate() {
+        if allowance.exhausted() {
+            // The pairs from here on are not compared: each statement says
+            // so, because a pair with no finding reads as equal.
+            let why = budget_reason(allowance);
+            for &(i, j) in &pairs[n..] {
+                for (side, it) in [(a, &ia[i]), (b, &ib[j])] {
+                    out.unknown_reasons.push(format!(
+                        "{} line {}: statement is {why}",
+                        side_name(side),
+                        line(side, &it.nodes)
+                    ));
+                }
+            }
+            break;
+        }
         // The other statements are only read for a witness search.
         let (oa, ob) = match wit {
             Some(_) => (other_terms(ia, i), other_terms(ib, j)),
@@ -5116,6 +5321,11 @@ fn pair_items(
             wit.map(|w| (w, [&oa[..], &ob[..]])),
             out,
         );
+        // One unit for the pair: its comparison is mostly unmetered, and an
+        // allowance that only saw the meter would never run out between two
+        // pairs. The metered work of the whole unit is taken when the unit
+        // ends (`compare_units`), not again here.
+        allowance.take(1);
     }
     pairs
 }

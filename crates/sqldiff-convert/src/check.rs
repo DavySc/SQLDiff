@@ -281,13 +281,13 @@ fn check_one(input: &str, draft: Draft, opts: &Options) -> Conversion {
     // reason that names no unit's line keeps the whole file from counting.
     let mut unproven = Vec::new();
     for reason in &report.unknown_reasons {
-        let hits: Vec<usize> = match reason_line(reason) {
-            Some((out_side, line)) => units
+        let hits: Vec<usize> = match reason_range(reason) {
+            Some((out_side, first, last)) => units
                 .iter()
                 .enumerate()
                 .filter(|(_, u)| {
                     let s = if out_side { u.out } else { u.src };
-                    s.line <= line && line <= s.end_line
+                    s.line <= last && first <= s.end_line
                 })
                 .map(|(i, _)| i)
                 .collect(),
@@ -319,7 +319,8 @@ fn check_one(input: &str, draft: Draft, opts: &Options) -> Conversion {
                 })
             })
             .collect();
-        let hits = inner;
+        // A range is about everything in it: every unit it reaches.
+        let hits = if is_range(reason) { hits } else { inner };
         let text = format!(
             "The engine did not compare this with its conversion: {}",
             reason_text(reason)
@@ -516,23 +517,43 @@ pub(crate) const EVERY_PAIR: [&str; 4] = [
 /// Rule of the note on a unit the engine did not compare.
 pub const NOT_COMPARED: &str = "equiv.not-compared";
 
-/// `(output side, line)` of an engine reason `side A (T-SQL) line 12: ...`.
-fn reason_line(reason: &str) -> Option<(bool, usize)> {
+/// `(output side, first line, last line)` of an engine reason: one line
+/// (`side A (T-SQL) line 12: ...`) or a range (`side A (T-SQL) lines 3-20:
+/// ...`). A range reason is about everything in it, so it reaches every unit
+/// that overlaps it, not only the innermost ones.
+fn reason_range(reason: &str) -> Option<(bool, usize, usize)> {
     let rest = reason.strip_prefix("side ")?;
     let out_side = match rest.as_bytes().first()? {
         b'A' => false,
         b'B' => true,
         _ => return None,
     };
-    let (_, after) = rest.split_once(") line ")?;
-    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-    after[digits.len()..].starts_with(':').then_some(())?;
-    Some((out_side, digits.parse().ok()?))
+    if let Some((_, after)) = rest.split_once(") line ") {
+        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        after[digits.len()..].starts_with(':').then_some(())?;
+        let l = digits.parse().ok()?;
+        return Some((out_side, l, l));
+    }
+    let (_, after) = rest.split_once(") lines ")?;
+    let (a, b) = after.split_once('-')?;
+    let digits: String = b.chars().take_while(|c| c.is_ascii_digit()).collect();
+    b[digits.len()..].starts_with(':').then_some(())?;
+    Some((out_side, a.parse().ok()?, digits.parse().ok()?))
+}
+
+/// Whether the reason names a range of lines.
+fn is_range(reason: &str) -> bool {
+    reason_range(reason).is_some_and(|(_, a, b)| a != b) || reason.contains(") lines ")
+}
+
+/// `(output side, line)` of an engine reason `side A (T-SQL) line 12: ...`.
+fn reason_line(reason: &str) -> Option<(bool, usize)> {
+    reason_range(reason).map(|(o, a, _)| (o, a))
 }
 
 /// A reason without its `side A (T-SQL) line 12: ` prefix.
 fn reason_text(reason: &str) -> &str {
-    match reason_line(reason) {
+    match reason_range(reason) {
         Some(_) => reason.split_once(": ").map_or(reason, |(_, rest)| rest),
         None => reason,
     }
