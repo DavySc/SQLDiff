@@ -762,6 +762,10 @@ fn compare_units_within(
     }
     let ia = items(ua, sa, false, ub.dialect);
     let ib = items(ub, sb, false, ua.dialect);
+    sqldiff_model::work::spend(
+        sqldiff_model::work::Site::ItemsBuilt,
+        (ia.len() + ib.len()) as u64,
+    );
     if std::env::var_os("SQLDIFF_DEBUG_TERMS").is_some() {
         for (name, items) in [("A", &ia), ("B", &ib)] {
             for it in items.iter() {
@@ -5321,10 +5325,10 @@ fn pair_items(
             wit.map(|w| (w, [&oa[..], &ob[..]])),
             out,
         );
-        // One unit for the pair: its comparison is mostly unmetered, and an
-        // allowance that only saw the meter would never run out between two
-        // pairs. The metered work of the whole unit is taken when the unit
-        // ends (`compare_units`), not again here.
+        // One unit for the pair, so that the allowance runs out between two
+        // pairs even where the meter sees little. `compare_pair` also spends
+        // one `PairCompares` unit, which the end of `compare_units` takes
+        // too: a pair therefore costs 2 in all.
         allowance.take(1);
     }
     pairs
@@ -5661,6 +5665,8 @@ fn compare_pair(
     wit: Option<(&Witnessing, [&[&Term]; 2])>,
     out: &mut Outcome,
 ) {
+    // Counting only: one unit per pair compared.
+    sqldiff_model::work::spend(sqldiff_model::work::Site::PairCompares, 1);
     let (na, nb) = (side_name(a), side_name(b));
     let la = location(a, &x.nodes);
     let lb = location(b, &y.nodes);
@@ -5887,6 +5893,10 @@ pub fn refine_modified(
     let ub = lower::lower_against(b, a.dialect());
     let ia = items(&ua, sa, true, ub.dialect);
     let ib = items(&ub, sb, true, ua.dialect);
+    sqldiff_model::work::spend(
+        sqldiff_model::work::Site::ItemsBuilt,
+        (ia.len() + ib.len()) as u64,
+    );
     // The first item (not a marker) one of whose nodes starts at each byte
     // offset: a finding names its statement by that offset, and a scan of
     // all items per finding was quadratic in a long script.
