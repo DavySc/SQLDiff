@@ -236,7 +236,7 @@ fn a_cut_leaves_the_units_it_does_not_name_as_they_were() {
                 }
             }
             partial |= c.units.iter().any(|u| !reached(u) && proven(u.status))
-                && c.units.iter().any(|u| reached(u));
+                && c.units.iter().any(reached);
         }
         assert!(partial, "{to:?}: no cap cut only part of the file");
     }
