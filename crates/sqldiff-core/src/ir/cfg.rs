@@ -188,12 +188,93 @@ pub struct Route {
     pub resume: NodeId,
 }
 
+/// The handler and the scopes left for every error kind, for one stack of
+/// enclosing frames. Every statement lowered under the same frame stack has
+/// the same one, so they share it (see `NodeRoutes`); only the statement's own
+/// `resume` differs. Immutable once built, and never compared or keyed by
+/// address.
+#[derive(Debug)]
+struct FrameRoutes {
+    /// Every scope left when no handler catches, innermost first: one per
+    /// frame, innermost frame first.
+    unwind: Vec<ScopeId>,
+    /// Per kind, in `ErrorKind::ALL` order: the handler that takes it and how
+    /// many scopes of `unwind` (from the front) are left before it runs; the
+    /// handler's own scope is not among them. A kind no frame catches has no
+    /// handler and leaves all of `unwind`.
+    kinds: Vec<(Option<HandlerRef>, usize)>,
+}
+
+impl FrameRoutes {
+    /// Builds the routes of a frame stack (outermost frame first): for each
+    /// kind the innermost frame whose handler takes it, as the route of a
+    /// statement inside the frames.
+    fn build(prof: &Profile, frames: &[Frame]) -> FrameRoutes {
+        let unwind: Vec<ScopeId> = frames
+            .iter()
+            .rev()
+            .map(|f| match f {
+                Frame::Scope(s) => *s,
+                Frame::Try { scope, .. } | Frame::Handlers { scope, .. } => *scope,
+            })
+            .collect();
+        let kinds = ErrorKind::ALL
+            .iter()
+            .map(|&kind| {
+                for (left, f) in frames.iter().rev().enumerate() {
+                    match f {
+                        Frame::Scope(_) => {}
+                        Frame::Try { scope, catch } => {
+                            if prof.condition_kinds("CATCH").contains(&kind) {
+                                let h = HandlerRef {
+                                    construct: "try_catch",
+                                    entry: *catch,
+                                    scope: *scope,
+                                };
+                                return (Some(h), left);
+                            }
+                        }
+                        Frame::Handlers { scope, handlers } => {
+                            if let Some((_, c, e)) =
+                                handlers.iter().find(|(k, _, _)| k.contains(&kind))
+                            {
+                                let h = HandlerRef {
+                                    construct: c,
+                                    entry: *e,
+                                    scope: *scope,
+                                };
+                                return (Some(h), left);
+                            }
+                        }
+                    }
+                }
+                (None, unwind.len())
+            })
+            .collect();
+        FrameRoutes { unwind, kinds }
+    }
+}
+
+/// The routes of one statement node: the shared handler and unwind of its
+/// frame stack for each error kind, and the statement after it.
+#[derive(Debug, Clone)]
+struct NodeRoutes {
+    /// The statement after the failing one.
+    resume: NodeId,
+    shared: Rc<FrameRoutes>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Node {
     pub op: Op,
     pub syntax: Option<SyntaxNode>,
     pub succ: Vec<(Edge, NodeId)>,
-    pub routes: Vec<(ErrorKind, Route)>,
+    /// A statement's routes, one per `ErrorKind::ALL` in that order; `None`
+    /// for every other node.
+    routes: Option<NodeRoutes>,
+    /// The routes as a test-only oracle builds them, one `Route` per kind.
+    #[cfg(test)]
+    oracle_routes: Vec<(ErrorKind, Route)>,
 }
 
 impl Cfg {
@@ -209,12 +290,7 @@ impl Cfg {
             }
             let node = self.node(n);
             todo.extend(node.succ.iter().map(|(_, t)| *t));
-            for (_, r) in &node.routes {
-                todo.push(r.resume);
-                if let Some(h) = &r.handler {
-                    todo.push(h.entry);
-                }
-            }
+            node.push_route_targets(&mut todo);
         }
         seen
     }
@@ -225,8 +301,45 @@ impl Node {
         self.succ.iter().find(|(x, _)| *x == e).map(|(_, n)| *n)
     }
 
-    pub fn route(&self, k: ErrorKind) -> Option<&Route> {
-        self.routes.iter().find(|(x, _)| *x == k).map(|(_, r)| r)
+    /// Where an error of kind `k` goes from this statement, built from the
+    /// shared part of its frame stack; `None` for a node that is no statement.
+    pub fn route(&self, k: ErrorKind) -> Option<Route> {
+        let r = self.routes.as_ref()?;
+        let i = ErrorKind::ALL.iter().position(|x| *x == k)?;
+        let (handler, left) = &r.shared.kinds[i];
+        Some(Route {
+            handler: handler.clone(),
+            unwind: r.shared.unwind[..*left].to_vec(),
+            resume: r.resume,
+        })
+    }
+
+    /// Pushes onto `out`, for each kind in `ErrorKind::ALL` order, the
+    /// statement after this one and then the entry of the kind's handler if
+    /// it has one: the nodes this one's error routes lead to. The order is
+    /// that of the routes, which the numbering of components follows.
+    pub fn push_route_targets(&self, out: &mut Vec<NodeId>) {
+        if let Some(r) = &self.routes {
+            for (handler, _) in &r.shared.kinds {
+                out.push(r.resume);
+                if let Some(h) = handler {
+                    out.push(h.entry);
+                }
+            }
+        }
+    }
+
+    /// Every route of this node in `ErrorKind::ALL` order, read back from the
+    /// shared routes, to compare with the oracle's.
+    #[cfg(test)]
+    fn all_routes(&self) -> Vec<(ErrorKind, Route)> {
+        match &self.routes {
+            None => Vec::new(),
+            Some(_) => ErrorKind::ALL
+                .iter()
+                .map(|&k| (k, self.route(k).expect("route per kind")))
+                .collect(),
+        }
     }
 
     pub fn stmt(&self) -> Option<&Stmt> {
@@ -347,6 +460,9 @@ enum Frame {
 #[derive(Clone)]
 struct Ctx {
     frames: Vec<Frame>,
+    /// The routes of `frames`, rebuilt whenever a frame is pushed
+    /// (`Lowerer::push_frame`) and shared by every statement lowered here.
+    routes: Rc<FrameRoutes>,
     scope: Option<ScopeId>,
     /// Innermost loop: (head, exit).
     loop_: Option<(NodeId, NodeId)>,
@@ -439,6 +555,7 @@ pub fn lower_routine(
     l.prescan(&scan_root);
     let ctx = Ctx {
         frames: Vec::new(),
+        routes: Rc::new(FrameRoutes::build(prof, &[])),
         scope: None,
         loop_: None,
         labels: Vec::new(),
@@ -515,7 +632,9 @@ impl Lowerer {
             op,
             syntax,
             succ: Vec::new(),
-            routes: Vec::new(),
+            routes: None,
+            #[cfg(test)]
+            oracle_routes: Vec::new(),
         });
         self.nodes.len() - 1
     }
@@ -853,7 +972,7 @@ impl Lowerer {
         // Handlers: lowered with the context outside this block's handlers.
         let mut handlers = Vec::new();
         let mut handler_ctx = inner.clone();
-        handler_ctx.frames.push(Frame::Scope(scope));
+        self.push_frame(&mut handler_ctx, Frame::Scope(scope));
         for h in n.children().filter(|c| c.kind() == SyntaxKind::HANDLER) {
             let words: Vec<String> = ast::header_tokens(&h).iter().take(3).map(upper).collect();
             let construct = match words.get(1).map(String::as_str) {
@@ -906,11 +1025,12 @@ impl Lowerer {
             }
         }
         handlers.sort_by_key(|(k, _, _)| k.len());
-        inner.frames.push(if handlers.is_empty() {
+        let frame = if handlers.is_empty() {
             Frame::Scope(scope)
         } else {
             Frame::Handlers { scope, handlers }
-        });
+        };
+        self.push_frame(&mut inner, frame);
         let units: Vec<SyntaxNode> = ast::structural_children(n)
             .into_iter()
             .filter(|c| {
@@ -1006,7 +1126,7 @@ impl Lowerer {
         self.edge(leave, Edge::Next, next);
         let mut inner = ctx.clone();
         inner.scope = Some(scope);
-        inner.frames.push(Frame::Try { scope, catch });
+        self.push_frame(&mut inner, Frame::Try { scope, catch });
         let try_units: Vec<SyntaxNode> = n
             .children()
             .filter(|c| c.kind() == SyntaxKind::TRY_BLOCK)
@@ -1174,46 +1294,11 @@ impl Lowerer {
         }
     }
 
-    fn resolve(&self, ctx: &Ctx, kind: ErrorKind, resume: NodeId) -> Route {
-        let mut unwind = Vec::new();
-        for f in ctx.frames.iter().rev() {
-            match f {
-                Frame::Scope(s) => unwind.push(*s),
-                Frame::Try { scope, catch } => {
-                    if self.prof.condition_kinds("CATCH").contains(&kind) {
-                        return Route {
-                            handler: Some(HandlerRef {
-                                construct: "try_catch",
-                                entry: *catch,
-                                scope: *scope,
-                            }),
-                            unwind,
-                            resume,
-                        };
-                    }
-                    unwind.push(*scope);
-                }
-                Frame::Handlers { scope, handlers } => {
-                    if let Some((_, c, e)) = handlers.iter().find(|(k, _, _)| k.contains(&kind)) {
-                        return Route {
-                            handler: Some(HandlerRef {
-                                construct: c,
-                                entry: *e,
-                                scope: *scope,
-                            }),
-                            unwind,
-                            resume,
-                        };
-                    }
-                    unwind.push(*scope);
-                }
-            }
-        }
-        Route {
-            handler: None,
-            unwind,
-            resume,
-        }
+    /// Pushes `frame` onto the context's frame stack and rebuilds the routes
+    /// that statements under it share. The frames are fixed after this.
+    fn push_frame(&self, ctx: &mut Ctx, frame: Frame) {
+        ctx.frames.push(frame);
+        ctx.routes = Rc::new(FrameRoutes::build(self.prof, &ctx.frames));
     }
 
     fn statement(&mut self, n: &SyntaxNode, next: NodeId, ctx: &Ctx) -> NodeId {
@@ -1278,13 +1363,23 @@ impl Lowerer {
         if !always_raises {
             self.edge(id, Edge::Next, if is_return { EXIT_OK } else { next });
         }
-        for k in ErrorKind::ALL {
-            let r = self.resolve(ctx, k, next);
+        self.nodes[id].routes = Some(NodeRoutes {
+            resume: next,
+            shared: Rc::clone(&ctx.routes),
+        });
+        for (i, k) in ErrorKind::ALL.into_iter().enumerate() {
             if raises.contains(&k) {
-                let to = r.handler.as_ref().map(|h| h.entry).unwrap_or(EXIT_ERR);
+                let to = ctx.routes.kinds[i]
+                    .0
+                    .as_ref()
+                    .map(|h| h.entry)
+                    .unwrap_or(EXIT_ERR);
                 self.edge(id, Edge::Error(k), to);
             }
-            self.nodes[id].routes.push((k, r));
+            #[cfg(test)]
+            self.nodes[id]
+                .oracle_routes
+                .push((k, resolve_oracle(self.prof, &ctx.frames, k, next)));
         }
         id
     }
@@ -1665,3 +1760,52 @@ fn call_name(n: &SyntaxNode) -> Option<String> {
     let parts = ast::qualified_name_at(&toks, i);
     parts.last().cloned()
 }
+
+/// The route of one error kind from a statement inside `frames`, built the way
+/// every statement used to build its own: a fresh unwind per kind. Kept as the
+/// oracle the shared `FrameRoutes` are compared with.
+#[cfg(test)]
+fn resolve_oracle(prof: &Profile, frames: &[Frame], kind: ErrorKind, resume: NodeId) -> Route {
+    let mut unwind = Vec::new();
+    for f in frames.iter().rev() {
+        match f {
+            Frame::Scope(s) => unwind.push(*s),
+            Frame::Try { scope, catch } => {
+                if prof.condition_kinds("CATCH").contains(&kind) {
+                    return Route {
+                        handler: Some(HandlerRef {
+                            construct: "try_catch",
+                            entry: *catch,
+                            scope: *scope,
+                        }),
+                        unwind,
+                        resume,
+                    };
+                }
+                unwind.push(*scope);
+            }
+            Frame::Handlers { scope, handlers } => {
+                if let Some((_, c, e)) = handlers.iter().find(|(k, _, _)| k.contains(&kind)) {
+                    return Route {
+                        handler: Some(HandlerRef {
+                            construct: c,
+                            entry: *e,
+                            scope: *scope,
+                        }),
+                        unwind,
+                        resume,
+                    };
+                }
+                unwind.push(*scope);
+            }
+        }
+    }
+    Route {
+        handler: None,
+        unwind,
+        resume,
+    }
+}
+
+#[cfg(test)]
+mod route_tests;

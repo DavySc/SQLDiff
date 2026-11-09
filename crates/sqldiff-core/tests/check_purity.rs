@@ -25,6 +25,10 @@
 //! - `behaviour.rs` (`sqldiff-core`) holds a test-only switch that turns its
 //!   explorer and flipped-scenario caches off; results and work counts are
 //!   the same either way.
+//! - `cfg/route_tests.rs` (`sqldiff-core`) is a test module: it reads the
+//!   corpus files (and, in an ignored test, directories named by an
+//!   environment variable) to compare the CFG's shared routes with their
+//!   oracle. It is compiled only for tests.
 //! - `work.rs` (`sqldiff-model`): the per-file work meter, a thread-local
 //!   counter of deterministic events; `SQLDIFF_WORK` only prints it. It
 //!   counts and never changes a result.
@@ -97,6 +101,12 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("sqldiff-equiv/src/equiv/mod.rs", &["OnceCell", "env::var"]),
     ("sqldiff-equiv/src/equiv/schema.rs", &["OnceLock", "fs::"]),
     ("sqldiff-core/src/format/tests.rs", &["fs::"]),
+    // Test-only: reads the corpus and, in an ignored test, the corpora a
+    // developer names.
+    (
+        "sqldiff-core/src/ir/cfg/route_tests.rs",
+        &["env::var", "fs::"],
+    ),
     (
         "sqldiff-core/src/ir/behaviour.rs",
         &["OnceCell", "thread_local!"],
