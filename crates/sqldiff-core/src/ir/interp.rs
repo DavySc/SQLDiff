@@ -362,6 +362,20 @@ impl<T> Drop for Hist<T> {
     }
 }
 
+/// A set that `finish` takes out of a path's state: moved when no sibling
+/// path shares it, otherwise copied (the copy a fork would have made).
+/// `Rc::unwrap_or_clone` needs Rust 1.76 and the MSRV is 1.75.
+fn own<T: Clone>(rc: Rc<T>) -> T {
+    Rc::try_unwrap(rc).unwrap_or_else(|rc| (*rc).clone())
+}
+
+/// One path of the explorer. Sets that a fork copies but rarely changes
+/// (`rows`, `assumptions`, `temp_reads`, `temp`) are `Rc` and shared between
+/// forked paths and checkpoints. Rules for such a field: write only through
+/// `Rc::make_mut` (never `Rc::get_mut(..).unwrap()`); no `Cell`/`RefCell`
+/// inside it; compare by content (`Rc::ptr_eq` at most as a fast path that
+/// implies equal contents); take out of the state with [`own`], not by
+/// reading the strong count.
 #[derive(Debug, Clone)]
 struct State {
     depth: u32,
@@ -375,7 +389,9 @@ struct State {
     /// State of each effect that ran, by key id (see [`Keys`]).
     live: LiveMap,
     log: Vec<Log>,
-    temp: BTreeMap<String, TempState>,
+    /// Shared between forked paths; written only through `State::set_temp`
+    /// (`Rc::make_mut`), compared by content.
+    temp: Rc<BTreeMap<String, TempState>>,
     scopes: Vec<(ScopeId, usize)>,
     savepoints: Vec<(String, usize)>,
     resume: Vec<NodeId>,
@@ -394,7 +410,9 @@ struct State {
     faults_done: BTreeSet<NodeId>,
     before_fault: Option<BeforeFault>,
     faulted: Option<String>,
-    temp_reads: BTreeSet<(NodeId, String, TempState)>,
+    /// Shared between forked paths; written only through `State::read_temp`
+    /// (`Rc::make_mut`), compared by content.
+    temp_reads: Rc<BTreeSet<(NodeId, String, TempState)>>,
     raised: bool,
     ret: Option<String>,
     raising: Option<ErrorKind>,
@@ -404,8 +422,12 @@ struct State {
     imprecise: Hist<Rc<str>>,
     cut: Vec<NodeId>,
     durability_unknown: Option<String>,
-    rows: BTreeSet<String>,
-    assumptions: BTreeSet<String>,
+    /// Shared between forked paths; written only through `Rc::make_mut`
+    /// (`Interp::row`), compared by content.
+    rows: Rc<BTreeSet<String>>,
+    /// Shared between forked paths; written only through `State::assume`
+    /// (`Rc::make_mut`), compared by content.
+    assumptions: Rc<BTreeSet<String>>,
     steps: usize,
     trace: Vec<NodeId>,
     fault_index: Option<usize>,
@@ -414,6 +436,33 @@ struct State {
 }
 
 impl State {
+    /// Notes the assumption `id` for this path. Writes through `Rc::make_mut`
+    /// (a copy only when a sibling still shares the set), and only when `id`
+    /// is new, so a repeated note leaves the set shared.
+    fn assume(&mut self, id: &str) {
+        if !self.assumptions.contains(id) {
+            Rc::make_mut(&mut self.assumptions).insert(id.to_string());
+        }
+    }
+
+    /// Sets the state of temporary table `t`; as [`State::assume`], a write
+    /// that changes nothing leaves the map shared.
+    fn set_temp(&mut self, t: &str, v: TempState) {
+        if self.temp.get(t) != Some(&v) {
+            Rc::make_mut(&mut self.temp).insert(t.to_string(), v);
+        }
+    }
+
+    /// Records that statement `id` read temporary table `t` while it was in
+    /// `state`; as [`State::assume`], a read already recorded leaves the set
+    /// shared.
+    fn read_temp(&mut self, id: NodeId, t: &str, state: TempState) {
+        let r = (id, t.to_string(), state);
+        if !self.temp_reads.contains(&r) {
+            Rc::make_mut(&mut self.temp_reads).insert(r);
+        }
+    }
+
     /// Whether `self` and `b` are in the same *run state*: everything the
     /// step function reads, but for the slots of the effects `spent` (which
     /// no statement can write again) and the log entries that name them,
@@ -473,7 +522,7 @@ impl State {
             || *xact_abort != b.xact_abort
             || *xact_abort_local != b.xact_abort_local
             || *implicit != b.implicit
-            || *temp != b.temp
+            || **temp != *b.temp
             || *resume != b.resume
             || *caught != b.caught
             || *last_error != b.last_error
@@ -1520,21 +1569,21 @@ impl Explorer {
                         }
                     }
                 }
-                let mut assumptions = p.assumptions.clone();
+                let mut assumptions = BTreeSet::clone(&p.assumptions);
                 assumptions.extend(o.assumptions.iter().cloned());
                 if o.unit_commit > 0 && unit_commit == 0 {
                     assumptions.remove("ASM-CALLER-COMMITS");
                 } else if unit_commit > 0 {
                     assumptions.insert("ASM-CALLER-COMMITS".into());
                 }
-                let mut rows = p.rows.clone();
+                let mut rows = BTreeSet::clone(&p.rows);
                 rows.extend(o.rows.iter().cloned());
                 let mut untested = p.untested.clone();
                 untested.extend(o.untested.iter().cloned());
                 // Reads the fault-free path had made that this replay did not
                 // were made at statements that cannot run again (see
                 // `history_covers`), so they are not in `o` for a later read.
-                let mut temp_reads = p.temp_reads.clone();
+                let mut temp_reads = BTreeSet::clone(&p.temp_reads);
                 temp_reads.extend(
                     o.temp_reads
                         .iter()
@@ -1912,9 +1961,9 @@ impl Interp<'_> {
         if st.rows.contains(id) {
             return;
         }
-        st.rows.insert(id.to_string());
+        Rc::make_mut(&mut st.rows).insert(id.to_string());
         if status != Status::Confirmed {
-            st.assumptions.insert(row_assumption_id(fact, id));
+            st.assume(&row_assumption_id(fact, id));
         }
         if status == Status::Unverified {
             st.untested.insert(match fact {
@@ -1942,7 +1991,7 @@ impl Interp<'_> {
             implicit: sc.implicit_transactions,
             live: LiveMap::default(),
             log: Vec::new(),
-            temp: BTreeMap::new(),
+            temp: Rc::new(BTreeMap::new()),
             scopes: Vec::new(),
             savepoints: Vec::new(),
             resume: Vec::new(),
@@ -1956,7 +2005,7 @@ impl Interp<'_> {
             faults_done: BTreeSet::new(),
             before_fault: None,
             faulted: None,
-            temp_reads: BTreeSet::new(),
+            temp_reads: Rc::new(BTreeSet::new()),
             raised: false,
             ret: None,
             raising: None,
@@ -1965,8 +2014,8 @@ impl Interp<'_> {
             imprecise: Hist::new(),
             cut: Vec::new(),
             durability_unknown: None,
-            rows: BTreeSet::new(),
-            assumptions: BTreeSet::new(),
+            rows: Rc::new(BTreeSet::new()),
+            assumptions: Rc::new(BTreeSet::new()),
             steps: 0,
             trace: Vec::new(),
             fault_index: None,
@@ -2013,7 +2062,7 @@ impl Interp<'_> {
                     .or_else(|| sc.commit_level.clone());
                 if self.cfg.commit_level.is_none() && level.is_some() {
                     // Declared in configuration, not stated by the routine.
-                    st.assumptions.insert("ASM-DB2-COMMIT-LEVEL".into());
+                    st.assume("ASM-DB2-COMMIT-LEVEL");
                 }
                 match &level {
                     Some(l) if self.prof.is_no_commit_level(l) => {
@@ -2028,7 +2077,7 @@ impl Interp<'_> {
                     }
                     Some(_) => {}
                     None => {
-                        st.assumptions.insert("ASM-DB2-COMMIT-LEVEL".into());
+                        st.assume("ASM-DB2-COMMIT-LEVEL");
                         st.durability_unknown = Some(
                             "the commit level is not declared and depends on how the routine was created (fact V5)".into(),
                         );
@@ -2055,7 +2104,7 @@ impl Interp<'_> {
             }
         }
         if !sc.caller_txn && self.cfg.routine != RoutineKind::Script {
-            st.assumptions.insert("ASM-NO-CALLER-TXN".into());
+            st.assume("ASM-NO-CALLER-TXN");
         }
         if sc.caller_txn && st.depth > 0 {
             // The caller's own uncommitted work, so its fate can be followed.
@@ -2361,19 +2410,19 @@ impl Interp<'_> {
                 return Step::Go(EXIT_OK, st);
             }
             Action::Call(_) => {
-                st.assumptions.insert("ASM-CALLEES-NO-TXN-CONTROL".into());
+                st.assume("ASM-CALLEES-NO-TXN-CONTROL");
             }
             Action::Opaque(what) => st.imprecise.push(format!("{what} is not modelled").into()),
             Action::Report => {
                 st.raised = true;
-                st.assumptions.insert("ASM-ERROR-CONTINUES-WARNING".into());
+                st.assume("ASM-ERROR-CONTINUES-WARNING");
             }
             Action::None => {}
         }
         // Temporary objects read before this statement writes.
         for t in &s.temp_reads {
             let state = st.temp.get(t).copied().unwrap_or(TempState::Empty);
-            st.temp_reads.insert((id, t.clone(), state));
+            st.read_temp(id, t, state);
         }
         for e in &s.effects {
             match &e.temp {
@@ -2402,7 +2451,7 @@ impl Interp<'_> {
 
     fn write_temp(&self, st: &mut State, t: &str) {
         let prev = st.temp.get(t).copied().unwrap_or(TempState::Empty);
-        st.temp.insert(t.to_string(), TempState::Rows);
+        st.set_temp(t, TempState::Rows);
         let Some(obj) = self.cfg.temps.get(t) else {
             return;
         };
@@ -2423,7 +2472,7 @@ impl Interp<'_> {
         }
         for (t, obj) in &self.cfg.temps {
             if obj.on_commit == "empty" {
-                st.temp.insert(t.clone(), TempState::Empty);
+                st.set_temp(t, TempState::Empty);
             }
         }
         st.savepoints.clear();
@@ -2445,7 +2494,7 @@ impl Interp<'_> {
                     } else {
                         prev
                     };
-                    st.temp.insert(t, v);
+                    st.set_temp(&t, v);
                 }
                 None => break,
             }
@@ -2460,7 +2509,7 @@ impl Interp<'_> {
         st.savepoints.clear();
         for (t, obj) in &self.cfg.temps {
             if obj.on_rollback == "empty" && !st.no_commit {
-                st.temp.insert(t.clone(), TempState::Empty);
+                st.set_temp(t, TempState::Empty);
             }
         }
     }
@@ -2705,8 +2754,7 @@ impl Interp<'_> {
         let s = node.stmt().expect("statement node");
         st.last_error = Some(kind);
         if self.cfg.dialect == Dialect::Tsql && !st.xact_abort_local && !self.sc.xact_abort {
-            st.assumptions
-                .insert("ASM-TSQL-CALLER-XACT-ABORT-OFF".into());
+            st.assume("ASM-TSQL-CALLER-XACT-ABORT-OFF");
         }
         let sit = self.situation(&st);
         let route = node.route(kind).expect("route per kind");
@@ -2780,7 +2828,7 @@ impl Interp<'_> {
                     let k = self.keys.id(&e.key);
                     self.write(&mut st, k);
                     st.partial.insert(e.key.clone());
-                    st.assumptions.insert("ASM-MULTI-ROW".into());
+                    st.assume("ASM-MULTI-ROW");
                 }
             }
         }
@@ -2913,7 +2961,7 @@ impl Interp<'_> {
             fates.push((i as u32, fate_code(Some(fate))));
         }
         if unit_commit > 0 {
-            st.assumptions.insert("ASM-CALLER-COMMITS".into());
+            st.assume("ASM-CALLER-COMMITS");
         }
         let (effects, open) = if sparse {
             (
@@ -2944,7 +2992,7 @@ impl Interp<'_> {
             before_fault: st.before_fault.unwrap_or_default(),
             faulted: st.faulted,
             fault_hit: !st.faults_done.is_empty(),
-            temp_reads: st.temp_reads,
+            temp_reads: own(st.temp_reads),
             raised: st.raised,
             depth: st.depth,
             left_open,
@@ -2953,8 +3001,8 @@ impl Interp<'_> {
             imprecise: st.imprecise.to_vec(),
             cut: st.cut,
             durability_unknown: st.durability_unknown,
-            rows: st.rows,
-            assumptions: st.assumptions,
+            rows: own(st.rows),
+            assumptions: own(st.assumptions),
             untested: st.untested,
             unit_commit,
         }
