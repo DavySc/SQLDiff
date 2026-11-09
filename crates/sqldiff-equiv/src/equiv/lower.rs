@@ -86,10 +86,20 @@ pub struct Local {
 }
 
 /// One data statement of the body.
+///
+/// It does not own its token list (that was a deep copy of what
+/// [`tokens_shared`](super::ast::tokens_shared) computes for `node`, held for
+/// the life of the unit). It keeps what identifies the tokens, `node` and
+/// `tok_from`, and [`LStmt::toks`] re-tokenises on demand: the tokens of
+/// `node` from index `tok_from`, which are exactly the tokens the statement
+/// was lowered from (all of them, or for a `CREATE VIEW name AS query` unit
+/// the query after `AS`).
 #[derive(Debug, Clone)]
 pub struct LStmt {
     pub node: SyntaxNode,
-    pub toks: Vec<Tok>,
+    /// Index into the tokens of `node` where the statement's own tokens start:
+    /// 0, or the position after `AS` for the query of a `CREATE VIEW`.
+    pub tok_from: usize,
     pub ast: Result<Stmt, String>,
     /// PostgreSQL declaration-section initializers are lowered as assignments.
     pub from_declare: bool,
@@ -102,6 +112,51 @@ pub struct LStmt {
     /// A statement of a cursor loop (`cursor.rs`; `ast` then says why it is
     /// not a plain statement): compared as `Canon::cursor_op` says.
     pub cursor: Option<CursorOp>,
+}
+
+impl LStmt {
+    /// The statement's tokens: `tokens_shared(&self.node)[self.tok_from..]`.
+    /// A pure function of the node (the cache behind `tokens_shared` never
+    /// changes what it returns), computed on each call, so a caller that needs
+    /// them more than once keeps the result.
+    pub fn toks(&self) -> StmtToks {
+        StmtToks {
+            all: tokens(&self.node),
+            from: self.tok_from,
+        }
+    }
+}
+
+/// The tokens of one [`LStmt`] (see [`LStmt::toks`]): the shared token list
+/// of its node and where the statement's own tokens start in it. It derefs to
+/// that slice.
+pub struct StmtToks {
+    all: std::rc::Rc<[Tok]>,
+    from: usize,
+}
+
+impl std::ops::Deref for StmtToks {
+    type Target = [Tok];
+    fn deref(&self) -> &[Tok] {
+        &self.all[self.from..]
+    }
+}
+
+/// Adds to `into` the names a data statement may write, for
+/// `Unit::dml_words`: when the first token of `toks` (the tokens of a
+/// statement just lowered) is `INSERT`, `UPDATE` or `MERGE`, the lower-case
+/// unquoted text of each of its `Word` and `Quoted` tokens.
+fn note_dml_words(into: &mut std::collections::BTreeSet<String>, toks: &[Tok]) {
+    if toks
+        .first()
+        .is_some_and(|f| matches!(f.up.as_str(), "INSERT" | "UPDATE" | "MERGE"))
+    {
+        for x in toks {
+            if matches!(x.kind, K::Word | K::Quoted) {
+                into.insert(cst::unquote(&x.text).to_lowercase());
+            }
+        }
+    }
 }
 
 /// A message or raised error whose text a format builds: T-SQL
@@ -247,6 +302,14 @@ pub struct Unit {
     pub sql_body: bool,
     pub locals: Vec<Local>,
     pub stmts: Vec<LStmt>,
+    /// The lower-case unquoted text of every `Word` and `Quoted` token of the
+    /// statements of `stmts` whose first token is `INSERT`, `UPDATE` or
+    /// `MERGE`: what `Canon::drops_period` asks of the whole unit, summarised
+    /// at lowering (as distinct names) so that it does not read every
+    /// statement's tokens again for each INSERT into a table with a period.
+    /// Kept equal to the union over `stmts` as they stand (`lower_trigger`,
+    /// the one place that removes a statement, rebuilds it).
+    pub dml_words: std::collections::BTreeSet<String>,
     /// Constructs outside the comparison: (node, description).
     pub uncovered: Vec<(SyntaxNode, String)>,
     /// A script's top-level `CREATE TABLE` statements, with the number of
@@ -414,6 +477,7 @@ fn empty(d: Dialect) -> Unit {
         sql_body: false,
         locals: Vec::new(),
         stmts: Vec::new(),
+        dml_words: Default::default(),
         uncovered: Vec::new(),
         tables: Vec::new(),
         earlier_tables: Vec::new(),
@@ -695,9 +759,10 @@ fn assign_loop(c: &SyntaxNode, u: &mut Unit) -> bool {
         it.assign = Some(v.to_lowercase());
         it.alias = None;
     }
+    note_dml_words(&mut u.dml_words, &tokens(c));
     u.stmts.push(LStmt {
         node: c.clone(),
-        toks: tokens(c).to_vec(),
+        tok_from: 0,
         ast: Ok(Stmt::Select(sel)),
         from_declare: false,
         msg: None,
@@ -1058,6 +1123,13 @@ pub fn lower_trigger(d: Dialect, body: &SyntaxNode, ctx: TrigCtx) -> Unit {
     };
     if returns_last(&u) {
         u.stmts.pop();
+        // The one place a statement is removed: the summary is the union over
+        // the statements that remain.
+        let mut words = std::collections::BTreeSet::new();
+        for s in &u.stmts {
+            note_dml_words(&mut words, &s.toks());
+        }
+        u.dml_words = words;
     } else if d == Dialect::Postgres {
         u.uncovered.push((
             body.clone(),
@@ -2274,9 +2346,10 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         if let Some(sev) = msg.as_ref().and_then(|m| m.severity.clone()) {
             return by_severity(c, u, ast, msg.unwrap(), sev);
         }
+        note_dml_words(&mut u.dml_words, &tokens(c));
         u.stmts.push(LStmt {
             node: c.clone(),
-            toks: tokens(c).to_vec(),
+            tok_from: 0,
             ast,
             from_declare: false,
             msg,
@@ -2399,9 +2472,10 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                 ast = Ok(Stmt::Assign(target, init.clone()));
                 from_declare = true;
             }
+            note_dml_words(&mut u.dml_words, &toks);
             u.stmts.push(LStmt {
                 node: c.clone(),
-                toks: toks.to_vec(),
+                tok_from: 0,
                 ast,
                 from_declare,
                 msg: None,
@@ -2475,12 +2549,13 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                                 matches!(t.kind, K::Dot | K::Word | K::Quoted) || t.text == "/"
                             })) =>
                 {
-                    let body: Vec<Tok> = toks[at + 1..].to_vec();
-                    let ast = parse_stmt_lowered(&body, d);
+                    let body = &toks[at + 1..];
+                    let ast = parse_stmt_lowered(body, d);
                     u.kind = UnitKind::View;
+                    note_dml_words(&mut u.dml_words, body);
                     u.stmts.push(LStmt {
                         node: c.clone(),
-                        toks: body,
+                        tok_from: at + 1,
                         ast,
                         from_declare: false,
                         msg: None,
@@ -2602,9 +2677,10 @@ fn result_open(c: &SyntaxNode, u: &mut Unit) -> bool {
         after_return,
         cursor: Some(n),
     });
+    note_dml_words(&mut u.dml_words, &toks);
     u.stmts.push(LStmt {
         node: c.clone(),
-        toks: toks.to_vec(),
+        tok_from: 0,
         ast,
         from_declare: false,
         msg: None,
@@ -2674,9 +2750,10 @@ fn cursor_stmt(c: &SyntaxNode, u: &mut Unit) -> bool {
         // DEALLOCATE: compared with the CLOSE (`linked`).
         return true;
     };
+    note_dml_words(&mut u.dml_words, &tokens(c));
     u.stmts.push(LStmt {
         node: c.clone(),
-        toks: tokens(c).to_vec(),
+        tok_from: 0,
         ast: Err("a cursor statement".into()),
         from_declare: false,
         msg: None,
@@ -2904,9 +2981,10 @@ fn is_create_ddl(c: &SyntaxNode, d: Dialect) -> bool {
 /// conversion writes: `if(@severity > 10)` the error, `else` the message.
 fn by_severity(c: &SyntaxNode, u: &mut Unit, ast: Result<Stmt, String>, m: Msg, sev: Expr) {
     let cond = Expr::Bin(">".into(), Box::new(sev), Box::new(Expr::Num("10".into())));
+    note_dml_words(&mut u.dml_words, &tokens(c));
     let stmt = |error: bool| LStmt {
         node: c.clone(),
-        toks: tokens(c).to_vec(),
+        tok_from: 0,
         ast: ast.clone(),
         from_declare: false,
         msg: Some(Msg { error, ..m.clone() }),
@@ -3304,9 +3382,10 @@ fn pg_declaration(s: &SyntaxNode, u: &mut Unit) {
             Err("trailing tokens".into())
         }
     });
+    note_dml_words(&mut u.dml_words, &toks);
     u.stmts.push(LStmt {
         node: s.clone(),
-        toks: toks.to_vec(),
+        tok_from: 0,
         ast,
         from_declare: true,
         msg: None,

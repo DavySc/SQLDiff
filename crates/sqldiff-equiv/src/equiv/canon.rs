@@ -1146,7 +1146,12 @@ impl<'a> Canon<'a> {
     }
 
     /// Whether the unit switches `t`'s versioning, or writes (or may write:
-    /// a data statement naming the column) one of its period columns.
+    /// a data statement naming the column) one of its period columns. The
+    /// second half asks whether any `Word` or `Quoted` token of a statement
+    /// that starts with INSERT, UPDATE or MERGE names a period column
+    /// (compared lower-case and unquoted); `Unit::dml_words` holds exactly
+    /// those names, summarised at lowering, so no statement's tokens are read
+    /// here.
     fn drops_period(&self, t: &super::schema::Table) -> bool {
         let switched = self.unit.calls.iter().any(|(node, _)| {
             matches!(
@@ -1161,20 +1166,10 @@ impl<'a> Canon<'a> {
             .filter(|c| c.period)
             .map(|c| c.name.as_str())
             .collect();
-        switched
-            || self.unit.stmts.iter().any(|s| {
-                s.toks
-                    .first()
-                    .is_some_and(|f| matches!(f.up.as_str(), "INSERT" | "UPDATE" | "MERGE"))
-                    && s.toks.iter().any(|x| {
-                        matches!(x.kind, super::ast::K::Word | super::ast::K::Quoted)
-                            && period.contains(
-                                &sqldiff_syntax::ast::unquote(&x.text)
-                                    .to_lowercase()
-                                    .as_str(),
-                            )
-                    })
-            })
+        let found = switched || period.iter().any(|p| self.unit.dml_words.contains(*p));
+        #[cfg(test)]
+        super::lower_tests::drops_period_agrees(self.unit, &period, switched, found);
+        found
     }
 
     fn sym(&self, name: &str) -> Option<(Term, Option<Ty>)> {
