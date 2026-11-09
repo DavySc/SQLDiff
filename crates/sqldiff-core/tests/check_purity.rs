@@ -35,6 +35,10 @@
 //! - `lower_tests.rs` (`sqldiff-equiv`) is a test module: it reads the corpus
 //!   files to compare the per-unit summary of `drops_period` with the scan of
 //!   every statement's tokens it replaced. It is compiled only for tests.
+//! - `interp/cursor_oracle.rs` (`sqldiff-core`) is a test module: it compares
+//!   the merge test's restored cursor machine with the walk it replaced, only
+//!   while a test turns it on, and counts what it checked, both in
+//!   thread-locals. It is compiled only for tests and changes no result.
 //! - `work.rs` (`sqldiff-model`): the per-file work meter, a thread-local
 //!   counter of deterministic events; `SQLDIFF_WORK` only prints it. It
 //!   counts and never changes a result.
@@ -118,6 +122,11 @@ const ALLOWED: &[(&str, &[&str])] = &[
     (
         "sqldiff-equiv/src/equiv/lower_tests.rs",
         &["fs::", "thread_local!"],
+    ),
+    // Test-only: the oracle's on/off switch and its counter.
+    (
+        "sqldiff-core/src/ir/interp/cursor_oracle.rs",
+        &["thread_local!"],
     ),
     ("sqldiff-core/src/format/tests.rs", &["fs::"]),
     // Test-only: reads the corpus and, in an ignored test, the corpora a
