@@ -837,15 +837,17 @@ fn convert_kept(
     for ((held, secs), core) in results.into_iter().zip(cores) {
         let mut c = match held {
             Held::Whole(c) => *c,
-            Held::Stored { key, .. } => match cache.as_ref().and_then(|c| c.store.get(&key)) {
-                Some((c, ..)) => c,
-                None => {
-                    return Err(format!(
-                        "the stored result {} is gone or unreadable; run again",
-                        key.as_str()
-                    ))
+            Held::Stored { key, .. } => {
+                match cache.as_ref().and_then(|c| c.store.get_without_units(&key)) {
+                    Some((c, ..)) => c,
+                    None => {
+                        return Err(format!(
+                            "the stored result {} is gone or unreadable; run again",
+                            key.as_str()
+                        ))
+                    }
                 }
-            },
+            }
         };
         finish.trim(&mut c);
         core.restore(&mut c);
