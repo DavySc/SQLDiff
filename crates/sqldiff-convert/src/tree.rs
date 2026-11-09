@@ -1670,29 +1670,26 @@ fn convert_files(
         // Shared but whole while it is compared and stored; trimmed after.
         finish.share(&mut c);
         let secs = t.elapsed().as_secs_f64();
-        // The stored conversion of a sampled file is read now, after the
-        // check, so it is not held through it. The mix is the one read
+        // The stored conversion of a sampled file is compared now, after the
+        // check, one element at a time (`Store::recheck`), so it is neither
+        // held through the check nor built whole. The mix is the one read
         // before (the one `same` was decided on).
         if let Some((cc, k, _, old_mix)) = &stored {
-            match cc.store.get(k) {
-                Some((mut old, ..)) => {
-                    finish.share(&mut old);
-                    if !crate::store::compare(&old, &c) || *old_mix != mix {
-                        cc.store.bundle(k, &old, &c);
-                        mismatch.lock().unwrap().push(format!(
-                            "{}: the stored result {} differs from a fresh check of the same \
-                             input; both are in {}/{}.json. The store is emptied: run again.",
-                            input.rel,
-                            k.as_str(),
-                            crate::store::MISMATCH_DIR,
-                            k.as_str()
-                        ));
-                    }
+            match cc.store.recheck(k, &mut c, *old_mix != mix) {
+                crate::store::Rechecked::Same => {}
+                crate::store::Rechecked::Differs => {
+                    mismatch.lock().unwrap().push(format!(
+                        "{}: the stored result {} differs from a fresh check of the same \
+                         input; both are in {}/{}.json. The store is emptied: run again.",
+                        input.rel,
+                        k.as_str(),
+                        crate::store::MISMATCH_DIR,
+                        k.as_str()
+                    ));
                 }
-                None => {
+                crate::store::Rechecked::Unread => {
                     // It read as present before the check and does not read
                     // back whole now: a mismatch, not a miss.
-                    cc.store.bundle_unread(k, &c);
                     mismatch.lock().unwrap().push(format!(
                         "{}: the stored result {} was present before a fresh check of the same \
                          input and does not read back whole after it; the fresh result is in \
@@ -2314,22 +2311,18 @@ fn convert_templates(
         // Shared but whole while it is compared and stored; trimmed after.
         finish.share(&mut c);
         if let Some((cc, k, _)) = &stored {
-            match cc.store.get(k) {
-                Some((mut old, ..)) => {
-                    finish.share(&mut old);
-                    if !crate::store::compare(&old, &c) {
-                        cc.store.bundle(k, &old, &c);
-                        mismatch.lock().unwrap().push(format!(
-                            "{name}: the stored result {} differs from a fresh check of the \
-                             same input; both are in {}/{}.json. The store is emptied: run again.",
-                            k.as_str(),
-                            crate::store::MISMATCH_DIR,
-                            k.as_str()
-                        ));
-                    }
+            match cc.store.recheck(k, &mut c, false) {
+                crate::store::Rechecked::Same => {}
+                crate::store::Rechecked::Differs => {
+                    mismatch.lock().unwrap().push(format!(
+                        "{name}: the stored result {} differs from a fresh check of the \
+                         same input; both are in {}/{}.json. The store is emptied: run again.",
+                        k.as_str(),
+                        crate::store::MISMATCH_DIR,
+                        k.as_str()
+                    ));
                 }
-                None => {
-                    cc.store.bundle_unread(k, &c);
+                crate::store::Rechecked::Unread => {
                     mismatch.lock().unwrap().push(format!(
                         "{name}: the stored result {} was present before a fresh check of the \
                          same input and does not read back whole after it; the fresh result is \

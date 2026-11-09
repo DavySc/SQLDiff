@@ -1176,6 +1176,116 @@ impl Store {
         }
     }
 
+    /// Whether the stored result under `key` serialises as `fresh`, without
+    /// building the stored [`Conversion`]: the file is read and its digest
+    /// and key checked as [`Store::get`] does, and its `conversion` is
+    /// followed by a streaming deserialiser. `fresh` is borrowed mutably only
+    /// to move its three big arrays out for the call; they are put back on
+    /// every path.
+    ///
+    /// **Why this equals `compare(&get(key), fresh)`.** `to_vec` of a
+    /// [`Conversion`] is the concatenation of its fields in declared order,
+    /// and `Conversion` and [`sqldiff_model::model::Report`] are plain
+    /// derived structs (no `flatten`, no untagged enum, no hand-written
+    /// `Serialize`; `skip_serializing_if` decides from the field's own
+    /// value). Let `lean` be a conversion with `units`, `report.findings` and
+    /// `output_check.findings` emptied. The text of a conversion is the text
+    /// of its `lean` with each of those three `[]` replaced by the array's
+    /// text, and an array's text is `[`, its elements' texts joined by `,`,
+    /// `]`. Every text is a JSON value, which splits into its parts in only
+    /// one way, so two conversions serialise alike exactly when their `lean`s
+    /// do and each of the three arrays has the same length and every pair of
+    /// elements serialises alike. That is what is checked: the arrays one
+    /// element at a time (each decoded through the same steps `get` applies:
+    /// pool markers expanded, a unit's note indices replaced from the table
+    /// of notes, `from_value` into the element's type), and the `lean` of the
+    /// stored side built from the other members with the same steps and
+    /// `from_value::<Conversion>`. An array the file lacks counts as empty
+    /// where `from_value` accepts that.
+    ///
+    /// [`Streamed::Undecided`] when the file cannot be followed (another
+    /// order of keys than `put` writes, a part that does not decode, a wrong
+    /// key or digest): the caller then uses `get`.
+    pub fn compare_streamed(&self, key: &Key, fresh: &mut Conversion) -> Streamed {
+        let Ok(path) = crate::tree::dest_under(&self.out, &Self::rel(key)) else {
+            return Streamed::Undecided;
+        };
+        let Ok(raw) = std::fs::read(path) else {
+            return Streamed::Undecided;
+        };
+        let Some(body) = verified_body(&raw) else {
+            return Streamed::Undecided;
+        };
+        let taken = Taken::new(fresh);
+        let mut ctx = Ctx {
+            key: &key.0,
+            units: &taken.units,
+            report: &taken.report,
+            output: &taken.output,
+            pool: None,
+            table: None,
+            different: false,
+            seen: [false; 3],
+            rest: serde_json::Map::new(),
+        };
+        let mut de = serde_json::Deserializer::from_slice(body);
+        let read = serde::de::DeserializeSeed::deserialize(EntrySeed { ctx: &mut ctx }, &mut de)
+            .and_then(|()| de.end());
+        if ctx.different {
+            return Streamed::Different;
+        }
+        if read.is_err() {
+            return Streamed::Undecided;
+        }
+        for (which, seen) in [Arr::Units, Arr::Report, Arr::Output]
+            .into_iter()
+            .zip(ctx.seen)
+        {
+            if !seen && ctx.len(which) != 0 {
+                return Streamed::Different;
+            }
+        }
+        let rest = std::mem::take(&mut ctx.rest);
+        let Ok(lean) = serde_json::from_value::<Conversion>(serde_json::Value::Object(rest)) else {
+            return Streamed::Undecided;
+        };
+        if compare(&lean, &*taken.c) {
+            Streamed::Equal
+        } else {
+            Streamed::Different
+        }
+    }
+
+    /// Compares the stored result under `key` with the `fresh` check of the
+    /// same input after it. `other_differs` is a difference found elsewhere
+    /// (the mix), which makes it a mismatch whatever the conversions say.
+    /// The stored conversion is followed by [`Store::compare_streamed`],
+    /// never built; only when that finds a difference, cannot decide, or
+    /// `other_differs` is set is the whole result read ([`Store::get`]), and
+    /// a mismatch is bundled with both sides as before. A result that
+    /// passed [`Store::peek`] and does not read back whole is
+    /// [`Rechecked::Unread`], a mismatch, not a miss.
+    pub fn recheck(&self, key: &Key, fresh: &mut Conversion, other_differs: bool) -> Rechecked {
+        let streamed = self.compare_streamed(key, fresh);
+        if streamed == Streamed::Equal && !other_differs {
+            return Rechecked::Same;
+        }
+        match self.get(key) {
+            None => {
+                self.bundle_unread(key, fresh);
+                Rechecked::Unread
+            }
+            Some((old, ..)) => {
+                if streamed == Streamed::Undecided && !other_differs && compare(&old, fresh) {
+                    Rechecked::Same
+                } else {
+                    self.bundle(key, &old, fresh);
+                    Rechecked::Differs
+                }
+            }
+        }
+    }
+
     /// Writes what a mismatch found when a stored result was present before
     /// a fresh check and did not read back whole after it: the fresh result,
     /// and `null` for the stored one.
@@ -1202,11 +1312,14 @@ impl Store {
 struct Expect<'a> {
     expect: &'a [u8],
     at: usize,
+    /// Set when the writer failed because the bytes differ.
+    broke: bool,
 }
 
 impl std::io::Write for Expect<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if self.expect.get(self.at..self.at + buf.len()) != Some(buf) {
+            self.broke = true;
             return Err(std::io::Error::other("differs"));
         }
         self.at += buf.len();
@@ -1230,8 +1343,324 @@ pub fn compare(stored: &Conversion, fresh: &Conversion) -> bool {
     let mut w = Expect {
         expect: &buf,
         at: 0,
+        broke: false,
     };
     serde_json::to_writer(&mut w, fresh).is_ok() && w.at == buf.len()
+}
+
+/// What [`Store::compare_streamed`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Streamed {
+    /// Every part serialises as the fresh one: [`compare`] would say equal.
+    Equal,
+    /// Some part serialises differently (or an array has another length).
+    Different,
+    /// The file could not be followed (it is not in the order `put` writes
+    /// it, a part does not decode, the key or digest is wrong, ...). Nothing
+    /// is known; the caller reads the whole result with [`Store::get`].
+    Undecided,
+}
+
+/// How [`Store::recheck`] found a stored result against the fresh one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rechecked {
+    Same,
+    /// The stored result differs; both are in the mismatch bundle.
+    Differs,
+    /// The stored result was present but does not read back whole; the fresh
+    /// one is in the mismatch bundle.
+    Unread,
+}
+
+/// `Ok(true)` when `stored` serialises as `fresh`, byte for byte. `Err` when
+/// the fresh side does not serialise, which only the whole comparison
+/// ([`compare`]) judges.
+fn same_bytes<T: Serialize>(stored: &T, fresh: Option<&T>) -> Result<bool, ()> {
+    let Some(fresh) = fresh else {
+        return Ok(false);
+    };
+    let buf = serde_json::to_vec(fresh).map_err(|_| ())?;
+    let mut w = Expect {
+        expect: &buf,
+        at: 0,
+        broke: false,
+    };
+    Ok(serde_json::to_writer(&mut w, stored).is_ok() && w.at == buf.len())
+}
+
+#[derive(Clone, Copy)]
+enum Arr {
+    Units = 0,
+    Report = 1,
+    Output = 2,
+}
+
+/// The state of one streamed comparison: the fresh conversion's three big
+/// arrays, the pool and the table of notes read so far, and the small rest
+/// of the stored conversion.
+struct Ctx<'t> {
+    key: &'t str,
+    units: &'t [crate::Unit],
+    report: &'t [sqldiff_model::model::Finding],
+    output: &'t [sqldiff_model::model::Finding],
+    pool: Option<Vec<String>>,
+    table: Option<Vec<serde_json::Value>>,
+    different: bool,
+    seen: [bool; 3],
+    rest: serde_json::Map<String, serde_json::Value>,
+}
+
+fn bad<E: serde::de::Error>(what: &str) -> E {
+    E::custom(what)
+}
+
+impl Ctx<'_> {
+    fn len(&self, which: Arr) -> usize {
+        match which {
+            Arr::Units => self.units.len(),
+            Arr::Report => self.report.len(),
+            Arr::Output => self.output.len(),
+        }
+    }
+
+    fn expand(&self, v: &mut serde_json::Value) -> Option<()> {
+        expand(v, self.pool.as_deref()?)
+    }
+
+    /// Decodes element `i` of an array exactly as [`Store::get`] decodes it
+    /// (pool markers expanded, a unit's note indices replaced by the notes of
+    /// the table, `from_value` into the element's type) and says whether it
+    /// serialises as the fresh element `i`.
+    fn element(&self, which: Arr, i: usize, mut v: serde_json::Value) -> Result<bool, ()> {
+        self.expand(&mut v).ok_or(())?;
+        match which {
+            Arr::Units => {
+                let table = self.table.as_ref().ok_or(())?;
+                if let Some(notes) = v.get_mut("notes").and_then(|n| n.as_array_mut()) {
+                    for n in notes.iter_mut() {
+                        let at = usize::try_from(n.as_u64().ok_or(())?).map_err(|_| ())?;
+                        *n = table.get(at).ok_or(())?.clone();
+                    }
+                }
+                let u: crate::Unit = serde_json::from_value(v).map_err(|_| ())?;
+                same_bytes(&u, self.units.get(i))
+            }
+            Arr::Report | Arr::Output => {
+                let f: sqldiff_model::model::Finding = serde_json::from_value(v).map_err(|_| ())?;
+                let fresh = if matches!(which, Arr::Report) {
+                    self.report
+                } else {
+                    self.output
+                };
+                same_bytes(&f, fresh.get(i))
+            }
+        }
+    }
+}
+
+/// One of the three big arrays, read element by element.
+struct ArrSeed<'a, 't> {
+    ctx: &'a mut Ctx<'t>,
+    which: Arr,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for ArrSeed<'_, '_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        if std::mem::replace(&mut self.ctx.seen[self.which as usize], true) {
+            return Err(bad("an array twice"));
+        }
+        d.deserialize_seq(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for ArrSeed<'_, '_> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("an array")
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        let mut i = 0usize;
+        while let Some(v) = seq.next_element::<serde_json::Value>()? {
+            match self.ctx.element(self.which, i, v) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.ctx.different = true;
+                    return Err(bad("an element differs"));
+                }
+                Err(()) => return Err(bad("an element does not decode")),
+            }
+            i += 1;
+        }
+        if i != self.ctx.len(self.which) {
+            self.ctx.different = true;
+            return Err(bad("an array has another length"));
+        }
+        Ok(())
+    }
+}
+
+/// `report` or `output_check`: an object whose `findings` array is read
+/// element by element and whose other members are kept as values. The
+/// result has `findings` empty.
+struct ReportSeed<'a, 't> {
+    ctx: &'a mut Ctx<'t>,
+    which: Arr,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for ReportSeed<'_, '_> {
+    type Value = serde_json::Value;
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<serde_json::Value, D::Error> {
+        d.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for ReportSeed<'_, '_> {
+    type Value = serde_json::Value;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a report object")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> Result<serde_json::Value, A::Error> {
+        let mut inner = serde_json::Map::new();
+        while let Some(k) = map.next_key::<String>()? {
+            if k == "findings" {
+                map.next_value_seed(ArrSeed {
+                    ctx: &mut *self.ctx,
+                    which: self.which,
+                })?;
+                inner.insert(k, serde_json::Value::Array(Vec::new()));
+            } else {
+                let mut v: serde_json::Value = map.next_value()?;
+                self.ctx.expand(&mut v).ok_or_else(|| bad("a marker"))?;
+                inner.insert(k, v);
+            }
+        }
+        Ok(serde_json::Value::Object(inner))
+    }
+}
+
+/// The `conversion` of a result: `note_table` first (keys come in byte
+/// order), then everything else. `units` and the two `findings` arrays are
+/// compared element by element and left empty in `ctx.rest`.
+struct ConvSeed<'a, 't> {
+    ctx: &'a mut Ctx<'t>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for ConvSeed<'_, '_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for ConvSeed<'_, '_> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a conversion object")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(k) = map.next_key::<String>()? {
+            match k.as_str() {
+                NOTE_TABLE => {
+                    let mut v: serde_json::Value = map.next_value()?;
+                    self.ctx.expand(&mut v).ok_or_else(|| bad("a marker"))?;
+                    match v {
+                        serde_json::Value::Array(t) if self.ctx.table.is_none() => {
+                            self.ctx.table = Some(t)
+                        }
+                        _ => return Err(bad("the note table")),
+                    }
+                }
+                "units" => {
+                    if self.ctx.table.is_none() {
+                        return Err(bad("units before the note table"));
+                    }
+                    map.next_value_seed(ArrSeed {
+                        ctx: &mut *self.ctx,
+                        which: Arr::Units,
+                    })?;
+                    self.ctx
+                        .rest
+                        .insert(k, serde_json::Value::Array(Vec::new()));
+                }
+                "report" | "output_check" => {
+                    let which = if k == "report" {
+                        Arr::Report
+                    } else {
+                        Arr::Output
+                    };
+                    let v = map.next_value_seed(ReportSeed {
+                        ctx: &mut *self.ctx,
+                        which,
+                    })?;
+                    self.ctx.rest.insert(k, v);
+                }
+                _ => {
+                    let mut v: serde_json::Value = map.next_value()?;
+                    self.ctx.expand(&mut v).ok_or_else(|| bad("a marker"))?;
+                    self.ctx.rest.insert(k, v);
+                }
+            }
+        }
+        if self.ctx.table.is_none() {
+            return Err(bad("no note table"));
+        }
+        Ok(())
+    }
+}
+
+/// The file: `key`, `pool`, `conversion` in the order `put` writes them.
+struct EntrySeed<'a, 't> {
+    ctx: &'a mut Ctx<'t>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for EntrySeed<'_, '_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for EntrySeed<'_, '_> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a result")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let (mut key, mut conversion) = (false, false);
+        while let Some(k) = map.next_key::<String>()? {
+            match k.as_str() {
+                "key" => {
+                    let s: String = map.next_value()?;
+                    if s != self.ctx.key {
+                        return Err(bad("another key"));
+                    }
+                    key = true;
+                }
+                "pool" => self.ctx.pool = Some(map.next_value()?),
+                "conversion" => {
+                    if !key || self.ctx.pool.is_none() || conversion {
+                        return Err(bad("the conversion before the key and the pool"));
+                    }
+                    map.next_value_seed(ConvSeed {
+                        ctx: &mut *self.ctx,
+                    })?;
+                    conversion = true;
+                }
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        if key && conversion {
+            Ok(())
+        } else {
+            Err(bad("an incomplete result"))
+        }
+    }
 }
 
 /// Which stored results to re-check this run: one file in 50 (at least one),
@@ -1843,6 +2272,205 @@ SELECT 1;
             );
             assert!(compare(&back, &c), "{}", p.display());
         }
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// Changes that a fresh check could differ by: one element, an element
+    /// more or fewer, a small field, in each of the three big arrays.
+    fn variants(c: &Conversion) -> Vec<(&'static str, Conversion)> {
+        let mut v: Vec<(&'static str, Conversion)> = vec![("same", c.clone())];
+        let mut add = |name: &'static str, f: &dyn Fn(&mut Conversion)| {
+            let mut d = c.clone();
+            f(&mut d);
+            v.push((name, d));
+        };
+        add("unit changed", &|d| {
+            if let Some(u) = d.units.first_mut() {
+                u.out.end_line += 1;
+            }
+        });
+        add("last unit changed", &|d| {
+            if let Some(u) = d.units.last_mut() {
+                u.src.line += 1;
+            }
+        });
+        add("unit removed", &|d| {
+            d.units.pop();
+        });
+        add("unit added", &|d| {
+            if let Some(u) = d.units.first().cloned() {
+                d.units.push(u);
+            }
+        });
+        add("units cleared", &|d| d.units.clear());
+        add("note changed", &|d| {
+            if let Some(n) = d.units.iter_mut().find_map(|u| u.notes.first_mut()) {
+                n.rule = format!("{}x", n.rule).into();
+            }
+        });
+        add("report finding changed", &|d| {
+            if let Some(f) = d.report.findings.first_mut() {
+                f.fingerprint.push('x');
+            }
+        });
+        add("report finding removed", &|d| {
+            d.report.findings.pop();
+        });
+        add("report finding added", &|d| {
+            if let Some(f) = d.report.findings.first().cloned() {
+                d.report.findings.push(f);
+            }
+        });
+        add("output finding changed", &|d| {
+            if let Some(f) = d.output_check.findings.last_mut() {
+                f.fingerprint.push('x');
+            }
+        });
+        add("output finding removed", &|d| {
+            d.output_check.findings.pop();
+        });
+        add("output finding added", &|d| {
+            if let Some(f) = d.output_check.findings.first().cloned() {
+                d.output_check.findings.push(f);
+            }
+        });
+        add("output text", &|d| d.output.push('x'));
+        add("counts", &|d| d.counts.converted += 1);
+        add("report field", &|d| d.report.tool_version.push('x'));
+        add("output_check field", &|d| {
+            d.output_check.normalizations.push("x".into())
+        });
+        add("unproven", &|d| d.unproven.push("x".into()));
+        add("unplaced", &|d| d.unplaced.push(0));
+        add("from", &|d| d.from.push('x'));
+        v
+    }
+
+    /// The streamed comparison and the whole one (`compare(get(..), ..)`)
+    /// agree, for the corpus and for every variant of it, and the fresh
+    /// conversion is whole afterwards.
+    #[test]
+    fn the_streamed_compare_agrees_with_the_whole_one() {
+        let mut cs = vec![
+            ("src", converted(SRC)),
+            ("notes", fixture_with_notes()),
+            ("empty", converted("")),
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+        for dir in ["pairs", "mutations"] {
+            for e in std::fs::read_dir(root.join(dir)).unwrap().flatten() {
+                let f = e.path().join("tsql.sql");
+                if f.is_file() {
+                    cs.push(("corpus", converted(&std::fs::read_to_string(f).unwrap())));
+                }
+            }
+        }
+        let mut different = 0;
+        for (i, (name, c)) in cs.iter().enumerate() {
+            let (store, key, _, out) = stored(&format!("stream-{i}"), c);
+            let (whole, ..) = store.get(&key).unwrap();
+            for (what, mut fresh) in variants(c) {
+                let before = serde_json::to_vec(&fresh).unwrap();
+                let want = compare(&whole, &fresh);
+                let got = store.compare_streamed(&key, &mut fresh);
+                assert_eq!(
+                    serde_json::to_vec(&fresh).unwrap(),
+                    before,
+                    "{name} {what}: fresh restored"
+                );
+                assert_eq!(
+                    got,
+                    if want {
+                        Streamed::Equal
+                    } else {
+                        Streamed::Different
+                    },
+                    "{name} {what}"
+                );
+                different += usize::from(!want);
+            }
+            let _ = std::fs::remove_dir_all(&out);
+        }
+        assert!(different > 20, "the variants change something: {different}");
+    }
+
+    /// Re-signs `path` after `f` changed its body text, which keeps the
+    /// order of keys `put` writes.
+    fn edit_body(path: &Path, f: impl Fn(&str) -> String) {
+        let raw = std::fs::read(path).unwrap();
+        let body = String::from_utf8(verified_body(&raw).unwrap().to_vec()).unwrap();
+        let new = f(&body);
+        assert_ne!(new, body, "the edit changed nothing");
+        std::fs::write(path, framed(new.as_bytes())).unwrap();
+    }
+
+    #[test]
+    fn a_tampered_stored_result_is_different_or_undecided_never_equal() {
+        let c = fixture_with_notes();
+        let (store, key, path, out) = stored("stream-stored", &c);
+        let mut fresh = c.clone();
+        assert_eq!(store.compare_streamed(&key, &mut fresh), Streamed::Equal);
+        assert_eq!(store.recheck(&key, &mut fresh, false), Rechecked::Same);
+        // A mix that differs is a mismatch whatever the conversions say.
+        assert_eq!(store.recheck(&key, &mut fresh, true), Rechecked::Differs);
+        let good = std::fs::read(&path).unwrap();
+        // One element, a small field, a length, each in the stored file.
+        for (what, f) in [
+            (
+                "a unit",
+                Box::new(|b: &str| b.replacen("\"end_line\":", "\"end_line\":9", 1))
+                    as Box<dyn Fn(&str) -> String>,
+            ),
+            (
+                "a small field",
+                Box::new(|b| b.replacen("\"from\":\"", "\"from\":\"x", 1)),
+            ),
+            (
+                "an array",
+                Box::new(|b| b.replacen("\"units\":[", "\"units\":[null,", 1)),
+            ),
+        ] {
+            std::fs::write(&path, &good).unwrap();
+            edit_body(&path, f);
+            let got = store.compare_streamed(&key, &mut fresh);
+            assert_ne!(got, Streamed::Equal, "{what}");
+            assert_eq!(
+                store.recheck(&key, &mut fresh, false),
+                if store.get(&key).is_some() {
+                    Rechecked::Differs
+                } else {
+                    Rechecked::Unread
+                },
+                "{what}"
+            );
+        }
+        // A unit that is another unit: Different, and it reads back.
+        std::fs::write(&path, &good).unwrap();
+        edit_body(&path, |b| b.replacen("\"end_line\":", "\"end_line\":9", 1));
+        assert_eq!(
+            store.compare_streamed(&key, &mut fresh),
+            Streamed::Different
+        );
+        assert!(store.get(&key).is_some());
+        // The order of keys of a file written through a `Value`: not
+        // followed, and equal when read whole.
+        std::fs::write(&path, &good).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(verified_body(&good).unwrap()).unwrap();
+        std::fs::write(&path, framed(&serde_json::to_vec(&v).unwrap())).unwrap();
+        assert_eq!(
+            store.compare_streamed(&key, &mut fresh),
+            Streamed::Undecided
+        );
+        assert_eq!(store.recheck(&key, &mut fresh, false), Rechecked::Same);
+        // A unit that does not decode: undecided, and a mismatch.
+        std::fs::write(&path, &good).unwrap();
+        edit_body(&path, |b| b.replacen("\"status\":\"", "\"status\":\"zz", 1));
+        assert_eq!(
+            store.compare_streamed(&key, &mut fresh),
+            Streamed::Undecided
+        );
+        assert!(store.get(&key).is_none());
+        assert_eq!(store.recheck(&key, &mut fresh, false), Rechecked::Unread);
         let _ = std::fs::remove_dir_all(&out);
     }
 
