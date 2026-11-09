@@ -650,6 +650,8 @@ impl State {
 /// Pseudo-effect for the caller's pending work in caller-transaction scenarios.
 pub const CALLER: &str = "caller";
 
+#[cfg(test)]
+mod cursor_oracle;
 pub mod pairs;
 
 const MAX_PATHS: usize = 128;
@@ -692,6 +694,20 @@ struct Machine {
     cur: Option<(NodeId, Box<State>)>,
     work: Vec<(NodeId, Rc<State>)>,
     outs: Vec<Outcome>,
+    /// Outcomes made before the first of `outs`, which this machine does not
+    /// hold: a machine restored only to read its current path
+    /// ([`Explorer::machine_at`] with `outs` false) counts them and does not
+    /// copy them. Everything that reads the count goes through
+    /// [`Machine::made`]; nothing may read `outs` as "all outcomes so far"
+    /// on such a machine.
+    ///
+    /// Invariant: this is 0 for every machine whose outcomes are used (the
+    /// result of a replay or a run, a live machine whose join entries record
+    /// `outs.len()`). Such a machine is never made from a restore with
+    /// `outs` false; the `debug_assert`s where outcomes leave a machine
+    /// ([`Explorer::replay`], [`Interp::finish_run`]) and where a live join
+    /// closes an entry ([`Machine::next_node`]) check it.
+    outs_before: usize,
     /// Path joining (see [`Join`]); `None` runs every path to its end.
     join: Option<Join>,
 }
@@ -793,6 +809,16 @@ impl Join {
 const STEP_CUT: &str = "step budget exhausted";
 
 impl Machine {
+    /// How many outcomes the exploration has made so far: those this machine
+    /// holds in `outs` plus those it only counts (`outs_before`). The path
+    /// budget (`tick_path`'s room and fork tests, `Explorer::try_merge`'s
+    /// check against a tick's `work + outs`) reads this and never `outs.len()`,
+    /// so a machine restored without its outcomes decides exactly as one
+    /// that holds them.
+    fn made(&self) -> usize {
+        self.outs_before + self.outs.len()
+    }
+
     /// The node the next step runs, taking the next forked path when the
     /// current one has ended.
     fn next_node(&mut self) -> Option<NodeId> {
@@ -806,6 +832,9 @@ impl Machine {
                 )
             });
             if let Some(j) = self.join.as_mut() {
+                // A live join records `outs.len()` in its entries: only a
+                // machine that holds all its outcomes may be live.
+                debug_assert!(!j.live || self.outs_before == 0);
                 j.close(self.work.len(), &self.outs);
             }
         }
@@ -1104,6 +1133,7 @@ impl Explorer {
                             cur: m.cur.clone(),
                             work: m.work.clone(),
                             outs: Vec::new(),
+                            outs_before: 0,
                             join: m.join.clone(),
                         },
                     ));
@@ -1233,17 +1263,28 @@ impl Explorer {
         it.run()
     }
 
-    /// The fault-free exploration just before tick `t`.
-    fn machine_at(&self, cfg: &Cfg, t: usize) -> Option<Machine> {
-        let (mut at, made, m) = self.checkpoints.iter().rev().find(|(c, _, _)| *c <= t)?;
+    /// The fault-free exploration just before tick `t`, restored from the
+    /// nearest checkpoint at or before `t` and re-run muted from there (the
+    /// ticks the checkpoint spares are not counted). It never fails for a
+    /// tick of the fault-free run: the checkpoint at tick 0 survives every
+    /// thinning.
+    ///
+    /// With `outs` true the machine holds the outcomes made so far (a replay
+    /// returns them). With `outs` false they are counted and not copied
+    /// (`Machine::outs_before`, [`Machine::made`]): the path budget reads only
+    /// how many there are, and the caller reads only the current path and the
+    /// work stack, never the outcomes. Such a machine must not be run to its
+    /// end or have its outcomes used (`debug_assert`ed where they leave a
+    /// machine).
+    fn machine_at(&self, cfg: &Cfg, t: usize, outs: bool) -> Option<Machine> {
+        let (at, made, m) = self.checkpoints.iter().rev().find(|(c, _, _)| *c <= t)?;
         let mut m = m.clone();
-        m.outs = self.outs[..*made].to_vec();
-        let base = Interp {
-            cfg,
-            keys: &self.keys,
-            prof: Profile::of(cfg.dialect),
-            sc: &self.base,
-        };
+        if outs {
+            m.outs = self.outs[..*made].to_vec();
+        } else {
+            m.outs = Vec::new();
+            m.outs_before = *made;
+        }
         // The memo is complete: the re-run only reads it.
         if let Some(j) = m.join.as_mut() {
             j.live = false;
@@ -1253,15 +1294,28 @@ impl Explorer {
         // checkpoints are is not part of the analysis, and the ticks before
         // `t` were counted when the fault-free run was made. A fault scenario
         // is charged what it runs itself, from `t` on.
+        self.rerun(cfg, &mut m, *at, t)?;
+        Some(m)
+    }
+
+    /// Ticks the fault-free machine `m`, which is before tick `at`, up to
+    /// just before tick `t` (`at <= t`), muted. It leaves `m` on a path
+    /// (`next_node` has been called), as `machine_at` does.
+    fn rerun(&self, cfg: &Cfg, m: &mut Machine, mut at: usize, t: usize) -> Option<()> {
+        let base = Interp {
+            cfg,
+            keys: &self.keys,
+            prof: Profile::of(cfg.dialect),
+            sc: &self.base,
+        };
         sqldiff_model::work::muted(|| {
             while at < t {
                 m.next_node()?;
-                base.tick(&mut m);
+                base.tick(&mut *m);
                 at += 1;
             }
             Some(())
-        })?;
-        Some(m)
+        })
     }
 
     /// [`explore`] of `sc`, reusing the fault-free run when `sc` differs from
@@ -1297,7 +1351,7 @@ impl Explorer {
         let Some(&t) = self.first.get(&fault.node) else {
             return kept();
         };
-        let Some(mut m) = self.machine_at(cfg, t) else {
+        let Some(mut m) = self.machine_at(cfg, t, true) else {
             return self.full(cfg, sc);
         };
         if m.next_node() != Some(fault.node) {
@@ -1348,7 +1402,7 @@ impl Explorer {
         for &k in &spent {
             after.extend(&self.key_nodes[k]);
         }
-        let mut cursor: Option<(usize, Machine)> = None;
+        let mut cursor: Option<(usize, Option<Machine>)> = None;
         let mut tries = 0;
         while m.next_node().is_some() {
             let doomed = m.cur.as_ref().is_some_and(|(_, p)| p.doomed);
@@ -1372,11 +1426,24 @@ impl Explorer {
             }
             it.tick(&mut m);
         }
+        // `m` came from `machine_at(.., true)`: it holds all its outcomes.
+        debug_assert_eq!(m.outs_before, 0);
         m.outs
     }
 
     /// The outcomes that replace the rest of the replay `m` if its current
     /// path merges into the fault-free run here.
+    ///
+    /// `cursor` is where this replay has read the fault-free run so far: a
+    /// tick `cu` and, once read there, the machine at `cu`. Reading a
+    /// candidate tick `u >= cu` counts `u - cu` explorer steps (the walk of
+    /// the fault-free run from the cursor to `u`, one step per tick, as it
+    /// was made before the machine was restored) and sets the cursor to `u`.
+    /// The machine is not walked: it is restored from the nearest checkpoint
+    /// at or before `u` without copying the outcomes (`machine_at` with
+    /// `outs` false). Only its current path and the number of outcomes made
+    /// are read. A candidate before the cursor starts it again at `t`. What this proves is unchanged: the compared path is the
+    /// fault-free run's path at `u`, which every re-run of that run reproduces.
     #[allow(clippy::too_many_arguments)]
     fn try_merge(
         &self,
@@ -1387,7 +1454,7 @@ impl Explorer {
         m: &Machine,
         spent: &[usize],
         after: &[NodeId],
-        cursor: &mut Option<(usize, Machine)>,
+        cursor: &mut Option<(usize, Option<Machine>)>,
         tries: &mut usize,
     ) -> Option<Vec<Outcome>> {
         let (node, p) = m.cur.as_ref()?;
@@ -1412,7 +1479,7 @@ impl Explorer {
         // cannot be read again.
         let unreachable = |n: NodeId| c(*node) < c(n) && p.resume.iter().all(|&r| c(r) < c(n));
         let small = small_hash(p);
-        let sum = (m.work.len() + m.outs.len()) as u32;
+        let sum = (m.work.len() + m.made()) as u32;
         let cands = self.at.get(&(*node, p.steps))?;
         for &u in cands {
             let k = self.ticks[u as usize];
@@ -1420,27 +1487,41 @@ impl Explorer {
                 continue;
             }
             *tries += 1;
-            // The fault-free run at tick u.
-            let reuse = matches!(cursor, Some((cu, _)) if *cu <= u as usize);
+            // The fault-free run at tick u. The cursor is a position `cu`
+            // in that run and, when it has been read there, the machine at
+            // `cu` (on its path, `next_node` called). A candidate before the
+            // cursor starts it again at `t`, where the replay left the
+            // fault-free run.
+            let u = u as usize;
+            let reuse = matches!(cursor, Some((cu, _)) if *cu <= u);
             if !reuse {
-                *cursor = Some((t, self.machine_at(cfg, t)?));
-                if let Some((_, cm)) = cursor.as_mut() {
-                    cm.next_node()?;
-                }
+                *cursor = Some((t, None));
             }
-            let (cu, cm) = cursor.as_mut()?;
-            let base = Interp {
-                cfg,
-                keys: &self.keys,
-                prof: Profile::of(cfg.dialect),
-                sc: &self.base,
-            };
-            while *cu < u as usize {
+            let (cu, slot) = cursor.as_mut()?;
+            if u > *cu || slot.is_none() {
+                // The machine at `u`, restored from the nearest checkpoint at
+                // or before `u` (muted; the outcomes are counted, not copied,
+                // see `machine_at`) instead of walked from `cu`. It is the
+                // fault-free machine at `u` whichever way it is made: the run
+                // is deterministic and every re-run of it is non-live, as the
+                // walk this replaces was. The build cannot fail for a tick of
+                // the fault-free run (see `machine_at`); it is made before
+                // anything is charged, so a charge never depends on it.
+                let mut cm = self.machine_at(cfg, u, false)?;
                 cm.next_node()?;
-                base.tick(cm);
-                *cu += 1;
+                // Walking the fault-free run from `cu` to `u` is `u - cu`
+                // steps of this scenario (a tick spends exactly one), counted
+                // as such although the machine was not walked here.
+                sqldiff_model::work::spend(
+                    sqldiff_model::work::Site::ExplorerSteps,
+                    (u - *cu) as u64,
+                );
+                *cu = u;
+                *slot = Some(cm);
             }
-            cm.next_node()?;
+            let cm = slot.as_ref()?;
+            #[cfg(test)]
+            cursor_oracle::check(self, cfg, t, u, cm);
             let (bn, b) = cm.cur.as_ref()?;
             if bn != node || !p.history_covers(b, &unreachable) {
                 continue;
@@ -1765,6 +1846,7 @@ impl Interp<'_> {
             cur: None,
             work: vec![(first, Rc::new(init))],
             outs: Vec::new(),
+            outs_before: 0,
             join: None,
         }
     }
@@ -1773,6 +1855,7 @@ impl Interp<'_> {
         while m.next_node().is_some() {
             self.tick(&mut m);
         }
+        debug_assert_eq!(m.outs_before, 0);
         m.outs
     }
 
@@ -1801,7 +1884,7 @@ impl Interp<'_> {
         }
         // Whether a decision's second branch would be kept (see below).
         let over = m.join.as_ref().is_some_and(|j| j.tick >= JOIN_TICKS);
-        let room = m.work.len() + m.outs.len() + 1 < MAX_PATHS && !over;
+        let room = m.work.len() + m.made() + 1 < MAX_PATHS && !over;
         match self.step_in(node, st, room) {
             Step::Go(n, s) => m.cur = Some((n, s)),
             Step::Pruned(n, mut s, dropped) => {
@@ -1818,7 +1901,7 @@ impl Interp<'_> {
                 // memo, so a size test would stop forking earlier than the
                 // run that made it (`entries are capped where they are made`).
                 let over = m.join.as_ref().is_some_and(|j| j.tick >= JOIN_TICKS);
-                if m.work.len() + m.outs.len() + v.len() < MAX_PATHS && !over {
+                if m.work.len() + m.made() + v.len() < MAX_PATHS && !over {
                     m.work.extend(v.into_iter().map(|(n, s)| (n, Rc::new(*s))));
                 } else {
                     s.imprecise.push("path budget exhausted".into());
