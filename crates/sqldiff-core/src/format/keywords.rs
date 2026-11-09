@@ -140,9 +140,45 @@ pub fn recasable(upper: &str, dialect: Dialect) -> bool {
     }
 }
 
+/// Built-in function and type names, and the literals `TRUE` and `FALSE`,
+/// the formatter may also recase (`COUNT(*)`, `varchar(10)`).
+///
+/// `call` says the word is followed by `(`. A function name counts only
+/// then, so a column called like a function keeps its case. PostgreSQL and
+/// Db2 for i fold every unquoted word, so there a built-in name, type or
+/// literal is always safe. T-SQL compares names under the database
+/// collation, which can be case sensitive, and the engine can show a
+/// recased function or type name harmless only under that assumption, so
+/// the check would keep the statement as written: nothing is recased there
+/// beyond [`recasable`].
+pub fn recasable_name(upper: &str, dialect: Dialect, call: bool) -> bool {
+    use sqldiff_catalog::builtins::{of, Availability};
+    if dialect == Dialect::Tsql {
+        return false;
+    }
+    let b = of(dialect);
+    let known = |a: Availability| !matches!(a, Availability::Unknown);
+    matches!(upper, "TRUE" | "FALSE")
+        || (call && known(b.function(upper, "")))
+        || known(b.data_type(upper, ""))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_names_are_recased_in_postgres_and_db2i_only() {
+        for d in [Dialect::Postgres, Dialect::Db2i] {
+            assert!(recasable_name("COUNT", d, true), "{d:?}");
+            assert!(!recasable_name("COUNT", d, false), "{d:?}: not a call");
+            assert!(recasable_name("VARCHAR", d, false), "{d:?}");
+            assert!(!recasable_name("MY_TABLE", d, true), "{d:?}");
+        }
+        assert!(recasable_name("TRUE", Dialect::Postgres, false));
+        assert!(!recasable_name("COUNT", Dialect::Tsql, true));
+        assert!(!recasable_name("VARCHAR", Dialect::Tsql, false));
+    }
 
     #[test]
     fn tsql_never_recases_unreserved_words() {

@@ -47,6 +47,13 @@ Keyword case is changed only where it cannot change a name:
   or `NOCOUNT`, keeps its case.
 - PostgreSQL and Db2 for i fold unquoted words before looking them up, so
   their keyword list also covers type names and procedural keywords.
+- In PostgreSQL and Db2 for i `keyword_case` also covers built-in function
+  names in call position (`COUNT(*)`, `now()`), built-in type names
+  (`varchar(10)`, `int`) and the literals `TRUE` and `FALSE`. A name that
+  is not followed by `(` is not taken for a function, quoted names and
+  string contents never change. T-SQL keeps the case of function and type
+  names (`COUNT`, `GETDATE`, `int`): only the engine's collation assumption
+  could show the change harmless, so the check would keep the statement.
 - A word next to a dot (`t.select`) or before a colon (a label) is a name
   and keeps its case.
 

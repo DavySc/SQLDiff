@@ -525,3 +525,41 @@ fn keys_from_options_invert_apply() {
     assert!(keys.names().contains(&"indent".to_string()));
     assert!(FormatKeys::default().names().is_empty());
 }
+
+#[test]
+fn builtin_functions_types_and_literals_follow_keyword_case() {
+    let lower = with(|o| o.keyword_case = KeywordCase::Lower);
+    let src = "SELECT COUNT(*), NOW(), TRUE, CAST(a AS VARCHAR(5)), \"Count\", 'COUNT(*)', Count FROM t;\n";
+    let upper_src = "select count(*), now(), true, cast(a as varchar(5)) from t;\n";
+    for d in [Dialect::Postgres, Dialect::Db2i] {
+        let f = format(src, d, &lower);
+        assert!(f.kept.is_empty(), "{d:?}: {:?}", f.kept);
+        // Quoted names and string literals keep their case; a bare name that
+        // is not followed by `(` is not a function call.
+        assert_eq!(
+            f.text,
+            "select count(*), now(), true, cast(a as varchar(5)), \"Count\", 'COUNT(*)', Count\nfrom t;\n",
+            "{d:?}"
+        );
+        let up = format(upper_src, d, &with(|o| o.keyword_case = KeywordCase::Upper));
+        assert!(up.kept.is_empty(), "{d:?}: {:?}", up.kept);
+        assert_eq!(
+            up.text, "SELECT COUNT(*), NOW(), TRUE, CAST(a AS VARCHAR(5))\nFROM t;\n",
+            "{d:?}"
+        );
+    }
+}
+
+#[test]
+fn tsql_function_and_type_names_keep_their_case() {
+    let f = format(
+        "SELECT Count(*), GetDate(), COALESCE(a, 0) FROM t",
+        Dialect::Tsql,
+        &with(|o| o.keyword_case = KeywordCase::Lower),
+    );
+    assert!(f.kept.is_empty(), "{:?}", f.kept);
+    assert_eq!(
+        f.text,
+        "select Count(*), GetDate(), coalesce(a, 0)\nfrom t\n"
+    );
+}

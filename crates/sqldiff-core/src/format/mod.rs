@@ -22,7 +22,7 @@ use sqldiff_syntax::{parse, Dialect, LineIndex, SyntaxElement, SyntaxKind, Synta
 
 use crate::{Artifact, Options, Verdict};
 
-pub use keywords::recasable;
+pub use keywords::{recasable, recasable_name};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -484,16 +484,20 @@ fn verify(
     // 1. The same tokens, in the same order, with the same text; only
     //    recasable keywords may differ in case.
     let (a, b) = (tokens(root), tokens(&new_root));
-    let same = |x: &(SyntaxKind, String), y: &(SyntaxKind, String)| {
+    let same = |k: usize, x: &(SyntaxKind, String), y: &(SyntaxKind, String)| {
         x.0 == y.0
             && (x.1 == y.1
                 || (x.0 == SyntaxKind::IDENT
                     && x.1.is_ascii()
                     && x.1.eq_ignore_ascii_case(&y.1)
-                    && recasable(&x.1.to_ascii_uppercase(), dialect)))
+                    && {
+                        let upper = x.1.to_ascii_uppercase();
+                        let call = a.get(k + 1).is_some_and(|t| t.0 == SyntaxKind::L_PAREN);
+                        recasable(&upper, dialect) || recasable_name(&upper, dialect, call)
+                    }))
     };
     if let Some(k) = (0..a.len().max(b.len())).find(|&k| match (a.get(k), b.get(k)) {
-        (Some(x), Some(y)) => !same(x, y),
+        (Some(x), Some(y)) => !same(k, x, y),
         _ => true,
     }) {
         let tops: BTreeSet<usize> = [k.checked_sub(1).and_then(top_of), top_of(k)]

@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 
 use sqldiff_syntax::{Diagnostic, Dialect, SyntaxElement, SyntaxKind, SyntaxKind::*, SyntaxNode};
 
-use super::keywords::recasable;
+use super::keywords::{recasable, recasable_name};
 use super::{FormatOptions, IndentStyle, KeywordCase};
 
 /// Why a line break goes before a token.
@@ -505,7 +505,11 @@ pub(super) fn keyword_set(text: &str, toks: &[Tok], dialect: Dialect) -> BTreeSe
             continue;
         }
         let w = &text[t.start..t.end];
-        if w.is_ascii() && recasable(&w.to_ascii_uppercase(), dialect) {
+        if !w.is_ascii() {
+            continue;
+        }
+        let upper = w.to_ascii_uppercase();
+        if recasable(&upper, dialect) || recasable_name(&upper, dialect, next_is(L_PAREN)) {
             out.insert(i);
         }
     }
