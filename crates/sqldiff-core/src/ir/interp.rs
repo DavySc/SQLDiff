@@ -1619,12 +1619,7 @@ fn small_hash(st: &State) -> u64 {
 fn successors(cfg: &Cfg, v: NodeId) -> Vec<NodeId> {
     let node = cfg.node(v);
     let mut out: Vec<NodeId> = node.succ.iter().map(|(_, t)| *t).collect();
-    for (_, r) in &node.routes {
-        out.push(r.resume);
-        if let Some(h) = &r.handler {
-            out.push(h.entry);
-        }
-    }
+    node.push_route_targets(&mut out);
     out
 }
 
@@ -2698,7 +2693,7 @@ impl Interp<'_> {
                 .insert("ASM-TSQL-CALLER-XACT-ABORT-OFF".into());
         }
         let sit = self.situation(&st);
-        let route = node.route(kind).cloned().expect("route per kind");
+        let route = node.route(kind).expect("route per kind");
         let rule = match &route.handler {
             Some(h) => self.prof.caught_rule(h.construct, kind, &sit),
             // First matching row in table order; form-specific rows (THROW,
