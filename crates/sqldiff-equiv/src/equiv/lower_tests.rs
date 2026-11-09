@@ -153,7 +153,7 @@ type Source = (String, Dialect, String);
 
 /// The sides of every corpus pair and mutation, the catalog files and the
 /// vendor code, with their dialects, line endings normalised. The path of a
-/// side is `<dir>/<file>`; the sides of one case are consecutive.
+/// side is `corpus/<kind>/<case>/<file>`, always with `/`; the sides of one case are consecutive.
 fn corpus_sources() -> Vec<Source> {
     let mut out: Vec<Source> = Vec::new();
     for kind in ["pairs", "mutations"] {
@@ -167,8 +167,9 @@ fn corpus_sources() -> Vec<Source> {
             let case: toml::Table = read(&dir.join("case.toml")).parse().unwrap();
             for (_, s) in case["sides"].as_table().unwrap() {
                 let file = s["file"].as_str().unwrap();
+                let name = dir.file_name().unwrap().to_string_lossy();
                 out.push((
-                    format!("{}/{file}", dir.display()),
+                    format!("corpus/{kind}/{name}/{file}"),
                     dialect(s["dialect"].as_str().unwrap()),
                     read(&dir.join(file)),
                 ));
