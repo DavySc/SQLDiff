@@ -326,6 +326,64 @@ fn a_stored_result_that_a_fresh_check_contradicts_fails_the_run_and_empties_the_
 }
 
 #[test]
+fn the_sampled_recheck_reports_a_stored_result_that_differs_and_bundles_both() {
+    // One file: the sample is that file. The stored result is read after the
+    // fresh check, and the bundle holds the stored and the fresh result.
+    let f = Fixture::new("sampled-differs", &[("p.sql", PROC)]);
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    let stored = results(&f.out("o"));
+    assert_eq!(stored.len(), 1);
+    let mut e = read_result(&stored[0]);
+    let honest = e["conversion"]["output"].clone();
+    e["conversion"]["output"] = "-- tampered\n".into();
+    write_result(&stored[0], &e);
+    let err = convert_into(&f.job("o", true, false), &Hooks::default())
+        .err()
+        .expect("a mismatch fails the run");
+    assert!(err.contains("differs from a fresh check"), "{err}");
+    assert!(results(&f.out("o")).is_empty(), "the store is emptied");
+    let bundle = std::fs::read_dir(f.out("o").join(".sqldiff/mismatch"))
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path();
+    let b: serde_json::Value = serde_json::from_slice(&std::fs::read(bundle).unwrap()).unwrap();
+    assert_eq!(b["stored"]["output"], "-- tampered\n");
+    assert_eq!(b["fresh"]["output"], honest);
+}
+
+#[test]
+fn the_sampled_recheck_reports_a_stored_result_that_does_not_read_back_as_a_mismatch() {
+    // The digest is right and the key is right, so the file is present when
+    // the sample is decided; its units do not deserialise, so the read after
+    // the fresh check fails. That is a mismatch, not a miss.
+    let f = Fixture::new("sampled-unreadable", &[("p.sql", PROC)]);
+    convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();
+    let stored = results(&f.out("o"));
+    assert_eq!(stored.len(), 1);
+    let mut e = read_result(&stored[0]);
+    e["conversion"]["units"] = serde_json::json!([{"status": "no such status"}]);
+    write_result(&stored[0], &e);
+    let err = convert_into(&f.job("o", true, false), &Hooks::default())
+        .err()
+        .expect("a stored result that does not read back fails the run");
+    assert!(err.contains("does not read back whole"), "{err}");
+    assert!(results(&f.out("o")).is_empty(), "the store is emptied");
+    let bundle = std::fs::read_dir(f.out("o").join(".sqldiff/mismatch"))
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path();
+    let b: serde_json::Value = serde_json::from_slice(&std::fs::read(bundle).unwrap()).unwrap();
+    assert!(b["stored"].is_null() && b["fresh"]["output"].is_string());
+    // The next run works, from nothing.
+    convert_into(&f.job("o", true, false), &Hooks::default()).unwrap();
+    assert_eq!(results(&f.out("o")).len(), 1);
+}
+
+#[test]
 fn a_directory_holding_only_the_store_is_empty_for_a_resume() {
     let f = Fixture::standard("onlystore");
     convert_into(&f.job("o", false, false), &Hooks::default()).unwrap();

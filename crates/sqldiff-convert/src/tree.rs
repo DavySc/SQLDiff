@@ -1564,20 +1564,34 @@ fn convert_files(
         // that lost before can win now, or the other way. A mix is built
         // again from the stored routines (pass-1 cost, no check) and
         // compared; anything else is a miss and the file is checked again.
+        //
+        // A file in the sample is checked again whatever it holds, so its
+        // stored conversion is not read before the check: `Store::peek`
+        // decides presence from the frame, the key and the mix, and the
+        // conversion is read after the check (`Store::get`), where it is
+        // compared. Any other file is reused and is read whole here.
+        let sampled = sample.contains(&idx);
         let stored = match (cache, key) {
-            (Some(c), Some(k)) if !c.fresh => c.store.get(k).and_then(|(r, mix, tried)| {
-                let same = match (&mix, rebuild) {
-                    // No mix was built. That says something only if one
-                    // could have been tried; a result stored under a
-                    // review ledger could not, so a run without one
-                    // checks the file again.
-                    (None, Some(_)) => tried,
-                    (None, None) => true,
-                    (Some(m), Some(rb)) => rb(&m.plain_at).canonical() == m.draft,
-                    (Some(_), None) => false,
+            (Some(c), Some(k)) if !c.fresh => {
+                let seen = if sampled {
+                    c.store.peek(k).map(|(mix, tried)| (None, mix, tried))
+                } else {
+                    c.store.get(k).map(|(r, mix, tried)| (Some(r), mix, tried))
                 };
-                same.then_some((c, k, r, mix))
-            }),
+                seen.and_then(|(r, mix, tried)| {
+                    let same = match (&mix, rebuild) {
+                        // No mix was built. That says something only if one
+                        // could have been tried; a result stored under a
+                        // review ledger could not, so a run without one
+                        // checks the file again.
+                        (None, Some(_)) => tried,
+                        (None, None) => true,
+                        (Some(m), Some(rb)) => rb(&m.plain_at).canonical() == m.draft,
+                        (Some(_), None) => false,
+                    };
+                    same.then_some((c, k, r, mix))
+                })
+            }
             _ => None,
         };
         if stored.is_none() && in_increment.as_ref().is_some_and(|m| !m[idx]) {
@@ -1640,14 +1654,13 @@ fn convert_files(
                     _ => Held::Whole(Box::new(c)),
                 }
             };
-        if let Some((_, k, conv, _)) = &stored {
-            if !sample.contains(&idx) {
-                let mut conv = conv.clone();
-                finish.apply(&mut conv);
-                hooks.file_done(&input.rel, crate::callees::file_status(&conv).label());
-                progress.tick();
-                return Some((hold(conv, Some(k), true, true), 0.0, true, false));
-            }
+        // A file that is not in the sample was read whole above: it is
+        // handed on as it is, not copied.
+        if let Some((_, k, Some(mut conv), _)) = stored {
+            finish.apply(&mut conv);
+            hooks.file_done(&input.rel, crate::callees::file_status(&conv).label());
+            progress.tick();
+            return Some((hold(conv, Some(k), true, true), 0.0, true, false));
         }
         let t = Instant::now();
         // One meter per file, named by the file (`SQLDIFF_WORK=1` prints it).
@@ -1657,19 +1670,39 @@ fn convert_files(
         // Shared but whole while it is compared and stored; trimmed after.
         finish.share(&mut c);
         let secs = t.elapsed().as_secs_f64();
-        if let Some((cc, k, old, old_mix)) = &stored {
-            let mut old = old.clone();
-            finish.share(&mut old);
-            if !crate::store::compare(&old, &c) || *old_mix != mix {
-                cc.store.bundle(k, &old, &c);
-                mismatch.lock().unwrap().push(format!(
-                    "{}: the stored result {} differs from a fresh check of the same input; \
-                     both are in {}/{}.json. The store is emptied: run again.",
-                    input.rel,
-                    k.as_str(),
-                    crate::store::MISMATCH_DIR,
-                    k.as_str()
-                ));
+        // The stored conversion of a sampled file is read now, after the
+        // check, so it is not held through it. The mix is the one read
+        // before (the one `same` was decided on).
+        if let Some((cc, k, _, old_mix)) = &stored {
+            match cc.store.get(k) {
+                Some((mut old, ..)) => {
+                    finish.share(&mut old);
+                    if !crate::store::compare(&old, &c) || *old_mix != mix {
+                        cc.store.bundle(k, &old, &c);
+                        mismatch.lock().unwrap().push(format!(
+                            "{}: the stored result {} differs from a fresh check of the same \
+                             input; both are in {}/{}.json. The store is emptied: run again.",
+                            input.rel,
+                            k.as_str(),
+                            crate::store::MISMATCH_DIR,
+                            k.as_str()
+                        ));
+                    }
+                }
+                None => {
+                    // It read as present before the check and does not read
+                    // back whole now: a mismatch, not a miss.
+                    cc.store.bundle_unread(k, &c);
+                    mismatch.lock().unwrap().push(format!(
+                        "{}: the stored result {} was present before a fresh check of the same \
+                         input and does not read back whole after it; the fresh result is in \
+                         {}/{}.json. The store is emptied: run again.",
+                        input.rel,
+                        k.as_str(),
+                        crate::store::MISMATCH_DIR,
+                        k.as_str()
+                    ));
+                }
             }
         }
         let mut in_store = false;
@@ -2248,17 +2281,25 @@ fn convert_templates(
             Target::File(k) => inputs[k].rel.as_str(),
             Target::Pair(h, _) => inputs[h].rel.as_str(),
         };
+        // A file in the sample is checked again whatever it holds, so its
+        // stored conversion is read after the check (`Store::peek` tells
+        // now whether there is one); any other file is read whole and handed
+        // on as it is.
+        let sampled = sample.contains(&idx);
         let stored = match (cache, key) {
-            (Some(c), Some(k)) if !c.fresh => c.store.get(k).map(|(r, ..)| (c, k, r)),
+            (Some(c), Some(k)) if !c.fresh => {
+                if sampled {
+                    c.store.peek(k).map(|_| (c, k, None))
+                } else {
+                    c.store.get(k).map(|(r, ..)| (c, k, Some(r)))
+                }
+            }
             _ => None,
         };
-        if let Some((_, k, conv)) = &stored {
-            if !sample.contains(&idx) {
-                let mut conv = conv.clone();
-                finish.apply(&mut conv);
-                progress.tick();
-                return Some((Some((*k).clone()), conv, 0.0, true, false));
-            }
+        if let Some((_, k, Some(mut conv))) = stored {
+            finish.apply(&mut conv);
+            progress.tick();
+            return Some((Some(k.clone()), conv, 0.0, true, false));
         }
         if stored.is_none() && in_increment.as_ref().is_some_and(|m| !m[idx]) {
             let mut c =
@@ -2272,18 +2313,32 @@ fn convert_templates(
         let secs = t0.elapsed().as_secs_f64();
         // Shared but whole while it is compared and stored; trimmed after.
         finish.share(&mut c);
-        if let Some((cc, k, old)) = &stored {
-            let mut old = old.clone();
-            finish.share(&mut old);
-            if !crate::store::compare(&old, &c) {
-                cc.store.bundle(k, &old, &c);
-                mismatch.lock().unwrap().push(format!(
-                    "{name}: the stored result {} differs from a fresh check of the same \
-                     input; both are in {}/{}.json. The store is emptied: run again.",
-                    k.as_str(),
-                    crate::store::MISMATCH_DIR,
-                    k.as_str()
-                ));
+        if let Some((cc, k, _)) = &stored {
+            match cc.store.get(k) {
+                Some((mut old, ..)) => {
+                    finish.share(&mut old);
+                    if !crate::store::compare(&old, &c) {
+                        cc.store.bundle(k, &old, &c);
+                        mismatch.lock().unwrap().push(format!(
+                            "{name}: the stored result {} differs from a fresh check of the \
+                             same input; both are in {}/{}.json. The store is emptied: run again.",
+                            k.as_str(),
+                            crate::store::MISMATCH_DIR,
+                            k.as_str()
+                        ));
+                    }
+                }
+                None => {
+                    cc.store.bundle_unread(k, &c);
+                    mismatch.lock().unwrap().push(format!(
+                        "{name}: the stored result {} was present before a fresh check of the \
+                         same input and does not read back whole after it; the fresh result is \
+                         in {}/{}.json. The store is emptied: run again.",
+                        k.as_str(),
+                        crate::store::MISMATCH_DIR,
+                        k.as_str()
+                    ));
+                }
             }
         }
         let mut in_store = None;

@@ -306,6 +306,19 @@ struct LeanEntry {
     mix_tried: bool,
 }
 
+/// [`Entry`] as [`Store::peek`] reads it: the conversion and the pool are
+/// parsed for their syntax only and never built.
+#[derive(Deserialize)]
+struct PeekEntry {
+    key: String,
+    #[allow(dead_code)]
+    pool: serde::de::IgnoredAny,
+    #[allow(dead_code)]
+    conversion: serde::de::IgnoredAny,
+    mix: Option<crate::check::Mix>,
+    mix_tried: bool,
+}
+
 /// The body of a result file: the file is the SHA-256 of its body in hex, a
 /// newline, then the body. A file edited after it was written (even into
 /// other valid JSON) does not match its digest and is a miss, so it is
@@ -803,6 +816,8 @@ impl Store {
         let raw = std::fs::read(path).ok()?;
         let body = verified_body(&raw)?;
         let mut e: Entry = serde_json::from_slice(body).ok()?;
+        // The text is not needed once it is parsed.
+        drop(raw);
         if e.key != key.0 {
             return None;
         }
@@ -810,6 +825,27 @@ impl Store {
         unshare_notes(&mut e.conversion)?;
         let conversion = serde_json::from_value(e.conversion).ok()?;
         Some((conversion, e.mix, e.mix_tried))
+    }
+
+    /// The `mix` and `mix_tried` of a result stored under `key` that passes
+    /// the frame and key checks of [`Store::get`], without building the
+    /// conversion: the file is read, its digest and key are checked, and the
+    /// conversion and the pool are only skipped over. The re-check of a
+    /// sampled file decides from this whether a stored result exists before
+    /// its fresh check, and reads the conversion (`get`) after it, so the
+    /// stored conversion is not held through the check. What `get` checks
+    /// inside the conversion (that it expands and deserialises) is not
+    /// checked here: a file that passes here and fails `get` is reported by
+    /// the caller as a mismatch.
+    pub fn peek(&self, key: &Key) -> Option<(Option<crate::check::Mix>, bool)> {
+        let path = crate::tree::dest_under(&self.out, &Self::rel(key)).ok()?;
+        let raw = std::fs::read(path).ok()?;
+        let body = verified_body(&raw)?;
+        let e: PeekEntry = serde_json::from_slice(body).ok()?;
+        if e.key != key.0 {
+            return None;
+        }
+        Some((e.mix, e.mix_tried))
     }
 
     /// The stored conversion with `units` left empty, for the finish
@@ -1140,6 +1176,17 @@ impl Store {
         }
     }
 
+    /// Writes what a mismatch found when a stored result was present before
+    /// a fresh check and did not read back whole after it: the fresh result,
+    /// and `null` for the stored one.
+    pub fn bundle_unread(&self, key: &Key, fresh: &Conversion) {
+        let rel = format!("{MISMATCH_DIR}/{}.json", key.0);
+        let body = serde_json::json!({ "key": key.0, "stored": null, "fresh": fresh });
+        if let Ok(b) = serde_json::to_vec_pretty(&body) {
+            let _ = crate::tree::write_under(&self.out, &rel, &b);
+        }
+    }
+
     /// Writes what a mismatch found, for whoever looks into it.
     pub fn bundle(&self, key: &Key, stored: &Conversion, fresh: &Conversion) {
         let rel = format!("{MISMATCH_DIR}/{}.json", key.0);
@@ -1150,10 +1197,41 @@ impl Store {
     }
 }
 
+/// A writer that accepts exactly the bytes of `expect`, in order, and fails
+/// at the first byte that differs or runs past its end.
+struct Expect<'a> {
+    expect: &'a [u8],
+    at: usize,
+}
+
+impl std::io::Write for Expect<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.expect.get(self.at..self.at + buf.len()) != Some(buf) {
+            return Err(std::io::Error::other("differs"));
+        }
+        self.at += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Whether a reused result equals a fresh check of the same input, byte for
-/// byte as it serialises.
+/// byte as it serialises. `stored` is serialised into one buffer and `fresh`
+/// straight into a writer that checks each byte against it and stops at the
+/// first difference, so there is one buffer, not two. A side that does not
+/// serialise equals only the other side not serialising.
 pub fn compare(stored: &Conversion, fresh: &Conversion) -> bool {
-    serde_json::to_vec(stored).ok() == serde_json::to_vec(fresh).ok()
+    let Ok(buf) = serde_json::to_vec(stored) else {
+        return serde_json::to_writer(std::io::sink(), fresh).is_err();
+    };
+    let mut w = Expect {
+        expect: &buf,
+        at: 0,
+    };
+    serde_json::to_writer(&mut w, fresh).is_ok() && w.at == buf.len()
 }
 
 /// Which stored results to re-check this run: one file in 50 (at least one),
@@ -1677,6 +1755,94 @@ SELECT 1;
         // A missing file.
         std::fs::remove_file(&path).unwrap();
         assert!(store.get(&key).is_none() && store.get_without_units(&key).is_none());
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn peek_reads_the_mix_and_checks_the_frame_and_the_key() {
+        let c = fixture_with_notes();
+        let (store, key, path, out) = stored("peek", &c);
+        assert_eq!(store.peek(&key), Some((None, true)));
+        let good = std::fs::read(&path).unwrap();
+        // The same checks as `get` makes outside the conversion.
+        let mut bad = good.clone();
+        let at = bad.len() - 5;
+        bad[at] ^= 1;
+        std::fs::write(&path, &bad).unwrap();
+        assert!(store.peek(&key).is_none() && store.get(&key).is_none());
+        let mut v: serde_json::Value =
+            serde_json::from_slice(verified_body(&good).unwrap()).unwrap();
+        let mut other = v.clone();
+        other["key"] = serde_json::json!("f".repeat(64));
+        std::fs::write(&path, framed(&serde_json::to_vec(&other).unwrap())).unwrap();
+        assert!(store.peek(&key).is_none() && store.get(&key).is_none());
+        // A conversion `get` cannot read passes `peek`: the caller reads it
+        // after the check and reports the difference.
+        v["conversion"]["units"] = serde_json::json!([{"status": "no such status"}]);
+        std::fs::write(&path, framed(&serde_json::to_vec(&v).unwrap())).unwrap();
+        assert!(store.get(&key).is_none());
+        assert_eq!(store.peek(&key), Some((None, true)));
+        std::fs::remove_file(&path).unwrap();
+        assert!(store.peek(&key).is_none());
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn compare_is_byte_exact() {
+        let c = fixture_with_notes();
+        assert!(compare(&c, &c.clone()));
+        let mut d = c.clone();
+        d.output.push('x');
+        assert!(!compare(&c, &d) && !compare(&d, &c), "a longer side");
+        let mut d = c.clone();
+        d.output = format!("y{}", &c.output[1..]);
+        assert!(!compare(&c, &d), "the same length, one byte");
+        let mut d = c.clone();
+        d.units.pop();
+        assert!(!compare(&c, &d) && !compare(&d, &c), "a unit fewer");
+        let mut d = c.clone();
+        d.unproven.push("last field".into());
+        assert!(!compare(&c, &d) && !compare(&d, &c));
+    }
+
+    /// The runtime re-check proves the read path on the sample; this proves
+    /// it on the corpus: what `get` gives back serialises as what was put.
+    #[test]
+    fn get_of_put_serialises_as_the_conversion_for_the_corpus() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+        let mut files = Vec::new();
+        for dir in ["pairs", "mutations"] {
+            for e in std::fs::read_dir(root.join(dir)).unwrap().flatten() {
+                if !e.path().is_dir() {
+                    continue;
+                }
+                for f in std::fs::read_dir(e.path()).unwrap().flatten() {
+                    let n = f.file_name().to_string_lossy().into_owned();
+                    if n == "tsql.sql" || n.ends_with(".tsql.sql") {
+                        files.push(f.path());
+                    }
+                }
+            }
+        }
+        files.push(root.join("catalog/tsql.sql"));
+        files.sort();
+        assert!(files.len() > 20);
+        let out = scratch("corpus-round-trip");
+        let store = Store::of(&out);
+        for (i, p) in files.iter().enumerate() {
+            let src = std::fs::read_to_string(p).unwrap();
+            let mut c = converted(&src);
+            let key = Key(format!("{i:0>64}"));
+            store.put(&key, &mut c, None, i % 2 == 0).unwrap();
+            let (back, mix, tried) = store.get(&key).unwrap();
+            assert_eq!((mix, tried), (None, i % 2 == 0));
+            assert!(
+                serde_json::to_vec(&back).unwrap() == serde_json::to_vec(&c).unwrap(),
+                "{}: get(put(c)) differs from c",
+                p.display()
+            );
+            assert!(compare(&back, &c), "{}", p.display());
+        }
         let _ = std::fs::remove_dir_all(&out);
     }
 
