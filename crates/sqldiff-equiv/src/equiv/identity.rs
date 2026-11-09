@@ -424,7 +424,7 @@ impl<'a> Side<'a> {
             }
             Ev::Stmt(s) => {
                 let mut plain: Option<Var> = None;
-                let mut kills: BTreeSet<Var> = self.token_writes(&s.toks);
+                let mut kills: BTreeSet<Var> = self.token_writes(&s.toks());
                 match &s.ast {
                     Ok(st) if s.msg.is_none() && s.cursor.is_none() => {
                         if let Some((t, _)) = st.assignment() {
@@ -482,7 +482,7 @@ impl<'a> Side<'a> {
                     }
                     // A statement the parser did not read (or a cursor or
                     // message statement) may write any variable it names.
-                    _ => kills.extend(self.mentioned(&s.toks)),
+                    _ => kills.extend(self.mentioned(&s.toks())),
                 }
                 if let Some(v) = plain {
                     // Only an item the statement level paired as a plain
@@ -1056,12 +1056,13 @@ fn variable_facts(ua: &Unit, ub: &Unit, sa: &Side<'_>) -> Vec<Result<Asms, Strin
     out
 }
 
-/// A label or `GOTO`: control flow the structured walk does not follow.
+/// A label or `GOTO`: control flow the structured walk does not follow. The
+/// first token of each statement is read on demand ([`LStmt::toks`]).
 fn jumps(u: &Unit) -> Option<String> {
     let goto = |t: &[super::ast::Tok]| t.first().is_some_and(|f| f.up == "GOTO");
     let hit = u.uncovered.iter().any(|(n, what)| {
         what.contains("label") || goto(&tokens(n)) || tokens(n).iter().any(|t| t.up == "GOTO")
-    }) || u.stmts.iter().any(|s| goto(&s.toks));
+    }) || u.stmts.iter().any(|s| goto(&s.toks()));
     hit.then(|| "a label or GOTO makes control flow the analysis does not follow".to_string())
 }
 

@@ -32,6 +32,9 @@
 //! - `view_tests.rs` (`sqldiff-equiv`) is a test module: it reads the corpus
 //!   files and `canon.rs` to compare `table_pair`'s script reading of a unit
 //!   with the clone it replaced. It is compiled only for tests.
+//! - `lower_tests.rs` (`sqldiff-equiv`) is a test module: it reads the corpus
+//!   files to compare the per-unit summary of `drops_period` with the scan of
+//!   every statement's tokens it replaced. It is compiled only for tests.
 //! - `work.rs` (`sqldiff-model`): the per-file work meter, a thread-local
 //!   counter of deterministic events; `SQLDIFF_WORK` only prints it. It
 //!   counts and never changes a result.
@@ -107,6 +110,11 @@ const ALLOWED: &[(&str, &[&str])] = &[
     // thread-local.
     (
         "sqldiff-equiv/src/equiv/view_tests.rs",
+        &["fs::", "thread_local!"],
+    ),
+    // Test-only: reads the corpus; counts what it checked in thread-locals.
+    (
+        "sqldiff-equiv/src/equiv/lower_tests.rs",
         &["fs::", "thread_local!"],
     ),
     ("sqldiff-core/src/format/tests.rs", &["fs::"]),

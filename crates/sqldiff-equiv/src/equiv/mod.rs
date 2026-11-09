@@ -96,8 +96,12 @@ fn side_name(a: &Analyzed) -> String {
 }
 
 /// Lowers every data statement of a unit, to compare with statements in
-/// dialect `other`.
+/// dialect `other`. A statement that does not canonicalise is compared as its
+/// tokens (a `raw` term), which it re-tokenises for the purpose
+/// ([`lower::LStmt::toks`]): the unit holds no token lists.
 fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Item> {
+    #[cfg(test)]
+    lower_tests::check_unit(unit);
     let mut c = Canon::new(unit, schema);
     c.by_name = by_name;
     c.fold_quoted = other == Dialect::Tsql;
@@ -152,7 +156,7 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Ite
                 n(
                     "raw",
                     std::iter::once(a(unit.dialect.id()))
-                        .chain(s.toks.iter().map(|t| {
+                        .chain(s.toks().iter().map(|t| {
                             // Only keywords and unquoted names fold; literals and
                             // quoted identifiers keep their case.
                             a(if t.kind == ast::K::Word {
@@ -181,17 +185,19 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Ite
 
 /// The binary variables a statement passes to a geography-from-WKB call, with
 /// the bytes the code before the statement fixes them to
-/// ([`known_bytes::before`]); the others are left out.
+/// ([`known_bytes::before`]); the others are left out. It takes the
+/// statement's tokens on demand ([`lower::LStmt::toks`]), once, and a
+/// statement that does not mention the call ends after one scan of them.
 fn known_wkb_args(unit: &Unit, s: &lower::LStmt) -> Vec<(String, String)> {
-    let mentions_wkb = s
-        .toks
+    let toks = s.toks();
+    let mentions_wkb = toks
         .iter()
         .any(|t| matches!(t.up.as_str(), "STGEOMFROMWKB" | "ST_GEOMFROMWKB"));
     if !mentions_wkb {
         return Vec::new();
     }
     let mut out: Vec<(String, String)> = Vec::new();
-    for t in &s.toks {
+    for t in toks.iter() {
         let name = match (unit.dialect, t.kind) {
             (Dialect::Tsql, ast::K::Var) if !t.text.starts_with("@@") => t.text[1..].to_lowercase(),
             (Dialect::Postgres, ast::K::Word)
@@ -4253,7 +4259,7 @@ fn result_cursors(ua: &Unit, ub: &Unit, na: &str, nb: &str) -> Option<Result<Uni
                 {
                     return Err(format!("{name} returns rows other than a plain SELECT"));
                 }
-                if let Some(w) = lazy_call(&u.stmts[r.at].toks) {
+                if let Some(w) = lazy_call(&u.stmts[r.at].toks()) {
                     return Err(format!("a result query of {name} uses {w}, which PostgreSQL evaluates when the rows are fetched, not when the cursor is opened"));
                 }
             }
@@ -6004,6 +6010,8 @@ pub fn refine_modified(
     *findings = keep;
 }
 
+#[cfg(test)]
+mod lower_tests;
 #[cfg(test)]
 mod view_tests;
 
