@@ -248,6 +248,64 @@ struct Entry {
     mix_tried: bool,
 }
 
+/// The `conversion` of a result file read without its `units` and
+/// `note_table`: those two keys are skipped while parsing
+/// (`serde::de::IgnoredAny`, so their elements are never built), every other
+/// key becomes a `Value` as in [`Entry`]. The flags say which of the two keys
+/// were present, so a file without them is still a miss as it is for `get`.
+struct Lean {
+    rest: serde_json::Value,
+    units: bool,
+    note_table: bool,
+}
+
+impl<'de> Deserialize<'de> for Lean {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Lean, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Lean;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a conversion object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut m: A) -> Result<Lean, A::Error> {
+                let mut rest = serde_json::Map::new();
+                let (mut units, mut note_table) = (false, false);
+                while let Some(k) = m.next_key::<String>()? {
+                    match k.as_str() {
+                        "units" => {
+                            m.next_value::<serde::de::IgnoredAny>()?;
+                            units = true;
+                        }
+                        NOTE_TABLE => {
+                            m.next_value::<serde::de::IgnoredAny>()?;
+                            note_table = true;
+                        }
+                        _ => {
+                            rest.insert(k, m.next_value()?);
+                        }
+                    }
+                }
+                Ok(Lean {
+                    rest: serde_json::Value::Object(rest),
+                    units,
+                    note_table,
+                })
+            }
+        }
+        d.deserialize_map(V)
+    }
+}
+
+/// [`Entry`] as [`Store::get_without_units`] reads it.
+#[derive(Deserialize)]
+struct LeanEntry {
+    key: String,
+    pool: Vec<String>,
+    conversion: Lean,
+    mix: Option<crate::check::Mix>,
+    mix_tried: bool,
+}
+
 /// The body of a result file: the file is the SHA-256 of its body in hex, a
 /// newline, then the body. A file edited after it was written (even into
 /// other valid JSON) does not match its digest and is a miss, so it is
@@ -738,8 +796,8 @@ impl Store {
         crate::tree::dest_under(&self.out, &Self::rel(key)).is_ok_and(|p| p.is_file())
     }
 
-    /// The stored conversion. A file that does not read back whole, or does
-    /// not name its own key, is a miss.
+    /// The stored conversion, whole: every field as it was put. A file that
+    /// does not read back whole, or does not name its own key, is a miss.
     pub fn get(&self, key: &Key) -> Option<(Conversion, Option<crate::check::Mix>, bool)> {
         let path = crate::tree::dest_under(&self.out, &Self::rel(key)).ok()?;
         let raw = std::fs::read(path).ok()?;
@@ -751,6 +809,39 @@ impl Store {
         expand(&mut e.conversion, &e.pool)?;
         unshare_notes(&mut e.conversion)?;
         let conversion = serde_json::from_value(e.conversion).ok()?;
+        Some((conversion, e.mix, e.mix_tried))
+    }
+
+    /// The stored conversion with `units` left empty, for the finish
+    /// read-back of a tree run, which gives the conversion its units and
+    /// counts again from the cross-file pass (`Core::restore`) and never
+    /// reads the stored ones.
+    ///
+    /// `units` and `note_table` are skipped while parsing, so the memory of
+    /// the stored units is never taken; every other field is read and its
+    /// pool markers expanded exactly as [`Store::get`] does, and the digest,
+    /// the key and the presence of both skipped keys are checked as there.
+    /// What is not checked is what `get` would check inside the skipped
+    /// parts: that `units` holds valid units, that `note_table` is a list,
+    /// and that its indices and the pool markers in the units are in range
+    /// (the digest still covers every byte). The reuse path needs the units
+    /// and uses `get`.
+    pub fn get_without_units(
+        &self,
+        key: &Key,
+    ) -> Option<(Conversion, Option<crate::check::Mix>, bool)> {
+        let path = crate::tree::dest_under(&self.out, &Self::rel(key)).ok()?;
+        let raw = std::fs::read(path).ok()?;
+        let body = verified_body(&raw)?;
+        let e: LeanEntry = serde_json::from_slice(body).ok()?;
+        drop(raw);
+        if e.key != key.0 || !e.conversion.units || !e.conversion.note_table {
+            return None;
+        }
+        let mut v = e.conversion.rest;
+        expand(&mut v, &e.pool)?;
+        v["units"] = serde_json::Value::Array(Vec::new());
+        let conversion = serde_json::from_value(v).ok()?;
         Some((conversion, e.mix, e.mix_tried))
     }
 
@@ -1480,6 +1571,112 @@ SELECT 1;
         let key = Key("c".repeat(64));
         assert!(Store::of(&out).put(&key, &mut c, None, false).is_err());
         assert_eq!(serde_json::to_vec(&c).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// Puts `c` and returns the store, its key, the path of the file and the
+    /// output directory.
+    fn stored(name: &str, c: &Conversion) -> (Store, Key, PathBuf, PathBuf) {
+        let out = scratch(name);
+        let store = Store::of(&out);
+        let key = Key(format!("{:0>64}", name.len() + 40));
+        store.put(&key, &mut c.clone(), None, true).unwrap();
+        let path = out.join(Store::rel(&key));
+        (store, key, path, out)
+    }
+
+    /// A conversion with units and notes, pooled and marked strings.
+    fn fixture_with_notes() -> Conversion {
+        let mut c = converted(SRC);
+        let long = "a repeated text that is long enough to be pooled".to_string();
+        c.unproven = vec![long.clone(), long.clone(), format!("{MARK}0 marker")];
+        c.output = format!("{MARK}{long}");
+        let extra = c.units.last().cloned().unwrap();
+        for _ in 0..3 {
+            let mut u = extra.clone();
+            if let Some(n) = u.notes.first().cloned() {
+                u.notes = vec![n.clone(), n];
+            }
+            c.units.push(u);
+        }
+        assert!(c.units.iter().any(|u| !u.notes.is_empty()));
+        assert!(!c.report.findings.is_empty() || !c.output_check.findings.is_empty());
+        c
+    }
+
+    #[test]
+    fn get_without_units_is_get_with_the_units_cleared() {
+        for (name, c) in [
+            ("lean-real", converted(SRC)),
+            ("lean-pooled", fixture_with_notes()),
+            ("lean-empty", converted("")),
+        ] {
+            let (store, key, _, out) = stored(name, &c);
+            let (full, ..) = store.get(&key).unwrap();
+            assert!(compare(&full, &c), "{name}: get still returns everything");
+            let (lean, mix, tried) = store.get_without_units(&key).unwrap();
+            assert!(lean.units.is_empty(), "{name}");
+            assert_eq!((mix, tried), (None, true), "{name}");
+            let mut want = c.clone();
+            want.units = Vec::new();
+            assert!(compare(&lean, &want), "{name}: only units differ");
+            let _ = std::fs::remove_dir_all(&out);
+        }
+    }
+
+    #[test]
+    fn get_without_units_does_not_parse_the_units() {
+        let c = fixture_with_notes();
+        let (store, key, path, out) = stored("lean-invalid", &c);
+        let mut v: serde_json::Value =
+            serde_json::from_slice(verified_body(&std::fs::read(&path).unwrap()).unwrap()).unwrap();
+        v["conversion"]["units"] = serde_json::json!([{"status": "no such status"}, 7]);
+        std::fs::write(&path, framed(&serde_json::to_vec(&v).unwrap())).unwrap();
+        assert!(store.get(&key).is_none(), "get parses the units");
+        let (lean, ..) = store.get_without_units(&key).unwrap();
+        assert!(lean.units.is_empty());
+        let mut want = c;
+        want.units = Vec::new();
+        assert!(compare(&lean, &want));
+        // Without either skipped key, both reads miss.
+        let mut no_units = v.clone();
+        no_units["conversion"]
+            .as_object_mut()
+            .unwrap()
+            .remove("units");
+        std::fs::write(&path, framed(&serde_json::to_vec(&no_units).unwrap())).unwrap();
+        assert!(store.get(&key).is_none() && store.get_without_units(&key).is_none());
+        let mut no_table = v;
+        no_table["conversion"]
+            .as_object_mut()
+            .unwrap()
+            .remove(NOTE_TABLE);
+        std::fs::write(&path, framed(&serde_json::to_vec(&no_table).unwrap())).unwrap();
+        assert!(store.get(&key).is_none() && store.get_without_units(&key).is_none());
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn get_without_units_checks_the_digest_and_the_key() {
+        let c = fixture_with_notes();
+        let (store, key, path, out) = stored("lean-digest", &c);
+        let good = std::fs::read(&path).unwrap();
+        assert!(store.get_without_units(&key).is_some());
+        // A flipped byte in the body does not match the digest.
+        let mut bad = good.clone();
+        let at = bad.len() - 5;
+        bad[at] ^= 1;
+        std::fs::write(&path, &bad).unwrap();
+        assert!(store.get(&key).is_none() && store.get_without_units(&key).is_none());
+        // Valid JSON and digest, but another key inside.
+        let mut v: serde_json::Value =
+            serde_json::from_slice(verified_body(&good).unwrap()).unwrap();
+        v["key"] = serde_json::json!("f".repeat(64));
+        std::fs::write(&path, framed(&serde_json::to_vec(&v).unwrap())).unwrap();
+        assert!(store.get(&key).is_none() && store.get_without_units(&key).is_none());
+        // A missing file.
+        std::fs::remove_file(&path).unwrap();
+        assert!(store.get(&key).is_none() && store.get_without_units(&key).is_none());
         let _ = std::fs::remove_dir_all(&out);
     }
 
