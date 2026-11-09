@@ -156,11 +156,17 @@ fn load_catalog(
 
 impl ConfigArgs {
     pub fn resolve(&self) -> Result<Resolved, String> {
+        self.resolve_from(None)
+    }
+
+    /// As [`resolve`](Self::resolve), looking for the project config from
+    /// `dir` upward instead of the working directory.
+    pub fn resolve_from(&self, dir: Option<PathBuf>) -> Result<Resolved, String> {
         let sources = Sources {
             project: self.config.clone(),
             user: self.user_config.clone(),
             isolated: self.isolated,
-            cwd: None,
+            cwd: dir,
             packs: self.packs.clone(),
             cli: {
                 let mut l = config::cli_layer(&self.assume, &self.dialect_versions, None)

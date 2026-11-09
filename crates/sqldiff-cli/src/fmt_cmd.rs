@@ -6,7 +6,8 @@
 //! are listed on stderr. The files are laid out by
 //! `sqldiff_source::format_run`, which the app's format runs run too.
 
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args as ClapArgs, ValueEnum};
@@ -16,6 +17,7 @@ use sqldiff_core::Dialect;
 use sqldiff_source::format_run;
 
 use crate::source_cmd::ConfigArgs;
+use crate::stdin_input;
 
 #[derive(Clone, Copy, ValueEnum)]
 pub enum Case {
@@ -34,12 +36,18 @@ pub enum Ending {
 #[derive(ClapArgs)]
 pub struct Args {
     /// Files to format; a folder stands for its SQL files (`.sql` and what
-    /// `dialect_map` names), which need --write or --check.
+    /// `dialect_map` names), which need --write or --check. `-` reads
+    /// standard input and writes the result to standard output.
     #[arg(required = true)]
     files: Vec<PathBuf>,
     /// Dialect (default: from `dialect_map` or the path convention).
     #[arg(short, long)]
     dialect: Option<Dialect>,
+    /// With `-`: the path standard input stands for. It decides the dialect
+    /// (`dialect_map`, path convention) and where the project config is
+    /// searched from; the file need not exist.
+    #[arg(long, value_name = "PATH")]
+    stdin_filepath: Option<PathBuf>,
     /// Write the result back to each file.
     #[arg(long, conflicts_with = "check")]
     write: bool,
@@ -102,7 +110,58 @@ impl Args {
     }
 }
 
+/// `sqldiff fmt -`: standard input in, laid-out text on standard output.
+fn run_stdin(a: &Args) -> Result<ExitCode, String> {
+    if a.write {
+        return Err("--write needs a file; `-` writes to standard output".into());
+    }
+    let path = a.stdin_filepath.as_deref();
+    let cfg = a.cfg.resolve_from(stdin_input::config_dir(path))?;
+    let flags = format::FormatConfig {
+        all: a.keys(),
+        ..Default::default()
+    };
+    flags.validate()?;
+    let mut config = cfg.policy.format.clone();
+    config.merge(&flags);
+    let text = stdin_input::read_text()?;
+    let art = stdin_input::artifact(text, path, a.dialect, &cfg)?;
+    let shown = art.path.clone();
+    let file = format_run::laid_out(Path::new(&shown), art, &config, &cfg);
+    if let Some(line) = file.skipped_line() {
+        eprintln!("{line}");
+        return Ok(ExitCode::from(2));
+    }
+    for line in file.kept_lines() {
+        eprintln!("{line}");
+    }
+    let text = file.text.as_deref().unwrap_or_default();
+    if a.check {
+        return Ok(if file.changed {
+            ExitCode::from(1)
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
+    // Bytes as they are: no newline translation on Windows.
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|e| format!("<stdout>: {e}"))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 pub fn run(a: Args) -> Result<ExitCode, String> {
+    let dash = a.files.iter().any(|f| stdin_input::is_stdin(f));
+    if dash {
+        if a.files.len() > 1 {
+            return Err("`-` (standard input) cannot be combined with other files".into());
+        }
+        return run_stdin(&a);
+    }
+    if a.stdin_filepath.is_some() {
+        return Err("--stdin-filepath needs `-` as the file".into());
+    }
     if !a.write && !a.check && (a.files.len() > 1 || a.files.iter().any(|f| f.is_dir())) {
         return Err("several files: give --write or --check".into());
     }

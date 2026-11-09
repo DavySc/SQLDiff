@@ -151,3 +151,104 @@ fn a_link_in_a_folder_is_not_written_through() {
         SRC
     );
 }
+
+fn with_stdin(dir: &PathBuf, args: &[&str], input: &[u8]) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut c = Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+        .current_dir(dir)
+        .env("SQLDIFF_CONFIG", dir.join("no-user-config.toml"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    c.stdin.take().unwrap().write_all(input).unwrap();
+    c.wait_with_output().unwrap()
+}
+
+#[test]
+fn stdin_to_stdout_with_filepath_dialect_and_config() {
+    let d = scratch("stdin");
+    std::fs::create_dir_all(d.join("db")).unwrap();
+    // Config is found from the --stdin-filepath directory, not the cwd.
+    std::fs::write(
+        d.join("db").join("sqldiff.toml"),
+        "[format]\nkeyword_case = \"lower\"\n",
+    )
+    .unwrap();
+    let o = with_stdin(
+        &d,
+        &["fmt", "-", "--stdin-filepath", "db/q.pg.sql"],
+        SRC.as_bytes(),
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(stdout(&o), "select a, b\nfrom t\nwhere x = 1\n");
+    // Without the filepath there is no dialect.
+    let o = with_stdin(&d, &["fmt", "-"], SRC.as_bytes());
+    assert_eq!(o.status.code(), Some(2));
+    // -d works without a path.
+    let o = with_stdin(
+        &d,
+        &["fmt", "-", "-d", "postgres", "--keyword-case", "upper"],
+        SRC.as_bytes(),
+    );
+    assert_eq!(stdout(&o), "SELECT a, b\nFROM t\nWHERE x = 1\n");
+}
+
+#[test]
+fn stdin_keeps_crlf_and_rejects_bad_utf8() {
+    let d = scratch("stdin-crlf");
+    let o = with_stdin(
+        &d,
+        &["fmt", "-", "-d", "postgres"],
+        b"select a,b\r\nfrom t\r\n",
+    );
+    assert_eq!(o.stdout, b"SELECT a, b\r\nFROM t\r\n");
+    let o = with_stdin(&d, &["fmt", "-", "-d", "postgres"], b"select '\xff'");
+    assert_eq!(o.status.code(), Some(2));
+    assert!(o.stdout.is_empty());
+}
+
+#[test]
+fn stdin_check_and_write() {
+    let d = scratch("stdin-check");
+    let o = with_stdin(
+        &d,
+        &["fmt", "-", "--check", "-d", "postgres"],
+        SRC.as_bytes(),
+    );
+    assert_eq!(o.status.code(), Some(1));
+    assert!(o.stdout.is_empty());
+    let o = with_stdin(
+        &d,
+        &["fmt", "-", "--write", "-d", "postgres"],
+        SRC.as_bytes(),
+    );
+    assert_eq!(o.status.code(), Some(2));
+    let o = with_stdin(&d, &["fmt", "x.sql", "--stdin-filepath", "y.sql"], b"");
+    assert_eq!(o.status.code(), Some(2));
+}
+
+#[test]
+fn check_reads_stdin_with_the_filepath_shown() {
+    let d = scratch("stdin-lint");
+    let o = with_stdin(
+        &d,
+        &[
+            "check",
+            "-",
+            "--stdin-filepath",
+            "sub/x.tsql.sql",
+            "-f",
+            "json",
+        ],
+        b"select 1\nfrom t limit 3\n",
+    );
+    let out = stdout(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(out.contains("\"path\": \"sub/x.tsql.sql\""), "{out}");
+    assert!(out.contains("residue.pg.limit"), "{out}");
+    assert!(out.contains("\"start_line\": 2"), "{out}");
+}

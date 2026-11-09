@@ -11,6 +11,21 @@ sqldiff fmt --check db/**/*.sql              # exit 1 and list the files that ar
 sqldiff fmt -d postgres --keyword-case lower --indent 2 f.sql
 ```
 
+## Editors: standard input
+
+`sqldiff fmt -` reads the buffer from standard input and writes the result to
+standard output. `--stdin-filepath PATH` says which file the buffer is: its
+name decides the dialect (`dialect_map`, path convention) and the project
+`sqldiff.toml` is searched from its directory (the file need not exist).
+Input must be UTF-8; line endings, CRLF included, pass through byte for byte.
+Statements kept as written are listed on stderr. `--check` prints nothing and
+exits 1 if the text would change; `--write` is refused. `sqldiff check -`
+reads standard input the same way.
+
+```sh
+sqldiff fmt - --stdin-filepath db/proc.tsql.sql < proc.tsql.sql
+```
+
 Without `-d` a file's dialect comes from `dialect_map` or the path
 convention, as for `diff` and `check`.
 

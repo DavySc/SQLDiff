@@ -151,14 +151,31 @@ fn one(
         Ok(art) => art,
         Err(e) => return skipped(shown, Skipped::Unreadable(e.0)),
     };
+    laid_out(path, art, config, cfg)
+}
+
+/// Lays out `art` (read from `file`, or from standard input).
+pub fn laid_out(
+    file: &Path,
+    art: sqldiff_core::Artifact,
+    config: &FormatConfig,
+    cfg: &Resolved,
+) -> File {
     if let Some(t) = &cfg.policy.template {
         if art.text.contains(&t.open) {
-            return skipped(art.path, Skipped::Template(t.open.clone()));
+            return File {
+                file: file.to_path_buf(),
+                shown: art.path,
+                text: None,
+                changed: false,
+                kept: Vec::new(),
+                skipped: Some(Skipped::Template(t.open.clone())),
+            };
         }
     }
     let f = format::format(&art.text, art.dialect, &config.options(art.dialect));
     File {
-        file: path.to_path_buf(),
+        file: file.to_path_buf(),
         changed: f.changed(&art.text),
         shown: art.path,
         text: Some(f.text),

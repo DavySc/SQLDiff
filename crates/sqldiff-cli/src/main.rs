@@ -30,6 +30,7 @@ mod queue_cmd;
 mod review_cmd;
 mod review_status_cmd;
 mod source_cmd;
+mod stdin_input;
 
 use review_cmd::{Pipeline, ReviewArgs};
 
@@ -107,10 +108,16 @@ enum Command {
     /// Lint one artifact: residue from other dialects, terminator hazards,
     /// parse problems and pack limits.
     Check {
+        /// The file to check; `-` reads standard input.
         file: PathBuf,
         /// Dialect (default: from `dialect_map` or the path convention).
         #[arg(short, long)]
         dialect: Option<Dialect>,
+        /// With `-`: the path standard input stands for. It decides the
+        /// dialect, where the project config is searched from and the path
+        /// findings show; the file need not exist.
+        #[arg(long, value_name = "PATH")]
+        stdin_filepath: Option<PathBuf>,
         #[arg(short, long, value_enum, default_value_t = Format::Text)]
         format: Format,
         /// Check mode for composed output: templates by name (file stem).
@@ -618,6 +625,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         Command::Check {
             file,
             dialect,
+            stdin_filepath,
             format,
             catalogs,
             templates,
@@ -625,8 +633,21 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             cfg,
             review,
         } => {
-            let cfg = cfg.resolve()?;
-            let art = read(&file, dialect, &cfg)?;
+            let stdin = stdin_input::is_stdin(&file);
+            if !stdin && stdin_filepath.is_some() {
+                return Err("--stdin-filepath needs `-` as the file".into());
+            }
+            let cfg = if stdin {
+                cfg.resolve_from(stdin_input::config_dir(stdin_filepath.as_deref()))?
+            } else {
+                cfg.resolve()?
+            };
+            let art = if stdin {
+                let text = stdin_input::read_text()?;
+                stdin_input::artifact(text, stdin_filepath.as_deref(), dialect, &cfg)?
+            } else {
+                read(&file, dialect, &cfg)?
+            };
             let mut pipe = review_cmd::pipeline(cfg, &review)?;
             pipe.templates = template_dir(templates.as_deref(), params)?;
             let mut opts = pipe.options();
