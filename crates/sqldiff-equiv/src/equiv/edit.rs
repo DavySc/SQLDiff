@@ -281,6 +281,19 @@ struct Routine<'x, 'a> {
     /// jump (see `jump`) and of every label, built on first use: a subtree
     /// with none of them cannot hold a jump.
     jump_marks: std::cell::OnceCell<Vec<usize>>,
+    /// The ranges of each node's CONDITION children, in child order, built on
+    /// first use: `deciding_conditions` asks for them at every ancestor of
+    /// every edit, and scanning the children each time was quadratic in a
+    /// flat body of thousands of statements. A lookup table only.
+    conditions: std::cell::OnceCell<HashMap<SyntaxNode, Vec<Span>>>,
+    /// Each node's non-empty child nodes as (start, end, node), in order,
+    /// filled per node on first use by `earlier_siblings_with_marks`, which
+    /// finds the child holding a mark by binary search instead of a walk
+    /// down from the root. A lookup table only.
+    kids: std::cell::RefCell<HashMap<SyntaxNode, Kids>>,
+    /// `SQLDIFF_EDIT_ORACLE` was set: `deciding_conditions` checks itself
+    /// against the original walk (tests).
+    oracle: bool,
     /// Interval index over `units`, when they are in start order.
     unit_index: std::cell::OnceCell<Option<UnitIndex>>,
     /// For each name id, the numbers of the units that read it (ascending).
@@ -355,6 +368,9 @@ impl<'x, 'a> Routine<'x, 'a> {
             spelling: std::cell::OnceCell::new(),
             parens: std::cell::OnceCell::new(),
             jump_marks: std::cell::OnceCell::new(),
+            conditions: std::cell::OnceCell::new(),
+            kids: std::cell::RefCell::new(HashMap::new()),
+            oracle: std::env::var_os("SQLDIFF_EDIT_ORACLE").is_some(),
             unit_index: std::cell::OnceCell::new(),
         };
         r.scan();
@@ -1034,7 +1050,59 @@ impl<'x, 'a> Routine<'x, 'a> {
     /// superset of the earlier siblings for which `has_jump` can be true,
     /// found from the mark list instead of by walking every earlier sibling
     /// (a flat procedure has thousands).
+    ///
+    /// A mark is the start of a node, so the token right of it starts there
+    /// and the sibling holding that token is the child of the parent whose
+    /// range holds the mark: found by binary search over the parent's
+    /// children (`kids`), where a walk down from the root went through every
+    /// child of every level. Once a mark has led to its sibling, the marks
+    /// before it inside that sibling are skipped: siblings are disjoint, so
+    /// they would only find it again. Without these every edit paid for every
+    /// mark and child before it, which was quadratic in a routine with many
+    /// RAISERRORs or RETURNs. The oracle (`deciding_conditions_reference`)
+    /// keeps the original walk.
     fn earlier_siblings_with_marks(&self, cur: &SyntaxNode) -> Vec<SyntaxNode> {
+        let Some(p) = cur.parent() else {
+            return Vec::new();
+        };
+        let lo = usize::from(p.text_range().start());
+        let hi = usize::from(cur.text_range().start());
+        let marks = self.jump_marks();
+        let from = marks.partition_point(|&m| m < lo);
+        let mut to = marks.partition_point(|&m| m < hi);
+        let mut out: Vec<SyntaxNode> = Vec::new();
+        if to == from {
+            return out;
+        }
+        let kids = self.kids_of(&p);
+        while to > from {
+            let m = marks[to - 1];
+            to -= 1;
+            let k = kids.partition_point(|e| e.0 <= m);
+            let Some((start, end, sib)) = k.checked_sub(1).map(|k| &kids[k]) else {
+                continue;
+            };
+            if m >= *end {
+                continue;
+            }
+            to = to.min(from.max(marks.partition_point(|&x| x < *start)));
+            if sib != cur && out.last() != Some(sib) {
+                out.push(sib.clone());
+            }
+        }
+        if self.oracle {
+            assert_eq!(
+                out,
+                self.earlier_siblings_with_marks_reference(cur),
+                "edit checker: earlier_siblings_with_marks differs from the original walk"
+            );
+        }
+        out
+    }
+
+    /// The original `earlier_siblings_with_marks` (tests, under the oracle):
+    /// every mark before `cur` mapped to its sibling through the token at it.
+    fn earlier_siblings_with_marks_reference(&self, cur: &SyntaxNode) -> Vec<SyntaxNode> {
         let Some(p) = cur.parent() else {
             return Vec::new();
         };
@@ -1064,6 +1132,23 @@ impl<'x, 'a> Routine<'x, 'a> {
             }
         }
         out
+    }
+
+    /// See the `kids` field.
+    fn kids_of(&self, p: &SyntaxNode) -> Kids {
+        if let Some(k) = self.kids.borrow().get(p) {
+            return k.clone();
+        }
+        let k: Kids = p
+            .children()
+            .filter(|c| !c.text_range().is_empty())
+            .map(|c| {
+                let r = c.text_range();
+                (usize::from(r.start()), usize::from(r.end()), c)
+            })
+            .collect();
+        self.kids.borrow_mut().insert(p.clone(), k.clone());
+        k
     }
 
     /// Whether some statement inside `u` may jump out of the sequence that holds `target`.
@@ -1576,6 +1661,9 @@ impl<'x, 'a> Routine<'x, 'a> {
 /// A byte range of one side that another finding marks as changed.
 type Span = (usize, usize);
 
+/// A node's non-empty child nodes as (start, end, node), in order.
+type Kids = std::rc::Rc<[(usize, usize, SyntaxNode)]>;
+
 /// Something every statement sets: a later read of it sees the statement before.
 const STATUS: &[&str] = &[
     "rowcount",
@@ -1904,12 +1992,66 @@ impl<'x, 'a> Routine<'x, 'a> {
                     out.push(cst::sig_range(&c));
                 }
             }
+            if let Some(cs) = self.condition_children().get(&p) {
+                out.extend(cs.iter().copied());
+            }
+            cur = p;
+        }
+        if self.oracle {
+            assert_eq!(
+                out,
+                self.deciding_conditions_reference(n),
+                "edit checker: deciding_conditions differs from the original walk"
+            );
+        }
+        out
+    }
+
+    /// The original `deciding_conditions` (tests, under the oracle): every
+    /// mark before the node mapped to its sibling, and every child of every
+    /// ancestor scanned for conditions.
+    fn deciding_conditions_reference(&self, n: &SyntaxNode) -> Vec<Span> {
+        let mut out = Vec::new();
+        let mut cur = n.clone();
+        while let Some(p) = cur.parent() {
+            for s in self
+                .earlier_siblings_with_marks_reference(&cur)
+                .into_iter()
+                .filter(|s| s.kind().is_unit() && self.has_jump(s, n))
+            {
+                for c in s
+                    .descendants()
+                    .filter(|c| c.kind() == SyntaxKind::CONDITION)
+                {
+                    out.push(cst::sig_range(&c));
+                }
+            }
             for c in p.children().filter(|c| c.kind() == SyntaxKind::CONDITION) {
                 out.push(cst::sig_range(&c));
             }
             cur = p;
         }
         out
+    }
+
+    /// See the `conditions` field: each node's CONDITION children, as
+    /// `p.children().filter(CONDITION)` would list them. A pre-order walk
+    /// meets a parent's children in child order.
+    fn condition_children(&self) -> &HashMap<SyntaxNode, Vec<Span>> {
+        self.conditions.get_or_init(|| {
+            let mut m: HashMap<SyntaxNode, Vec<Span>> = HashMap::new();
+            for c in self
+                .side
+                .root
+                .descendants()
+                .filter(|c| c.kind() == SyntaxKind::CONDITION)
+            {
+                if let Some(p) = c.parent() {
+                    m.entry(p).or_default().push(cst::sig_range(&c));
+                }
+            }
+            m
+        })
     }
 
     /// The unit overlap index, when the units are in start order.
