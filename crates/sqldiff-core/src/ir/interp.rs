@@ -678,10 +678,19 @@ enum Step {
 
 /// The whole exploration between two steps: the path being run, the forked
 /// paths still to run, and the outcomes so far.
+///
+/// The pending paths in `work` are shared (`Rc`) between a machine and its
+/// checkpoints, so a checkpoint or a restore copies one pointer per path. A
+/// shared state is never mutated: `State` has no interior mutability, nothing
+/// uses `Rc::get_mut`, and a path leaves `work` only by turning it back into
+/// an owned `Box<State>` ([`Machine::next_node`]; the initial state in
+/// `pairs::measure`): a move when nothing else holds it, otherwise the same
+/// deep copy that was made before. Only that owned value is stepped.
+/// `Rc::ptr_eq` is not used.
 #[derive(Clone)]
 struct Machine {
     cur: Option<(NodeId, Box<State>)>,
-    work: Vec<(NodeId, Box<State>)>,
+    work: Vec<(NodeId, Rc<State>)>,
     outs: Vec<Outcome>,
     /// Path joining (see [`Join`]); `None` runs every path to its end.
     join: Option<Join>,
@@ -788,7 +797,14 @@ impl Machine {
     /// current one has ended.
     fn next_node(&mut self) -> Option<NodeId> {
         if self.cur.is_none() {
-            self.cur = self.work.pop();
+            // An owned state again: a move if unshared, else a deep copy.
+            // (`Rc::unwrap_or_clone` needs Rust 1.76; the MSRV is 1.75.)
+            self.cur = self.work.pop().map(|(n, rc)| {
+                (
+                    n,
+                    Box::new(Rc::try_unwrap(rc).unwrap_or_else(|shared| State::clone(&shared))),
+                )
+            });
             if let Some(j) = self.join.as_mut() {
                 j.close(self.work.len(), &self.outs);
             }
@@ -1752,7 +1768,7 @@ impl Interp<'_> {
             .unwrap_or(EXIT_OK);
         Machine {
             cur: None,
-            work: vec![(first, Box::new(init))],
+            work: vec![(first, Rc::new(init))],
             outs: Vec::new(),
             join: None,
         }
@@ -1808,7 +1824,7 @@ impl Interp<'_> {
                 // run that made it (`entries are capped where they are made`).
                 let over = m.join.as_ref().is_some_and(|j| j.tick >= JOIN_TICKS);
                 if m.work.len() + m.outs.len() + v.len() < MAX_PATHS && !over {
-                    m.work.extend(v);
+                    m.work.extend(v.into_iter().map(|(n, s)| (n, Rc::new(*s))));
                 } else {
                     s.imprecise.push("path budget exhausted".into());
                     s.cut.extend(v.iter().map(|(n, _)| *n));
