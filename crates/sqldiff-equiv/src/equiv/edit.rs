@@ -2577,8 +2577,6 @@ impl SideEdits {
             }
         }
         eligible.sort_by_key(|e| (e.0, e.1));
-        #[cfg(datalog_bench)]
-        let bench_t0 = std::time::Instant::now();
         if !eligible.is_empty() {
             let mut sweep = TaintSweep::new(r, &me.set);
             for (at, j, node, here) in &eligible {
@@ -2586,8 +2584,6 @@ impl SideEdits {
                 let fast = sweep.answer(node, *here);
                 me.fast.insert(*j, fast);
             }
-            #[cfg(datalog_bench)]
-            datalog_bench::TAINT_NS.store(bench_t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             // What each edit writes reaches, from the right end of the
             // routine to the left. Only edits the taint half did not already
             // decide need it.
@@ -2611,82 +2607,7 @@ impl SideEdits {
             me.reach_steps = reach.steps;
             sqldiff_model::work::spend(sqldiff_model::work::Site::EditReach, reach.steps as u64);
         }
-        #[cfg(datalog_bench)]
-        if !eligible.is_empty() {
-            let ns = bench_t0.elapsed().as_nanos();
-            datalog_bench::dump(r, &me, &eligible, ns);
-        }
         me
-    }
-}
-
-/// Benchmark only (`RUSTFLAGS="--cfg datalog_bench"`, never in a shipped
-/// build): writes the sweeps' inputs and answers as Soufflé facts, one
-/// instance per call, under `$SQLDIFF_DATALOG_DUMP`.
-#[cfg(datalog_bench)]
-mod datalog_bench {
-    use super::*;
-    use std::io::Write as _;
-    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    pub(super) static TAINT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    pub(super) fn dump(
-        r: &Routine,
-        me: &SideEdits,
-        eligible: &[(usize, usize, SyntaxNode, Span)],
-        ns: u128,
-    ) {
-        let Some(dir) = std::env::var_os("SQLDIFF_DATALOG_DUMP") else { return };
-        let dir = std::path::PathBuf::from(dir);
-        let c = ((std::process::id() as usize) << 16) | NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let units = r.units();
-        let names = r.unit_names();
-        let mut out: std::collections::BTreeMap<&str, String> = Default::default();
-        let mut w = |f: &'static str, line: String| {
-            let e = out.entry(f).or_default();
-            e.push_str(&line);
-            e.push('\n');
-        };
-        for (u, x) in units.iter().enumerate() {
-            w("unit.facts", format!("{c}\t{u}\t{}\t{}\t{}", x.start, x.end, u8::from(x.jumps)));
-            for n in &x.reads { w("reads.facts", format!("{c}\t{u}\t{n}")); }
-            for n in &x.writes { w("writes.facts", format!("{c}\t{u}\t{n}")); }
-            for n in &x.touches { w("touches.facts", format!("{c}\t{u}\t{n}")); }
-        }
-        for (n, st) in names.status.iter().enumerate() {
-            if *st { w("status.facts", format!("{c}\t{n}")); }
-        }
-        for (_, s) in &me.spans { w("fspan.facts", format!("{c}\t{}\t{}", s.0, s.1)); }
-        // The sweeps call `deciding_conditions` once per edit whose taint
-        // half looks; time those calls alone (a tree walk, not closure work).
-        let t = std::time::Instant::now();
-        let mut keep = 0usize;
-        for (_, j, node, _) in eligible {
-            if me.fast[j].first_change.is_some() {
-                keep += r.deciding_conditions(node).len();
-            }
-        }
-        let dc_ns = t.elapsed().as_nanos();
-        std::hint::black_box(keep);
-        for (at, j, node, here) in eligible {
-            w("edit.facts", format!("{c}\t{j}\t{at}\t{}\t{}", here.0, here.1));
-            for sp in r.deciding_conditions(node) {
-                w("dspan.facts", format!("{c}\t{j}\t{}\t{}", sp.0, sp.1));
-            }
-            let f = &me.fast[j];
-            let o = |v: Option<usize>| v.map_or("-".to_string(), |x| x.to_string());
-            let hit = match f.hit { None => "-".into(), Some(None) => "any".into(), Some(Some(n)) => n.to_string() };
-            let reach = match f.reach { None => "-".into(), Some(None) => "none".into(), Some(Some(s)) => s.to_string() };
-            w("rust_answer.tsv", format!("{c}\t{j}\t{}\t{}\t{hit}\t{reach}", o(f.first_change), o(f.jump)));
-        }
-        w("rust_time.tsv", format!("{c}\t{ns}\t{}\t{}\t{}\t{}\t{}", units.len(), eligible.len(), me.reach_steps, TAINT_NS.load(std::sync::atomic::Ordering::Relaxed), dc_ns));
-        let _g = LOCK.lock();
-        let _ = std::fs::create_dir_all(&dir);
-        for (f, text) in out {
-            let mut h = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(f)).expect("dump");
-            h.write_all(text.as_bytes()).expect("dump");
-        }
     }
 }
 

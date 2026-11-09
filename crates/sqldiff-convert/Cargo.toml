@@ -24,6 +24,3 @@ sqldiff-source.workspace = true
 sha2.workspace = true
 regex.workspace = true
 
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(datalog_bench)"] }

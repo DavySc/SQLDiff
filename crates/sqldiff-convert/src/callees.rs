@@ -79,10 +79,6 @@ pub fn resolve<C: Cored>(inputs: &[Input], convs: &mut [&mut C], from: Dialect) 
             false
         })
         .collect();
-    #[cfg(datalog_bench)]
-    let bench = bench::Dump::before(inputs, convs, &defs, &deps, &cyclic);
-    #[cfg(datalog_bench)]
-    let bench_t0 = std::time::Instant::now();
     // Statuses only get worse and notes are only added, so this ends.
     loop {
         let mut changed = false;
@@ -156,105 +152,8 @@ pub fn resolve<C: Cored>(inputs: &[Input], convs: &mut [&mut C], from: Dialect) 
             break;
         }
     }
-    #[cfg(datalog_bench)]
-    bench.after(convs, bench_t0.elapsed().as_nanos());
     for c in convs.iter_mut() {
         crate::recount(&mut **c);
-    }
-}
-
-/// Benchmark only (`RUSTFLAGS="--cfg datalog_bench"`): the propagation's
-/// inputs and final unit statuses as Soufflé facts under
-/// `$SQLDIFF_DATALOG_DUMP/callees`.
-#[cfg(datalog_bench)]
-mod bench {
-    use super::*;
-    pub(super) struct Dump {
-        dir: Option<std::path::PathBuf>,
-        out: String,
-        keys: BTreeMap<String, usize>,
-        scan_ns: u128,
-    }
-    fn line(out: &mut String, f: &str, l: String) {
-        out.push_str(f);
-        out.push('\t');
-        out.push_str(&l);
-        out.push('\n');
-    }
-    impl Dump {
-        pub(super) fn before<C: Cored>(
-            inputs: &[Input],
-            convs: &[&mut C],
-            defs: &BTreeMap<String, Vec<usize>>,
-            deps: &[BTreeSet<String>],
-            cyclic: &[bool],
-        ) -> Dump {
-            let dir = std::env::var_os("SQLDIFF_DATALOG_DUMP").map(|d| std::path::PathBuf::from(d).join("callees"));
-            let mut me = Dump { dir, out: String::new(), keys: BTreeMap::new(), scan_ns: 0 };
-            if me.dir.is_none() {
-                return me;
-            }
-            let mut kid = |k: &str, keys: &mut BTreeMap<String, usize>| {
-                let n = keys.len();
-                *keys.entry(k.to_string()).or_insert(n)
-            };
-            for (i, c) in convs.iter().enumerate() {
-                let c: &C = &**c;
-                line(&mut me.out, "file", format!("{i}\t{}\t{}", u8::from(c.blocked()), u8::from(cyclic[i])));
-                for (u, x) in c.units().iter().enumerate() {
-                    line(&mut me.out, "unit0", format!("{i}\t{u}\t{}", x.status as u8));
-                    for n in &x.notes {
-                        if n.status == Status::Assumptions {
-                            line(&mut me.out, "anote0", format!("{i}\t{u}\t{}", n.rule));
-                        }
-                    }
-                }
-                for k in &deps[i] {
-                    let id = kid(k, &mut me.keys);
-                    line(&mut me.out, "dep", format!("{i}\t{id}"));
-                    let t = std::time::Instant::now();
-                    std::hint::black_box(calling_units(&inputs[i].text, c, k, false));
-                    me.scan_ns += t.elapsed().as_nanos();
-                    for wide in [false, true] {
-                        for u in calling_units(&inputs[i].text, c, k, wide) {
-                            line(&mut me.out, if wide { "callwide" } else { "callok" }, format!("{i}\t{id}\t{u}"));
-                        }
-                    }
-                }
-            }
-            for (k, js) in defs {
-                let id = kid(k, &mut me.keys);
-                for j in js {
-                    line(&mut me.out, "def", format!("{id}\t{j}"));
-                }
-            }
-            me
-        }
-        pub(super) fn after<C: Cored>(self, convs: &[&mut C], ns: u128) {
-            let Some(dir) = self.dir else { return };
-            let mut out = self.out;
-            for (i, c) in convs.iter().enumerate() {
-                for (u, x) in c.units().iter().enumerate() {
-                    let mut rules: Vec<&str> = x.notes.iter().filter(|n| n.status == Status::Assumptions).map(|n| n.rule.as_ref()).collect();
-                    rules.sort_unstable();
-                    rules.dedup();
-                    line(&mut out, "rust_unit", format!("{i}\t{u}\t{}\t{}", x.status as u8, rules.join(",")));
-                }
-            }
-            line(&mut out, "rust_time", format!("{ns}\t{}\t{}", convs.len(), self.scan_ns));
-            let _ = std::fs::create_dir_all(&dir);
-            let mut files: BTreeMap<String, String> = BTreeMap::new();
-            for l in out.lines() {
-                let (f, rest) = l.split_once('\t').expect("tagged");
-                let e = files.entry(f.to_string()).or_default();
-                e.push_str(rest);
-                e.push('\n');
-            }
-            for (f, t) in files {
-                let ext = if f.starts_with("rust_") { "tsv" } else { "facts" };
-                std::fs::write(dir.join(format!("{f}.{ext}")), t).expect("dump");
-            }
-        }
     }
 }
 
