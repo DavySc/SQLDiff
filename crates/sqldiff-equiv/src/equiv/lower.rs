@@ -1114,6 +1114,10 @@ fn place_txn(u: &mut Unit) {
                 .push((node, format!("{} between data statements", kind.label())));
         }
     }
+    // The last step of every lowering: the vectors grew by doubling, and their
+    // count is not known before the walk. Only capacity changes.
+    u.stmts.shrink_to_fit();
+    u.ctl.shrink_to_fit();
 }
 
 fn header(r: &SyntaxNode, u: &mut Unit) {

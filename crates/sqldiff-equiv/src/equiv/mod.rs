@@ -102,7 +102,8 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Ite
     c.by_name = by_name;
     c.fold_quoted = other == Dialect::Tsql;
     c.other = Some(other);
-    let mut out = Vec::new();
+    // At most one item per statement and per marker.
+    let mut out = Vec::with_capacity(unit.stmts.len() + unit.ctl.len());
     let mut stmts = unit.stmts.iter().enumerate().peekable();
     let mut ctl = unit.ctl.iter().peekable();
     loop {
