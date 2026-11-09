@@ -7738,7 +7738,8 @@ impl<'a> Canon<'a> {
 
     /// Statement list of the unit, after the cross-statement lifts.
     pub fn lift(&mut self, stmts: Vec<Item>) -> Vec<Item> {
-        let mut out: Vec<Item> = Vec::new();
+        // Merging only removes items, so the input length bounds the result.
+        let mut out: Vec<Item> = Vec::with_capacity(stmts.len());
         for mut it in stmts {
             // T-SQL: INSERT ...; SET @v = SCOPE_IDENTITY();
             let t = it.term.clone();
