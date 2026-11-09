@@ -509,12 +509,16 @@ pub(super) fn keyword_set(text: &str, toks: &[Tok], dialect: Dialect) -> BTreeSe
             continue;
         }
         let prev = k.checked_sub(1).map(|p| &toks[sig[p]]);
-        // `:name` is a psql or host variable, which is case sensitive. A
-        // colon right after a name ends a label, and the word after it is
-        // an ordinary keyword.
-        if prev.is_some_and(|p| p.kind == COLON) {
+        // `:name` is a psql or host variable, which is case sensitive.
+        if let Some(c) = prev.filter(|p| p.kind == COLON) {
+            // A word touching the colon is always a variable (`:Name`,
+            // `into :a :Date`, `x:Date`). Only `name: word`, with a gap,
+            // is a label, and the word after a label is a keyword.
             let before = k.checked_sub(2).map(|p| &toks[sig[p]]);
-            if !before.is_some_and(|b| matches!(b.kind, IDENT | QUOTED_IDENT)) {
+            let label = c.end < t.start
+                && before
+                    .is_some_and(|b| matches!(b.kind, IDENT | QUOTED_IDENT) && b.end == c.start);
+            if !label {
                 continue;
             }
         }

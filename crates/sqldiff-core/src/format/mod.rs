@@ -421,6 +421,24 @@ fn fail(tops: Vec<usize>, reason: impl Into<String>) -> Option<Failure> {
 }
 
 /// Non-whitespace tokens with text, as the layout sees them.
+/// For each token [`tokens`] lists: no whitespace between it and the one before.
+fn glued(root: &SyntaxNode) -> Vec<bool> {
+    let mut gap = false;
+    let mut out = Vec::new();
+    for t in root
+        .descendants_with_tokens()
+        .filter_map(SyntaxElement::into_token)
+    {
+        if t.kind() == SyntaxKind::WHITESPACE {
+            gap = true;
+        } else if t.kind() != SyntaxKind::INFERRED_TERMINATOR && !t.text().is_empty() {
+            out.push(!gap);
+            gap = false;
+        }
+    }
+    out
+}
+
 fn tokens(root: &SyntaxNode) -> Vec<(SyntaxKind, String)> {
     root.descendants_with_tokens()
         .filter_map(SyntaxElement::into_token)
@@ -484,6 +502,7 @@ fn verify(
     // 1. The same tokens, in the same order, with the same text; only
     //    recasable keywords may differ in case.
     let (a, b) = (tokens(root), tokens(&new_root));
+    let glued_a = glued(root);
     let same = |k: usize, x: &(SyntaxKind, String), y: &(SyntaxKind, String)| {
         x.0 == y.0
             && (x.1 == y.1
@@ -500,12 +519,20 @@ fn verify(
                             .find(|t| !is_comment(t))
                             .is_some_and(|t| t.0 == SyntaxKind::L_PAREN);
                         // A single `:` before the word: a psql or host variable.
-                        // (after a name it ends a label instead).
-                        let mut before = a[..k].iter().rev().filter(|t| !is_comment(t));
-                        let variable = before.next().is_some_and(|t| t.0 == SyntaxKind::COLON)
-                            && !before.next().is_some_and(|t| {
-                                matches!(t.0, SyntaxKind::IDENT | SyntaxKind::QUOTED_IDENT)
-                            });
+                        // Only `name: word`, with a gap after the colon and none
+                        // before it, is a label.
+                        let mut before = (0..k).rev().filter(|&j| !is_comment(&&a[j]));
+                        let colon = before.next().filter(|&j| a[j].0 == SyntaxKind::COLON);
+                        let variable = colon.is_some_and(|c| {
+                            let label = !glued_a[k]
+                                && c > 0
+                                && glued_a[c]
+                                && matches!(
+                                    a[c - 1].0,
+                                    SyntaxKind::IDENT | SyntaxKind::QUOTED_IDENT
+                                );
+                            !label
+                        });
                         !variable
                             && (recasable(&upper, dialect)
                                 || recasable_name(&upper, dialect, call, true))

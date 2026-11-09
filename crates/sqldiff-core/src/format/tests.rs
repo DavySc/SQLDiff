@@ -652,3 +652,24 @@ fn a_keyword_after_a_label_is_recased_and_aliases_are_not_types() {
         f.text
     );
 }
+
+#[test]
+fn variables_after_a_name_keep_their_case() {
+    let up = with(|o| o.keyword_case = KeywordCase::Upper);
+    for d in [Dialect::Postgres, Dialect::Db2i] {
+        for src in [
+            "select a into :Name :Date from t;\n",
+            "select a into :hv:Time from t;\n",
+            "select col :Date from t;\n",
+            "select a[i:Date] from t;\n",
+            "select a[1:Time] from t;\n",
+        ] {
+            let f = format(src, d, &up);
+            for var in [":Date", ":Time", ":Name"] {
+                if src.contains(var) {
+                    assert!(f.text.contains(var), "{d:?}: {src} -> {}", f.text);
+                }
+            }
+        }
+    }
+}
