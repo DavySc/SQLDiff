@@ -492,8 +492,22 @@ fn verify(
                     && x.1.eq_ignore_ascii_case(&y.1)
                     && {
                         let upper = x.1.to_ascii_uppercase();
-                        let call = a.get(k + 1).is_some_and(|t| t.0 == SyntaxKind::L_PAREN);
-                        recasable(&upper, dialect) || recasable_name(&upper, dialect, call)
+                        let is_comment = |t: &&(SyntaxKind, String)| {
+                            matches!(t.0, SyntaxKind::LINE_COMMENT | SyntaxKind::BLOCK_COMMENT)
+                        };
+                        let call = a[k + 1..]
+                            .iter()
+                            .find(|t| !is_comment(t))
+                            .is_some_and(|t| t.0 == SyntaxKind::L_PAREN);
+                        // A single `:` before the word: a psql or host variable.
+                        let variable = a[..k]
+                            .iter()
+                            .rev()
+                            .find(|t| !is_comment(t))
+                            .is_some_and(|t| t.0 == SyntaxKind::COLON);
+                        !variable
+                            && (recasable(&upper, dialect)
+                                || recasable_name(&upper, dialect, call, true))
                     }))
     };
     if let Some(k) = (0..a.len().max(b.len())).find(|&k| match (a.get(k), b.get(k)) {

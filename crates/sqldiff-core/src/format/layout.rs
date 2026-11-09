@@ -508,12 +508,61 @@ pub(super) fn keyword_set(text: &str, toks: &[Tok], dialect: Dialect) -> BTreeSe
         if !w.is_ascii() {
             continue;
         }
+        let prev = k.checked_sub(1).map(|p| &toks[sig[p]]);
+        // `:name` is a psql or host variable, which is case sensitive.
+        if prev.is_some_and(|p| p.kind == COLON) {
+            continue;
+        }
         let upper = w.to_ascii_uppercase();
-        if recasable(&upper, dialect) || recasable_name(&upper, dialect, next_is(L_PAREN)) {
+        let word = |t: &Tok| text[t.start..t.end].to_ascii_uppercase();
+        // A type name stands after `::`, after `RETURNS`/`OF`, after `AS`
+        // inside `CAST(`, after the name it types (a column or parameter),
+        // or before `(`. Elsewhere it is a column or alias that happens to
+        // be called like a type.
+        let type_pos = next_is(L_PAREN)
+            || prev.is_some_and(|p| {
+                (p.kind == OP && &text[p.start..p.end] == "::")
+                    || p.kind == QUOTED_IDENT
+                    || (p.kind == IDENT && {
+                        let w = word(p);
+                        match w.as_str() {
+                            "RETURNS" | "OF" => true,
+                            "AS" => cast_open(text, toks, &sig, k),
+                            _ => !recasable(&w, dialect),
+                        }
+                    })
+            });
+        if recasable(&upper, dialect) || recasable_name(&upper, dialect, next_is(L_PAREN), type_pos)
+        {
             out.insert(i);
         }
     }
     out
+}
+
+/// True if the innermost open parenthesis before significant token `k` is
+/// the one of a `CAST(` or `TRY_CAST(`.
+fn cast_open(text: &str, toks: &[Tok], sig: &[usize], k: usize) -> bool {
+    let mut depth = 0usize;
+    for j in (0..k).rev() {
+        let t = &toks[sig[j]];
+        match t.kind {
+            R_PAREN => depth += 1,
+            L_PAREN if depth > 0 => depth -= 1,
+            L_PAREN => {
+                return j > 0 && {
+                    let p = &toks[sig[j - 1]];
+                    p.kind == IDENT
+                        && matches!(
+                            text[p.start..p.end].to_ascii_uppercase().as_str(),
+                            "CAST" | "TRY_CAST"
+                        )
+                };
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Renders the layout. `reverted` holds top-level statements kept as written.

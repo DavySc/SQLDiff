@@ -563,3 +563,57 @@ fn tsql_function_and_type_names_keep_their_case() {
         "select Count(*), GetDate(), coalesce(a, 0)\nfrom t\n"
     );
 }
+
+#[test]
+fn a_word_after_a_colon_is_a_variable_and_keeps_its_case() {
+    let up = with(|o| o.keyword_case = KeywordCase::Upper);
+    for d in [Dialect::Postgres, Dialect::Db2i] {
+        let f = format(
+            "select a from t where b = :Name and c = :Date and d = :count;\n",
+            d,
+            &up,
+        );
+        assert!(f.kept.is_empty(), "{d:?}: {:?}", f.kept);
+        assert!(
+            f.text.contains(":Name") && f.text.contains(":Date") && f.text.contains(":count"),
+            "{d:?}: {}",
+            f.text
+        );
+    }
+}
+
+#[test]
+fn type_names_are_recased_only_in_type_position() {
+    let up = with(|o| o.keyword_case = KeywordCase::Upper);
+    for d in [Dialect::Postgres, Dialect::Db2i] {
+        let f = format("select name, uuid, count(*) as json from t;\n", d, &up);
+        assert!(f.kept.is_empty(), "{d:?}: {:?}", f.kept);
+        assert_eq!(
+            f.text, "SELECT name, uuid, COUNT(*) AS json\nFROM t;\n",
+            "{d:?}"
+        );
+        let f = format(
+            "create table t (name varchar(5), id int);\nselect cast(a as int) from t;\n",
+            d,
+            &up,
+        );
+        assert!(f.kept.is_empty(), "{d:?}: {:?}", f.kept);
+        assert!(
+            f.text.contains("(name VARCHAR(5), id INT)"),
+            "{d:?}: {}",
+            f.text
+        );
+        assert!(f.text.contains("CAST(a AS INT)"), "{d:?}: {}", f.text);
+    }
+    let f = format(
+        "select x::int, count /* c */ (y) from t;\n",
+        Dialect::Postgres,
+        &up,
+    );
+    assert!(f.kept.is_empty(), "{:?}", f.kept);
+    assert!(
+        f.text.contains("x::INT") && f.text.contains("COUNT /* c */ (y)"),
+        "{}",
+        f.text
+    );
+}
