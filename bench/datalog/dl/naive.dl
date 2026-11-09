@@ -1,0 +1,47 @@
+// D1: the textbook formulation, one closure per edit (no sharing between edits).
+#include "common.dl"
+
+// Taint half: units ending at or before the edit's start are offered.
+.decl off(c:number, j:number, u:number)
+off(c,j,u) :- edit(c,j,at,_,_), unit(c,u,_,e,_), e <= at.
+.decl tainted(c:number, j:number, n:number)
+.decl nonempty(c:number, j:number)
+.decl fired(c:number, j:number, u:number)
+tainted(c,j,n) :- off(c,j,u), changed(c,u), writes(c,u,n).
+nonempty(c,j) :- tainted(c,j,_).
+fired(c,j,u) :- off(c,j,u), unchanged(c,u), reads(c,u,n), tainted(c,j,n).
+fired(c,j,u) :- off(c,j,u), unchanged(c,u), hasreads(c,u), tainted(c,j,0).
+fired(c,j,u) :- off(c,j,u), unchanged(c,u), reads(c,u,0), nonempty(c,j).
+tainted(c,j,w) :- fired(c,j,u), writes(c,u,w).
+
+meets(c,j) :- needed(c,j,n), tainted(c,j,n).
+meets(c,j) :- needed(c,j,_), tainted(c,j,0).
+meets(c,j) :- needed(c,j,0), nonempty(c,j).
+.decl ans_hit(c:number, j:number, n:number)   // -1: only the any-name is shared
+ans_hit(c,j,v) :- meets(c,j), v = min n : { needed(c,j,n), n != 0, tainted(c,j,n) }.
+ans_hit(c,j,-1) :- meets(c,j), !hitname(c,j).
+.decl hitname(c:number, j:number)
+hitname(c,j) :- needed(c,j,n), n != 0, tainted(c,j,n).
+
+// Reach half: per (edit, seed) closure over unchanged units starting at or after the edit's end.
+.decl roff(c:number, j:number, u:number)
+roff(c,j,u) :- ask(c,j), edit(c,j,_,_,h1), unit(c,u,s,_,_), s >= h1, unchanged(c,u).
+.decl reached(c:number, j:number, x:number, n:number)
+reached(c,j,x,x) :- seed(c,j,x).
+.decl rfired(c:number, j:number, x:number, u:number)
+rfired(c,j,x,u) :- roff(c,j,u), reads(c,u,n), reached(c,j,x,n).
+rfired(c,j,x,u) :- roff(c,j,u), hasreads(c,u), reached(c,j,x,0).
+rfired(c,j,x,u) :- roff(c,j,u), reads(c,u,0), seed(c,j,x).
+reached(c,j,x,w) :- rfired(c,j,x,u), writes(c,u,w), !status(c,w).
+
+.decl rhit(c:number, j:number, u:number)
+rhit(c,j,u) :- ask(c,j), seed(c,j,_), edit(c,j,_,_,h1), unit(c,u,s,_,1), changed(c,u), s >= h1.
+rhit(c,j,u) :- reached(c,j,_,n), edit(c,j,_,_,h1), touches(c,u,n), changed(c,u), unit(c,u,s,_,_), s >= h1.
+rhit(c,j,u) :- reached(c,j,_,0), edit(c,j,_,_,h1), changed(c,u), touches(c,u,_), unit(c,u,s,_,_), s >= h1.
+rhit(c,j,u) :- ask(c,j), seed(c,j,_), edit(c,j,_,_,h1), touches(c,u,0), changed(c,u), unit(c,u,s,_,_), s >= h1.
+.decl ans_reach(c:number, j:number, v:number)   // -1: reaches no changed code
+ans_reach(c,j,v) :- edit(c,j,_,_,_), seed(c,j,_), v = min s : { rhit(c,j,u), unit(c,u,s,_,_) }.
+ans_reach(c,j,-1) :- ask(c,j), !rhitany(c,j).
+.decl rhitany(c:number, j:number)
+rhitany(c,j) :- rhit(c,j,_), seed(c,j,_).
+.output ans_hit, ans_reach

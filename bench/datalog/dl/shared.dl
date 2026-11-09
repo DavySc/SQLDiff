@@ -1,0 +1,56 @@
+// D2: closures shared across edits, as the Rust sweeps share them. Because a
+// unit fires on any one tainted read, a derivation is a path; for each name
+// keep only the best "time" at which it becomes reachable (subsumption):
+// taint: the smallest largest-unit-end on a path; reach: the largest
+// smallest-unit-start on a path. An edit then reads the answer off by a
+// comparison instead of running its own closure.
+#include "common.dl"
+
+.decl tt(c:number, n:number, t:number) btree_delete
+.decl tf(c:number, u:number, t:number) btree_delete
+tt(c,n,e) :- unit(c,u,_,e,_), changed(c,u), writes(c,u,n).
+tf(c,u,x) :- unit(c,u,_,e,_), unchanged(c,u), reads(c,u,n), tt(c,n,t), x = max(e,t).
+tf(c,u,x) :- unit(c,u,_,e,_), unchanged(c,u), hasreads(c,u), tt(c,0,t), x = max(e,t).
+tf(c,u,x) :- unit(c,u,_,e,_), unchanged(c,u), reads(c,u,0), tt(c,_,t), x = max(e,t).
+tt(c,w,x) :- tf(c,u,x), writes(c,u,w).
+tt(c,n,x) <= tt(c,n,y) :- y <= x.
+tf(c,u,x) <= tf(c,u,y) :- y <= x.
+
+// Earliest time any name is tainted (taint non-empty).
+.decl tany(c:number, t:number)
+tany(c,t) :- tt(c,_,_), t = min x : { tt(c,_,x) }.
+
+meets(c,j) :- edit(c,j,at,_,_), needed(c,j,n), tt(c,n,t), t <= at.
+meets(c,j) :- edit(c,j,at,_,_), needed(c,j,_), tt(c,0,t), t <= at.
+meets(c,j) :- edit(c,j,at,_,_), needed(c,j,0), tany(c,t), t <= at.
+.decl hitname(c:number, j:number)
+hitname(c,j) :- edit(c,j,at,_,_), needed(c,j,n), n != 0, tt(c,n,t), t <= at.
+.decl ans_hit(c:number, j:number, n:number)
+ans_hit(c,j,v) :- meets(c,j), edit(c,j,at,_,_), v = min n : { needed(c,j,n), n != 0, tt(c,n,t), t <= at }.
+ans_hit(c,j,-1) :- meets(c,j), !hitname(c,j).
+
+// Reach, per seed name: the largest smallest-start over paths.
+.decl rseed(c:number, x:number)
+rseed(c,x) :- seed(c,_,x).
+.decl rr(c:number, x:number, n:number, m:number) btree_delete
+.decl rf(c:number, x:number, u:number, m:number) btree_delete
+rr(c,x,x,9223372036854775807) :- rseed(c,x).
+rf(c,x,u,m2) :- rr(c,x,n,m), reads(c,u,n), unchanged(c,u), unit(c,u,s,_,_), m2 = min(m,s).
+rf(c,x,u,m2) :- rr(c,x,0,m), hasreads(c,u), unchanged(c,u), unit(c,u,s,_,_), m2 = min(m,s).
+rf(c,x,u,s) :- rseed(c,x), reads(c,u,0), unchanged(c,u), unit(c,u,s,_,_).
+rr(c,x,w,m) :- rf(c,x,u,m), writes(c,u,w), !status(c,w).
+rr(c,x,n,m) <= rr(c,x,n,k) :- m <= k.
+rf(c,x,u,m) <= rf(c,x,u,k) :- m <= k.
+
+.decl rhit(c:number, j:number, u:number)
+rhit(c,j,u) :- ask(c,j), seed(c,j,_), edit(c,j,_,_,h1), unit(c,u,s,_,1), changed(c,u), s >= h1.
+// Join order chosen by hand: seed, then what it reaches in this window, then the units touching it.
+rhit(c,j,u) :- seed(c,j,x), edit(c,j,_,_,h1), rr(c,x,n,m), m >= h1, touches(c,u,n), changed(c,u), unit(c,u,s,_,_), s >= h1.
+rhit(c,j,u) :- seed(c,j,x), edit(c,j,_,_,h1), rr(c,x,0,m), m >= h1, changed(c,u), touches(c,u,_), unit(c,u,s,_,_), s >= h1.
+rhit(c,j,u) :- ask(c,j), seed(c,j,_), edit(c,j,_,_,h1), touches(c,u,0), changed(c,u), unit(c,u,s,_,_), s >= h1.
+.decl rhitany(c:number, j:number)
+rhitany(c,j) :- rhit(c,j,_), seed(c,j,_).
+.decl ans_reach(c:number, j:number, v:number)
+ans_reach(c,j,v) :- seed(c,j,_), v = min s : { rhit(c,j,u), unit(c,u,s,_,_) }.
+ans_reach(c,j,-1) :- ask(c,j), !rhitany(c,j).
+.output ans_hit, ans_reach

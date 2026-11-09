@@ -1,0 +1,13 @@
+// Inputs dumped by the Rust edit checker (one instance c per sweep call).
+.decl unit(c:number, u:number, s:number, e:number, jumps:number)
+.decl reads(c:number, u:number, n:number)
+.decl writes(c:number, u:number, n:number)
+.decl touches(c:number, u:number, n:number)
+.decl status(c:number, n:number)
+.decl fspan(c:number, a:number, b:number)          // spans of every non-equal finding
+.decl edit(c:number, j:number, at:number, h0:number, h1:number)
+.decl dspan(c:number, j:number, a:number, b:number) // deciding conditions of edit j
+.input unit, reads, writes, touches, status, fspan, edit, dspan
+.decl n(x:number)
+n(x) :- x = count : { unit(_,_,_,_,_) }.
+.output n
