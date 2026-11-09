@@ -299,7 +299,9 @@ fn stdin_filepath_matches_dialect_map_when_absolute_or_dotdot() {
         SRC.as_bytes(),
     );
     assert_eq!(o.status.code(), Some(2));
+}
 
+#[test]
 fn check_json_ranges_are_one_based_byte_columns() {
     let d = scratch("stdin-range");
     let o = with_stdin(
