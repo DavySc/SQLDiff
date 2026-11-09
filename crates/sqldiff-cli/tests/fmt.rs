@@ -299,4 +299,22 @@ fn stdin_filepath_matches_dialect_map_when_absolute_or_dotdot() {
         SRC.as_bytes(),
     );
     assert_eq!(o.status.code(), Some(2));
+
+fn check_json_ranges_are_one_based_byte_columns() {
+    let d = scratch("stdin-range");
+    let o = with_stdin(
+        &d,
+        &["check", "-", "--stdin-filepath", "x.tsql.sql", "-f", "json"],
+        "select 'é', 1\nfrom t limit 3\n".as_bytes(),
+    );
+    let out = stdout(&o);
+    // `limit 3` starts at byte column 8 of line 2 and ends (exclusive) at 15.
+    for key in [
+        "\"start_line\": 2",
+        "\"start_col\": 8",
+        "\"end_line\": 2",
+        "\"end_col\": 15",
+    ] {
+        assert!(out.contains(key), "{key} in {out}");
+    }
 }
