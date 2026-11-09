@@ -326,6 +326,9 @@ fn replace(v: &mut serde_json::Value, index: &std::collections::BTreeMap<&str, u
 }
 
 /// Moves the strings that repeat into a pool. Object keys are not touched.
+/// The streamed `put` does the same one element at a time (`Plan`); this is
+/// the in-memory original, kept as the oracle of its tests.
+#[cfg(test)]
 fn intern(mut v: serde_json::Value) -> (Vec<String>, serde_json::Value) {
     let mut seen = std::collections::BTreeMap::new();
     count(&v, &mut seen);
@@ -351,6 +354,7 @@ const NOTE_TABLE: &str = "note_table";
 /// (one file of 1,200 units held 200,000 equal notes, 94 % of its stored
 /// result). In the stored form every distinct note is written once, in
 /// order of first use, and a unit's `notes` are indices into that table.
+#[cfg(test)]
 fn share_notes(v: &mut serde_json::Value) {
     let Some(units) = v.get_mut("units").and_then(|u| u.as_array_mut()) else {
         return;
@@ -418,6 +422,300 @@ fn expand(v: &mut serde_json::Value, pool: &[String]) -> Option<()> {
     Some(())
 }
 
+/// The conversion `c` with its three big arrays moved out; they go back into
+/// `c` when this is dropped, whatever happened in between.
+struct Taken<'a> {
+    c: &'a mut Conversion,
+    units: Vec<crate::Unit>,
+    report: Vec<sqldiff_model::model::Finding>,
+    output: Vec<sqldiff_model::model::Finding>,
+}
+
+impl<'a> Taken<'a> {
+    fn new(c: &'a mut Conversion) -> Self {
+        Taken {
+            units: std::mem::take(&mut c.units),
+            report: std::mem::take(&mut c.report.findings),
+            output: std::mem::take(&mut c.output_check.findings),
+            c,
+        }
+    }
+}
+
+impl Drop for Taken<'_> {
+    fn drop(&mut self) {
+        self.c.units = std::mem::take(&mut self.units);
+        self.c.report.findings = std::mem::take(&mut self.report);
+        self.c.output_check.findings = std::mem::take(&mut self.output);
+    }
+}
+
+/// What pass 1 of a put found: the small rest of the conversion as a
+/// `Value` (without the three arrays, with the table of notes), the index of
+/// every note in that table by its text, and the pool.
+struct Plan {
+    rest: serde_json::Value,
+    note_at: std::collections::BTreeMap<String, usize>,
+    pool: Vec<String>,
+}
+
+impl Plan {
+    /// Builds the table of notes exactly as [`share_notes`] does (order of
+    /// first use over the units) and counts the long strings exactly as
+    /// [`intern`] does over the note-shared form (the table once, the units
+    /// with their notes as indices), one element at a time.
+    fn new(t: &Taken) -> Result<Plan, String> {
+        let err = |e: serde_json::Error| e.to_string();
+        let mut rest = serde_json::to_value(&*t.c).map_err(err)?;
+        let mut seen = std::collections::BTreeMap::new();
+        let mut table: Vec<serde_json::Value> = Vec::new();
+        let mut note_at: std::collections::BTreeMap<String, usize> = Default::default();
+        for u in &t.units {
+            let mut v = serde_json::to_value(u).map_err(err)?;
+            if let Some(notes) = v.get_mut("notes").and_then(|n| n.as_array_mut()) {
+                for n in notes.iter_mut() {
+                    let i = *note_at.entry(n.to_string()).or_insert_with(|| {
+                        table.push(n.clone());
+                        table.len() - 1
+                    });
+                    *n = serde_json::Value::from(i);
+                }
+            }
+            count(&v, &mut seen);
+        }
+        for f in t.report.iter().chain(&t.output) {
+            count(&serde_json::to_value(f).map_err(err)?, &mut seen);
+        }
+        rest[NOTE_TABLE] = serde_json::Value::Array(table);
+        count(&rest, &mut seen);
+        let mut pool: Vec<String> = seen
+            .into_iter()
+            .filter(|(_, n)| *n >= 2)
+            .map(|(s, _)| s)
+            .collect();
+        pool.sort();
+        Ok(Plan {
+            rest,
+            note_at,
+            pool,
+        })
+    }
+}
+
+/// A member of an object of the conversion: a small value, or one of the
+/// three big arrays, which are streamed.
+enum Part {
+    Val(serde_json::Value),
+    Units,
+    ReportFindings,
+    OutputFindings,
+    Obj(std::collections::BTreeMap<String, Part>),
+}
+
+/// Splits the small rest of the conversion into [`Part`]s. A `Map` is a
+/// `BTreeMap`, so its keys come in byte order (a test pins that), and so do
+/// those of a `BTreeMap`.
+fn parts(rest: serde_json::Value) -> Option<Part> {
+    let serde_json::Value::Object(map) = rest else {
+        return None;
+    };
+    let mut out = std::collections::BTreeMap::new();
+    for (k, v) in map {
+        let p = match (k.as_str(), v) {
+            ("units", _) => Part::Units,
+            ("report" | "output_check", serde_json::Value::Object(o)) => {
+                let findings = || match k.as_str() {
+                    "report" => Part::ReportFindings,
+                    _ => Part::OutputFindings,
+                };
+                Part::Obj(
+                    o.into_iter()
+                        .map(|(ik, iv)| {
+                            let p = if ik == "findings" {
+                                findings()
+                            } else {
+                                Part::Val(iv)
+                            };
+                            (ik, p)
+                        })
+                        .collect(),
+                )
+            }
+            (_, v) => Part::Val(v),
+        };
+        out.insert(k, p);
+    }
+    Some(Part::Obj(out))
+}
+
+/// Writes the body of a result (what `reference_body` returns) to `w`.
+struct BodyWriter<'a, W: std::io::Write> {
+    w: &'a mut W,
+    t: &'a Taken<'a>,
+    index: std::collections::BTreeMap<&'a str, usize>,
+    note_at: &'a std::collections::BTreeMap<String, usize>,
+}
+
+impl<W: std::io::Write> BodyWriter<'_, W> {
+    fn raw(&mut self, s: &str) -> Result<(), String> {
+        self.w.write_all(s.as_bytes()).map_err(|e| e.to_string())
+    }
+
+    fn json<T: Serialize + ?Sized>(&mut self, v: &T) -> Result<(), String> {
+        serde_json::to_writer(&mut *self.w, v).map_err(|e| e.to_string())
+    }
+
+    fn element<T: Serialize>(&mut self, x: &T, note_at: bool) -> Result<(), String> {
+        let mut v = serde_json::to_value(x).map_err(|e| e.to_string())?;
+        if note_at {
+            if let Some(notes) = v.get_mut("notes").and_then(|n| n.as_array_mut()) {
+                for n in notes.iter_mut() {
+                    let at = *self
+                        .note_at
+                        .get(&n.to_string())
+                        .ok_or("a note is missing from the note table")?;
+                    *n = serde_json::Value::from(at);
+                }
+            }
+        }
+        replace(&mut v, &self.index);
+        self.json(&v)
+    }
+
+    fn array<T: Serialize>(&mut self, xs: &[T], note_at: bool) -> Result<(), String> {
+        self.raw("[")?;
+        for (i, x) in xs.iter().enumerate() {
+            if i > 0 {
+                self.raw(",")?;
+            }
+            self.element(x, note_at)?;
+        }
+        self.raw("]")
+    }
+
+    fn part(&mut self, p: Part) -> Result<(), String> {
+        let t = self.t;
+        match p {
+            Part::Val(mut v) => {
+                replace(&mut v, &self.index);
+                self.json(&v)
+            }
+            Part::Units => self.array(&t.units, true),
+            Part::ReportFindings => self.array(&t.report, false),
+            Part::OutputFindings => self.array(&t.output, false),
+            Part::Obj(m) => {
+                self.raw("{")?;
+                for (i, (k, p)) in m.into_iter().enumerate() {
+                    if i > 0 {
+                        self.raw(",")?;
+                    }
+                    self.json(&k)?;
+                    self.raw(":")?;
+                    self.part(p)?;
+                }
+                self.raw("}")
+            }
+        }
+    }
+}
+
+/// Hashes what passes through to the file.
+struct HashWriter {
+    out: std::io::BufWriter<std::fs::File>,
+    hash: Sha256,
+}
+
+impl std::io::Write for HashWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.out.write(buf)?;
+        self.hash.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
+}
+
+/// Writes the file of a result to `tmp`: 65 bytes of placeholder, the body
+/// (streamed and hashed as it goes), then the digest and the newline over
+/// the placeholder. The file is `framed` of `reference_body`.
+fn write_framed(
+    tmp: &Path,
+    key: &str,
+    plan: Plan,
+    t: &Taken,
+    mix: Option<&crate::check::Mix>,
+    mix_tried: bool,
+) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom, Write};
+    let here = |e: std::io::Error| format!("{}: {e}", tmp.display());
+    let file = std::fs::File::create(tmp).map_err(here)?;
+    let mut hw = HashWriter {
+        out: std::io::BufWriter::with_capacity(1 << 16, file),
+        hash: Sha256::new(),
+    };
+    hw.out.write_all(&[b' '; 65]).map_err(here)?;
+    {
+        let Plan {
+            rest,
+            note_at,
+            pool,
+        } = plan;
+        let index: std::collections::BTreeMap<&str, usize> = pool
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_str(), i))
+            .collect();
+        let conversion = parts(rest).ok_or("the conversion is not an object")?;
+        let mut bw = BodyWriter {
+            w: &mut hw,
+            t,
+            index,
+            note_at: &note_at,
+        };
+        bw.raw("{\"key\":")?;
+        bw.json(key)?;
+        bw.raw(",\"pool\":")?;
+        bw.json(&pool)?;
+        bw.raw(",\"conversion\":")?;
+        bw.part(conversion)?;
+        bw.raw(",\"mix\":")?;
+        bw.json(&mix)?;
+        bw.raw(",\"mix_tried\":")?;
+        bw.json(&mix_tried)?;
+        bw.raw("}")?;
+    }
+    let digest = hex(&hw.hash.finalize_reset());
+    let mut file = hw.out.into_inner().map_err(|e| here(e.into_error()))?;
+    file.seek(SeekFrom::Start(0)).map_err(here)?;
+    file.write_all(digest.as_bytes()).map_err(here)?;
+    file.write_all(b"\n").map_err(here)?;
+    Ok(())
+}
+
+/// The body of a result as the first version of [`Store::put`] built it, all
+/// in memory: the oracle the tests compare the streamed file with.
+#[cfg(test)]
+fn reference_body(
+    key: &Key,
+    c: &Conversion,
+    mix: Option<&crate::check::Mix>,
+    mix_tried: bool,
+) -> Result<Vec<u8>, String> {
+    let mut value = serde_json::to_value(c).map_err(|e| e.to_string())?;
+    share_notes(&mut value);
+    let (pool, conversion) = intern(value);
+    serde_json::to_vec(&Entry {
+        key: key.0.clone(),
+        pool,
+        conversion,
+        mix: mix.cloned(),
+        mix_tried,
+    })
+    .map_err(|e| e.to_string())
+}
+
 /// The results of one output tree.
 pub struct Store {
     out: PathBuf,
@@ -459,25 +757,25 @@ impl Store {
     /// Stores a result: written beside its name and renamed into place,
     /// retried a few times because a virus scanner on Windows can hold the
     /// file for a moment.
+    ///
+    /// The file is `framed` of `reference_body`, byte for byte, but the big
+    /// arrays of the conversion (`units`, `report.findings`,
+    /// `output_check.findings`) are never one `Value` or one buffer. They are
+    /// taken out of `c` for the call and put back on every path, a panic
+    /// included, by [`Taken`]; the small rest is serialised once; the arrays
+    /// are written element by element into the temporary file through a
+    /// hashing writer. Pass 1 (the table of notes and the pool counts, which
+    /// the head of the file needs) finishes before any byte is written. `c`
+    /// is borrowed mutably only for that take and restore.
     pub fn put(
         &self,
         key: &Key,
-        c: &Conversion,
+        c: &mut Conversion,
         mix: Option<&crate::check::Mix>,
         mix_tried: bool,
     ) -> Result<(), String> {
-        let mut value = serde_json::to_value(c).map_err(|e| e.to_string())?;
-        share_notes(&mut value);
-        let (pool, conversion) = intern(value);
-        let body = serde_json::to_vec(&Entry {
-            key: key.0.clone(),
-            pool,
-            conversion,
-            mix: mix.cloned(),
-            mix_tried,
-        })
-        .map_err(|e| e.to_string())?;
-        let bytes = framed(&body);
+        let taken = Taken::new(c);
+        let plan = Plan::new(&taken)?;
         let dest = crate::tree::dest_under(&self.out, &Self::rel(key))?;
         if let Some(p) = dest.parent() {
             std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
@@ -487,7 +785,11 @@ impl Store {
             std::process::id(),
             std::thread::current().id()
         ));
-        std::fs::write(&tmp, &bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        if let Err(e) = write_framed(&tmp, &key.0, plan, &taken, mix, mix_tried) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        drop(taken);
         let mut last = String::new();
         for attempt in 0..5u64 {
             match std::fs::rename(&tmp, &dest) {
@@ -1035,5 +1337,178 @@ mod template_key_tests {
         for o in others {
             assert_ne!(k, o.key());
         }
+    }
+}
+
+#[cfg(test)]
+mod streamed_put_tests {
+    use super::*;
+    use crate::check::Mix;
+
+    const SRC: &str = "\
+CREATE PROCEDURE dbo.a1 @n INT AS BEGIN SELECT TOP (10) x FROM dbo.t WHERE x > @n ORDER BY x; END;
+GO
+CREATE PROCEDURE dbo.a2 AS BEGIN SELECT DATEADD(day, 1, GETDATE()) AS d, ISNULL(NULL, 1) AS e; END;
+GO
+CREATE PROCEDURE dbo.a3 AS BEGIN DECLARE @s NVARCHAR(40) = N'x'; SELECT LEN(@s) + 1 AS n; END;
+GO
+CREATE TABLE dbo.t (x INT NOT NULL, y DATETIME2 NULL);
+GO
+SELECT 1;
+";
+
+    fn converted(src: &str) -> Conversion {
+        crate::convert(
+            src,
+            sqldiff_core::Dialect::Tsql,
+            sqldiff_core::Dialect::Postgres,
+        )
+        .unwrap()
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "sqldiff-streamed-put-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// Puts `c` and checks the file against the reference, the conversion
+    /// against itself, and `get` against `c`.
+    fn check_same(name: &str, mut c: Conversion, mix: Option<&Mix>, mix_tried: bool) {
+        let out = scratch(name);
+        let store = Store::of(&out);
+        let key = Key(format!("{:0>64}", name.len()));
+        let before = serde_json::to_vec(&c).unwrap();
+        store.put(&key, &mut c, mix, mix_tried).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&c).unwrap(),
+            before,
+            "{name}: c restored"
+        );
+        let want = framed(&reference_body(&key, &c, mix, mix_tried).unwrap());
+        let got = std::fs::read(out.join(Store::rel(&key))).unwrap();
+        assert!(
+            got == want,
+            "{name}: the streamed file differs from the reference"
+        );
+        assert!(verified_body(&got).is_some());
+        let (back, bmix, btried) = store.get(&key).unwrap();
+        assert!(compare(&back, &c), "{name}: round trip");
+        assert_eq!((bmix.as_ref(), btried), (mix, mix_tried), "{name}: mix");
+        let leftovers = std::fs::read_dir(out.join(DIR)).unwrap().count();
+        assert_eq!(leftovers, 1, "{name}: no temporary file is left");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn streamed_file_equals_the_reference_on_a_real_conversion() {
+        let c = converted(SRC);
+        assert!(
+            c.units.iter().any(|u| !u.notes.is_empty()),
+            "fixture has notes"
+        );
+        assert!(!c.report.findings.is_empty() || !c.output_check.findings.is_empty());
+        let e: Entry =
+            serde_json::from_slice(&reference_body(&Key("a".repeat(64)), &c, None, false).unwrap())
+                .unwrap();
+        assert!(!e.pool.is_empty(), "fixture pools a repeated string");
+        let table = e.conversion[NOTE_TABLE].as_array().unwrap().len();
+        assert!(table > 0, "fixture has a note table");
+        check_same("real", c.clone(), None, false);
+        let mix = Mix {
+            plain_at: vec![1, 3],
+            draft: "a draft long enough to be pooled but it is not".into(),
+        };
+        check_same("mixed", c, Some(&mix), true);
+    }
+
+    #[test]
+    fn streamed_file_equals_the_reference_on_pooled_and_marked_strings() {
+        let mut c = converted(SRC);
+        let long = "a repeated text that is long enough to be pooled".to_string();
+        c.unproven = vec![
+            long.clone(),
+            long.clone(),
+            format!("{MARK}0 starts with the marker"),
+            format!("{MARK}{MARK}twice"),
+            format!("{MARK}"),
+        ];
+        c.output = format!("{MARK}{long}");
+        c.report.unknown_reasons = vec![long.clone(), "short".into(), long.clone()];
+        c.output_check.normalizations = vec![long.clone()];
+        let extra = c.units.last().cloned().unwrap();
+        for _ in 0..3 {
+            let mut u = extra.clone();
+            if let Some(n) = u.notes.first().cloned() {
+                u.notes = vec![n.clone(), n];
+            }
+            c.units.push(u);
+        }
+        check_same("marked", c.clone(), None, true);
+        // Findings that repeat a long text across both finding arrays.
+        if let Some(f) = c.report.findings.first().cloned() {
+            c.output_check.findings.push(f.clone());
+            c.output_check.findings.push(f);
+        }
+        check_same("shared-findings", c, None, false);
+    }
+
+    #[test]
+    fn streamed_file_equals_the_reference_on_empty_arrays() {
+        check_same("empty-source", converted(""), None, false);
+        let mut c = converted(SRC);
+        c.units.clear();
+        c.report.findings.clear();
+        c.output_check.findings.clear();
+        check_same("emptied", c.clone(), None, false);
+        c.template = None;
+        c.unplaced = vec![0, 2];
+        check_same("emptied-unplaced", c, None, true);
+    }
+
+    #[test]
+    fn put_restores_the_conversion_when_it_fails() {
+        let mut c = converted(SRC);
+        let before = serde_json::to_vec(&c).unwrap();
+        let out = scratch("fails");
+        // A file where the results directory should be: create_dir_all fails.
+        std::fs::create_dir_all(out.join(".sqldiff")).unwrap();
+        std::fs::write(out.join(DIR), b"in the way").unwrap();
+        let key = Key("c".repeat(64));
+        assert!(Store::of(&out).put(&key, &mut c, None, false).is_err());
+        assert_eq!(serde_json::to_vec(&c).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// `Value` objects are written in key order only while serde_json keeps
+    /// `Map` a `BTreeMap` (no `preserve_order`). The streamed put writes the
+    /// objects of `conversion` in byte order itself and relies on that.
+    #[test]
+    fn the_reference_values_have_sorted_keys() {
+        fn sorted(v: &serde_json::Value) -> bool {
+            match v {
+                serde_json::Value::Object(o) => {
+                    let ks: Vec<&String> = o.keys().collect();
+                    ks.windows(2).all(|w| w[0] < w[1]) && o.values().all(sorted)
+                }
+                serde_json::Value::Array(a) => a.iter().all(sorted),
+                _ => true,
+            }
+        }
+        let mut m = serde_json::Map::new();
+        for k in ["b", "a", "c"] {
+            m.insert(k.to_string(), serde_json::Value::Null);
+        }
+        assert_eq!(m.keys().collect::<Vec<_>>(), ["a", "b", "c"]);
+        let mut v = serde_json::to_value(converted(SRC)).unwrap();
+        share_notes(&mut v);
+        assert!(
+            sorted(&v),
+            "enabling preserve_order would reorder the stored bytes"
+        );
+        assert!(v.as_object().unwrap().contains_key(NOTE_TABLE));
     }
 }

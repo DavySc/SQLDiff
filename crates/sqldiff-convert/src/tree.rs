@@ -1672,7 +1672,7 @@ fn convert_files(
         }
         let mut in_store = false;
         if let (Some(cc), Some(k)) = (cache, key) {
-            match cc.store.put(k, &c, mix.as_ref(), rebuild.is_some()) {
+            match cc.store.put(k, &mut c, mix.as_ref(), rebuild.is_some()) {
                 Ok(()) => in_store = true,
                 Err(e) => eprintln!("sqldiff: result not stored: {e}"),
             }
@@ -2286,7 +2286,7 @@ fn convert_templates(
         }
         let mut in_store = None;
         if let (Some(cc), Some(k)) = (cache, key) {
-            match cc.store.put(k, &c, None, false) {
+            match cc.store.put(k, &mut c, None, false) {
                 Ok(()) => in_store = Some(k.clone()),
                 Err(e) => eprintln!("sqldiff: result not stored: {e}"),
             }
