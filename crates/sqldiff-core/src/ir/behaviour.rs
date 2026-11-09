@@ -1133,9 +1133,11 @@ fn pair_statements(
 
 /// T-SQL compared against PostgreSQL or Db2 for i: the other side's
 /// temporary tables, which a table variable may have been converted to.
+/// Read from `other`'s cached set (`Analyzed::temp_table_names`), so the
+/// whole-file scan runs once per `Analyzed`, not once per pair.
 fn other_temps(x: &Analyzed, other: &Analyzed) -> HashSet<String> {
     if x.dialect() == Dialect::Tsql && other.dialect() != Dialect::Tsql {
-        crate::classify::temp_table_names(&other.root)
+        other.temp_table_names().clone()
     } else {
         HashSet::new()
     }
@@ -1396,7 +1398,9 @@ struct Collector<'x, 'a> {
     /// Fingerprints of the findings of the routines analysed before this one
     /// in the same files, and this routine's name: two routines whose
     /// statements start with the same words must not share a fingerprint.
-    prior: HashSet<String>,
+    /// Shared with the file loop, which extends it only between pairs, when
+    /// no collector holds it: read through `contains` only.
+    prior: Rc<HashSet<String>>,
     salt: String,
     /// Statements where a path of some scenario was cut by a budget, per
     /// side (see `Outcome::cut`).
@@ -1540,7 +1544,7 @@ impl<'x, 'a> Collector<'x, 'a> {
             al,
             keys,
             incomplete: false,
-            prior: HashSet::new(),
+            prior: Rc::new(HashSet::new()),
             salt: String::new(),
             cut_a: BTreeSet::new(),
             cut_b: BTreeSet::new(),
@@ -2439,7 +2443,7 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
             ra.first().cloned(),
             rb.first().cloned(),
             "",
-            &HashSet::new(),
+            &Rc::new(HashSet::new()),
             &file_spent,
             file_work,
         );
@@ -2481,7 +2485,7 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
         cap: file_work_cap(m.pairs.len().max(1) as u64, largest),
     };
     let mut out = Behaviour::default();
-    let mut prior: HashSet<String> = HashSet::new();
+    let mut prior: Rc<HashSet<String>> = Rc::new(HashSet::new());
     let mut all_compared = m.only_a.is_empty() && m.only_b.is_empty();
     for (x, y) in &m.pairs {
         let name = sqldiff_syntax::ast::routine_name(x).unwrap_or_default();
@@ -2496,7 +2500,9 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
             &file_spent,
             file_work,
         );
-        prior.extend(r.findings.iter().map(|f| f.fingerprint.clone()));
+        // The pair's collector is gone, so `prior` is unique here and
+        // `make_mut` does not copy it.
+        Rc::make_mut(&mut prior).extend(r.findings.iter().map(|f| f.fingerprint.clone()));
         all_compared &= r.txn_compared;
         if r.txn_compared {
             let span = |n: &SyntaxNode| {
@@ -2523,7 +2529,8 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
 }
 
 /// The analysis of one pair of routines (or, with `None`, of the statements
-/// outside any routine).
+/// outside any routine). `prior` is shared, not copied: the collector only
+/// reads it, and the caller extends it after the pair.
 #[allow(clippy::too_many_arguments)]
 fn analyze_pair(
     a: &Analyzed,
@@ -2532,13 +2539,13 @@ fn analyze_pair(
     ra: Option<SyntaxNode>,
     rb: Option<SyntaxNode>,
     salt: &str,
-    prior: &HashSet<String>,
+    prior: &Rc<HashSet<String>>,
     file_spent: &Rc<Cell<u64>>,
     file_work: FileWork,
 ) -> Behaviour {
     let mut c = Collector::new(a, b, env.clone(), ra, rb, file_spent.clone(), file_work);
     c.salt = salt.to_string();
-    c.prior = prior.clone();
+    c.prior = Rc::clone(prior);
     c.faults();
     c.split_findings();
     c.run(Kind::Baseline, env.scenario(), env.scenario());

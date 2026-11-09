@@ -484,7 +484,7 @@ struct Lowerer {
     /// The routine's name: names the temporary table a T-SQL table variable
     /// is converted to (`classify::table_variable_table`).
     routine_name: Option<String>,
-    /// The other side's temporary tables (`classify::temp_table_names`): a
+    /// The other side's temporary tables (`Analyzed::temp_table_names`): a
     /// table variable converted to one of them is keyed by its name.
     /// Otherwise `@t` and `#t` share the key `T`, so a table variable
     /// replaced by a temporary table of the same name pairs.

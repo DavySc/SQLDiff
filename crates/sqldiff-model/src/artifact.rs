@@ -1,5 +1,8 @@
 //! Artifacts (layer 0 input) and their parsed form.
 
+use std::cell::OnceCell;
+use std::collections::HashSet;
+
 use sha2::{Digest, Sha256};
 use sqldiff_syntax::{ast, parse, Dialect, LineIndex, Parse, SyntaxKind, SyntaxNode};
 
@@ -99,6 +102,13 @@ pub struct Analyzed<'a> {
     pub lines: LineIndex,
     pub object: String,
     pub excerpt_lines: usize,
+    /// Cache of `temp_table_names`: a pure function of `root`. Invariant:
+    /// `root` and `parse` are never reassigned or mutated after `new` (the
+    /// tree is immutable and `artifact` is borrowed), so the cached set is
+    /// exactly what a fresh scan of `root` would return. Changed text
+    /// (for example a blanked copy of a trigger) needs a new `Analyzed`,
+    /// which gets its own cache. Keep this field private.
+    temp_names: OnceCell<HashSet<String>>,
 }
 
 impl<'a> Analyzed<'a> {
@@ -122,7 +132,28 @@ impl<'a> Analyzed<'a> {
             root,
             object,
             excerpt_lines,
+            temp_names: OnceCell::new(),
         }
+    }
+
+    /// Lower-case names of the temporary tables `root` names as `pg_temp.x`
+    /// or `SESSION.x`: where a converted T-SQL table variable may have gone.
+    /// Scans the whole tree on the first call and caches the set (see the
+    /// invariant on `temp_names`); later calls are free. Callers only test
+    /// membership, so the set's order never reaches an output.
+    pub fn temp_table_names(&self) -> &HashSet<String> {
+        self.temp_names.get_or_init(|| {
+            let toks: Vec<_> = ast::sig_tokens(&self.root).collect();
+            toks.windows(3)
+                .filter(|w| {
+                    (w[0].text().eq_ignore_ascii_case("pg_temp")
+                        || w[0].text().eq_ignore_ascii_case("SESSION"))
+                        && w[1].kind() == SyntaxKind::DOT
+                        && w[2].kind() == SyntaxKind::IDENT
+                })
+                .map(|w| w[2].text().to_lowercase())
+                .collect()
+        })
     }
 
     pub fn dialect(&self) -> Dialect {

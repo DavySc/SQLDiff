@@ -40,6 +40,8 @@
 //!   counts and never changes a result.
 //! - `record.rs` (`sqldiff-catalog`): the recorder collects the check's own reads
 //!   (a write-only sink; nothing the check computes depends on it).
+//! - `artifact.rs` (`sqldiff-model`) caches `Analyzed::temp_table_names`, a
+//!   pure function of the immutable parse tree, in a private `OnceCell`.
 //! - `abstract_syntax.rs` (`sqldiff-syntax`) keeps a bounded per-thread cache of the
 //!   tokens of a node (`tokens_shared`), a pure function of the node.
 
@@ -128,6 +130,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
         "sqldiff-core/src/ir/behaviour.rs",
         &["OnceCell", "thread_local!"],
     ),
+    ("sqldiff-model/src/artifact.rs", &["OnceCell"]),
     ("sqldiff-model/src/profile.rs", &["OnceLock"]),
     ("sqldiff-core/src/lint.rs", &["OnceLock"]),
     ("sqldiff-core/src/rule_proofs.rs", &["OnceLock"]),
