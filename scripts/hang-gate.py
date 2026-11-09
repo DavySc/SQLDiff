@@ -35,9 +35,8 @@ OVERRIDES = {}
 # turn a runaway there into "not proven: work budget". Statement-level work
 # (alignment, the edit checker, witness search) is not capped until step B (a later PR);
 # one alignment can still use up to LCS_WORK cells.
-KNOWN_OPEN = {
-    "a_procs_500x20": "R1: 246 s (0.5 s per routine)",
-}
+# Empty since #453: a_procs_500x20 (the last entry) ran in 72-91 s on CI.
+KNOWN_OPEN = {}
 
 
 def run(binary, path, out, timeout, kill_rss_mb, dialect="tsql"):
