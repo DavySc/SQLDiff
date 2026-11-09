@@ -701,6 +701,22 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
         "KILLED = {killed:#?}\nREDUNDANT = {redundant:#?}\nDOMINATED = {dom:#?}\nGAP = {gap:#?}"
     );
     if only.is_some() {
+        // A shard (`SQLDIFF_T3_ONLY`, as the workflow `t3-sites` runs them):
+        // every site it classified must be in the class pinned for it.
+        let wrong = |got: &[String], pinned: &[&str], class: &str| {
+            let bad: Vec<&String> = got
+                .iter()
+                .filter(|n| !pinned.contains(&n.as_str()))
+                .collect();
+            assert!(
+                bad.is_empty(),
+                "sites found {class} that are not pinned {class}: {bad:?}"
+            );
+        };
+        wrong(&killed, KILLED, "KILLED");
+        wrong(&redundant, REDUNDANT, "REDUNDANT");
+        wrong(&dom, DOMINATED, "DOMINATED");
+        assert!(gap.is_empty(), "sites with no proof: {gap:?}");
         return;
     }
     let sorted = |v: &[&str]| {
