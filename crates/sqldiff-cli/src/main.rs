@@ -637,14 +637,22 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             if !stdin && stdin_filepath.is_some() {
                 return Err("--stdin-filepath needs `-` as the file".into());
             }
+            let dir = stdin_input::config_dir(stdin_filepath.as_deref());
+            let project = stdin.then(|| cfg.project_dir(dir.as_deref())).flatten();
             let cfg = if stdin {
-                cfg.resolve_from(stdin_input::config_dir(stdin_filepath.as_deref()))?
+                cfg.resolve_from(dir)?
             } else {
                 cfg.resolve()?
             };
             let art = if stdin {
                 let text = stdin_input::read_text()?;
-                stdin_input::artifact(text, stdin_filepath.as_deref(), dialect, &cfg)?
+                stdin_input::artifact(
+                    text,
+                    stdin_filepath.as_deref(),
+                    project.as_deref(),
+                    dialect,
+                    &cfg,
+                )?
             } else {
                 read(&file, dialect, &cfg)?
             };

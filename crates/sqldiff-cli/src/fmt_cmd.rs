@@ -116,7 +116,9 @@ fn run_stdin(a: &Args) -> Result<ExitCode, String> {
         return Err("--write needs a file; `-` writes to standard output".into());
     }
     let path = a.stdin_filepath.as_deref();
-    let cfg = a.cfg.resolve_from(stdin_input::config_dir(path))?;
+    let dir = stdin_input::config_dir(path);
+    let project = a.cfg.project_dir(dir.as_deref());
+    let cfg = a.cfg.resolve_from(dir)?;
     let flags = format::FormatConfig {
         all: a.keys(),
         ..Default::default()
@@ -125,7 +127,7 @@ fn run_stdin(a: &Args) -> Result<ExitCode, String> {
     let mut config = cfg.policy.format.clone();
     config.merge(&flags);
     let text = stdin_input::read_text()?;
-    let art = stdin_input::artifact(text, path, a.dialect, &cfg)?;
+    let art = stdin_input::artifact(text, path, project.as_deref(), a.dialect, &cfg)?;
     let shown = art.path.clone();
     let file = format_run::laid_out(Path::new(&shown), art, &config, &cfg);
     if let Some(line) = file.skipped_line() {

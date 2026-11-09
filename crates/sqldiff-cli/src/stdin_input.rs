@@ -37,6 +37,39 @@ pub fn config_dir(filepath: Option<&Path>) -> Option<PathBuf> {
     std::env::current_dir().ok().map(|c| c.join(parent))
 }
 
+/// `p` made absolute against the working directory, with `.` and `..`
+/// folded away (the file need not exist, so no symlinks are followed).
+fn absolute(p: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let full = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(p)
+    };
+    let mut out = PathBuf::new();
+    for c in full.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Some(out)
+}
+
+/// The path `dialect_map` globs are matched against: relative to the
+/// project config's directory, as for files found in the project. Outside
+/// the project (or with no config) the path as given.
+pub fn classify_path(filepath: &Path, project_dir: Option<&Path>) -> String {
+    let rel = project_dir
+        .and_then(absolute)
+        .zip(absolute(filepath))
+        .and_then(|(root, f)| f.strip_prefix(&root).ok().map(Path::to_path_buf));
+    tree::slashed(rel.as_deref().unwrap_or(filepath))
+}
+
 /// The path as messages show it.
 pub fn shown(filepath: Option<&Path>) -> String {
     filepath.map_or_else(|| "<stdin>".to_string(), |p| p.display().to_string())
@@ -46,10 +79,13 @@ pub fn shown(filepath: Option<&Path>) -> String {
 pub fn artifact(
     text: String,
     filepath: Option<&Path>,
+    project_dir: Option<&Path>,
     dialect: Option<Dialect>,
     cfg: &Resolved,
 ) -> Result<Artifact, String> {
-    let rel = filepath.map(tree::slashed).unwrap_or_default();
+    let rel = filepath
+        .map(|p| classify_path(p, project_dir))
+        .unwrap_or_default();
     tree::artifact(shown(filepath), &rel, dialect, text, cfg).map_err(|e| e.0)
 }
 
@@ -61,6 +97,30 @@ mod tests {
     fn dash_is_stdin() {
         assert!(is_stdin(Path::new("-")));
         assert!(!is_stdin(Path::new("a.sql")));
+    }
+
+    #[test]
+    fn classify_is_relative_to_the_project() {
+        let cwd = std::env::current_dir().unwrap();
+        let proj = cwd.join("proj");
+        for f in [
+            proj.join("db").join("x.sql"),
+            cwd.join("other")
+                .join("..")
+                .join("proj")
+                .join("db")
+                .join("x.sql"),
+            PathBuf::from("proj/db/x.sql"),
+            PathBuf::from("proj/./db/../db/x.sql"),
+        ] {
+            assert_eq!(classify_path(&f, Some(&proj)), "db/x.sql", "{f:?}");
+        }
+        // Outside the project, or without one: as given.
+        assert_eq!(
+            classify_path(Path::new("../z/x.sql"), Some(&proj)),
+            "../z/x.sql"
+        );
+        assert_eq!(classify_path(Path::new("a/x.sql"), None), "a/x.sql");
     }
 
     #[test]

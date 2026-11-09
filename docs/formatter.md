@@ -16,7 +16,8 @@ sqldiff fmt -d postgres --keyword-case lower --indent 2 f.sql
 `sqldiff fmt -` reads the buffer from standard input and writes the result to
 standard output. `--stdin-filepath PATH` says which file the buffer is: its
 name decides the dialect (`dialect_map`, path convention) and the project
-`sqldiff.toml` is searched from its directory (the file need not exist).
+`sqldiff.toml` is searched from its directory (the file need not exist). `dialect_map` globs are matched against the path
+relative to that `sqldiff.toml`, so an absolute or `../` path works.
 Input must be UTF-8; line endings, CRLF included, pass through byte for byte.
 Statements kept as written are listed on stderr. `--check` prints nothing and
 exits 1 if the text would change; `--write` is refused. `sqldiff check -`
@@ -148,3 +149,6 @@ MCP server does not offer it yet, and conversion output is not formatted.
 
 The engine already ignores layout when it compares (a reformatted file
 gives no findings), so the diff does not format first.
+
+A generator template (see above) is not formatted: with `-` the run exits 2
+with nothing on standard output, so an editor keeps its buffer.
