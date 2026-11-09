@@ -36,7 +36,6 @@ OVERRIDES = {}
 # (alignment, the edit checker, witness search) is not capped until step B (a later PR);
 # one alignment can still use up to LCS_WORK cells.
 KNOWN_OPEN = {
-    "j_branches_16": "the input doubles per depth (10.5 MB, 131k statements in one routine): 125 s and 3.3 GB, over the 120 s and 2 GB limits; depth 14 (26 s, 0.9 GB) is guarded in the normal run",
     "a_procs_500x20": "R1: 246 s (0.5 s per routine)",
 }
 
