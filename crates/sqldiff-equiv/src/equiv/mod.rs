@@ -440,14 +440,16 @@ fn compare_rest(
 }
 
 /// T-SQL against PostgreSQL or Db2 for i: the other side's temporary
-/// tables, which the T-SQL side's table variables may have become.
+/// tables, which the T-SQL side's table variables may have become. Each
+/// set is the cached one of the `Analyzed` passed in, which may be a
+/// blanked copy built from edited text (its own tree, its own set).
 fn tv_names(a: &Analyzed, b: &Analyzed, ua: &mut Unit, ub: &mut Unit) {
     let tsql = sqldiff_syntax::Dialect::Tsql;
     if a.dialect() == tsql && b.dialect() != tsql {
-        ua.other_temps = crate::classify::temp_table_names(&b.root);
+        ua.other_temps = b.temp_table_names().clone();
     }
     if b.dialect() == tsql && a.dialect() != tsql {
-        ub.other_temps = crate::classify::temp_table_names(&a.root);
+        ub.other_temps = a.temp_table_names().clone();
     }
 }
 

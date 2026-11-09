@@ -538,21 +538,6 @@ fn name_parts(routine: &str) -> Vec<String> {
         .collect()
 }
 
-/// Lower-case names of the temporary tables `root` names as `pg_temp.x` or
-/// `SESSION.x`: where a converted T-SQL table variable may have gone.
-pub fn temp_table_names(root: &SyntaxNode) -> std::collections::HashSet<String> {
-    let toks: Vec<SyntaxToken> = ast::sig_tokens(root).collect();
-    toks.windows(3)
-        .filter(|w| {
-            (w[0].text().eq_ignore_ascii_case("pg_temp")
-                || w[0].text().eq_ignore_ascii_case("SESSION"))
-                && w[1].kind() == SyntaxKind::DOT
-                && w[2].kind() == SyntaxKind::IDENT
-        })
-        .map(|w| w[2].text().to_lowercase())
-        .collect()
-}
-
 /// A T-SQL ROLLBACK in `node`, other than in a CATCH that only rolls back
 /// and rethrows (`IF @@TRANCOUNT > 0 ROLLBACK; THROW;`): that error ends the
 /// routine, and its table variables with it. A PostgreSQL ROLLBACK empties

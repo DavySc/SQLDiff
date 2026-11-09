@@ -370,7 +370,7 @@ pub struct Unit {
     /// That routine's name parts as its header writes them, unquoted.
     pub routine_parts: Vec<String>,
     /// T-SQL compared against PostgreSQL or Db2 for i: the other side's
-    /// temporary tables (`classify::temp_table_names`). A table variable
+    /// temporary tables (`Analyzed::temp_table_names`). A table variable
     /// converted to one of them is named as it; otherwise `@t` keeps the key
     /// `temp:t`, which a `#t` replacing it shares.
     pub other_temps: std::collections::HashSet<String>,

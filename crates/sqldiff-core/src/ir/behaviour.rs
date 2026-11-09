@@ -1133,9 +1133,11 @@ fn pair_statements(
 
 /// T-SQL compared against PostgreSQL or Db2 for i: the other side's
 /// temporary tables, which a table variable may have been converted to.
+/// Read from `other`'s cached set (`Analyzed::temp_table_names`), so the
+/// whole-file scan runs once per `Analyzed`, not once per pair.
 fn other_temps(x: &Analyzed, other: &Analyzed) -> HashSet<String> {
     if x.dialect() == Dialect::Tsql && other.dialect() != Dialect::Tsql {
-        crate::classify::temp_table_names(&other.root)
+        other.temp_table_names().clone()
     } else {
         HashSet::new()
     }
