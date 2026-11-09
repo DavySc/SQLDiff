@@ -191,7 +191,7 @@ fn known_wkb_args(unit: &Unit, s: &lower::LStmt) -> Vec<(String, String)> {
         return Vec::new();
     }
     let mut out: Vec<(String, String)> = Vec::new();
-    for t in &s.toks {
+    for t in s.toks.iter() {
         let name = match (unit.dialect, t.kind) {
             (Dialect::Tsql, ast::K::Var) if !t.text.starts_with("@@") => t.text[1..].to_lowercase(),
             (Dialect::Postgres, ast::K::Word)

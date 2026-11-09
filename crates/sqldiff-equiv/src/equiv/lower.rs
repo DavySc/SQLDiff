@@ -2,6 +2,8 @@
 //! data statements, plus everything the statement-level comparison does not
 //! cover (control flow other than the recognised transaction protocols).
 
+use std::rc::Rc;
+
 use sqldiff_syntax::{ast as cst, Dialect, SyntaxKind, SyntaxNode};
 
 use super::ast::{
@@ -89,7 +91,9 @@ pub struct Local {
 #[derive(Debug, Clone)]
 pub struct LStmt {
     pub node: SyntaxNode,
-    pub toks: Vec<Tok>,
+    /// The statement's tokens, as `tokens_shared` returns them (or the part
+    /// of them the statement keeps): shared, not copied, and read only.
+    pub toks: Rc<[Tok]>,
     pub ast: Result<Stmt, String>,
     /// PostgreSQL declaration-section initializers are lowered as assignments.
     pub from_declare: bool,
@@ -697,7 +701,7 @@ fn assign_loop(c: &SyntaxNode, u: &mut Unit) -> bool {
     }
     u.stmts.push(LStmt {
         node: c.clone(),
-        toks: tokens(c).to_vec(),
+        toks: tokens(c),
         ast: Ok(Stmt::Select(sel)),
         from_declare: false,
         msg: None,
@@ -2272,7 +2276,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         }
         u.stmts.push(LStmt {
             node: c.clone(),
-            toks: tokens(c).to_vec(),
+            toks: tokens(c),
             ast,
             from_declare: false,
             msg,
@@ -2397,7 +2401,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
             }
             u.stmts.push(LStmt {
                 node: c.clone(),
-                toks: toks.to_vec(),
+                toks,
                 ast,
                 from_declare,
                 msg: None,
@@ -2471,7 +2475,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                                 matches!(t.kind, K::Dot | K::Word | K::Quoted) || t.text == "/"
                             })) =>
                 {
-                    let body: Vec<Tok> = toks[at + 1..].to_vec();
+                    let body: Rc<[Tok]> = toks[at + 1..].into();
                     let ast = parse_stmt_lowered(&body, d);
                     u.kind = UnitKind::View;
                     u.stmts.push(LStmt {
@@ -2600,7 +2604,7 @@ fn result_open(c: &SyntaxNode, u: &mut Unit) -> bool {
     });
     u.stmts.push(LStmt {
         node: c.clone(),
-        toks: toks.to_vec(),
+        toks,
         ast,
         from_declare: false,
         msg: None,
@@ -2672,7 +2676,7 @@ fn cursor_stmt(c: &SyntaxNode, u: &mut Unit) -> bool {
     };
     u.stmts.push(LStmt {
         node: c.clone(),
-        toks: tokens(c).to_vec(),
+        toks: tokens(c),
         ast: Err("a cursor statement".into()),
         from_declare: false,
         msg: None,
@@ -2902,7 +2906,7 @@ fn by_severity(c: &SyntaxNode, u: &mut Unit, ast: Result<Stmt, String>, m: Msg, 
     let cond = Expr::Bin(">".into(), Box::new(sev), Box::new(Expr::Num("10".into())));
     let stmt = |error: bool| LStmt {
         node: c.clone(),
-        toks: tokens(c).to_vec(),
+        toks: tokens(c),
         ast: ast.clone(),
         from_declare: false,
         msg: Some(Msg { error, ..m.clone() }),
@@ -3302,7 +3306,7 @@ fn pg_declaration(s: &SyntaxNode, u: &mut Unit) {
     });
     u.stmts.push(LStmt {
         node: s.clone(),
-        toks: toks.to_vec(),
+        toks,
         ast,
         from_declare: true,
         msg: None,
