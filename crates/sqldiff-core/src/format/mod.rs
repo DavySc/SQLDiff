@@ -500,11 +500,12 @@ fn verify(
                             .find(|t| !is_comment(t))
                             .is_some_and(|t| t.0 == SyntaxKind::L_PAREN);
                         // A single `:` before the word: a psql or host variable.
-                        let variable = a[..k]
-                            .iter()
-                            .rev()
-                            .find(|t| !is_comment(t))
-                            .is_some_and(|t| t.0 == SyntaxKind::COLON);
+                        // (after a name it ends a label instead).
+                        let mut before = a[..k].iter().rev().filter(|t| !is_comment(t));
+                        let variable = before.next().is_some_and(|t| t.0 == SyntaxKind::COLON)
+                            && !before.next().is_some_and(|t| {
+                                matches!(t.0, SyntaxKind::IDENT | SyntaxKind::QUOTED_IDENT)
+                            });
                         !variable
                             && (recasable(&upper, dialect)
                                 || recasable_name(&upper, dialect, call, true))

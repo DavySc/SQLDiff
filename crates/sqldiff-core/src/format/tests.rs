@@ -617,3 +617,38 @@ fn type_names_are_recased_only_in_type_position() {
         f.text
     );
 }
+
+#[test]
+fn a_keyword_after_a_label_is_recased_and_aliases_are_not_types() {
+    let up = with(|o| o.keyword_case = KeywordCase::Upper);
+    let f = format(
+        "fetch_loop: loop select 1; end loop fetch_loop;\n",
+        Dialect::Db2i,
+        &up,
+    );
+    assert!(f.kept.is_empty(), "{:?}", f.kept);
+    assert!(f.text.contains("fetch_loop: LOOP"), "{}", f.text);
+    let f = format(
+        "retry: begin try select 1; end try begin catch select 2; end catch\n",
+        Dialect::Tsql,
+        &up,
+    );
+    assert!(f.text.starts_with("retry:\nBEGIN"), "{}", f.text);
+    let f = format(
+        "select a name, x json from t uuid;\n",
+        Dialect::Postgres,
+        &up,
+    );
+    assert!(f.kept.is_empty(), "{:?}", f.kept);
+    assert!(
+        f.text.contains("a name, x json") && f.text.contains("t uuid"),
+        "{}",
+        f.text
+    );
+    let f = format("declare v int; create function f(a int, b varchar(3)) returns int language sql as 'select 1';\n", Dialect::Postgres, &up);
+    assert!(
+        f.text.contains("DECLARE v INT") && f.text.contains("(a INT, b VARCHAR(3))"),
+        "{}",
+        f.text
+    );
+}

@@ -509,27 +509,40 @@ pub(super) fn keyword_set(text: &str, toks: &[Tok], dialect: Dialect) -> BTreeSe
             continue;
         }
         let prev = k.checked_sub(1).map(|p| &toks[sig[p]]);
-        // `:name` is a psql or host variable, which is case sensitive.
+        // `:name` is a psql or host variable, which is case sensitive. A
+        // colon right after a name ends a label, and the word after it is
+        // an ordinary keyword.
         if prev.is_some_and(|p| p.kind == COLON) {
-            continue;
+            let before = k.checked_sub(2).map(|p| &toks[sig[p]]);
+            if !before.is_some_and(|b| matches!(b.kind, IDENT | QUOTED_IDENT)) {
+                continue;
+            }
         }
         let upper = w.to_ascii_uppercase();
         let word = |t: &Tok| text[t.start..t.end].to_ascii_uppercase();
         // A type name stands after `::`, after `RETURNS`/`OF`, after `AS`
-        // inside `CAST(`, after the name it types (a column or parameter),
-        // or before `(`. Elsewhere it is a column or alias that happens to
-        // be called like a type.
+        // inside `CAST(`, before `(`, after `DECLARE name`, and after the
+        // name it types in a column or parameter list. Elsewhere (a column,
+        // an alias) it is a name that happens to be called like a type.
+        let name_before =
+            |p: &Tok| p.kind == QUOTED_IDENT || (p.kind == IDENT && !recasable(&word(p), dialect));
         let type_pos = next_is(L_PAREN)
             || prev.is_some_and(|p| {
                 (p.kind == OP && &text[p.start..p.end] == "::")
-                    || p.kind == QUOTED_IDENT
-                    || (p.kind == IDENT && {
-                        let w = word(p);
-                        match w.as_str() {
-                            "RETURNS" | "OF" => true,
-                            "AS" => cast_open(text, toks, &sig, k),
-                            _ => !recasable(&w, dialect),
-                        }
+                    || (p.kind == IDENT && matches!(word(p).as_str(), "RETURNS" | "OF"))
+                    || (p.kind == IDENT
+                        && word(p) == "AS"
+                        && matches!(
+                            open_owner(text, toks, &sig, k).as_deref(),
+                            Some("CAST" | "TRY_CAST")
+                        ))
+                    || (name_before(p) && {
+                        let pp = k.checked_sub(2).map(|q| &toks[sig[q]]);
+                        pp.is_some_and(|q| q.kind == IDENT && word(q) == "DECLARE")
+                            || open_owner(text, toks, &sig, k).is_some_and(|o| {
+                                !matches!(o.as_str(), "" | "CAST" | "TRY_CAST")
+                                    && !recasable(&o, dialect)
+                            })
                     })
             });
         if recasable(&upper, dialect) || recasable_name(&upper, dialect, next_is(L_PAREN), type_pos)
@@ -540,29 +553,27 @@ pub(super) fn keyword_set(text: &str, toks: &[Tok], dialect: Dialect) -> BTreeSe
     out
 }
 
-/// True if the innermost open parenthesis before significant token `k` is
-/// the one of a `CAST(` or `TRY_CAST(`.
-fn cast_open(text: &str, toks: &[Tok], sig: &[usize], k: usize) -> bool {
+/// The word (upper case) just before the innermost parenthesis still open
+/// before significant token `k`; empty if that is not a plain word, `None`
+/// if no parenthesis is open.
+fn open_owner(text: &str, toks: &[Tok], sig: &[usize], k: usize) -> Option<String> {
     let mut depth = 0usize;
     for j in (0..k).rev() {
-        let t = &toks[sig[j]];
-        match t.kind {
+        match toks[sig[j]].kind {
             R_PAREN => depth += 1,
             L_PAREN if depth > 0 => depth -= 1,
             L_PAREN => {
-                return j > 0 && {
-                    let p = &toks[sig[j - 1]];
-                    p.kind == IDENT
-                        && matches!(
-                            text[p.start..p.end].to_ascii_uppercase().as_str(),
-                            "CAST" | "TRY_CAST"
-                        )
-                };
+                let p = j.checked_sub(1).map(|q| &toks[sig[q]]);
+                return Some(match p {
+                    Some(p) if p.kind == IDENT => text[p.start..p.end].to_ascii_uppercase(),
+                    Some(p) if p.kind == QUOTED_IDENT => "\"".to_string(),
+                    _ => String::new(),
+                });
             }
             _ => {}
         }
     }
-    false
+    None
 }
 
 /// Renders the layout. `reverted` holds top-level statements kept as written.
