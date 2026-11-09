@@ -35,8 +35,8 @@ const SEEDS: &[u64] = &[7, 21];
 fn recheck_at_most(e: &Edit) -> usize {
     let measured = match e {
         Edit::NoOpComment | Edit::NoOpReorderTables => 0,
-        Edit::AddTable => 5,
-        Edit::DropTable => 23,
+        Edit::AddTable => 6,
+        Edit::DropTable => 24,
         Edit::RenameTable
         | Edit::AddColumn
         | Edit::AddMixedCaseColumn
@@ -45,10 +45,10 @@ fn recheck_at_most(e: &Edit) -> usize {
         | Edit::ReorderColumns
         | Edit::FlipNullability
         | Edit::ChangeDefault
-        | Edit::ToggleIndex => 24,
-        Edit::ViewBody | Edit::AddRoutine | Edit::DropRoutine | Edit::AddTrigger => 5,
-        Edit::ChangeParameterType | Edit::AddSchemaTable | Edit::BaseDrop => 6,
-        Edit::DropTrigger => 3,
+        | Edit::ToggleIndex => 25,
+        Edit::ViewBody | Edit::AddRoutine | Edit::DropRoutine | Edit::AddTrigger => 6,
+        Edit::ChangeParameterType | Edit::AddSchemaTable | Edit::BaseDrop => 7,
+        Edit::DropTrigger => 4,
         Edit::VersioningOn
         | Edit::DropAllTables
         | Edit::NoProcedures
@@ -63,10 +63,12 @@ fn recheck_at_most(e: &Edit) -> usize {
         | Edit::NoBaseA
         | Edit::NoBaseB
         | Edit::RetypeSide
-        | Edit::NoCatalog => usize::MAX / 2,
-        Edit::BaseRetype => 5,
-        Edit::BaseTable => 4,
-        Edit::SplitBase => 12,
+        | Edit::NoCatalog
+        | Edit::HandWritten => usize::MAX / 2,
+        Edit::BaseTriggerEvent => 5,
+        Edit::BaseRetype => 6,
+        Edit::BaseTable => 5,
+        Edit::SplitBase => 13,
     };
     measured.saturating_add(2)
 }
@@ -177,16 +179,16 @@ const EXEMPT: &[(Dialect, &str, &str)] = &[
     (Dialect::Db2i, "TargetOverrides", "same"),
     (Dialect::Db2i, "SourceOverrides", "same, and DROP TRIGGER (the one file it changes on PostgreSQL) is not compared for Db2 for i"),
     (
-        Dialect::Postgres,
-        "NoBaseB",
-        "the target base catalog only repeats ext.Ref in the target dialect; no file's output depends on that copy (measured)",
-    ),
-    (
         Dialect::Db2i,
         "CaseClashColumn",
         "the column and index spelling checks guard conversions to PostgreSQL that fold case; no Db2 for i conversion reads them in another file (measured)",
     ),
     (Dialect::Db2i, "CaseClashIndex", "same"),
+    (
+        Dialect::Db2i,
+        "BaseTriggerEvent",
+        "DROP TRIGGER is compared only from T-SQL to PostgreSQL",
+    ),
     (
         Dialect::Db2i,
         "RetypeSide",
@@ -225,6 +227,8 @@ fn every_edit_changes_the_input_unless_it_is_a_no_op() {
                 (
                     m.files(),
                     [Dialect::Tsql, Dialect::Postgres, Dialect::Db2i].map(|d| m.base_files(d)),
+                    // Not a file of the tree: the ledger the fixture writes.
+                    m.hand,
                 )
             };
             if matches!(e, Edit::NoOpReorderTables) {

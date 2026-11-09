@@ -143,6 +143,13 @@ pub struct Model {
     pub no_base_b: bool,
     /// The job runs with `--no-catalog`.
     pub no_catalog: bool,
+    /// The event of the trigger `dbo.Tr1` the base catalogs define (the
+    /// source one `AFTER INSERT`, or `AFTER UPDATE` when this is set; the
+    /// target one always `AFTER INSERT`).
+    pub tr1_update: bool,
+    /// The output of the table T0 is written by hand, with one more column
+    /// than the rules give it.
+    pub hand: bool,
 }
 
 /// The three tables the fixed dependents use.
@@ -293,7 +300,13 @@ impl Model {
             routines,
             triggers,
             base,
-            extra: Vec::new(),
+            // A table with a CHECK: the one place a table's own
+            // file evaluates a predicate against the catalog's view of
+            // that table (so what the catalog holds under its name matters).
+            extra: vec![(
+                "tables/dbo.Comp.sql".into(),
+                "CREATE TABLE dbo.Comp (\n  Id int NOT NULL,\n  PRIMARY KEY (Id),\n  C0 varchar(20) NULL,\n  CONSTRAINT CK_Comp CHECK (C0 <> 'x' AND C0 LIKE 'a%')\n);\nGO\n".into(),
+            )],
             notes: Vec::new(),
             split_base: false,
             no_procs: false,
@@ -307,6 +320,8 @@ impl Model {
             no_base_a: false,
             no_base_b: false,
             no_catalog: false,
+            tr1_update: false,
+            hand: false,
         }
     }
 
@@ -393,8 +408,8 @@ impl Model {
         if (d == Dialect::Tsql && self.look_a) || (d != Dialect::Tsql && self.look_b) {
             // Tables of another schema with the names the tree uses.
             for n in [
-                "Fresh", "inserted", "More", "Other", "Sink", "SinkNN", "SinkRef", "SinkV", "T0",
-                "T1", "T2", "X0",
+                "Comp", "Fresh", "inserted", "More", "Other", "Sink", "SinkNN", "SinkRef", "SinkV",
+                "T0", "T1", "T2", "X0",
             ] {
                 s.push('\n');
                 s.push_str(&create_table(
@@ -421,6 +436,19 @@ impl Model {
                     q(d, "Sink"),
                     if d == Dialect::Tsql { "GO\n" } else { "" }
                 ));
+            }
+        }
+        if !self.tables.is_empty() {
+            // A trigger of the base catalogs on the tree's table X0, which
+            // `DropBaseTr1` drops (the source one's event is what
+            // `BaseTriggerEvent` changes, the target one's stays).
+            match d {
+                Dialect::Tsql => s.push_str(&format!(
+                    "\nCREATE TRIGGER dbo.Tr1 ON dbo.X0 AFTER {} AS\nBEGIN\n  SET NOCOUNT ON;\n  INSERT INTO dbo.X0 (Id) SELECT Id FROM inserted;\nEND\nGO\n",
+                    if self.tr1_update { "UPDATE" } else { "INSERT" }
+                )),
+                Dialect::Postgres => s.push_str("\nCREATE FUNCTION tr1() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;\nCREATE TRIGGER tr1 AFTER INSERT ON x0 FOR EACH ROW EXECUTE FUNCTION tr1();\n"),
+                _ => {}
             }
         }
         if (d == Dialect::Tsql && self.over_a) || (d != Dialect::Tsql && self.over_b) {
@@ -591,6 +619,7 @@ fn dependents() -> Vec<(String, String)> {
     }
     add("DropTr0".into(), "DROP TRIGGER dbo.Tr0".into());
     add("DropTg1".into(), "DROP TRIGGER dbo.Tg1".into());
+    add("DropBaseTr1".into(), "DROP TRIGGER dbo.Tr1".into());
     add(
         "ViewStar".into(),
         "INSERT INTO dbo.SinkV SELECT * FROM dbo.V0".into(),
@@ -834,6 +863,12 @@ pub enum Edit {
     RetypeSide,
     /// The job runs with `--no-catalog`: no side has a catalog.
     NoCatalog,
+    /// The event of a trigger in the source base catalog changes, the
+    /// target base catalog's copy of it does not.
+    BaseTriggerEvent,
+    /// The target output of the table T0 is written by hand (it has a
+    /// column the source table does not).
+    HandWritten,
 }
 
 pub const ALL_EDITS: &[Edit] = &[
@@ -876,6 +911,8 @@ pub const ALL_EDITS: &[Edit] = &[
     Edit::NoBaseB,
     Edit::RetypeSide,
     Edit::NoCatalog,
+    Edit::BaseTriggerEvent,
+    Edit::HandWritten,
 ];
 
 impl Edit {
@@ -1093,6 +1130,14 @@ impl Edit {
             Edit::NoBaseB => {
                 m.no_base_b = true;
                 "no target base catalog".into()
+            }
+            Edit::BaseTriggerEvent => {
+                m.tr1_update = true;
+                "the source base trigger Tr1 fires on UPDATE".into()
+            }
+            Edit::HandWritten => {
+                m.hand = true;
+                "the target output of T0 is written by hand".into()
             }
             Edit::NoCatalog => {
                 m.no_catalog = true;

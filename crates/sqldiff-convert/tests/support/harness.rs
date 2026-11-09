@@ -17,6 +17,9 @@ pub struct Fixture {
     pub to: Dialect,
     /// Set by `write` from the model: the job checks without a catalog.
     pub no_catalog: std::cell::Cell<bool>,
+    /// Set by `write` from the model: the target table T0 is hand-written
+    /// (a ledger record) in every output folder a run writes.
+    pub hand: std::cell::Cell<bool>,
 }
 
 impl Fixture {
@@ -32,12 +35,14 @@ impl Fixture {
             dir,
             to,
             no_catalog: std::cell::Cell::new(false),
+            hand: std::cell::Cell::new(false),
         }
     }
 
     /// Writes the model's tree and base catalogs, replacing what was there.
     pub fn write(&self, m: &Model) {
         self.no_catalog.set(m.no_catalog);
+        self.hand.set(m.hand);
         let src = self.dir.join("src");
         let _ = std::fs::remove_dir_all(&src);
         for (p, text) in m.files() {
@@ -101,7 +106,58 @@ impl Fixture {
     /// [`run`](Self::run) that returns the run's error (a store mismatch
     /// among them).
     pub fn try_run(&self, out: &str, fresh: bool) -> Result<(), String> {
+        if self.hand.get() {
+            self.write_hand(out)?;
+        }
         convert_into(&self.job(out, fresh), &Hooks::default()).map(|_| ())
+    }
+}
+
+impl Fixture {
+    /// Records, in the output folder, a hand-written text for the table T0
+    /// of the tree: the rules' output with one more column. The source
+    /// table does not change, the target table does: what a dependent reads
+    /// of the target table is no function of what it reads of the source's.
+    /// (Once per folder; a folder that has the record keeps it.)
+    fn write_hand(&self, out: &str) -> Result<(), String> {
+        use sqldiff_convert::review::{append, By, LEDGER_FILE};
+        let dir = self.dir.join(out);
+        if dir.join(LEDGER_FILE).exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let a = self.job(out, false).tree;
+        let (inputs, unreadable) = tree::read(&a)?;
+        let t = tree::convert(&a, &inputs, unreadable, None)?;
+        let path = "tables/dbo.T0.sql";
+        let k = t
+            .report
+            .files
+            .iter()
+            .position(|f| f.path == path)
+            .ok_or("no tables/dbo.T0.sql")?;
+        let c = &t.conversions[k];
+        let u = c
+            .units
+            .iter()
+            .position(|u| c.output[u.out.start..u.out.end].contains("CREATE TABLE"))
+            .ok_or("no CREATE TABLE unit")?;
+        let unit = t.report.files[k].units[u].id.clone();
+        let old = &c.output[c.units[u].out.start..c.units[u].out.end];
+        let at = old.rfind(')').ok_or("no closing parenthesis")?;
+        let text = format!("{},\n  C9 integer NULL{}", old[..at].trim_end(), &old[at..]);
+        let r = tree::written_record(
+            &t,
+            &inputs,
+            path,
+            &unit,
+            &text,
+            By::Human,
+            "tester",
+            "one more column",
+            "2026-11-08T12:00:00Z",
+        )?;
+        append(&dir, &r)
     }
 }
 

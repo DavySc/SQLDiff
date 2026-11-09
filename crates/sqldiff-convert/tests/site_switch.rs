@@ -56,6 +56,21 @@ const KEYED: &[&str] = &[
     "crates/sqldiff-core/src/engine.rs::check_recorded@a: (&aa, &bound, read.supplied()),",
 ];
 
+/// Sites whose read is made again by every consumer of what it feeds. The
+/// two `with_ddl` calls of `table_pair` ask which table of the catalog has
+/// the name of the table the file creates, to record whether the name is
+/// ambiguous (two schemas hold it) in the layered schema. The only reader of
+/// that flag is `Schema::table_exact`, which asks the same question itself
+/// (`ask_table`) before it looks: a file whose output depends on the flag
+/// has recorded the same query already. No output depends on the flag
+/// without that consumer, so no edit can show it (measured: the lookalike
+/// edits flip the flag and change nothing the file says). Guarded by
+/// [`the_layer_ambiguity_is_read_only_through_table_exact`].
+const CONSUMED: &[&str] = &[
+    "crates/sqldiff-equiv/src/equiv/mod.rs::table_pair@sa.with_ddl(&p.ddl.0, a.dialect()),",
+    "crates/sqldiff-equiv/src/equiv/mod.rs::table_pair@sb.with_ddl(&p.ddl.1, b.dialect()),",
+];
+
 /// Sites killed by some generated edit.
 const KILLED: &[&str] = &[
     "crates/sqldiff-core/src/bind/query.rs::resolve_call@_ => match view.routines(parts) {",
@@ -101,7 +116,7 @@ const REDUNDANT: &[&str] = &[
 ];
 
 /// Sites whose recorded reads are covered by others in every tree, by the
-/// rule in [`twin_holds`].
+/// rule in [`twins`] and [`depends`].
 const DOMINATED: &[&str] = &[
     "crates/sqldiff-core/src/bind/query.rs::lookup_table_silent@_ => match self.input.view.table(parts) {",
     "crates/sqldiff-equiv/src/equiv/canon.rs::all_columns@None => self.schema.table_exact(",
@@ -204,6 +219,10 @@ fn run_tree(
     (ids, seen)
 }
 
+/// What each file (its store key) was answered for each question, as the
+/// union over its entries: `side query` to the set of answer digests.
+type Answers = BTreeMap<String, BTreeMap<String, BTreeSet<String>>>;
+
 /// [`run_tree`], and the questions of each entry (for a diagnosis).
 fn run_tree_with_reads(
     to: Dialect,
@@ -214,6 +233,21 @@ fn run_tree_with_reads(
     Vec<site_switch::Site>,
     BTreeMap<String, Vec<String>>,
 ) {
+    let (ids, seen, qs, _) = run_tree_answers(to, hidden, edit);
+    (ids, seen, qs)
+}
+
+/// [`run_tree_with_reads`], and the answers too.
+fn run_tree_answers(
+    to: Dialect,
+    hidden: bool,
+    edit: Option<&Edit>,
+) -> (
+    BTreeSet<String>,
+    Vec<site_switch::Site>,
+    BTreeMap<String, Vec<String>>,
+    Answers,
+) {
     let f = Fixture::new(&format!("t3-{to:?}-{hidden}-{edit:?}"), to);
     f.write(&model_with(edit, hidden));
     f.run("res", false);
@@ -221,31 +255,34 @@ fn run_tree_with_reads(
     let results = f.dir.join("res/.sqldiff/results");
     let mut ids = BTreeSet::new();
     let mut qs = BTreeMap::new();
+    let mut answers: Answers = BTreeMap::new();
     for k in std::fs::read_dir(results).unwrap().flatten() {
         for e in std::fs::read_dir(k.path()).unwrap().flatten() {
             let n = e.file_name().to_string_lossy().into_owned();
             if n.ends_with(".reads") {
-                let id = format!("{}/{n}", k.file_name().to_string_lossy());
-                {
-                    // framed JSON: digest, newline, body
-                    let raw = std::fs::read_to_string(e.path()).unwrap_or_default();
-                    let v: serde_json::Value =
-                        serde_json::from_str(raw.get(65..).unwrap_or("null")).unwrap_or_default();
-                    let reads = v["reads"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .map(|r| format!("{} {}", r[0], r[1]))
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    qs.insert(id.clone(), reads);
+                let key = k.file_name().to_string_lossy().into_owned();
+                let id = format!("{key}/{n}");
+                // framed JSON: digest, newline, body
+                let raw = std::fs::read_to_string(e.path()).unwrap_or_default();
+                let v: serde_json::Value =
+                    serde_json::from_str(raw.get(65..).unwrap_or("null")).unwrap_or_default();
+                let mut reads = Vec::new();
+                for r in v["reads"].as_array().into_iter().flatten() {
+                    let q = format!("{} {}", r[0], r[1]);
+                    answers
+                        .entry(key.clone())
+                        .or_default()
+                        .entry(q.clone())
+                        .or_default()
+                        .insert(r[2].to_string());
+                    reads.push(q);
                 }
+                qs.insert(id.clone(), reads);
                 ids.insert(id);
             }
         }
     }
-    (ids, seen, qs)
+    (ids, seen, qs, answers)
 }
 
 /// Every site a check of the base tree reads from, per dialect.
@@ -288,63 +325,133 @@ fn by_name(q: &str) -> Option<&str> {
     rest.strip_suffix("\"}")
 }
 
-/// The rule that makes a vanished read dominated. A read `v` that is gone
-/// when its site is skipped is covered when `kept`, the other reads of the
-/// same file in the skipped run, hold one of:
+/// The rule that names the twins of a vanished read. A read `v` that is gone
+/// when its site is skipped has as its possible twins, among `kept` (the
+/// other reads of the same file in the skipped run):
 ///
 /// 1. target side (`Target`, `OwnTarget`): the same query on the source side,
-///    for a table or view of the tree (`names`). A table the tree defines is the same on both sides: a base-catalog
-///    table of the same name does not change either (shadowing, tested by
-///    the `SourceOverrides` and `TargetOverrides` edits), so the target
-///    side's copy is a function of the source side's.
+///    or the source side's `Table` read of the same name, for a table or
+///    view of the tree (`names`): a table the tree defines is the same on
+///    both sides, and a base-catalog table of the same name does not change
+///    either (shadowing, tested by the `SourceOverrides` and
+///    `TargetOverrides` edits). The target table is the conversion of the
+///    source one except where its output is written by hand, which is why
+///    the edit `HandWritten` is part of the check below.
 /// 2. target side: the whole-catalog digest of the same side, which holds
 ///    every answer of it.
 /// 3. a by-name question (`SchemaTables`, `StarView`) of either side about a
-///    table or view of the tree: the source side's `Table` read of a table of that name (the digest of the
-///    table the file binds).
-/// 5. a source-side `SchemaTables` question about a table of the tree: the
-///    target side's question of the same name. The target table is the
-///    conversion of the source one, and a base-catalog table of another
-///    schema with the name (what the source side's answer adds) changes
-///    nothing the file reads (`SourceLookalikes`).
-/// 4. the source side's whole-catalog digest: the target side's, which a
-///    change of the source catalog reaches through the converted tree (the
-///    edit `SourceOverrides` re-checks the file with this site skipped).
-fn twin_holds(v: &str, kept: &BTreeSet<String>, names: &BTreeSet<String>) -> bool {
+///    table or view of the tree: the source side's `Table` read of a table
+///    of that name (the digest of the table the file binds).
+/// 4. a source-side `SchemaTables` question about a table of the tree: the
+///    target side's question of the same name (a base-catalog table of
+///    another schema with the name, which the source side's answer adds,
+///    changes nothing the file reads: `SourceLookalikes`).
+///
+/// There is no rule for the source side's whole-catalog digest: with a
+/// target base catalog of its own (`--catalog-b`) a change of the source
+/// base catalog does not reach the target side (edit `BaseTriggerEvent`).
+///
+/// A twin counts only through [`depends`]: the presence of a twin proves
+/// nothing, its answer has to change wherever the vanished read's does.
+fn twins(v: &str, kept: &BTreeSet<String>, names: &BTreeSet<String>) -> Vec<String> {
     let Some((side, q)) = v.split_once(' ') else {
-        return false;
+        return Vec::new();
     };
-    let source = |q: &str| kept.contains(&format!("\"Source\" {q}"));
-    let source_table = |n: &str| {
-        kept.iter().any(|k| {
-            k.strip_prefix("\"Source\" ")
-                .and_then(table_name)
-                .is_some_and(|t| t == n)
-        })
+    let source_tables = |n: &str| -> Vec<String> {
+        kept.iter()
+            .filter(|k| {
+                k.strip_prefix("\"Source\" ")
+                    .and_then(table_name)
+                    .is_some_and(|t| t == n)
+            })
+            .cloned()
+            .collect()
     };
     // The tables rules 1 and 3 speak of are the tree's own.
-    let ours = |q: &str| {
-        table_name(q)
-            .or_else(|| by_name(q).map(str::to_string))
-            .is_some_and(|n| names.contains(&n))
-    };
+    let ours = table_name(q)
+        .or_else(|| by_name(q).map(str::to_string))
+        .is_some_and(|n| names.contains(&n));
+    let mut out = Vec::new();
     match side {
         "\"Target\"" | "\"OwnTarget\"" => {
-            kept.contains(&format!("{side} \"WholeCatalog\""))
-                || (ours(q) && (source(q) || table_name(q).is_some_and(|n| source_table(&n))))
-                || (ours(q) && by_name(q).is_some_and(source_table))
-        }
-        "\"Source\"" => {
-            if q == "\"WholeCatalog\"" {
-                kept.contains("\"Target\" \"WholeCatalog\"")
-            } else {
-                ours(q)
-                    && (by_name(q).is_some_and(source_table)
-                        || (q.starts_with("{\"SchemaTables\"")
-                            && kept.contains(&format!("\"Target\" {q}"))))
+            let whole = format!("{side} \"WholeCatalog\"");
+            if kept.contains(&whole) {
+                out.push(whole);
+            }
+            if ours {
+                let same = format!("\"Source\" {q}");
+                if kept.contains(&same) {
+                    out.push(same);
+                }
+                if let Some(n) = table_name(q).or_else(|| by_name(q).map(str::to_string)) {
+                    out.extend(source_tables(&n));
+                }
             }
         }
-        _ => false,
+        "\"Source\"" => {
+            if ours {
+                if let Some(n) = by_name(q) {
+                    out.extend(source_tables(n));
+                }
+                if q.starts_with("{\"SchemaTables\"") {
+                    let t = format!("\"Target\" {q}");
+                    if kept.contains(&t) {
+                        out.push(t);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Whether skipping the recording of `v` could go unnoticed in one pair of
+/// runs of a file, the stored one (`old`, before the edit) and the checked
+/// one (`new`, after it): `v`'s answer is the same in both, or some twin's
+/// answer differs (a twin missing from one of them differs).
+fn depends(
+    v: &str,
+    twins: &[String],
+    old: &BTreeMap<String, BTreeSet<String>>,
+    new: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    let changed = |q: &str| old.get(q) != new.get(q);
+    !changed(v) || twins.iter().any(|t| changed(t))
+}
+
+/// The guard of [`CONSUMED`]: the layered schema's ambiguity flag is read
+/// in one place, `table_exact`, right after its own `ask_table`.
+#[test]
+fn the_layer_ambiguity_is_read_only_through_table_exact() {
+    let text = std::fs::read_to_string(root().join("crates/sqldiff-equiv/src/equiv/schema.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let calls: Vec<usize> = text
+        .match_indices("is_ambiguous(")
+        .map(|(i, _)| i)
+        .collect();
+    // The definition and the one call.
+    assert_eq!(
+        calls.len(),
+        2,
+        "is_ambiguous is read in a new place: {calls:?}"
+    );
+    let at = calls[1];
+    let before = &text[..at];
+    let start = before.rfind("pub fn table_exact").expect("table_exact");
+    assert!(
+        before[start..].contains("self.ask_table(&name);")
+            && !before[start..].contains("\n    }\n"),
+        "the call is not inside table_exact after its ask_table"
+    );
+    // The flag itself is only read there too.
+    for field in ["self.ambiguous.contains", "self.extra_ambiguous.contains"] {
+        assert_eq!(
+            text.matches(field).count(),
+            1,
+            "{field} is read in a new place"
+        );
     }
 }
 
@@ -356,11 +463,12 @@ fn every_site_the_base_tree_reads_from_is_classified_and_the_classified_sites_ex
         .chain(GAP)
         .chain(DOMINATED)
         .chain(KEYED)
+        .chain(CONSUMED)
         .copied()
         .collect();
     assert_eq!(
         known.len(),
-        KILLED.len() + REDUNDANT.len() + GAP.len() + DOMINATED.len() + KEYED.len(),
+        KILLED.len() + REDUNDANT.len() + GAP.len() + DOMINATED.len() + KEYED.len() + CONSUMED.len(),
         "a site is in two classes"
     );
     let keys = keys_of(&base_sites());
@@ -426,16 +534,17 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
         BTreeSet<String>,
         BTreeSet<site_switch::Site>,
         BTreeMap<String, Vec<String>>,
+        Answers,
     );
     let mut reference: Vec<Reference> = Vec::new();
     let mut all: BTreeSet<site_switch::Site> = BTreeSet::new();
     for (d, h, e) in &trees {
         site_switch::discover();
-        let (ids, seen, qs) = run_tree_with_reads(*d, *h, *e);
+        let (ids, seen, qs, ans) = run_tree_answers(*d, *h, *e);
         site_switch::off();
         let seen: BTreeSet<_> = seen.into_iter().collect();
         all.extend(seen.iter().cloned());
-        reference.push((ids, seen, qs));
+        reference.push((ids, seen, qs, ans));
     }
     let keys = keys_of(&all);
     assert!(all.len() >= 20, "only {} sites seen", all.len());
@@ -453,10 +562,14 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
             println!("{name}: KEYED");
             continue;
         }
+        if CONSUMED.contains(&name.as_str()) {
+            println!("{name}: CONSUMED");
+            continue;
+        }
         // Redundant: the read sets are the same on every tree the site reads
         // from (and, by construction, on the others it is never reached).
         let mut is_redundant = true;
-        for ((d, h, e), (ids, seen, _)) in trees.iter().zip(&reference) {
+        for ((d, h, e), (ids, seen, _, _)) in trees.iter().zip(&reference) {
             if !seen.contains(site) {
                 continue;
             }
@@ -495,7 +608,7 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
             if !trees
                 .iter()
                 .zip(&reference)
-                .any(|((td, th, _), (_, s, _))| *td == d && *th == hidden && s.contains(site))
+                .any(|((td, th, _), (_, s, _, _))| *td == d && *th == hidden && s.contains(site))
             {
                 continue;
             }
@@ -520,17 +633,28 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
             killed.push(name);
             continue;
         }
-        // Dominated: on every tree the site reads from, every read that
-        // vanishes when it is skipped has its twin among the reads that
-        // remain in the same file (see [`twin_holds`]).
+        // Dominated: on every edited tree the site reads from, every read
+        // that vanishes when the site is skipped and whose answer the edit
+        // changes has a twin among the reads that remain in the same file
+        // (see [`twins`]) whose answer the edit changes too: a stored entry
+        // without the vanished read cannot then hold after the edit.
         let mut dominated = true;
-        'dom: for ((d, h, e), (_, seen, rq)) in trees.iter().zip(&reference) {
+        'dom: for ((d, h, e), (_, seen, rq, edit_ans)) in trees.iter().zip(&reference) {
             // `--no-catalog` changes every file's store key (the supplied
             // bit; `a_changed_supplied_bit_finds_nothing_stored`): nothing is
             // reused across it, whatever the read sets hold.
-            if !seen.contains(site) || matches!(e, Some(Edit::NoCatalog)) {
+            if e.is_none() || !seen.contains(site) || matches!(e, Some(Edit::NoCatalog)) {
                 continue;
             }
+            // The stored run: the same tree before the edit.
+            let Some((_, _, _, base_ans)) = trees
+                .iter()
+                .zip(&reference)
+                .find(|((td, th, te), _)| td == d && th == h && te.is_none())
+                .map(|(_, r)| r)
+            else {
+                continue;
+            };
             site_switch::skip(site.clone());
             let (_, _, sq) = run_tree_with_reads(*d, *h, *e);
             site_switch::off();
@@ -547,10 +671,18 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
                 })
                 .collect();
             for (k, reads) in &rk {
+                // A file whose key is new has no stored entry to reuse.
+                let Some(old) = base_ans.get(k) else {
+                    continue;
+                };
+                let new = edit_ans.get(k).cloned().unwrap_or_default();
                 let kept = sk.get(k).cloned().unwrap_or_default();
                 for v in reads.difference(&kept) {
-                    if !twin_holds(v, &kept, &names) {
-                        println!("  {name}: {d:?} hidden={h} {e:?}: no twin for {v}");
+                    let t = twins(v, &kept, &names);
+                    if !depends(v, &t, old, &new) {
+                        println!(
+                            "  {name}: {d:?} hidden={h} {e:?}: no twin that changes with {v} (twins: {t:?})"
+                        );
                         dominated = false;
                         break 'dom;
                     }
