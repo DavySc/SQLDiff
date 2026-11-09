@@ -29,6 +29,9 @@
 //!   corpus files (and, in an ignored test, directories named by an
 //!   environment variable) to compare the CFG's shared routes with their
 //!   oracle. It is compiled only for tests.
+//! - `view_tests.rs` (`sqldiff-equiv`) is a test module: it reads the corpus
+//!   files and `canon.rs` to compare `table_pair`'s script reading of a unit
+//!   with the clone it replaced. It is compiled only for tests.
 //! - `work.rs` (`sqldiff-model`): the per-file work meter, a thread-local
 //!   counter of deterministic events; `SQLDIFF_WORK` only prints it. It
 //!   counts and never changes a result.
@@ -100,6 +103,12 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ),
     ("sqldiff-equiv/src/equiv/mod.rs", &["OnceCell", "env::var"]),
     ("sqldiff-equiv/src/equiv/schema.rs", &["OnceLock", "fs::"]),
+    // Test-only: reads the corpus and `canon.rs`; counts its comparisons in a
+    // thread-local.
+    (
+        "sqldiff-equiv/src/equiv/view_tests.rs",
+        &["fs::", "thread_local!"],
+    ),
     ("sqldiff-core/src/format/tests.rs", &["fs::"]),
     // Test-only: reads the corpus and, in an ignored test, the corpora a
     // developer names.
