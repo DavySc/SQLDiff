@@ -1,6 +1,6 @@
 //! Owned token slices over the CST, with the small helpers the rules need.
 
-use sqldiff_syntax::{SyntaxElement, SyntaxKind, SyntaxNode};
+use sqldiff_syntax::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken};
 use SyntaxKind::*;
 
 #[derive(Debug, Clone)]
@@ -44,15 +44,63 @@ impl T {
 pub(crate) fn tokens(n: &SyntaxNode) -> Vec<T> {
     n.descendants_with_tokens()
         .filter_map(SyntaxElement::into_token)
-        .map(|t| {
-            let r = t.text_range();
-            T {
-                k: t.kind(),
-                s: t.text().to_string(),
-                pos: (r.start().into(), r.end().into()),
-                made: None,
-            }
-        })
+        .map(owned)
+        .collect()
+}
+
+/// One CST token as the owned `T` that [`tokens`] makes of it.
+fn owned(t: SyntaxToken) -> T {
+    let r = t.text_range();
+    T {
+        k: t.kind(),
+        s: t.text().to_string(),
+        pos: (r.start().into(), r.end().into()),
+        made: None,
+    }
+}
+
+/// Whether `one` holds for a significant token of `n`, or `two` for two
+/// significant tokens that follow each other (trivia between them does not
+/// separate them). It answers what `any` and `windows(2)` over
+/// `tokens(n)` filtered to [`T::sig`] answer, but owns at most two tokens at
+/// a time instead of a copy of the whole subtree.
+pub(crate) fn any_sig(
+    n: &SyntaxNode,
+    one: impl Fn(&T) -> bool,
+    two: impl Fn(&T, &T) -> bool,
+) -> bool {
+    let mut prev: Option<T> = None;
+    for t in n
+        .descendants_with_tokens()
+        .filter_map(SyntaxElement::into_token)
+        .map(owned)
+        .filter(T::sig)
+    {
+        if one(&t) || prev.as_ref().is_some_and(|p| two(p, &t)) {
+            return true;
+        }
+        prev = Some(t);
+    }
+    false
+}
+
+/// How many tokens `tokens(n)` returns, trivia included, without building
+/// the list: it walks the same elements and keeps none of them.
+pub(crate) fn count_tokens(n: &SyntaxNode) -> usize {
+    n.descendants_with_tokens()
+        .filter_map(SyntaxElement::into_token)
+        .count()
+}
+
+/// The upper-cased text of the first `k` significant tokens of `n` (fewer
+/// when `n` has fewer), the same words `sig(&tokens(n))` yields in order, and
+/// without reading the tokens after them.
+pub(crate) fn lead_words(n: &SyntaxNode, k: usize) -> Vec<String> {
+    n.descendants_with_tokens()
+        .filter_map(SyntaxElement::into_token)
+        .filter(|t| !t.kind().is_trivia() && t.kind() != INFERRED_TERMINATOR)
+        .take(k)
+        .map(|t| t.text().to_ascii_uppercase())
         .collect()
 }
 
