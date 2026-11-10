@@ -147,6 +147,9 @@ pub struct Model {
     /// source one `AFTER INSERT`, or `AFTER UPDATE` when this is set; the
     /// target one always `AFTER INSERT`).
     pub tr1_update: bool,
+    /// The target `tr1` fires on UPDATE (the source one stays `AFTER INSERT`,
+    /// or `AFTER UPDATE` too with `tr1_update`).
+    pub tr1_target_update: bool,
     /// The output of the table T0 is written by hand, with one more column
     /// than the rules give it.
     pub hand: bool,
@@ -300,7 +303,12 @@ impl Model {
             routines,
             triggers,
             base,
-            extra: Vec::new(),
+            // An index in a file of its own: its key column's facts (can it
+            // be NULL?) come from the catalog's table, not from the file.
+            extra: vec![(
+                "indexes/dbo.IX_Sep.sql".into(),
+                "CREATE UNIQUE INDEX IX_Sep ON dbo.T1 (C1);\nGO\n".into(),
+            )],
             notes: Vec::new(),
             split_base: false,
             no_procs: false,
@@ -315,6 +323,7 @@ impl Model {
             no_base_b: false,
             no_catalog: false,
             tr1_update: false,
+            tr1_target_update: false,
             hand: false,
         }
     }
@@ -403,7 +412,7 @@ impl Model {
             // Tables of another schema with the names the tree uses.
             for n in [
                 "Fresh", "inserted", "More", "Other", "Sink", "SinkNN", "SinkRef", "SinkV", "T0",
-                "T1", "T2", "X0",
+                "T1", "T2", "V0", "X0",
             ] {
                 s.push('\n');
                 s.push_str(&create_table(
@@ -441,7 +450,7 @@ impl Model {
                     "\nCREATE TRIGGER dbo.Tr1 ON dbo.X0 AFTER {} AS\nBEGIN\n  SET NOCOUNT ON;\n  INSERT INTO dbo.X0 (Id) SELECT Id FROM inserted;\nEND\nGO\n",
                     if self.tr1_update { "UPDATE" } else { "INSERT" }
                 )),
-                Dialect::Postgres => s.push_str("\nCREATE FUNCTION tr1() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;\nCREATE TRIGGER tr1 AFTER INSERT ON x0 FOR EACH ROW EXECUTE FUNCTION tr1();\n"),
+                Dialect::Postgres => s.push_str(&format!("\nCREATE FUNCTION tr1() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;\nCREATE TRIGGER tr1 AFTER {} ON x0 FOR EACH ROW EXECUTE FUNCTION tr1();\n", if self.tr1_target_update { "UPDATE" } else { "INSERT" })),
                 _ => {}
             }
         }
@@ -870,6 +879,11 @@ pub enum Edit {
     /// The event of a trigger in the source base catalog changes, the
     /// target base catalog's copy of it does not.
     BaseTriggerEvent,
+    /// The same for the target base catalog's copy of the trigger.
+    TargetBaseTriggerEvent,
+    /// System versioning goes from the tables that have it (and comes to
+    /// another table when none has it).
+    VersioningToggle,
     /// The target output of the table T0 is written by hand (it has a
     /// column the source table does not).
     HandWritten,
@@ -916,6 +930,8 @@ pub const ALL_EDITS: &[Edit] = &[
     Edit::RetypeSide,
     Edit::NoCatalog,
     Edit::BaseTriggerEvent,
+    Edit::TargetBaseTriggerEvent,
+    Edit::VersioningToggle,
     Edit::HandWritten,
 ];
 
@@ -1138,6 +1154,20 @@ impl Edit {
             Edit::BaseTriggerEvent => {
                 m.tr1_update = true;
                 "the source base trigger Tr1 fires on UPDATE".into()
+            }
+            Edit::VersioningToggle => {
+                if m.tables.iter().any(|t| t.versioned) {
+                    m.tables.iter_mut().for_each(|t| t.versioned = false);
+                    "no table is system-versioned".into()
+                } else {
+                    let ti = (ti + 1) % ANCHORS;
+                    m.tables[ti].versioned = true;
+                    format!("system versioning on for {}", m.tables[ti].name)
+                }
+            }
+            Edit::TargetBaseTriggerEvent => {
+                m.tr1_target_update = true;
+                "the target base trigger tr1 fires on UPDATE".into()
             }
             Edit::HandWritten => {
                 m.hand = true;

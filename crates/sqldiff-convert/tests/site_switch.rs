@@ -42,7 +42,7 @@ use std::path::PathBuf;
 use sqldiff_catalog::record::site_switch;
 use sqldiff_core::Dialect;
 use support::edits::{Edit, Model, Rng, ALL_EDITS};
-use support::harness::{per_file, try_one, try_one_in, Fixture};
+use support::harness::{per_file, try_one, try_one_in, try_two_in, Fixture};
 
 const SEED: u64 = 7;
 const DIALECTS: &[Dialect] = &[Dialect::Postgres, Dialect::Db2i];
@@ -54,6 +54,21 @@ const DIALECTS: &[Dialect] = &[Dialect::Postgres, Dialect::Db2i];
 const KEYED: &[&str] = &[
     "crates/sqldiff-core/src/engine.rs::diff_inner@b: Some((&ab, &bound_b, read_b.supplied())),",
     "crates/sqldiff-core/src/engine.rs::check_recorded@a: (&aa, &bound, read.supplied()),",
+];
+
+/// Sites whose read is made again by every consumer of what it feeds. The
+/// two `with_ddl` calls of `table_pair` ask which table of the catalog has
+/// the name of the table the file creates, to record whether the name is
+/// ambiguous (two schemas hold it) in the layered schema. The only reader of
+/// that flag is `Schema::table_exact`, which asks the same question itself
+/// (`ask_table`) before it looks: a file whose output depends on the flag
+/// has recorded the same query already. No output depends on the flag
+/// without that consumer, so no edit can show it (measured: the lookalike
+/// edits flip the flag and change nothing the file says). Guarded by
+/// [`the_layer_ambiguity_is_read_only_through_table_exact`].
+const CONSUMED: &[&str] = &[
+    "crates/sqldiff-equiv/src/equiv/mod.rs::table_pair@sa.with_ddl(&p.ddl.0, a.dialect()),",
+    "crates/sqldiff-equiv/src/equiv/mod.rs::table_pair@sb.with_ddl(&p.ddl.1, b.dialect()),",
 ];
 
 /// Sites killed by some generated edit.
@@ -101,7 +116,7 @@ const REDUNDANT: &[&str] = &[
 ];
 
 /// Sites whose recorded reads are covered by others in every tree, by the
-/// condition of [`depends`].
+/// condition described at the test.
 const DOMINATED: &[&str] = &[
     "crates/sqldiff-core/src/bind/query.rs::lookup_table_silent@_ => match self.input.view.table(parts) {",
     "crates/sqldiff-equiv/src/equiv/canon.rs::all_columns@None => self.schema.table_exact(",
@@ -206,7 +221,22 @@ fn run_tree(
 
 /// What each file (its store key) was answered for each question, as the
 /// union over its entries: `side query` to the set of answer digests.
+/// The pseudo question under which [`Answers`] holds a hash of a file's stored result.
+const RESULT: &str = "\0result";
+const TEXT: &str = "\0text";
+/// The pseudo question that holds the paths of the files whose converted text is a file's stored result.
+const PATH: &str = "\0path";
+
 type Answers = BTreeMap<String, BTreeMap<String, BTreeSet<String>>>;
+
+/// One reference run of a tree: the entry ids, the sites it reads from, the
+/// questions of each entry and the answers.
+type Reference = (
+    BTreeSet<String>,
+    BTreeSet<site_switch::Site>,
+    BTreeMap<String, Vec<String>>,
+    Answers,
+);
 
 /// [`run_tree`], and the questions of each entry (for a diagnosis).
 fn run_tree_with_reads(
@@ -262,10 +292,77 @@ fn run_tree_answers(
                         .insert(r[2].to_string());
                     reads.push(q);
                 }
+                // What the entry says: a change of it is a change of the
+                // file's result (the key of this answer cannot be a query).
+                let body = std::fs::read(e.path().with_extension("json")).unwrap_or_default();
+                // (Not the key and id, which hold the hash of the read set.)
+                // (framed: a digest, a newline, the body)
+                let parsed = body
+                    .get(65..)
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok());
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                match &parsed {
+                    Some(j) => std::hash::Hash::hash(&j["conversion"].to_string(), &mut h),
+                    None => std::hash::Hash::hash(&body, &mut h),
+                }
+                answers
+                    .entry(key.clone())
+                    .or_default()
+                    .entry(RESULT.to_string())
+                    .or_default()
+                    .insert(std::hash::Hasher::finish(&h).to_string());
+                // A look at the file for a diagnosis.
+                if let Some(j) = &parsed {
+                    let text = j["conversion"]["output"].as_str().unwrap_or_default();
+                    answers
+                        .entry(key.clone())
+                        .or_default()
+                        .entry(TEXT.to_string())
+                        .or_default()
+                        .insert(text.replace("\r\n", "\n"));
+                }
                 qs.insert(id.clone(), reads);
                 ids.insert(id);
             }
         }
+    }
+    // The files of the run, to say which file a stored result is of: the
+    // path whose converted text holds the result's text.
+    let out = f.dir.join("res");
+    let paths: Vec<(String, String)> = std::fs::read(out.join("conversion-report.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|j| {
+            j["files"].as_array().map(|a| {
+                a.iter()
+                    .filter_map(|x| x["path"].as_str())
+                    .filter_map(|p| {
+                        let t = std::fs::read_to_string(out.join(p)).ok()?;
+                        Some((p.to_string(), t.replace("\r\n", "\n")))
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    for (key, q) in answers.iter_mut() {
+        let Some(text) = q.get(TEXT).and_then(|t| t.iter().next()).cloned() else {
+            continue;
+        };
+        // The written files carry notes between the lines: match the first
+        // line of the statement.
+        let Some(first) = text
+            .lines()
+            .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with("--"))
+        else {
+            continue;
+        };
+        let found: BTreeSet<String> = paths
+            .iter()
+            .filter(|(_, t)| t.contains(first))
+            .map(|(p, _)| p.clone())
+            .collect();
+        let _ = key;
+        q.insert(PATH.to_string(), found);
     }
     (ids, seen, qs, answers)
 }
@@ -294,24 +391,76 @@ fn per_key(qs: &BTreeMap<String, Vec<String>>) -> BTreeMap<String, BTreeSet<Stri
     out
 }
 
-/// Whether skipping the recording of `v` could go unnoticed in one pair of
-/// runs of a file, the stored one (`old`, before the edit) and the checked
-/// one (`new`, after it). A stored entry is taken exactly when every read it
-/// holds has the answer it had, so an entry without `v` is taken stale only
-/// if the check still asks `v`, `v`'s answer changed, and no read the entry
-/// keeps (`kept`) changed with it. Whatever the reason a kept read changes
-/// (it asks the same question of the other side, a whole-catalog digest, the
-/// table a view reads, the same question from another call site), the entry
-/// is refused then, and the file is checked again. A kept read the checked
-/// run no longer asks is not counted: its new answer is not known.
-fn depends(
-    v: &String,
-    kept: &BTreeSet<String>,
-    old: &BTreeMap<String, BTreeSet<String>>,
-    new: &BTreeMap<String, BTreeSet<String>>,
-) -> bool {
-    let changed = |q: &String| new.contains_key(q) && old.get(q) != new.get(q);
-    !new.contains_key(v) || !changed(v) || kept.iter().any(changed)
+#[test]
+fn the_layer_ambiguity_is_read_only_through_table_exact() {
+    let text = std::fs::read_to_string(root().join("crates/sqldiff-equiv/src/equiv/schema.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let calls: Vec<usize> = text
+        .match_indices("is_ambiguous(")
+        .map(|(i, _)| i)
+        .collect();
+    // The definition and the one call.
+    assert_eq!(
+        calls.len(),
+        2,
+        "is_ambiguous is read in a new place: {calls:?}"
+    );
+    let at = calls[1];
+    let before = &text[..at];
+    let start = before.rfind("pub fn table_exact").expect("table_exact");
+    assert!(
+        before[start..].contains("self.ask_table(&name);")
+            && !before[start..].contains("\n    }\n"),
+        "the call is not inside table_exact after its ask_table"
+    );
+    // The flag itself is only read there too.
+    for field in ["self.ambiguous.contains", "self.extra_ambiguous.contains"] {
+        assert_eq!(
+            text.matches(field).count(),
+            1,
+            "{field} is read in a new place"
+        );
+    }
+}
+
+/// The edits that start a chain: ones that change which reads a check makes
+/// (a trigger that now differs, a table that is now versioned), so the entry
+/// the resume stores differs in its reads from the unedited tree's.
+const CHAIN_FIRST: &[Edit] = &[
+    Edit::BaseTriggerEvent,
+    Edit::TargetBaseTriggerEvent,
+    Edit::VersioningOn,
+    Edit::VersioningToggle,
+];
+
+/// A chain (edit, resume, edit, resume) with the site skipped that ends in
+/// a resume different from the fresh run.
+fn chain_kill(
+    site: &site_switch::Site,
+    trees: &[(Dialect, bool, Option<&Edit>)],
+    reference: &[Reference],
+) -> Option<String> {
+    for (d, h) in DIALECTS.iter().flat_map(|&d| [(d, false), (d, true)]) {
+        if !trees
+            .iter()
+            .zip(reference)
+            .any(|((td, th, _), (_, s, _, _))| *td == d && *th == h && s.contains(site))
+        {
+            continue;
+        }
+        for first in CHAIN_FIRST {
+            for second in ALL_EDITS.iter().filter(|e| !e.is_no_op()) {
+                site_switch::skip(site.clone());
+                let r = try_two_in(d, SEED, first, second, h);
+                site_switch::off();
+                if r.is_err() {
+                    return Some(format!("{d:?} hidden={h} {first:?} then {second:?}"));
+                }
+            }
+        }
+    }
+    None
 }
 
 #[test]
@@ -322,11 +471,12 @@ fn every_site_the_base_tree_reads_from_is_classified_and_the_classified_sites_ex
         .chain(GAP)
         .chain(DOMINATED)
         .chain(KEYED)
+        .chain(CONSUMED)
         .copied()
         .collect();
     assert_eq!(
         known.len(),
-        KILLED.len() + REDUNDANT.len() + GAP.len() + DOMINATED.len() + KEYED.len(),
+        KILLED.len() + REDUNDANT.len() + GAP.len() + DOMINATED.len() + KEYED.len() + CONSUMED.len(),
         "a site is in two classes"
     );
     let keys = keys_of(&base_sites());
@@ -388,12 +538,6 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
         })
         .collect();
     // The reference run of each tree: the sites it reads from, the read sets.
-    type Reference = (
-        BTreeSet<String>,
-        BTreeSet<site_switch::Site>,
-        BTreeMap<String, Vec<String>>,
-        Answers,
-    );
     let mut reference: Vec<Reference> = Vec::new();
     let mut all: BTreeSet<site_switch::Site> = BTreeSet::new();
     for (d, h, e) in &trees {
@@ -420,6 +564,10 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
         }
         if KEYED.contains(&name.as_str()) {
             println!("{name}: KEYED");
+            continue;
+        }
+        if CONSUMED.contains(&name.as_str()) {
+            println!("{name}: CONSUMED");
             continue;
         }
         // Redundant: the read sets are the same on every tree the site reads
@@ -460,6 +608,7 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
             continue;
         }
         let mut by = None;
+        let mut agains: BTreeMap<(Dialect, bool, String), Vec<String>> = BTreeMap::new();
         'search: for (d, hidden) in DIALECTS.iter().flat_map(|&d| [(d, false), (d, true)]) {
             if !trees
                 .iter()
@@ -482,6 +631,7 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
                     by = Some(format!("{d:?} hidden={hidden} {e:?}"));
                     break 'search;
                 }
+                agains.insert((d, hidden, format!("{e:?}")), o.again);
             }
         }
         if let Some(b) = by {
@@ -490,17 +640,20 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
             continue;
         }
         // Dominated: the stored entry of a file is the one the unedited
-        // tree makes with the site skipped. For every edit, every read that
-        // entry lacks (the base run has it, the skipped base run does not),
-        // that the edited run asks too and whose answer the edit changes,
-        // goes with a read the entry keeps that the edit changes as well (see
-        // [`depends`]): the entry is refused then, whatever the site gave.
+        // tree makes with the site skipped. Where an edit changes a file's
+        // result, and a read that entry lacks (the base run has it, the
+        // skipped base run does not) that the edited run asks too has another
+        // answer, the resume with the site skipped has to check the file
+        // again (it did: `agains`, from the runs above, which saw no stale
+        // result). A site that is never in that case is not proven.
         let mut dominated = true;
+        let mut mattered = false;
         'dom: for ((d, h, e), (_, _, rq, edit_ans)) in trees.iter().zip(&reference) {
             // `--no-catalog` changes every file's store key (the supplied
             // bit; `a_changed_supplied_bit_finds_nothing_stored`): nothing is
             // reused across it, whatever the read sets hold.
-            if e.is_none() || matches!(e, Some(Edit::NoCatalog)) {
+            let Some(e) = e else { continue };
+            if matches!(e, Edit::NoCatalog) {
                 continue;
             }
             // The stored run: the same tree before the edit.
@@ -510,6 +663,9 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
                 .find(|((td, th, te), _)| td == d && th == h && te.is_none())
                 .map(|(_, r)| r)
             else {
+                continue;
+            };
+            let Some(again) = agains.get(&(*d, *h, format!("{e:?}"))) else {
                 continue;
             };
             if !bseen.contains(site) {
@@ -532,25 +688,62 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
                     continue;
                 };
                 let new = edit_ans.get(k).cloned().unwrap_or_default();
+                // A file whose result the edit leaves alone cannot be taken
+                // stale in a way that shows.
+                if old.get(RESULT) == new.get(RESULT) {
+                    continue;
+                }
                 let kept = skipped.get(k).cloned().unwrap_or_default();
-                for v in base_reads.difference(&kept).filter(|v| reads.contains(*v)) {
-                    if !depends(v, &kept, old, &new) {
+                if std::env::var("SQLDIFF_T3_VERBOSE").is_ok() {
+                    let gone: Vec<&String> = base_reads
+                        .difference(&kept)
+                        .filter(|v| reads.contains(*v))
+                        .collect();
+                    if !gone.is_empty() {
                         println!(
-                            "  {name}: {d:?} hidden={h} {e:?}: {v} changes and no read the stored entry keeps does"
+                            "    {d:?} hidden={h} {e:?}: result changes for {:?}, vanished {gone:?}, changed {:?}",
+                            new.get(PATH),
+                            gone.iter()
+                                .filter(|v| old.get(**v) != new.get(**v))
+                                .collect::<Vec<_>>()
                         );
-                        if std::env::var("SQLDIFF_T3_VERBOSE").is_ok() {
-                            println!("    file {k}, reads that remain: {kept:#?}");
-                        }
-                        dominated = false;
-                        break 'dom;
                     }
+                }
+                let lost = base_reads
+                    .difference(&kept)
+                    .filter(|v| {
+                        reads.contains(*v) && new.contains_key(*v) && old.get(*v) != new.get(*v)
+                    })
+                    .count();
+                if lost == 0 {
+                    continue;
+                }
+                mattered = true;
+                // The file checked again?
+                let paths = new.get(PATH).cloned().unwrap_or_default();
+                if paths.is_empty() || !paths.iter().all(|p| again.contains(p)) {
+                    println!(
+                        "  {name}: {d:?} hidden={h} {e:?}: a read of {paths:?} changes, the result changes, and the resumed run does not check the file again"
+                    );
+                    dominated = false;
+                    break 'dom;
                 }
             }
         }
         skipped_base.clear();
-        if dominated {
+        // A site no edit ever made matter is no better proven than one no
+        // edit kills.
+        if dominated && !mattered {
+            println!("  {name}: no edit changes a result through a read it alone gives");
+        }
+        if dominated && mattered {
             println!("{name}: DOMINATED");
             dom.push(name);
+        } else if let Some(b) = chain_kill(site, &trees, &reference) {
+            // The stored entries of a run made after an edit are what the
+            // next resume takes: some sites show only there.
+            println!("{name}: KILLED by {b}");
+            killed.push(name);
         } else {
             println!("{name}: GAP");
             gap.push(name);

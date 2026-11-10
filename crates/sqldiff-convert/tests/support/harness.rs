@@ -379,3 +379,35 @@ pub fn try_one_in(to: Dialect, seed: u64, edit: &Edit, hidden: bool) -> Outcome 
         verdict,
     }
 }
+
+/// Two edits one after the other, each resumed on the store the one before
+/// left, then a fresh run: the stored entries of a resumed run (made after
+/// the first edit) are what the second resume takes. Whether the second
+/// resume equals the fresh run is the verdict.
+pub fn try_two_in(
+    to: Dialect,
+    seed: u64,
+    first: &Edit,
+    second: &Edit,
+    hidden: bool,
+) -> Result<(), String> {
+    let tag = format!("{to:?}-{seed}-{first:?}-{second:?}-{hidden}");
+    let f = Fixture::new(&tag, to);
+    let mut model = Model::generate_with(seed, hidden);
+    f.write(&model);
+    f.run("res", false);
+    let mut what = String::new();
+    for e in [first, second] {
+        let mut r = Rng::new(seed ^ 0xA5A5);
+        what.push_str(&format!("{e:?}: {}; ", e.apply(&mut model, &mut r)));
+        f.write(&model);
+        f.try_run("res", false)
+            .map_err(|e| format!("{tag}: the resumed run failed: {e}"))?;
+    }
+    f.run("fre", true);
+    try_compare(
+        &tree_of(&f.dir.join("res")),
+        &tree_of(&f.dir.join("fre")),
+        &format!("{to:?} seed {seed}, edits {what}"),
+    )
+}

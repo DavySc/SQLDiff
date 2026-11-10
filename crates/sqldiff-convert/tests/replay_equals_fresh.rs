@@ -64,8 +64,9 @@ fn recheck_at_most(e: &Edit) -> usize {
         | Edit::NoBaseB
         | Edit::RetypeSide
         | Edit::NoCatalog
+        | Edit::VersioningToggle
         | Edit::HandWritten => usize::MAX / 2,
-        Edit::BaseTriggerEvent => 5,
+        Edit::BaseTriggerEvent | Edit::TargetBaseTriggerEvent => 5,
         Edit::BaseRetype => 6,
         Edit::BaseTable => 5,
         Edit::SplitBase => 13,
@@ -189,6 +190,7 @@ const EXEMPT: &[(Dialect, &str, &str)] = &[
         "BaseTriggerEvent",
         "DROP TRIGGER is compared only from T-SQL to PostgreSQL",
     ),
+    (Dialect::Db2i, "TargetBaseTriggerEvent", "same"),
     (
         Dialect::Db2i,
         "RetypeSide",
