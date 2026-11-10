@@ -324,6 +324,11 @@ impl Replay {
     /// The answer to `q` asked of `side`'s catalog now. `None` when the
     /// question cannot be asked again (the stored result is then not taken).
     pub fn outcome(&self, side: ReadSide, q: &Query) -> Option<Outcome> {
+        // A pass-1 read (`Draft`) is replayed by `SourceReads::ask`, never
+        // through a check's view: its `Table` answer is another question.
+        if side == ReadSide::Draft {
+            return None;
+        }
         let key = (side, q.clone());
         if let Some(o) = self.memo.lock().ok()?.get(&key) {
             return *o;
@@ -331,6 +336,7 @@ impl Replay {
         let bound = match side {
             ReadSide::Source => &self.source,
             ReadSide::Target | ReadSide::OwnTarget => &self.target,
+            ReadSide::Draft => return None,
         };
         let rec = Arc::new(Recorder::default());
         let asked = {

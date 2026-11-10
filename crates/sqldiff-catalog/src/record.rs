@@ -34,6 +34,13 @@ pub enum Side {
     Target,
     /// The target catalog read for the output's own check.
     OwnTarget,
+    /// The source catalog as pass 1 (`sqldiff-draft`) reads it, through
+    /// [`SourceReads`]. Its `Table` answer is `table_position`'s, not
+    /// [`CatalogView::table`]'s `Lookup`: same key, different question, so
+    /// a pass-1 read can never be replayed as a pass-2 one or the other way
+    /// round ([`RecordingView::ask`] and [`SourceReads::ask`] each refuse
+    /// the other's side).
+    Draft,
 }
 
 /// One part of a name as written: its text and whether it was quoted.
@@ -88,6 +95,11 @@ pub enum Query {
     TriggersOn(Vec<String>),
     /// Triggers that run a function, as stored parts.
     TriggersRunning(Vec<String>),
+    /// Pass 1 only (`Side::Draft`): the distinct column types of the whole
+    /// catalog as `(base, arguments)`, sorted. What the bit-comparison rules
+    /// need to know whether any column could be a `bit`; it changes only when
+    /// a type shape appears or disappears, not on every column edit.
+    ColumnTypes,
     /// The sound fallback for a read that has no narrow form: the whole
     /// catalog. A file that records it re-checks on any edit, as today.
     WholeCatalog,
@@ -130,6 +142,13 @@ pub trait ReadSink: Sync {
     /// run pays for.
     fn active(&self) -> bool {
         true
+    }
+
+    /// Whether this sink already holds an answer to the question. A reader
+    /// of an immutable catalog (pass 1) then skips the digest: the answer
+    /// cannot differ. Defaults to `false`, so the digest is always made.
+    fn holds(&self, _: Side, _: &Query) -> bool {
+        false
     }
 }
 
@@ -184,6 +203,14 @@ impl Recorder {
 }
 
 impl ReadSink for Recorder {
+    fn holds(&self, side: Side, query: &Query) -> bool {
+        self.reads
+            .lock()
+            .unwrap()
+            .0
+            .contains_key(&(side, query.clone()))
+    }
+
     fn record(&self, side: Side, query: &Query, outcome: Outcome) {
         let mut r = self.reads.lock().unwrap();
         if let Some(old) = r.0.insert((side, query.clone()), outcome) {
@@ -363,6 +390,9 @@ impl<'a> RecordingView<'a> {
     /// check ran. `false` for a question this view cannot be asked: a
     /// replay that meets one rejects the stored result.
     pub fn ask(&self, q: &Query) -> bool {
+        if self.side == Side::Draft {
+            return false;
+        }
         let idents = |parts: &[Part]| -> Vec<Ident> {
             parts
                 .iter()
@@ -414,39 +444,124 @@ impl<'a> RecordingView<'a> {
     }
 }
 
+/// The digests of one source catalog, made once and shared by every
+/// [`SourceReads`] over it (a table never changes once the catalog is built;
+/// pass 1 asks about the same table thousands of times). Without it a
+/// recording read digests the whole table text on every call, the cost
+/// recording had in pass 2 before the table digest was cached.
+pub struct SourceDigests {
+    tables: Vec<std::sync::OnceLock<Outcome>>,
+    whole: std::sync::OnceLock<Outcome>,
+    types: std::sync::OnceLock<Vec<(String, Vec<u32>)>>,
+}
+
+impl SourceDigests {
+    /// Empty caches sized for `cat`. Use them with this catalog only.
+    pub fn new(cat: &Catalog) -> Self {
+        SourceDigests {
+            tables: cat.tables.iter().map(|_| Default::default()).collect(),
+            whole: Default::default(),
+            types: Default::default(),
+        }
+    }
+}
+
+/// The distinct column types of a catalog, sorted: the answer of
+/// [`Query::ColumnTypes`].
+fn column_types_of(cat: &Catalog) -> Vec<(String, Vec<u32>)> {
+    let mut v: Vec<(String, Vec<u32>)> = cat
+        .tables
+        .iter()
+        .flat_map(|t| t.columns.iter())
+        .map(|c| (c.data_type.base.clone(), c.data_type.args.clone()))
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 /// The source catalog as pass 1 (`sqldiff-draft`) reads it. Pass 1 holds this
 /// and never a `Catalog`, so every read of the tree's catalog goes through
 /// one of these methods (the compiler enforces it; the door scan in
-/// `tests/catalog_sites.rs` counts the calls). The sandbox of Phase A: reads
-/// go to a sink that keeps nothing today, and become `SourceReads` of a
-/// stored draft only if Phase B is built.
+/// `tests/catalog_sites.rs` counts the calls). Reads go to a sink under
+/// [`Side::Draft`]; [`new`](Self::new) gives the sink that keeps nothing (the
+/// file's own text and every run that does not record).
 #[derive(Clone, Copy)]
 pub struct SourceReads<'a> {
     cat: &'a Catalog,
     dialect: Dialect,
     sink: &'a dyn ReadSink,
+    digests: Option<&'a SourceDigests>,
 }
 
 impl<'a> SourceReads<'a> {
-    /// Wraps the catalog a draft is made against (the driver's one call).
+    /// Wraps the catalog a draft is made against, recording nothing. The
+    /// local catalog of a file (`type_catalog` without a tree) is always
+    /// made this way: its input is the file's text, which is in the key.
     pub fn new(cat: &'a Catalog, dialect: Dialect) -> Self {
         SourceReads {
             cat,
             dialect,
             sink: &NO_SINK,
+            digests: None,
         }
     }
 
+    /// The same, recording every read to `sink` as [`Side::Draft`], with the
+    /// digests of `digests` (built for `cat`) shared across the readers.
+    pub fn recording(
+        cat: &'a Catalog,
+        dialect: Dialect,
+        sink: &'a dyn ReadSink,
+        digests: &'a SourceDigests,
+    ) -> Self {
+        SourceReads {
+            cat,
+            dialect,
+            sink,
+            digests: Some(digests),
+        }
+    }
+
+    /// Records `q` with the digest `d` makes, unless the sink holds it.
+    fn rec_with(&self, q: impl FnOnce() -> Query, d: impl FnOnce() -> Outcome) {
+        if !self.sink.active() {
+            return;
+        }
+        let q = q();
+        if self.sink.holds(Side::Draft, &q) {
+            return;
+        }
+        self.sink.record(Side::Draft, &q, d());
+    }
+
     fn rec<T: std::fmt::Debug + ?Sized>(&self, q: impl FnOnce() -> Query, answer: &T) {
-        if self.sink.active() {
-            self.sink.record(Side::Source, &q(), Outcome::of(answer));
+        self.rec_with(q, || Outcome::of(answer));
+    }
+
+    /// The digest of the whole catalog, made once per [`SourceDigests`].
+    fn whole_digest(&self) -> Outcome {
+        match self.digests {
+            Some(d) => *d.whole.get_or_init(|| Outcome::of(self.cat)),
+            None => Outcome::of(self.cat),
         }
     }
 
     /// A table by name.
     pub fn table(&self, parts: &[Ident]) -> Option<&'a Table> {
-        let a = crate::table_position(self.dialect, self.cat, parts).map(|i| &self.cat.tables[i]);
-        self.rec(|| Query::Table(parts_of(parts)), &a);
+        let at = crate::table_position(self.dialect, self.cat, parts);
+        let a = at.map(|i| &self.cat.tables[i]);
+        self.rec_with(
+            || Query::Table(parts_of(parts)),
+            || {
+                // The answer is the table's digest (cached) or none.
+                let t = at.map(|i| match self.digests {
+                    Some(d) => *d.tables[i].get_or_init(|| Outcome::of(&self.cat.tables[i])),
+                    None => Outcome::of(&self.cat.tables[i]),
+                });
+                Outcome::of(&t)
+            },
+        );
         a
     }
 
@@ -460,15 +575,58 @@ impl<'a> SourceReads<'a> {
         a
     }
 
+    /// The distinct column types of the catalog, sorted (`(base, arguments)`).
+    /// Records [`Query::ColumnTypes`], not the whole catalog.
+    pub fn column_types(&self) -> std::borrow::Cow<'a, [(String, Vec<u32>)]> {
+        let types = match self.digests {
+            Some(d) => std::borrow::Cow::Borrowed(
+                d.types.get_or_init(|| column_types_of(self.cat)).as_slice(),
+            ),
+            None => std::borrow::Cow::Owned(column_types_of(self.cat)),
+        };
+        self.rec(|| Query::ColumnTypes, &*types);
+        types
+    }
+
     /// Every table: records `WholeCatalog`.
     pub fn tables(&self) -> &'a [Table] {
-        self.rec(|| Query::WholeCatalog, self.cat);
+        self.rec_with(|| Query::WholeCatalog, || self.whole_digest());
         &self.cat.tables
     }
 
     /// Every routine: records `WholeCatalog`.
     pub fn routines(&self) -> &'a [Routine] {
-        self.rec(|| Query::WholeCatalog, self.cat);
+        self.rec_with(|| Query::WholeCatalog, || self.whole_digest());
         &self.cat.routines
+    }
+
+    /// Replay: asks the question `q` of this catalog through the very method
+    /// pass 1 used, so the answer is recorded (to this reader's sink) by the
+    /// code that made the draft. `false` for a question pass 1 never asks, or
+    /// one that belongs to a [`RecordingView`] (pass 2): the stored draft is
+    /// then not taken.
+    pub fn ask(&self, q: &Query) -> bool {
+        let idents = |parts: &[Part]| -> Vec<Ident> {
+            parts
+                .iter()
+                .map(|(t, q)| Ident::new(t.as_str(), *q))
+                .collect()
+        };
+        match q {
+            Query::Table(parts) => {
+                self.table(&idents(parts));
+            }
+            Query::TriggersNamed(schema, name) => {
+                self.triggers_named(schema.as_deref(), name);
+            }
+            Query::ColumnTypes => {
+                self.column_types();
+            }
+            Query::WholeCatalog => {
+                self.tables();
+            }
+            _ => return false,
+        }
+        true
     }
 }

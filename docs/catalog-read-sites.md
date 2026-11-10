@@ -121,7 +121,6 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 
 | file | stage | count |
 |---|---|---|
-| `sqldiff-draft/src/tsql/bits.rs` | pass 1 | 1 |
 | `sqldiff-draft/src/tsql/temporal.rs` | pass 1 | 1 |
 | `sqldiff-equiv/src/equiv/canon.rs` | check | 3 |
 | `sqldiff-equiv/src/equiv/mod.rs` | check | 9 |
@@ -168,7 +167,7 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 | file | stage | count |
 |---|---|---|
 | `sqldiff-draft/src/tsql.rs` | pass 1 | 9 |
-| `sqldiff-draft/src/tsql/bits.rs` | pass 1 | 2 |
+| `sqldiff-draft/src/tsql/bits.rs` | pass 1 | 1 |
 | `sqldiff-draft/src/tsql/paging.rs` | pass 1 | 1 |
 | `sqldiff-draft/src/tsql/temporal.rs` | pass 1 | 4 |
 | `sqldiff-draft/src/tsql/trigger.rs` | pass 1 | 1 |
@@ -244,10 +243,13 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 | method | becomes |
 |---|---|
 | `new` | builder (the driver's one call; `sqldiff-draft/src/lib.rs`) |
+| `recording` | builder with a live sink (Phase B; nothing builds it yet) |
 | `table` | pass 1 `Table(parts)` |
 | `triggers_named` | pass 1 `TriggersNamed` |
+| `column_types` | pass 1 `ColumnTypes` |
 | `tables` | pass 1 `WholeCatalog` |
 | `routines` | pass 1 `WholeCatalog` |
+| `ask` | replay: a pass-1 query again, through the draft's own method |
 
 ## `LocalView` public methods
 
