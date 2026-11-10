@@ -1447,6 +1447,10 @@ struct FileWork {
     start: u64,
     /// The file cap before the unit's own cap is taken into account.
     cap: u64,
+    /// Work the file had already done when this pair began, when the pair
+    /// runs alone (`analyze_one_pair`): its meter reads as it would inside
+    /// the file. Zero in a whole-file analysis.
+    offset: u64,
 }
 
 /// Work cap of one unit (a routine pair, or the statements outside any
@@ -1614,6 +1618,7 @@ impl<'x, 'a> Collector<'x, 'a> {
         sqldiff_model::work::now()
             .total()
             .saturating_sub(self.file_work.start)
+            .saturating_add(self.file_work.offset)
     }
 
     fn file_cap(&self) -> u64 {
@@ -2418,6 +2423,37 @@ fn meet(a: &Analyzed, b: &Analyzed) -> Option<Meeting> {
 /// budgets. A routine that meets none is not analysed, and a transaction
 /// statement inside it stays unproven.
 pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
+    analyze_runs(a, b, env, None)
+}
+
+/// What the file's shared budgets looked like around one routine pair of an
+/// analysis, and what the pair spent: the facts a stored pair result needs to
+/// be replayed (design `w4-4-routine-units.md`, section G).
+#[derive(Debug, Clone)]
+pub struct PairRun {
+    /// `diff` calls the file had spent when the pair began, and when it ended.
+    pub file_spent_before: u64,
+    pub file_spent_after: u64,
+    /// Metered work since the analysis began, when the pair began and ended.
+    pub work_before: u64,
+    pub work_after: u64,
+    /// `diff` calls the pair itself spent, and whether a budget cut it.
+    pub spent: u64,
+    pub cut: bool,
+    /// Fingerprints of the findings of the pairs before it (the collision
+    /// salt reads them).
+    pub prior: Vec<String>,
+    pub behaviour: Behaviour,
+}
+
+/// [`analyze`], also listing each routine pair's run in pair order (nothing
+/// for a file analysed as one unit).
+pub fn analyze_runs(
+    a: &Analyzed,
+    b: &Analyzed,
+    env: &Env,
+    mut runs: Option<&mut Vec<PairRun>>,
+) -> Behaviour {
     // The work caps read the meter, which counts nothing outside a scope: an
     // entry that opened none would run uncapped.
     debug_assert!(
@@ -2432,11 +2468,12 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
         let file_work = FileWork {
             start,
             cap: file_work_cap(1, 0),
+            offset: 0,
         };
         // At most one routine on each side: `routines_of` picks it, so a
         // setup `DO` block beside it is not mistaken for it.
         let (ra, rb) = (routines_of(a), routines_of(b));
-        let mut out = analyze_pair(
+        let (mut out, _) = analyze_pair(
             a,
             b,
             env,
@@ -2483,13 +2520,25 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
     let file_work = FileWork {
         start,
         cap: file_work_cap(m.pairs.len().max(1) as u64, largest),
+        offset: 0,
     };
     let mut out = Behaviour::default();
     let mut prior: Rc<HashSet<String>> = Rc::new(HashSet::new());
     let mut all_compared = m.only_a.is_empty() && m.only_b.is_empty();
     for (x, y) in &m.pairs {
         let name = sqldiff_syntax::ast::routine_name(x).unwrap_or_default();
-        let r = analyze_pair(
+        let before = runs.is_some().then(|| {
+            // Sorted at once: the order of the set is never read.
+            #[allow(clippy::disallowed_methods)]
+            let mut v: Vec<String> = prior.iter().cloned().collect();
+            v.sort();
+            (
+                file_spent.get(),
+                sqldiff_model::work::now().total().saturating_sub(start),
+                v,
+            )
+        });
+        let (r, stats) = analyze_pair(
             a,
             b,
             env,
@@ -2500,6 +2549,20 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
             &file_spent,
             file_work,
         );
+        if let (Some(runs), Some((spent_before, work_before, prior_before))) =
+            (runs.as_deref_mut(), before)
+        {
+            runs.push(PairRun {
+                file_spent_before: spent_before,
+                file_spent_after: file_spent.get(),
+                work_before,
+                work_after: sqldiff_model::work::now().total().saturating_sub(start),
+                spent: stats.spent,
+                cut: stats.cut,
+                prior: prior_before,
+                behaviour: r.clone(),
+            });
+        }
         // The pair's collector is gone, so `prior` is unique here and
         // `make_mut` does not copy it.
         Rc::make_mut(&mut prior).extend(r.findings.iter().map(|f| f.fingerprint.clone()));
@@ -2542,7 +2605,7 @@ fn analyze_pair(
     prior: &Rc<HashSet<String>>,
     file_spent: &Rc<Cell<u64>>,
     file_work: FileWork,
-) -> Behaviour {
+) -> (Behaviour, PairStats) {
     let mut c = Collector::new(a, b, env.clone(), ra, rb, file_spent.clone(), file_work);
     c.salt = salt.to_string();
     c.prior = Rc::clone(prior);
@@ -2580,7 +2643,102 @@ fn analyze_pair(
             .findings
             .iter()
             .all(|f| matches!(f.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions));
-    c.out
+    let stats = PairStats {
+        spent: c.spent.get(),
+        cut: c.out_of_budget.get(),
+    };
+    (c.out, stats)
+}
+
+/// What `analyze_pair` reports besides the behaviour.
+struct PairStats {
+    spent: u64,
+    cut: bool,
+}
+
+/// Where a routine pair stands in its file's shared budgets when it runs
+/// alone (see [`analyze_one_pair`]).
+#[derive(Debug, Clone, Default)]
+pub struct PairEntry {
+    /// `diff` calls the file had spent before the pair.
+    pub file_spent: u64,
+    /// Metered work since the analysis began, before the pair.
+    pub work_before: u64,
+    /// Fingerprints of the findings of the pairs before it.
+    pub prior: Vec<String>,
+}
+
+/// The analysis of the `index`th routine pair of a file that `meet` pairs,
+/// run alone: the pair's own collector, with the file's shared state (the
+/// `diff` calls and work already spent, the fingerprints already seen) given
+/// as `entry` instead of left by the pairs before it. For the entry a
+/// whole-file analysis had at that pair this returns exactly the pair's
+/// result in it (`pair_tests`). `None` when the file is not analysed pair by
+/// pair or `index` is out of range.
+pub fn analyze_one_pair(
+    a: &Analyzed,
+    b: &Analyzed,
+    env: &Env,
+    index: usize,
+    entry: &PairEntry,
+) -> Option<PairRun> {
+    debug_assert!(
+        sqldiff_model::work::in_scope(),
+        "behaviour::analyze_one_pair needs an open work scope"
+    );
+    let start = sqldiff_model::work::now().total();
+    let m = meet(a, b)?;
+    let (x, y) = m.pairs.get(index)?;
+    // The file cap is a function of every pair of the file.
+    let largest = if env.work_caps.is_some() {
+        0
+    } else {
+        m.pairs
+            .iter()
+            .map(|(x, y)| unit_work_cap(pair_statements(a, b, Some(x.clone()), Some(y.clone()))))
+            .max()
+            .unwrap_or(0)
+    };
+    let file_work = FileWork {
+        start,
+        cap: file_work_cap(m.pairs.len().max(1) as u64, largest),
+        // Work done before the pair, less what this call spent on the file
+        // cap above (the whole-file analysis spent it before its first pair).
+        offset: entry
+            .work_before
+            .saturating_sub(sqldiff_model::work::now().total().saturating_sub(start)),
+    };
+    let file_spent = Rc::new(Cell::new(entry.file_spent));
+    let prior: Rc<HashSet<String>> = Rc::new(entry.prior.iter().cloned().collect());
+    let name = sqldiff_syntax::ast::routine_name(x).unwrap_or_default();
+    let work_before = sqldiff_model::work::now()
+        .total()
+        .saturating_sub(start)
+        .saturating_add(file_work.offset);
+    let (r, stats) = analyze_pair(
+        a,
+        b,
+        env,
+        Some(x.clone()),
+        Some(y.clone()),
+        &format!("{name}|"),
+        &prior,
+        &file_spent,
+        file_work,
+    );
+    Some(PairRun {
+        file_spent_before: entry.file_spent,
+        file_spent_after: file_spent.get(),
+        work_before,
+        work_after: sqldiff_model::work::now()
+            .total()
+            .saturating_sub(start)
+            .saturating_add(file_work.offset),
+        spent: stats.spent,
+        cut: stats.cut,
+        prior: entry.prior.clone(),
+        behaviour: r,
+    })
 }
 
 fn rank(v: Verdict) -> u8 {
@@ -2659,6 +2817,7 @@ pub fn what_if(
     let file_work = FileWork {
         start: sqldiff_model::work::now().total(),
         cap: file_work_cap(1, 0),
+        offset: 0,
     };
     let mut c = Collector::new(a, b, env.clone(), ra, rb, Rc::new(Cell::new(0)), file_work);
     let (this, other) = if on_a { (&c.sa, &c.sb) } else { (&c.sb, &c.sa) };
@@ -2784,6 +2943,7 @@ mod cap_tests {
         let file_work = FileWork {
             start: sqldiff_model::work::now().total(),
             cap: 0,
+            offset: 0,
         };
         let (ra, rb) = (
             routines_of(&a).first().cloned(),
@@ -3212,4 +3372,164 @@ pub fn pair_states(a: &Analyzed, b: &Analyzed, env: &Env, max_states: usize) -> 
         }
     }
     rows
+}
+
+/// The proof test of W4.4 step 1 (design `w4-4-routine-units.md`, sections E
+/// to G): a routine pair run alone with the file's shared state injected
+/// returns exactly what it returned inside the whole-file analysis, for the
+/// budgets that bind (the diff-count budgets and the work caps) at every
+/// position of the cut.
+#[cfg(test)]
+mod pair_tests {
+    use super::*;
+    use crate::model::Side;
+
+    fn tsql(n: usize, branches: usize) -> String {
+        (0..n)
+            .map(|i| {
+                let ifs: String = (0..branches + i % 3)
+                    .map(|k| {
+                        format!(
+                            "IF @x > {k} UPDATE dbo.t SET c = c + {i} WHERE id = @x; ELSE INSERT INTO dbo.t (id, c) VALUES (@x, {k});\n"
+                        )
+                    })
+                    .collect();
+                format!("CREATE PROCEDURE dbo.p{i} @x int AS\nBEGIN\n{ifs}END;\nGO\n")
+            })
+            .collect()
+    }
+
+    /// The PostgreSQL side; routine `skew` has one branch changed, so the
+    /// files carry differences as well as equalities.
+    fn pg(n: usize, branches: usize, skew: Option<usize>) -> String {
+        (0..n)
+            .map(|i| {
+                let ifs: String = (0..branches + i % 3)
+                    .map(|k| {
+                        let add = if skew == Some(i) && k == 0 { i + 1 } else { i };
+                        format!(
+                            "IF x > {k} THEN UPDATE t SET c = c + {add} WHERE id = x; ELSE INSERT INTO t (id, c) VALUES (x, {k}); END IF;\n"
+                        )
+                    })
+                    .collect();
+                format!(
+                    "CREATE PROCEDURE p{i}(x int) LANGUAGE plpgsql AS $$\nBEGIN\n{ifs}END;\n$$;\n"
+                )
+            })
+            .collect()
+    }
+
+    fn analysed(a: &str, b: &str, env: &Env) -> (Behaviour, Vec<PairRun>) {
+        let (ta, tb) = (
+            crate::Artifact::new("a.sql", Dialect::Tsql, a),
+            crate::Artifact::new("b.sql", Dialect::Postgres, b),
+        );
+        let (x, y) = (
+            Analyzed::new(&ta, Side::A, 3),
+            Analyzed::new(&tb, Side::B, 3),
+        );
+        let mut runs = Vec::new();
+        let (out, _) =
+            sqldiff_model::work::scope("pair test", || analyze_runs(&x, &y, env, Some(&mut runs)));
+        (out, runs)
+    }
+
+    fn alone(a: &str, b: &str, env: &Env, index: usize, entry: &PairEntry) -> Option<PairRun> {
+        let (ta, tb) = (
+            crate::Artifact::new("a.sql", Dialect::Tsql, a),
+            crate::Artifact::new("b.sql", Dialect::Postgres, b),
+        );
+        let (x, y) = (
+            Analyzed::new(&ta, Side::A, 3),
+            Analyzed::new(&tb, Side::B, 3),
+        );
+        sqldiff_model::work::scope("pair test", || analyze_one_pair(&x, &y, env, index, entry)).0
+    }
+
+    /// Every pair of `runs` run alone with its recorded entry equals its run.
+    fn check(a: &str, b: &str, env: &Env, label: &str) -> (usize, usize) {
+        let (_, runs) = analysed(a, b, env);
+        assert!(
+            !runs.is_empty(),
+            "{label}: the file is not analysed per pair"
+        );
+        let cut = runs.iter().filter(|r| r.cut).count();
+        for (i, r) in runs.iter().enumerate() {
+            let entry = PairEntry {
+                file_spent: r.file_spent_before,
+                work_before: r.work_before,
+                prior: r.prior.clone(),
+            };
+            let one = alone(a, b, env, i, &entry)
+                .unwrap_or_else(|| panic!("{label}: pair {i} did not run alone"));
+            let show = |x: &PairRun| {
+                format!(
+                    "{:?} {} {} {} {} {} {}",
+                    x.behaviour,
+                    x.file_spent_before,
+                    x.file_spent_after,
+                    x.work_before,
+                    x.work_after,
+                    x.spent,
+                    x.cut
+                )
+            };
+            assert_eq!(show(&one), show(r), "{label}: pair {i} alone differs");
+        }
+        (runs.len(), cut)
+    }
+
+    #[test]
+    fn a_pair_alone_equals_the_pair_in_its_file() {
+        let (a, b) = (tsql(6, 4), pg(6, 4, Some(2)));
+        let (n, cut) = check(&a, &b, &Env::default(), "no budget binds");
+        assert_eq!((n, cut), (6, 0), "nothing is cut with the default budgets");
+    }
+
+    #[test]
+    fn a_pair_alone_equals_the_pair_in_its_file_when_the_budgets_bind() {
+        let (a, b) = (tsql(6, 3), pg(6, 3, Some(3)));
+        // Learn what the pairs spend, then place each budget so that the cut
+        // falls before, exactly at, inside and after the pairs.
+        let (_, runs) = analysed(&a, &b, &Env::default());
+        let total_spent = runs.last().unwrap().file_spent_after;
+        let total_work = runs.last().unwrap().work_after;
+        assert!(
+            total_spent > 8 && total_work > 8,
+            "the pairs spend something"
+        );
+        let mut cuts = BTreeSet::new();
+        for r in &runs {
+            // Exactly at a pair's boundary, one before it and one after.
+            for d in [
+                r.file_spent_before,
+                r.file_spent_before + 1,
+                r.file_spent_after,
+            ] {
+                for e in [d.saturating_sub(1), d, d + 1] {
+                    let env = Env {
+                        work_budgets: Some((1 << 21, e)),
+                        ..Env::default()
+                    };
+                    let (n, cut) = check(&a, &b, &env, &format!("diff budget {e}"));
+                    assert_eq!(n, 6);
+                    cuts.insert(cut);
+                }
+            }
+            for d in [r.work_before, r.work_after] {
+                for e in [d.saturating_sub(1), d, d + 1] {
+                    let env = Env {
+                        work_caps: Some((u64::MAX / 2, e)),
+                        ..Env::default()
+                    };
+                    let (_, cut) = check(&a, &b, &env, &format!("work cap {e}"));
+                    cuts.insert(cut);
+                }
+            }
+        }
+        assert!(
+            cuts.len() > 3,
+            "the budgets cut different numbers of pairs: {cuts:?}"
+        );
+    }
 }
