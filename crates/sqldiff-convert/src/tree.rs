@@ -4272,8 +4272,9 @@ mod tree_state_tests {
     /// Drafts stored as pass 1 goes, by file text and read set: a second
     /// build takes them (a run killed in pass 1 keeps its work), builds the
     /// one that does not read back, and fails on a stored draft that differs
-    /// from one built again; an edit of one file, or of a table another file
-    /// reads, leaves the drafts of the files that did not read it.
+    /// from one built again; an edit of one file leaves the drafts of the
+    /// others. (An edit of a catalog object is covered by
+    /// `replay_equals_fresh`, which compares every edit with a fresh run.)
     #[test]
     fn stored_drafts_are_taken_rebuilt_or_refused() {
         let dir = std::env::temp_dir().join(format!("sqldiff-drafts-{}", std::process::id()));

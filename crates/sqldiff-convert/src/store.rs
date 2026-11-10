@@ -2133,6 +2133,9 @@ impl Store {
     /// before an edit, or of another build), keeps at most [`MAX_ENTRIES`]
     /// of the others (those in `used` first, then by id), and removes the
     /// folder of the earlier draft layout. Returns how many files went.
+    /// (So reverting a file's own text after an edit builds that file again,
+    /// its old key being gone, while reverting an edit of the catalog finds
+    /// the entries of every other file still there.)
     pub fn gc_drafts(&self, live: &BTreeSet<String>, used: &BTreeSet<(String, String)>) -> usize {
         let mut removed = 0;
         if let Ok(old) = crate::tree::dest_under(&self.out, DRAFTS_DIR) {

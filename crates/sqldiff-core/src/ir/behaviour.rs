@@ -2572,18 +2572,10 @@ pub fn analyze_runs(
     };
     // The file cap is a function of the file: its units and the largest unit
     // cap, known before the first unit runs.
-    let unit_caps: Vec<u64> = if env.work_caps.is_some() {
-        Vec::new()
-    } else {
-        m.pairs
-            .iter()
-            .map(|(x, y)| unit_work_cap(pair_statements(a, b, Some(x.clone()), Some(y.clone()))))
-            .collect()
-    };
-    let largest = unit_caps.iter().copied().max().unwrap_or(0);
+    let (unit_caps, file_cap) = file_caps(a, b, env, m.pairs.len(), &m);
     let file_work = FileWork {
         start,
-        cap: file_work_cap(m.pairs.len().max(1) as u64, largest),
+        cap: file_cap,
         offset: 0,
     };
     let mut out = Behaviour::default();
@@ -3087,6 +3079,23 @@ struct PairStats {
     tested: Vec<(String, bool)>,
 }
 
+/// The work caps of a file, a function of the file alone: each pair's unit
+/// cap (empty when `env.work_caps` overrides them) and the file's cap. The
+/// whole-file analysis and a pair run alone both take them from here, so
+/// they cannot drift apart.
+fn file_caps(a: &Analyzed, b: &Analyzed, env: &Env, pairs: usize, m: &Meeting) -> (Vec<u64>, u64) {
+    let unit_caps: Vec<u64> = if env.work_caps.is_some() {
+        Vec::new()
+    } else {
+        m.pairs
+            .iter()
+            .map(|(x, y)| unit_work_cap(pair_statements(a, b, Some(x.clone()), Some(y.clone()))))
+            .collect()
+    };
+    let largest = unit_caps.iter().copied().max().unwrap_or(0);
+    (unit_caps, file_work_cap(pairs.max(1) as u64, largest))
+}
+
 /// Where a routine pair stands in its file's shared budgets when it runs
 /// alone (see [`analyze_one_pair`]).
 #[derive(Debug, Clone, Default)]
@@ -3121,23 +3130,19 @@ pub fn analyze_one_pair(
     let m = meet(a, b)?;
     let (x, y) = m.pairs.get(index)?;
     // The file cap is a function of every pair of the file.
-    let largest = if env.work_caps.is_some() {
-        0
-    } else {
-        m.pairs
-            .iter()
-            .map(|(x, y)| unit_work_cap(pair_statements(a, b, Some(x.clone()), Some(y.clone()))))
-            .max()
-            .unwrap_or(0)
-    };
+    let (_, file_cap) = file_caps(a, b, env, m.pairs.len(), &m);
+    let spent_here = sqldiff_model::work::now().total().saturating_sub(start);
+    // Pre-pair work of this call is deducted from the offset; the whole-file
+    // analysis spent that much before its first pair, so it can never exceed
+    // what the entry says was done before the pair.
+    debug_assert!(
+        spent_here <= entry.work_before,
+        "the alone call's pre-pair work exceeds the file's"
+    );
     let file_work = FileWork {
         start,
-        cap: file_work_cap(m.pairs.len().max(1) as u64, largest),
-        // Work done before the pair, less what this call spent on the file
-        // cap above (the whole-file analysis spent it before its first pair).
-        offset: entry
-            .work_before
-            .saturating_sub(sqldiff_model::work::now().total().saturating_sub(start)),
+        cap: file_cap,
+        offset: entry.work_before.saturating_sub(spent_here),
     };
     let file_spent = Rc::new(Cell::new(entry.file_spent));
     let prior: Rc<HashSet<String>> = Rc::new(entry.prior.iter().cloned().collect());
@@ -4221,6 +4226,120 @@ mod pair_tests {
             }
         }
         assert!(taken > 0, "the budget runs took something from the cache");
+    }
+
+    /// Every cap placement of the base file, then the same placements on a
+    /// file edited so that its first routine does more work on the same
+    /// lines: stored results made under the base file's cut points are
+    /// served only where the edited file's shared budgets still allow, and
+    /// what is served equals a fresh run (B1 and B5, edits moving the cut).
+    #[test]
+    fn an_edit_that_moves_the_cut_point_never_serves_a_result_the_new_file_would_cut() {
+        let (a, b) = (tsql(6, 3), pg(6, 3, Some(3)));
+        let a2 = a.replacen(
+            "VALUES (@x, 0);\n",
+            "VALUES (@x, 0); INSERT INTO dbo.t (id, c) VALUES (@x, 90);\n",
+            1,
+        );
+        let b2 = b.replacen(
+            "VALUES (x, 0); END IF;\n",
+            "VALUES (x, 0); END IF; INSERT INTO t (id, c) VALUES (x, 90);\n",
+            1,
+        );
+        assert_ne!(a, a2);
+        assert_ne!(b, b2);
+        let (_, base) = analysed(&a, &b, &Env::default());
+        let (_, edited) = analysed(&a2, &b2, &Env::default());
+        let mut envs: Vec<Env> = Vec::new();
+        for runs in [&base, &edited] {
+            for r in runs {
+                for d in [r.file_spent_before, r.file_spent_after] {
+                    for e in [d.saturating_sub(1), d, d + 1] {
+                        envs.push(Env {
+                            work_budgets: Some((1 << 21, e)),
+                            ..Env::default()
+                        });
+                    }
+                }
+                for d in [r.work_before, r.work_after] {
+                    for e in [d.saturating_sub(1), d, d + 1] {
+                        envs.push(Env {
+                            work_caps: Some((u64::MAX / 2, e)),
+                            ..Env::default()
+                        });
+                    }
+                }
+            }
+        }
+        let (mut served, mut cut) = (0, 0);
+        for env in &envs {
+            let cache = std::sync::Arc::new(MemCache::default());
+            let cached_env = with_cache(env, &cache);
+            let _ = analysed(&a, &b, &cached_env);
+            cache.reset_events();
+            let (got, got_runs) = analysed(&a2, &b2, &cached_env);
+            let (fresh, fresh_runs) = analysed(&a2, &b2, env);
+            assert_eq!(
+                shown(&got_runs, &got),
+                shown(&fresh_runs, &fresh),
+                "{:?}",
+                (env.work_budgets, env.work_caps)
+            );
+            served += cache.count(PairEvent::Reused);
+            cut += fresh_runs.iter().filter(|r| r.cut).count();
+        }
+        assert!(
+            served > 0 && cut > 0,
+            "served {served}, cut {cut}: the placements prove nothing"
+        );
+    }
+
+    /// B1 as the reuse rule, probed directly (reviewer of #462): a pair run
+    /// with a budget in a file gives what it gives with no budget exactly
+    /// when the work before it plus its own spend stays strictly below the
+    /// cap, for both budgets. At equality it may or may not; the cache
+    /// reruns there.
+    #[test]
+    fn a_pair_under_a_budget_equals_its_free_run_while_it_stays_strictly_below_the_cap() {
+        let (a, b) = (tsql(6, 3), pg(6, 3, Some(3)));
+        let (_, free) = analysed(&a, &b, &Env::default());
+        let show = |x: &PairRun| format!("{:?} {} {}", x.behaviour, x.spent, x.cut);
+        let mut caps: Vec<(bool, u64)> = Vec::new();
+        for r in &free {
+            for d in [r.file_spent_before, r.file_spent_after] {
+                caps.extend([d.saturating_sub(1), d, d + 1].map(|e| (false, e)));
+            }
+            for d in [r.work_before, r.work_after] {
+                caps.extend([d.saturating_sub(1), d, d + 1].map(|e| (true, e)));
+            }
+        }
+        let mut below = 0;
+        for (work, e) in caps {
+            let env = if work {
+                Env {
+                    work_caps: Some((u64::MAX / 2, e)),
+                    ..Env::default()
+                }
+            } else {
+                Env {
+                    work_budgets: Some((1 << 21, e)),
+                    ..Env::default()
+                }
+            };
+            let (_, capped) = analysed(&a, &b, &env);
+            for (k, (c, f)) in capped.iter().zip(&free).enumerate() {
+                let (before, spend) = if work {
+                    (c.work_before, f.work_after - f.work_before)
+                } else {
+                    (c.file_spent_before, f.spent)
+                };
+                if before + spend < e {
+                    assert_eq!(show(c), show(f), "work={work} cap={e} pair {k}");
+                    below += 1;
+                }
+            }
+        }
+        assert!(below > 0);
     }
 
     #[test]
