@@ -575,6 +575,13 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
             if !seen.contains(site) {
                 continue;
             }
+            // The edit that removes both supplied catalogs changes the store key
+            // (`a_changed_supplied_bit_finds_nothing_stored`): nothing stored
+            // is taken after it, so what the site records there cannot be
+            // stale.
+            if matches!(e, Some(Edit::NoCatalog)) {
+                continue;
+            }
             site_switch::skip(site.clone());
             let (skipped, _, sq) = run_tree_with_reads(*d, *h, *e);
             site_switch::off();
