@@ -91,6 +91,9 @@ const KILLED: &[&str] = &[
     "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(&i.name), false)?;",
     "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(n), false)?;",
     "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(n), true)?;",
+    "crates/sqldiff-equiv/src/equiv/mod.rs::col_facts@let t = schema.table_exact(want.0.as_deref(), &want.1)?;",
+    "crates/sqldiff-equiv/src/equiv/mod.rs::trigger_drop@.whole()",
+    "crates/sqldiff-equiv/src/equiv/mod.rs::trigger_drop@.whole()#1",
     "crates/sqldiff-equiv/src/equiv/schema.rs::list_stars_with@b.ask_table(n);",
     "crates/sqldiff-equiv/src/equiv/table.rs::case_check@schema.case_check(&stored(n), false)?;",
 ];
@@ -109,7 +112,6 @@ const REDUNDANT: &[&str] = &[
     "crates/sqldiff-equiv/src/equiv/canon.rs::user_fn@let found: Vec<&crate::catalog::Routine> = match view.routines(&parts) {",
     "crates/sqldiff-equiv/src/equiv/canon.rs::written@.table(Self::base_table(table))",
     "crates/sqldiff-equiv/src/equiv/mod.rs::read@Some((n, _)) => ddl::case_check(dd, &s.with_ddl(&n.text().to_string(), d)),",
-    "crates/sqldiff-equiv/src/equiv/mod.rs::trigger_drop@.whole()#1",
     "crates/sqldiff-equiv/src/equiv/mod.rs::trigger_drop@if cat_p.whole().triggers.iter().any(|d| {",
     "crates/sqldiff-equiv/src/equiv/xwit.rs::not_null@.table(t)",
     "crates/sqldiff-equiv/src/equiv/xwit.rs::types@.and_then(|t| side.schema.table(t))",
@@ -120,14 +122,9 @@ const REDUNDANT: &[&str] = &[
 const DOMINATED: &[&str] = &[
     "crates/sqldiff-core/src/bind/query.rs::lookup_table_silent@_ => match self.input.view.table(parts) {",
     "crates/sqldiff-equiv/src/equiv/canon.rs::all_columns@None => self.schema.table_exact(",
-    "crates/sqldiff-equiv/src/equiv/canon.rs::visible_star@.table(Self::base_table(&b.table))",
     "crates/sqldiff-equiv/src/equiv/canon.rs::visible_star@b.derived.is_none() && self.schema.is_star_view(&lc(Self::base_table(&b.table)))",
     "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(n), true)?;#2",
     "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(n), x.kind == \"TABLE\")?;",
-    "crates/sqldiff-equiv/src/equiv/mod.rs::col_facts@let t = schema.table_exact(want.0.as_deref(), &want.1)?;",
-    "crates/sqldiff-equiv/src/equiv/mod.rs::table_pair@sa.with_ddl(&p.ddl.0, a.dialect()),",
-    "crates/sqldiff-equiv/src/equiv/mod.rs::table_pair@sb.with_ddl(&p.ddl.1, b.dialect()),",
-    "crates/sqldiff-equiv/src/equiv/mod.rs::trigger_drop@.whole()",
     "crates/sqldiff-equiv/src/equiv/trigger.rs::pairs_for@.with_images(&tr.table, &names)",
     "crates/sqldiff-equiv/src/equiv/trigger.rs::pairs_for@let sa2 = sa.with_images(&table, &names).unwrap_or_else(|| sa.clone());",
 ];
@@ -135,6 +132,15 @@ const DOMINATED: &[&str] = &[
 /// Sites whose read sets change but that no generated edit kills: work for
 /// the generator.
 const GAP: &[&str] = &[];
+
+/// Sites whose answer changes a stored result in a way no output shows: the
+/// run after the edit, built fresh, shows the same report entry and the same
+/// converted text for those files as the run before (`SHOWN`), so a resume
+/// that took the stale result could not differ from a fresh run in anything
+/// the run writes. Found by the run, per edit, from the answers the site
+/// alone records.
+const STORE_ONLY: &[&str] =
+    &["crates/sqldiff-equiv/src/equiv/canon.rs::visible_star@.table(Self::base_table(&b.table))"];
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -223,6 +229,8 @@ fn run_tree(
 /// union over its entries: `side query` to the set of answer digests.
 /// The pseudo question under which [`Answers`] holds a hash of a file's stored result.
 const RESULT: &str = "\0result";
+/// What a run shows of the file (its report entry and its converted text).
+const SHOWN: &str = "\0shown";
 const TEXT: &str = "\0text";
 /// The pseudo question that holds the paths of the files whose converted text is a file's stored result.
 const PATH: &str = "\0path";
@@ -344,6 +352,7 @@ fn run_tree_answers(
             })
         })
         .unwrap_or_default();
+    let shown_files = per_file(&out);
     for (key, q) in answers.iter_mut() {
         let Some(text) = q.get(TEXT).and_then(|t| t.iter().next()).cloned() else {
             continue;
@@ -362,6 +371,13 @@ fn run_tree_answers(
             .map(|(p, _)| p.clone())
             .collect();
         let _ = key;
+        // What the run shows of those files.
+        let shown: String = found
+            .iter()
+            .map(|p| shown_files.get(p).cloned().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        q.insert(SHOWN.to_string(), BTreeSet::from([shown]));
         q.insert(PATH.to_string(), found);
     }
     (ids, seen, qs, answers)
@@ -472,11 +488,18 @@ fn every_site_the_base_tree_reads_from_is_classified_and_the_classified_sites_ex
         .chain(DOMINATED)
         .chain(KEYED)
         .chain(CONSUMED)
+        .chain(STORE_ONLY)
         .copied()
         .collect();
     assert_eq!(
         known.len(),
-        KILLED.len() + REDUNDANT.len() + GAP.len() + DOMINATED.len() + KEYED.len() + CONSUMED.len(),
+        KILLED.len()
+            + REDUNDANT.len()
+            + GAP.len()
+            + DOMINATED.len()
+            + KEYED.len()
+            + CONSUMED.len()
+            + STORE_ONLY.len(),
         "a site is in two classes"
     );
     let keys = keys_of(&base_sites());
@@ -552,8 +575,8 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
     assert!(all.len() >= 20, "only {} sites seen", all.len());
     let mut skipped_base: BTreeMap<(Dialect, bool), BTreeMap<String, BTreeSet<String>>> =
         BTreeMap::new();
-    let (mut killed, mut redundant, mut gap, mut dom) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut killed, mut redundant, mut gap, mut dom, mut so) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for site in &all {
         let name = keys[site].clone();
         if only
@@ -568,6 +591,10 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
         }
         if CONSUMED.contains(&name.as_str()) {
             println!("{name}: CONSUMED");
+            continue;
+        }
+        if STORE_ONLY.contains(&name.as_str()) {
+            println!("{name}: STORE_ONLY");
             continue;
         }
         // Redundant: the read sets are the same on every tree the site reads
@@ -648,6 +675,7 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
         // result). A site that is never in that case is not proven.
         let mut dominated = true;
         let mut mattered = false;
+        let mut store_mattered = false;
         'dom: for ((d, h, e), (_, _, rq, edit_ans)) in trees.iter().zip(&reference) {
             // `--no-catalog` changes every file's store key (the supplied
             // bit; `a_changed_supplied_bit_finds_nothing_stored`): nothing is
@@ -690,10 +718,10 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
                 let new = edit_ans.get(k).cloned().unwrap_or_default();
                 // A file whose result the edit leaves alone cannot be taken
                 // stale in a way that shows.
+                let kept = skipped.get(k).cloned().unwrap_or_default();
                 if old.get(RESULT) == new.get(RESULT) {
                     continue;
                 }
-                let kept = skipped.get(k).cloned().unwrap_or_default();
                 if std::env::var("SQLDIFF_T3_VERBOSE").is_ok() {
                     let gone: Vec<&String> = base_reads
                         .difference(&kept)
@@ -718,6 +746,12 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
                 if lost == 0 {
                     continue;
                 }
+                // What the fresh run after the edit shows of the file is what
+                // the run before showed: a stale stored result is not visible.
+                if old.get(SHOWN).is_some() && old.get(SHOWN) == new.get(SHOWN) {
+                    store_mattered = true;
+                    continue;
+                }
                 mattered = true;
                 // The file checked again?
                 let paths = new.get(PATH).cloned().unwrap_or_default();
@@ -739,6 +773,9 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
         if dominated && mattered {
             println!("{name}: DOMINATED");
             dom.push(name);
+        } else if dominated && store_mattered {
+            println!("{name}: STORE_ONLY");
+            so.push(name);
         } else if let Some(b) = chain_kill(site, &trees, &reference) {
             // The stored entries of a run made after an edit are what the
             // next resume takes: some sites show only there.
@@ -750,7 +787,7 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
         }
     }
     println!(
-        "KILLED = {killed:#?}\nREDUNDANT = {redundant:#?}\nDOMINATED = {dom:#?}\nGAP = {gap:#?}"
+        "KILLED = {killed:#?}\nREDUNDANT = {redundant:#?}\nDOMINATED = {dom:#?}\nSTORE_ONLY = {so:#?}\nGAP = {gap:#?}"
     );
     if only.is_some() {
         // A shard (`SQLDIFF_T3_ONLY`, as the workflow `t3-sites` runs them):
@@ -768,6 +805,7 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
         wrong(&killed, KILLED, "KILLED");
         wrong(&redundant, REDUNDANT, "REDUNDANT");
         wrong(&dom, DOMINATED, "DOMINATED");
+        wrong(&so, STORE_ONLY, "STORE_ONLY");
         assert!(gap.is_empty(), "sites with no proof: {gap:?}");
         return;
     }
@@ -783,6 +821,8 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
     assert_eq!(redundant, sorted(REDUNDANT), "redundant sites");
     dom.sort();
     assert_eq!(dom, sorted(DOMINATED), "dominated sites");
+    so.sort();
+    assert_eq!(so, sorted(STORE_ONLY), "store-only sites");
     assert_eq!(gap, sorted(GAP), "gap sites");
 }
 
@@ -859,12 +899,25 @@ fn reads() {
     });
     for (label, ed) in [("before", None), ("after", Some(e))] {
         let f = Fixture::new("reads", Dialect::Postgres);
-        f.write(&model_with(ed, false));
+        f.write(&model_with(ed, std::env::var("SQLDIFF_T3_HIDDEN").is_ok()));
         if let Some(s) = &skip {
             site_switch::skip(s.clone());
         }
         f.run("res", false);
         site_switch::off();
+        if let Ok(fp) = std::env::var("SQLDIFF_T3_FP") {
+            let mut stack = vec![f.dir.join("res")];
+            while let Some(d) = stack.pop() {
+                for e in std::fs::read_dir(&d).unwrap().flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else if std::fs::read_to_string(&p).is_ok_and(|t| t.contains(&fp)) {
+                        println!("{label} {fp} is in {}", p.display());
+                    }
+                }
+            }
+        }
         let results = f.dir.join("res/.sqldiff/results");
         for k in std::fs::read_dir(results).unwrap().flatten() {
             for en in std::fs::read_dir(k.path()).unwrap().flatten() {
@@ -881,6 +934,12 @@ fn reads() {
                 let v: serde_json::Value =
                     serde_json::from_str(raw.get(65..).unwrap_or("null")).unwrap_or_default();
                 println!("{label} {}:", en.path().display());
+                if let Ok(dump) = std::env::var("SQLDIFF_T3_BODY") {
+                    let _ = std::fs::write(
+                        format!("{dump}-{label}.json"),
+                        body.get(65..).unwrap_or(""),
+                    );
+                }
                 for r in v["reads"].as_array().into_iter().flatten() {
                     println!(
                         "   {} {} {}",

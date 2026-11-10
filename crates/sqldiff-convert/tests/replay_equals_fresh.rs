@@ -60,6 +60,7 @@ fn recheck_at_most(e: &Edit) -> usize {
         | Edit::SourceOverrides
         | Edit::TargetOverrides
         | Edit::TargetLookalikes
+        | Edit::ViewLookalike
         | Edit::NoBaseA
         | Edit::NoBaseB
         | Edit::RetypeSide
@@ -150,6 +151,12 @@ fn only(e: &Edit) -> bool {
 
 /// Edits the probe cannot show on a dependent, with why.
 const EXEMPT: &[(Dialect, &str, &str)] = &[
+    (
+        Dialect::Postgres,
+        "ViewLookalike",
+        "it changes the stored result of a file only in what no output shows (`site_switch.rs`: STORE_ONLY)",
+    ),
+    (Dialect::Db2i, "ViewLookalike", "same"),
     (
         Dialect::Postgres,
         "ChangeDefault",

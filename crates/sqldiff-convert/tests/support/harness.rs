@@ -78,7 +78,10 @@ impl Fixture {
                 to: self.to,
                 jobs: Some(2),
                 no_catalog: self.no_catalog.get(),
-                recheck: Default::default(),
+                // No sampled re-check: it would catch some stale reuse by
+                // failing the run, depending on the tree's key, and these
+                // tests prove the keys by comparing outputs.
+                recheck: tree::Recheck::None,
                 template: None,
                 extensions: tree::extensions(Vec::new()),
                 helpers: Vec::new(),

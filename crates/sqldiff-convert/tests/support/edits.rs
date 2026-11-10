@@ -134,6 +134,8 @@ pub struct Model {
     /// source base catalog / the target base catalog.
     pub look_a: bool,
     pub look_b: bool,
+    /// Both base catalogs hold a table of another schema named like the tree's view V0.
+    pub look_v: bool,
     /// The base catalog of a side defines the tree's own tables again,
     /// shaped differently.
     pub over_a: bool,
@@ -290,13 +292,25 @@ impl Model {
             name: "Tr0".into(),
             on: "T1".into(),
         }];
-        let base = vec![Table {
-            schema: "ext".into(),
-            name: "Ref".into(),
-            cols: vec![key(), col("Note", "nvarchar(40)", true)],
-            index: None,
-            versioned: false,
-        }];
+        let base = vec![
+            Table {
+                schema: "ext".into(),
+                name: "Ref".into(),
+                cols: vec![key(), col("Note", "nvarchar(40)", true)],
+                index: None,
+                versioned: false,
+            },
+            // A table of the default schema that only the catalog has: what
+            // a dependent reads of it (its columns) comes from the catalog,
+            // and a second schema's table of that name makes it unknown.
+            Table {
+                schema: "dbo".into(),
+                name: "Lone".into(),
+                cols: vec![key(), col("C0", "nvarchar(40)", true)],
+                index: None,
+                versioned: false,
+            },
+        ];
         Model {
             tables,
             views,
@@ -317,6 +331,7 @@ impl Model {
             clash_column: false,
             look_a: false,
             look_b: false,
+            look_v: false,
             over_a: false,
             over_b: false,
             no_base_a: false,
@@ -411,8 +426,8 @@ impl Model {
         if (d == Dialect::Tsql && self.look_a) || (d != Dialect::Tsql && self.look_b) {
             // Tables of another schema with the names the tree uses.
             for n in [
-                "Fresh", "inserted", "More", "Other", "Sink", "SinkNN", "SinkRef", "SinkV", "T0",
-                "T1", "T2", "V0", "X0",
+                "Fresh", "inserted", "Lone", "More", "Other", "Sink", "SinkNN", "SinkRef", "SinkV",
+                "T0", "T1", "T2", "X0",
             ] {
                 s.push('\n');
                 s.push_str(&create_table(
@@ -426,6 +441,19 @@ impl Model {
                     d,
                 ));
             }
+        }
+        if self.look_v {
+            s.push('\n');
+            s.push_str(&create_table(
+                &Table {
+                    schema: "ops".into(),
+                    name: "V0".into(),
+                    cols: vec![key(), col("C0", "nvarchar(40)", true)],
+                    index: None,
+                    versioned: false,
+                },
+                d,
+            ));
         }
         if (d == Dialect::Tsql && self.look_a) || (d != Dialect::Tsql && self.look_b) {
             // Views of another schema, with the names of tables and a view
@@ -505,7 +533,7 @@ impl Model {
                 Dialect::Postgres => format!("\"{}\"", n.to_uppercase()),
                 _ => format!("\"{n}\""),
             };
-            for t in ["T0", "T1", "T2", "Idx"] {
+            for t in ["T0", "T1", "T2", "X0", "Idx"] {
                 s.push_str(&format!(
                     "\nCREATE TABLE {} ({} int PRIMARY KEY, {} varchar(40), {} int, {} timestamp(3){});\n",
                     other(t),
@@ -630,6 +658,14 @@ fn dependents() -> Vec<(String, String)> {
         "INSERT INTO dbo.SinkV SELECT Id, C0 FROM dbo.T0".into(),
     );
     add(
+        "InsertLone".into(),
+        "INSERT INTO dbo.Lone VALUES (1, N'a')".into(),
+    );
+    add(
+        "StarLone".into(),
+        "INSERT INTO dbo.Sink SELECT * FROM dbo.Lone".into(),
+    );
+    add(
         "InsertNoListSink".into(),
         "INSERT INTO dbo.Sink VALUES (1, N'a', 1, NULL)".into(),
     );
@@ -733,9 +769,15 @@ fn ty_in(d: Dialect, ty: &str) -> String {
 fn create_table(t: &Table, d: Dialect) -> String {
     let mut s = String::new();
     let tsql = d == Dialect::Tsql;
+    // The converter puts `dbo` objects in `public`.
+    let schema = if d == Dialect::Postgres && t.schema == "dbo" {
+        "public"
+    } else {
+        &t.schema
+    };
     s.push_str(&format!(
         "CREATE TABLE {}.{} (\n",
-        q(d, &t.schema),
+        q(d, schema),
         q(d, &t.name)
     ));
     for (i, c) in t.cols.iter().enumerate() {
@@ -854,6 +896,8 @@ pub enum Edit {
     DropFunctions,
     /// The target base catalog gains other spellings of the tree's names.
     CaseClash,
+    /// Both base catalogs gain a table named like the tree's view V0, in another schema.
+    ViewLookalike,
     /// Only index names have another spelling there.
     CaseClashIndex,
     /// Only column names have another spelling there.
@@ -919,6 +963,7 @@ pub const ALL_EDITS: &[Edit] = &[
     Edit::NoProcedures,
     Edit::DropFunctions,
     Edit::CaseClash,
+    Edit::ViewLookalike,
     Edit::CaseClashIndex,
     Edit::CaseClashColumn,
     Edit::SourceOverrides,
@@ -1189,6 +1234,10 @@ impl Edit {
             Edit::CaseClashColumn => {
                 m.clash_column = true;
                 "column names have other spellings in the target base catalog".into()
+            }
+            Edit::ViewLookalike => {
+                m.look_v = true;
+                "both base catalogs have a table named like the view V0".into()
             }
             Edit::CaseClash => {
                 m.case_clash = true;
