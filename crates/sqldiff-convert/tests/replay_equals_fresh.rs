@@ -36,7 +36,7 @@ fn recheck_at_most(e: &Edit) -> usize {
     let measured = match e {
         Edit::NoOpComment | Edit::NoOpReorderTables => 0,
         Edit::AddTable => 6,
-        Edit::DropTable => 24,
+        Edit::DropTable => 25,
         Edit::RenameTable
         | Edit::AddColumn
         | Edit::AddMixedCaseColumn
@@ -45,7 +45,7 @@ fn recheck_at_most(e: &Edit) -> usize {
         | Edit::ReorderColumns
         | Edit::FlipNullability
         | Edit::ChangeDefault
-        | Edit::ToggleIndex => 25,
+        | Edit::ToggleIndex => 26,
         Edit::ViewBody | Edit::AddRoutine | Edit::DropRoutine | Edit::AddTrigger => 6,
         Edit::ChangeParameterType | Edit::AddSchemaTable | Edit::BaseDrop => 7,
         Edit::DropTrigger => 4,

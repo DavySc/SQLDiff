@@ -300,13 +300,7 @@ impl Model {
             routines,
             triggers,
             base,
-            // A table with a CHECK: the one place a table's own
-            // file evaluates a predicate against the catalog's view of
-            // that table (so what the catalog holds under its name matters).
-            extra: vec![(
-                "tables/dbo.Comp.sql".into(),
-                "CREATE TABLE dbo.Comp (\n  Id int NOT NULL,\n  PRIMARY KEY (Id),\n  C0 varchar(20) NULL,\n  CONSTRAINT CK_Comp CHECK (C0 <> 'x' AND C0 LIKE 'a%')\n);\nGO\n".into(),
-            )],
+            extra: Vec::new(),
             notes: Vec::new(),
             split_base: false,
             no_procs: false,
@@ -408,8 +402,8 @@ impl Model {
         if (d == Dialect::Tsql && self.look_a) || (d != Dialect::Tsql && self.look_b) {
             // Tables of another schema with the names the tree uses.
             for n in [
-                "Comp", "Fresh", "inserted", "More", "Other", "Sink", "SinkNN", "SinkRef", "SinkV",
-                "T0", "T1", "T2", "X0",
+                "Fresh", "inserted", "More", "Other", "Sink", "SinkNN", "SinkRef", "SinkV", "T0",
+                "T1", "T2", "X0",
             ] {
                 s.push('\n');
                 s.push_str(&create_table(
@@ -620,6 +614,12 @@ fn dependents() -> Vec<(String, String)> {
     add("DropTr0".into(), "DROP TRIGGER dbo.Tr0".into());
     add("DropTg1".into(), "DROP TRIGGER dbo.Tg1".into());
     add("DropBaseTr1".into(), "DROP TRIGGER dbo.Tr1".into());
+    // An INSERT without a column list: the columns come from the catalog's
+    // table of that name, which is refused when two schemas have one.
+    add(
+        "InsertNoList".into(),
+        "INSERT INTO dbo.SinkV SELECT Id, C0 FROM dbo.T0".into(),
+    );
     add(
         "ViewStar".into(),
         "INSERT INTO dbo.SinkV SELECT * FROM dbo.V0".into(),
