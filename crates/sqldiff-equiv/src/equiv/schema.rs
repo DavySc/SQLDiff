@@ -392,8 +392,23 @@ struct Ext {
     star_views: std::sync::Arc<std::collections::HashSet<String>>,
     view_families: std::sync::Arc<HashMap<String, HashMap<String, Fam>>>,
     spellings: std::sync::Arc<HashMap<String, std::collections::BTreeSet<String>>>,
+    /// The digest of each table of `tables` (same keys), worked out the first
+    /// time a recorded answer needs it: a table does not change after the
+    /// catalog is read, and the text of a table is long (every column), so
+    /// it is formatted and hashed once and not once per query that returns it.
+    digests: std::sync::Arc<HashMap<String, std::sync::OnceLock<crate::catalog::record::Outcome>>>,
     /// PostgreSQL: spellings are asked.
     pg: bool,
+}
+
+impl Ext {
+    /// The digest of the table under `key`, kept after the first time.
+    fn table_digest(&self, key: &str, t: &Table) -> crate::catalog::record::Outcome {
+        match self.digests.get(key) {
+            Some(cell) => *cell.get_or_init(|| crate::catalog::record::Outcome::of(t)),
+            None => crate::catalog::record::Outcome::of(t),
+        }
+    }
 }
 
 /// The role and the sink of the check a schema serves.
@@ -470,9 +485,19 @@ impl Schema {
     /// says, because `ambiguous` is computed across both.
     #[track_caller]
     fn ask_table(&self, key: &str) {
+        // The table is in the answer as its digest (`Ext::table_digest`, the
+        // digest of its whole `Debug` text, every field), so the answer's
+        // digest changes with any field of the table and the table is not
+        // formatted again for every query.
         self.rec(
             || Query::SchemaTables(key.to_string()),
-            &(self.ext.tables.get(key), self.ext.ambiguous.contains(key)),
+            &(
+                self.ext
+                    .tables
+                    .get(key)
+                    .map(|t| self.ext.table_digest(key, t)),
+                self.ext.ambiguous.contains(key),
+            ),
         );
     }
 
@@ -1068,6 +1093,13 @@ impl Schema {
             );
         }
         s.ext = Ext {
+            #[allow(clippy::disallowed_methods)] // hash order cannot reach an output: one cell per key, in a map
+            digests: std::sync::Arc::new(
+                s.tables
+                    .keys()
+                    .map(|k| (k.clone(), std::sync::OnceLock::new()))
+                    .collect(),
+            ),
             tables: s.tables.clone(),
             ambiguous: s.ambiguous.clone(),
             star_views: s.star_views.clone(),
@@ -1106,6 +1138,39 @@ mod tests {
     /// it has a line here that changes the text.
     fn digest<T: std::fmt::Debug>(v: &T) -> crate::catalog::record::Outcome {
         crate::catalog::record::Outcome::of(v)
+    }
+
+    /// The recorded `SchemaTables` answer holds the table as its cached
+    /// digest: the cache gives the digest of the whole `Debug` text, the same
+    /// every time, and the answer changes with the table and with the flag.
+    #[test]
+    fn the_table_answer_is_digested_through_the_cache() {
+        let mut t = Table {
+            name: "a".into(),
+            ..Table::default()
+        };
+        let ext = Ext {
+            digests: std::sync::Arc::new(HashMap::from([(
+                "a".to_string(),
+                std::sync::OnceLock::new(),
+            )])),
+            ..Ext::default()
+        };
+        let d = ext.table_digest("a", &t);
+        assert_eq!(d, digest(&t), "the cache holds the digest of the table");
+        assert_eq!(d, ext.table_digest("a", &t), "asked again");
+        // A table of another key is not cached and is digested as it is.
+        assert_eq!(ext.table_digest("b", &t), d);
+        let answer = |t: Option<crate::catalog::record::Outcome>, amb: bool| digest(&(t, amb));
+        let base = answer(Some(d), false);
+        assert_ne!(base, answer(Some(d), true), "the ambiguity flag");
+        assert_ne!(base, answer(None, false), "no table");
+        t.complete = true;
+        assert_ne!(
+            base,
+            answer(Some(digest(&t)), false),
+            "a field of the table"
+        );
     }
 
     #[test]
