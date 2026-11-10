@@ -484,3 +484,145 @@ mod recording_view {
         assert!(none.supplied());
     }
 }
+
+// ---- SourceReads (pass 1) ------------------------------------------------
+
+mod source_reads {
+    use super::*;
+    use sqldiff_catalog::record::{RecordingView, SourceDigests, SourceReads};
+    use sqldiff_catalog::{ddl, CatalogView, Ident};
+    use sqldiff_syntax::Dialect;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn catalog(sql: &str) -> Catalog {
+        ddl::load(sql, Dialect::Tsql, "t.sql")
+    }
+
+    const SQL: &str = "CREATE TABLE dbo.a (id int NOT NULL, n varchar(10));\
+                       CREATE TABLE dbo.b (id int NOT NULL, w decimal(9));";
+
+    fn name(t: &str) -> [Ident; 2] {
+        [Ident::new("dbo", false), Ident::new(t, false)]
+    }
+
+    #[test]
+    fn reads_are_filed_under_the_draft_side_and_replay_asks_them_again() {
+        let cat = catalog(SQL);
+        let digests = SourceDigests::new(&cat);
+        let first = Recorder::default();
+        let r = SourceReads::recording(&cat, Dialect::Tsql, &first, &digests);
+        r.table(&name("a"));
+        r.table(&name("zzz"));
+        r.column_types();
+        r.tables();
+        let (reads, conflicts) = first.finish();
+        assert!(conflicts.is_empty());
+        assert!(reads.0.keys().all(|(side, _)| *side == Side::Draft));
+        assert_eq!(reads.0.len(), 4);
+        // Replay through the same methods gives the same set, answer for answer.
+        let second = Recorder::default();
+        let digests2 = SourceDigests::new(&cat);
+        let r2 = SourceReads::recording(&cat, Dialect::Tsql, &second, &digests2);
+        for (_, q) in reads.0.keys() {
+            assert!(r2.ask(q), "{q:?}");
+        }
+        assert_eq!(second.finish().0, reads);
+    }
+
+    #[test]
+    fn the_answer_follows_the_table_and_not_other_tables() {
+        let digest_of = |sql: &str, t: &str| {
+            let cat = catalog(sql);
+            let d = SourceDigests::new(&cat);
+            let rec = Recorder::default();
+            SourceReads::recording(&cat, Dialect::Tsql, &rec, &d).table(&name(t));
+            let (reads, _) = rec.finish();
+            *reads.0.values().next().unwrap()
+        };
+        let base = digest_of(SQL, "a");
+        // Another table's change does not move the answer for `a`.
+        assert_eq!(base, digest_of(&SQL.replace("w decimal(9)", "w int"), "a"));
+        // A column of `a` does.
+        assert_ne!(
+            base,
+            digest_of(&SQL.replace("n varchar(10)", "n varchar(11)"), "a")
+        );
+        // A missing table is a different answer from a present one.
+        assert_ne!(base, digest_of(SQL, "zzz"));
+    }
+
+    #[test]
+    fn column_types_change_only_with_a_type_shape() {
+        let digest = |sql: &str| {
+            let cat = catalog(sql);
+            let d = SourceDigests::new(&cat);
+            let rec = Recorder::default();
+            let r = SourceReads::recording(&cat, Dialect::Tsql, &rec, &d);
+            let types = r.column_types().into_owned();
+            let (reads, _) = rec.finish();
+            assert_eq!(reads.0.len(), 1, "one narrow query, not the whole catalog");
+            assert!(reads.0.contains_key(&(Side::Draft, Query::ColumnTypes)));
+            (types, *reads.0.values().next().unwrap())
+        };
+        let (t0, d0) = digest(SQL);
+        assert!(t0.windows(2).all(|w| w[0] < w[1]), "sorted, distinct");
+        // A renamed column or a new table of an existing shape: same answer.
+        let (_, d1) = digest(&SQL.replace("n varchar(10)", "renamed varchar(10)"));
+        assert_eq!(d0, d1);
+        let (_, d2) = digest(&format!("{SQL}CREATE TABLE dbo.c (id int NOT NULL);"));
+        assert_eq!(d0, d2);
+        // A new shape (or a changed argument) moves it.
+        let (_, d3) = digest(&SQL.replace("w decimal(9)", "w bit"));
+        assert_ne!(d0, d3);
+        let (_, d4) = digest(&SQL.replace("varchar(10)", "varchar(11)"));
+        assert_ne!(d0, d4);
+    }
+
+    #[test]
+    fn the_same_question_is_digested_once_and_the_cache_is_shared() {
+        struct Count(AtomicUsize, Recorder);
+        impl ReadSink for Count {
+            fn record(&self, s: Side, q: &Query, o: Outcome) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                self.1.record(s, q, o);
+            }
+            fn holds(&self, s: Side, q: &Query) -> bool {
+                self.1.holds(s, q)
+            }
+        }
+        let cat = catalog(SQL);
+        let d = SourceDigests::new(&cat);
+        let sink = Count(AtomicUsize::new(0), Recorder::default());
+        let r = SourceReads::recording(&cat, Dialect::Tsql, &sink, &d);
+        for _ in 0..50 {
+            r.table(&name("a"));
+            r.tables();
+        }
+        assert_eq!(sink.0.load(Ordering::SeqCst), 2, "each question once");
+    }
+
+    #[test]
+    fn a_sink_that_keeps_nothing_costs_no_record() {
+        let cat = catalog(SQL);
+        let r = SourceReads::new(&cat, Dialect::Tsql);
+        assert!(r.table(&name("a")).is_some());
+        assert_eq!(r.column_types().len(), 3);
+    }
+
+    #[test]
+    fn a_pass_one_read_is_never_replayed_through_a_pass_two_view_or_back() {
+        let cat = catalog(SQL);
+        let view = CatalogView::new(Dialect::Tsql, &[&cat]);
+        let rec = Recorder::default();
+        let draft_view = RecordingView::new(&view, Side::Draft, &rec);
+        assert!(!draft_view.ask(&Query::Supplied));
+        assert!(!draft_view.ask(&Query::Table(vec![("a".into(), false)])));
+        // The other direction: a query pass 1 never asks is refused.
+        let r = SourceReads::new(&cat, Dialect::Tsql);
+        assert!(!r.ask(&Query::Supplied));
+        assert!(!r.ask(&Query::Origin));
+        assert!(!r.ask(&Query::Routines(vec![("p".into(), false)])));
+        assert!(!r.ask(&Query::SchemaTables("a".into())));
+        assert!(rec.finish().0 .0.is_empty());
+    }
+}

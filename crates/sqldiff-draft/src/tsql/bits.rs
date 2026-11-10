@@ -829,19 +829,9 @@ impl Cx<'_> {
     /// each distinct type answers for every column.
     fn catalog_types(&self) -> &[(String, Vec<u32>)] {
         self.catalog_types.get_or_init(|| {
-            let mut v: Vec<(String, Vec<u32>)> = self
-                .type_catalog()
-                .map(|c| {
-                    c.tables()
-                        .iter()
-                        .flat_map(|t| t.columns.iter())
-                        .map(|c| (c.data_type.base.clone(), c.data_type.args.clone()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            v.sort();
-            v.dedup();
-            v
+            self.type_catalog()
+                .map(|c| c.column_types().into_owned())
+                .unwrap_or_default()
         })
     }
 

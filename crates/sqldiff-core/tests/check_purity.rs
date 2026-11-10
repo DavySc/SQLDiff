@@ -43,7 +43,9 @@
 //!   counter of deterministic events; `SQLDIFF_WORK` only prints it. It
 //!   counts and never changes a result.
 //! - `record.rs` (`sqldiff-catalog`): the recorder collects the check's own reads
-//!   (a write-only sink; nothing the check computes depends on it).
+//!   (a write-only sink; nothing the check computes depends on it); its
+//!   `SourceDigests` memoise, in `OnceLock`s, the digests and the column-type
+//!   set of one immutable catalog (pure functions of that catalog).
 //! - `artifact.rs` (`sqldiff-model`) caches `Analyzed::temp_table_names`, a
 //!   pure function of the immutable parse tree, in a private `OnceCell`.
 //! - `abstract_syntax.rs` (`sqldiff-syntax`) keeps a bounded per-thread cache of the
@@ -97,7 +99,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("sqldiff-catalog/src/builtins.rs", &["OnceLock"]),
     ("sqldiff-catalog/src/ddl.rs", &["fs::"]),
     // The read recorder (W4.3): a sink the check writes to, not a source it reads from.
-    ("sqldiff-catalog/src/record.rs", &["Mutex"]),
+    ("sqldiff-catalog/src/record.rs", &["Mutex", "OnceLock"]),
     ("sqldiff-core/src/engine.rs", &["Mutex", "OnceLock"]),
     (
         "sqldiff-equiv/src/equiv/canon.rs",

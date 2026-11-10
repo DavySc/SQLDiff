@@ -575,10 +575,19 @@ const SOURCE_METHODS: &[(&str, &str)] = &[
         "new",
         "builder (the driver's one call; `sqldiff-draft/src/lib.rs`)",
     ),
+    (
+        "recording",
+        "builder with a live sink (Phase B; nothing builds it yet)",
+    ),
     ("table", "pass 1 `Table(parts)`"),
     ("triggers_named", "pass 1 `TriggersNamed`"),
+    ("column_types", "pass 1 `ColumnTypes`"),
     ("tables", "pass 1 `WholeCatalog`"),
     ("routines", "pass 1 `WholeCatalog`"),
+    (
+        "ask",
+        "replay: a pass-1 query again, through the draft's own method",
+    ),
 ];
 
 /// `LocalView` public methods: the file's own objects, no external read.
