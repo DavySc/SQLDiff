@@ -24,7 +24,9 @@ use sha2::{Digest, Sha256};
 
 /// Which catalog a read went to. The same catalog can be read through
 /// different views; replay must ask the same side again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum Side {
     /// The catalog the input (source dialect) binds against.
     Source,
@@ -39,7 +41,7 @@ pub type Part = (String, bool);
 
 /// A question to a catalog. Closed on purpose: a read that is not one of
 /// these is not a recorded read. `Ord` is the order of a read set.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum Query {
     /// Whether any catalog was supplied for the side (`CatalogView::supplied`).
     Supplied,
@@ -105,6 +107,18 @@ impl Outcome {
     pub fn hex(&self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
     }
+
+    /// The digest [`hex`](Self::hex) wrote; `None` for any other text.
+    pub fn from_hex(text: &str) -> Option<Outcome> {
+        if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok()?;
+        }
+        Some(Outcome(out))
+    }
 }
 
 /// Where reads go. A check holds a sink; the default drops them.
@@ -151,6 +165,16 @@ pub struct Recorder {
 }
 
 impl Recorder {
+    /// The reads so far and the questions that got two answers, leaving the
+    /// recorder as it is (a recorder shared through an `Arc` cannot be
+    /// consumed).
+    pub fn snapshot(&self) -> (Reads, Vec<(Side, Query)>) {
+        (
+            self.reads.lock().unwrap().clone(),
+            self.conflicts.lock().unwrap().clone(),
+        )
+    }
+
     pub fn finish(self) -> (Reads, Vec<(Side, Query)>) {
         (
             self.reads.into_inner().unwrap(),
@@ -175,6 +199,85 @@ impl ReadSink for Recorder {
 // ---------------------------------------------------------------------------
 
 use crate::{Catalog, CatalogView, Dialect, Ident, Lookup, Routine, RoutineKind, Table};
+
+/// Test switch over the call sites of catalog reads (the `site-switch`
+/// feature): a read is attributed to the place in a check crate that asked
+/// for it (`#[track_caller]` carries the place through the reading methods
+/// to the first caller that is not one), and the switch can list the places
+/// seen or skip recording at one of them. Without the feature
+/// [`site_skipped`] is `false` and nothing is stored.
+#[cfg(feature = "site-switch")]
+pub mod site_switch {
+    use std::collections::BTreeSet;
+    use std::panic::Location;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Mutex;
+
+    /// A place in the sources: file and line.
+    pub type Site = (String, u32);
+
+    const OFF: u8 = 0;
+    const DISCOVER: u8 = 1;
+    const SKIP: u8 = 2;
+    static MODE: AtomicU8 = AtomicU8::new(OFF);
+    static SEEN: Mutex<BTreeSet<Site>> = Mutex::new(BTreeSet::new());
+    static SKIPPED: Mutex<Option<Site>> = Mutex::new(None);
+
+    /// Records every site that reads from now on (`seen` lists them).
+    pub fn discover() {
+        SEEN.lock().unwrap().clear();
+        MODE.store(DISCOVER, Ordering::SeqCst);
+    }
+
+    /// Skips recording the reads asked for at `site`.
+    pub fn skip(site: Site) {
+        *SKIPPED.lock().unwrap() = Some(site);
+        MODE.store(SKIP, Ordering::SeqCst);
+    }
+
+    /// Back to recording everything, nothing noted.
+    pub fn off() {
+        MODE.store(OFF, Ordering::SeqCst);
+        *SKIPPED.lock().unwrap() = None;
+    }
+
+    /// The sites seen since [`discover`], in order.
+    pub fn seen() -> Vec<Site> {
+        SEEN.lock().unwrap().iter().cloned().collect()
+    }
+
+    pub(super) fn skipped(at: &Location<'static>) -> bool {
+        match MODE.load(Ordering::Relaxed) {
+            OFF => false,
+            DISCOVER => {
+                SEEN.lock()
+                    .unwrap()
+                    .insert((at.file().replace('\\', "/"), at.line()));
+                false
+            }
+            _ => SKIPPED
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|(f, l)| *l == at.line() && *f == at.file().replace('\\', "/")),
+        }
+    }
+}
+
+/// Whether recording is switched off for the read being asked for (see
+/// [`site_switch`]). Always `false` without the `site-switch` feature.
+#[track_caller]
+#[inline(always)]
+pub fn site_skipped() -> bool {
+    #[cfg(feature = "site-switch")]
+    {
+        site_switch::skipped(std::panic::Location::caller())
+    }
+    #[cfg(not(feature = "site-switch"))]
+    {
+        false
+    }
+}
 
 /// A sink that drops everything, for a view not under a recorded check.
 pub static NO_SINK: NoSink = NoSink;
@@ -202,8 +305,9 @@ impl<'a> RecordingView<'a> {
         RecordingView { view, side, sink }
     }
 
+    #[track_caller]
     fn rec<T: std::fmt::Debug + ?Sized>(&self, q: impl FnOnce() -> Query, answer: &T) {
-        if self.sink.active() {
+        if self.sink.active() && !site_skipped() {
             self.sink.record(self.side, &q(), Outcome::of(answer));
         }
     }
@@ -212,46 +316,97 @@ impl<'a> RecordingView<'a> {
         self.view.dialect
     }
 
+    #[track_caller]
     pub fn supplied(&self) -> bool {
         let a = self.view.supplied();
         self.rec(|| Query::Supplied, &a);
         a
     }
 
+    #[track_caller]
     pub fn origin(&self) -> String {
         let a = self.view.origin();
         self.rec(|| Query::Origin, &a);
         a
     }
 
+    #[track_caller]
     pub fn tables_authoritative(&self) -> bool {
         let a = self.view.tables_authoritative();
         self.rec(|| Query::TablesAuthoritative, &a);
         a
     }
 
+    #[track_caller]
     pub fn routines_authoritative(&self, kind: RoutineKind) -> bool {
         let a = self.view.routines_authoritative(kind);
         self.rec(|| Query::RoutinesAuthoritative(format!("{kind:?}")), &a);
         a
     }
 
+    #[track_caller]
     pub fn table(&self, parts: &[Ident]) -> Lookup<&'a Table> {
         let a = self.view.table(parts);
         self.rec(|| Query::Table(parts_of(parts)), &a);
         a
     }
 
+    #[track_caller]
     pub fn routines(&self, parts: &[Ident]) -> Lookup<Vec<&'a Routine>> {
         let a = self.view.routines(parts);
         self.rec(|| Query::Routines(parts_of(parts)), &a);
         a
     }
 
+    /// Replay: asks the question `q` through the same method a check used,
+    /// so the answer is recorded (to this view's sink) by the very code the
+    /// check ran. `false` for a question this view cannot be asked: a
+    /// replay that meets one rejects the stored result.
+    pub fn ask(&self, q: &Query) -> bool {
+        let idents = |parts: &[Part]| -> Vec<Ident> {
+            parts
+                .iter()
+                .map(|(t, q)| Ident::new(t.as_str(), *q))
+                .collect()
+        };
+        match q {
+            Query::Supplied => {
+                self.supplied();
+            }
+            Query::Origin => {
+                self.origin();
+            }
+            Query::TablesAuthoritative => {
+                self.tables_authoritative();
+            }
+            Query::RoutinesAuthoritative(kind) => {
+                let kind = match kind.as_str() {
+                    "Procedure" => RoutineKind::Procedure,
+                    "Function" => RoutineKind::Function,
+                    "Trigger" => RoutineKind::Trigger,
+                    _ => return false,
+                };
+                self.routines_authoritative(kind);
+            }
+            Query::Table(parts) => {
+                self.table(&idents(parts));
+            }
+            Query::Routines(parts) => {
+                self.routines(&idents(parts));
+            }
+            Query::WholeCatalog => {
+                self.whole();
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// The whole catalog, for a read that has no narrow query yet. Recorded
     /// as `WholeCatalog` with the digest of everything, so a file that calls
     /// it is re-checked on any edit of this side's catalog: sound, and the
     /// price of not having a narrow form. Each call site is in the inventory.
+    #[track_caller]
     pub fn whole(&self) -> &'a Catalog {
         let c = self.view.unrecorded_catalog();
         self.rec(|| Query::WholeCatalog, c);

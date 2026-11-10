@@ -8,11 +8,20 @@
 //! [`crate::check`]; a new input has to be added there to be read at all,
 //! and adding it changes every key. That the check reads nothing else
 //! (environment, files, clocks) is guarded by the `check_purity` test in
-//! `sqldiff-core`. Keys are SHA-256, and a result is a file named by its key
-//! under `OUT/.sqldiff/results`, written to a temporary name and renamed
-//! into place, so a run killed at any moment leaves only whole results.
-//! Two runs writing the same key write the same bytes (no timings are stored),
-//! so no lock is needed for the results themselves.
+//! `sqldiff-core`. Keys are SHA-256.
+//!
+//! Since format 5 the key no longer holds the catalogs. A key names the file,
+//! its draft and everything else a check reads except the catalogs' content,
+//! and below it live up to [`MAX_ENTRIES`] entries, one per set of catalog
+//! reads the check made (`<key>/<id>.json`, with the reads in
+//! `<key>/<id>.reads`; the id is the hash of the read set). An entry is taken
+//! only if every read in it has, against the catalogs of this run, the answer
+//! it had when the entry was made ([`sqldiff_core::Replay`]); an edit that
+//! no read of a file sees leaves its entry valid. Entries are written to a
+//! temporary name and renamed into place, so a run killed at any moment
+//! leaves only whole results. Two runs writing the same entry write the same
+//! bytes (no timings are stored), so no lock is needed for the results
+//! themselves.
 //!
 //! Every run re-checks a sample of the results it would reuse and compares
 //! them byte for byte with the stored ones (`pick`, `compare`): a mismatch
@@ -24,6 +33,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqldiff_core::catalog::builtins::Helper;
+use sqldiff_core::catalog::record::{Outcome, Query, Reads, Side as ReadSide};
 use sqldiff_core::catalog::Catalog;
 use sqldiff_core::Dialect;
 
@@ -103,16 +113,17 @@ pub struct CheckInput<'a> {
     /// from the ledger already applied).
     pub text: &'a str,
     pub draft: &'a crate::Draft,
-    /// [`catalog_digest`] of the source and the target catalog the check
-    /// binds against, when the run uses catalogs.
-    pub source: Option<&'a str>,
-    pub target: Option<&'a str>,
+    /// Whether the run supplies a source and a target catalog. What the
+    /// catalogs hold is not in the key: it is recorded as the reads of each
+    /// result (`Reads`), and a result is taken only when they still hold.
+    pub source: bool,
+    pub target: bool,
 }
 
 impl CheckInput<'_> {
     pub fn key(&self) -> Key {
         let mut k = KeyBuilder::new();
-        k.field("format", b"4");
+        k.field("format", b"5");
         k.field("build", self.build.as_bytes());
         k.field("from", self.from.id().as_bytes());
         k.field("to", self.to.id().as_bytes());
@@ -123,8 +134,8 @@ impl CheckInput<'_> {
         // draft of the other mode is never reused.
         k.field("rules", format!("{:?}", self.draft.options()).as_bytes());
         k.field("draft", self.draft.canonical().as_bytes());
-        k.field("source", self.source.unwrap_or("none").as_bytes());
-        k.field("target", self.target.unwrap_or("none").as_bytes());
+        k.field("source", &[self.source as u8]);
+        k.field("target", &[self.target as u8]);
         k.finish()
     }
 }
@@ -234,6 +245,9 @@ impl TreeKeyBuilder {
 #[derive(Serialize, Deserialize)]
 struct Entry {
     key: String,
+    /// The id of the entry: the hash of its read set and `mix_tried`
+    /// ([`entry_id`]).
+    id: String,
     pool: Vec<String>,
     conversion: serde_json::Value,
     /// The mix of the two variants of the draft that was built for this
@@ -300,6 +314,7 @@ impl<'de> Deserialize<'de> for Lean {
 #[derive(Deserialize)]
 struct LeanEntry {
     key: String,
+    id: String,
     pool: Vec<String>,
     conversion: Lean,
     mix: Option<crate::check::Mix>,
@@ -311,6 +326,7 @@ struct LeanEntry {
 #[derive(Deserialize)]
 struct PeekEntry {
     key: String,
+    id: String,
     #[allow(dead_code)]
     pool: serde::de::IgnoredAny,
     #[allow(dead_code)]
@@ -491,6 +507,143 @@ fn expand(v: &mut serde_json::Value, pool: &[String]) -> Option<()> {
         _ => {}
     }
     Some(())
+}
+
+/// Most entries one key keeps. A file's entries differ only when catalogs
+/// changed in a way it reads; a file seen under more catalog states than
+/// this keeps the entries the last run used, then the first by id.
+pub const MAX_ENTRIES: usize = 8;
+
+/// One stored result: the key of the file's check and the id of the read
+/// set it was made under.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EntryRef {
+    pub key: Key,
+    pub id: String,
+}
+
+/// What [`Store::put`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Put {
+    /// A new entry.
+    Written,
+    /// The entry was stored already, with the same bytes.
+    Same,
+    /// An entry of the same id holds other bytes. Nothing was changed. A
+    /// check is a function of its reads, so two results under one id mean
+    /// a recorder or determinism bug: the caller reports a mismatch.
+    Differs,
+}
+
+/// The id of an entry: the SHA-256 of its read set (as `Reads::canonical`
+/// writes it) and whether a mix could be tried, in hex.
+pub fn entry_id(reads: &Reads, mix_tried: bool) -> String {
+    let mut k = KeyBuilder::new();
+    k.field("reads", reads.canonical().as_bytes());
+    k.field("mix-tried", &[mix_tried as u8]);
+    k.finish().0
+}
+
+/// The read set of an entry as it is written: a map keyed by a pair has no
+/// JSON form, so it is a list, in the order of the set.
+#[derive(Serialize, Deserialize)]
+struct ReadsFile {
+    key: String,
+    id: String,
+    mix_tried: bool,
+    reads: Vec<(ReadSide, Query, String)>,
+}
+
+impl ReadsFile {
+    fn of(key: &str, id: &str, mix_tried: bool, reads: &Reads) -> ReadsFile {
+        ReadsFile {
+            key: key.to_string(),
+            id: id.to_string(),
+            mix_tried,
+            reads: reads
+                .0
+                .iter()
+                .map(|((s, q), o)| (*s, q.clone(), o.hex()))
+                .collect(),
+        }
+    }
+
+    /// The read set, if this file is the one for `key` and `id` and the id
+    /// is the hash of what it holds.
+    fn open(self, key: &str, id: &str) -> Option<Reads> {
+        if self.key != key || self.id != id {
+            return None;
+        }
+        let mut reads = Reads::default();
+        for (s, q, o) in self.reads {
+            reads.0.insert((s, q), Outcome::from_hex(&o)?);
+        }
+        (entry_id(&reads, self.mix_tried) == id).then_some(reads)
+    }
+}
+
+/// Writes `bytes` to a temporary name beside `dest` and renames it into
+/// place, retrying a few times because a virus scanner on Windows can hold
+/// a file for a moment.
+fn write_atomically(dest: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(p) = dest.parent() {
+        std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    }
+    let tmp = dest.with_extension(format!(
+        "tmp{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    let mut last = String::new();
+    for attempt in 0..5u64 {
+        match std::fs::rename(&tmp, dest) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = format!("{}: {e}", dest.display());
+                std::thread::sleep(std::time::Duration::from_millis(40 * (attempt + 1)));
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    Err(last)
+}
+
+/// Moves the finished temporary file `tmp` to `dest`, retried a few times
+/// because a virus scanner on Windows can hold the file for a moment.
+fn rename_into_place(tmp: &Path, dest: &Path) -> Result<(), String> {
+    let mut last = String::new();
+    for attempt in 0..5u64 {
+        match std::fs::rename(tmp, dest) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = format!("{}: {e}", dest.display());
+                std::thread::sleep(std::time::Duration::from_millis(40 * (attempt + 1)));
+            }
+        }
+    }
+    let _ = std::fs::remove_file(tmp);
+    Err(last)
+}
+
+/// The digest a result file names, if the file passes the frame check (its
+/// body is read in pieces and hashed, never held whole).
+fn file_digest(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut head = [0u8; 65];
+    f.read_exact(&mut head).ok()?;
+    let mut hash = Sha256::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        let n = f.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n]);
+    }
+    let digest = hex(&hash.finalize());
+    (head[64] == b'\n' && head[..64] == *digest.as_bytes()).then_some(digest)
 }
 
 /// The conversion `c` with its three big arrays moved out; they go back into
@@ -714,6 +867,7 @@ impl std::io::Write for HashWriter {
 fn write_framed(
     tmp: &Path,
     key: &str,
+    id: &str,
     plan: Plan,
     t: &Taken,
     mix: Option<&crate::check::Mix>,
@@ -747,6 +901,8 @@ fn write_framed(
         };
         bw.raw("{\"key\":")?;
         bw.json(key)?;
+        bw.raw(",\"id\":")?;
+        bw.json(id)?;
         bw.raw(",\"pool\":")?;
         bw.json(&pool)?;
         bw.raw(",\"conversion\":")?;
@@ -770,6 +926,7 @@ fn write_framed(
 #[cfg(test)]
 fn reference_body(
     key: &Key,
+    id: &str,
     c: &Conversion,
     mix: Option<&crate::check::Mix>,
     mix_tried: bool,
@@ -779,6 +936,7 @@ fn reference_body(
     let (pool, conversion) = intern(value);
     serde_json::to_vec(&Entry {
         key: key.0.clone(),
+        id: id.to_string(),
         pool,
         conversion,
         mix: mix.cloned(),
@@ -800,110 +958,168 @@ impl Store {
         }
     }
 
-    fn rel(key: &Key) -> String {
-        format!("{DIR}/{}.json", key.0)
+    fn dir_rel(key: &Key) -> String {
+        format!("{DIR}/{}", key.0)
     }
 
-    /// Whether a result is stored under `key` (it may still not read back).
-    pub fn has(&self, key: &Key) -> bool {
-        crate::tree::dest_under(&self.out, &Self::rel(key)).is_ok_and(|p| p.is_file())
+    fn entry_rel(key: &Key, id: &str) -> String {
+        format!("{DIR}/{}/{id}.json", key.0)
     }
 
-    /// The stored conversion, whole: every field as it was put. A file that
-    /// does not read back whole, or does not name its own key, is a miss.
-    pub fn get(&self, key: &Key) -> Option<(Conversion, Option<crate::check::Mix>, bool)> {
-        let path = crate::tree::dest_under(&self.out, &Self::rel(key)).ok()?;
+    fn reads_rel(key: &Key, id: &str) -> String {
+        format!("{DIR}/{}/{id}.reads", key.0)
+    }
+
+    /// The entries stored under `key` whose read sets read back whole, with
+    /// the read set of each, sorted by id. The result of an entry is read
+    /// only by [`get`](Self::get): this is what a run lists for every file
+    /// before it plans, so it reads the small `.reads` files, not the
+    /// results. An entry whose result file is missing is not listed.
+    pub fn entries(&self, key: &Key) -> Vec<(String, Reads)> {
+        let Ok(dir) = crate::tree::dest_under(&self.out, &Self::dir_rel(key)) else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(id) = name.strip_suffix(".reads") else {
+                continue;
+            };
+            if !is_key(id) || !e.path().with_extension("json").is_file() {
+                continue;
+            }
+            let Some(reads) = std::fs::read(e.path()).ok().and_then(|raw| {
+                let f: ReadsFile = serde_json::from_slice(verified_body(&raw)?).ok()?;
+                f.open(&key.0, id)
+            }) else {
+                continue;
+            };
+            found.push((id.to_string(), reads));
+        }
+        found.sort_by(|x, y| x.0.cmp(&y.0));
+        found
+    }
+
+    /// The entry of a result whose key holds everything it read (a template
+    /// job: its key has the catalog digests, so its read set is empty and
+    /// always holds), if one is stored.
+    pub fn whole_entry(&self, key: &Key) -> Option<EntryRef> {
+        self.entries(key)
+            .into_iter()
+            .next()
+            .map(|(id, _)| EntryRef {
+                key: key.clone(),
+                id,
+            })
+    }
+
+    /// The stored conversion of one entry, whole: every field as it was put.
+    /// A file that does not read back whole, or does not name its own key
+    /// and id, is a miss.
+    pub fn get(&self, e: &EntryRef) -> Option<(Conversion, Option<crate::check::Mix>, bool)> {
+        let path = crate::tree::dest_under(&self.out, &Self::entry_rel(&e.key, &e.id)).ok()?;
         let raw = std::fs::read(path).ok()?;
         let body = verified_body(&raw)?;
-        let mut e: Entry = serde_json::from_slice(body).ok()?;
+        let mut x: Entry = serde_json::from_slice(body).ok()?;
         // The text is not needed once it is parsed.
         drop(raw);
-        if e.key != key.0 {
+        if x.key != e.key.0 || x.id != e.id {
             return None;
         }
-        expand(&mut e.conversion, &e.pool)?;
-        unshare_notes(&mut e.conversion)?;
-        let conversion = serde_json::from_value(e.conversion).ok()?;
-        Some((conversion, e.mix, e.mix_tried))
+        expand(&mut x.conversion, &x.pool)?;
+        unshare_notes(&mut x.conversion)?;
+        let conversion = serde_json::from_value(x.conversion).ok()?;
+        Some((conversion, x.mix, x.mix_tried))
     }
 
-    /// The `mix` and `mix_tried` of a result stored under `key` that passes
-    /// the frame and key checks of [`Store::get`], without building the
-    /// conversion: the file is read, its digest and key are checked, and the
-    /// conversion and the pool are only skipped over. The re-check of a
-    /// sampled file decides from this whether a stored result exists before
-    /// its fresh check, and reads the conversion (`get`) after it, so the
-    /// stored conversion is not held through the check. What `get` checks
-    /// inside the conversion (that it expands and deserialises) is not
-    /// checked here: a file that passes here and fails `get` is reported by
-    /// the caller as a mismatch.
-    pub fn peek(&self, key: &Key) -> Option<(Option<crate::check::Mix>, bool)> {
-        let path = crate::tree::dest_under(&self.out, &Self::rel(key)).ok()?;
+    /// The `mix` and `mix_tried` of the entry `e` that passes the frame, key
+    /// and id checks of [`Store::get`], without building the conversion: the
+    /// file is read, its digest, key and id are checked, and the conversion
+    /// and the pool are only skipped over. The re-check of a sampled file
+    /// decides from this whether a stored result exists before its fresh
+    /// check, and reads the conversion (`get`) after it, so the stored
+    /// conversion is not held through the check. What `get` checks inside the
+    /// conversion (that it expands and deserialises) is not checked here: a
+    /// file that passes here and fails `get` is reported by the caller as a
+    /// mismatch.
+    pub fn peek(&self, e: &EntryRef) -> Option<(Option<crate::check::Mix>, bool)> {
+        let path = crate::tree::dest_under(&self.out, &Self::entry_rel(&e.key, &e.id)).ok()?;
         let raw = std::fs::read(path).ok()?;
         let body = verified_body(&raw)?;
-        let e: PeekEntry = serde_json::from_slice(body).ok()?;
-        if e.key != key.0 {
+        let x: PeekEntry = serde_json::from_slice(body).ok()?;
+        if x.key != e.key.0 || x.id != e.id {
             return None;
         }
-        Some((e.mix, e.mix_tried))
+        Some((x.mix, x.mix_tried))
     }
 
-    /// The stored conversion with `units` left empty, for the finish
-    /// read-back of a tree run, which gives the conversion its units and
-    /// counts again from the cross-file pass (`Core::restore`) and never
-    /// reads the stored ones.
+    /// The stored conversion of the entry `e` with `units` left empty, for
+    /// the finish read-back of a tree run, which gives the conversion its
+    /// units and counts again from the cross-file pass (`Core::restore`) and
+    /// never reads the stored ones.
     ///
     /// `units` and `note_table` are skipped while parsing, so the memory of
     /// the stored units is never taken; every other field is read and its
     /// pool markers expanded exactly as [`Store::get`] does, and the digest,
-    /// the key and the presence of both skipped keys are checked as there.
-    /// What is not checked is what `get` would check inside the skipped
-    /// parts: that `units` holds valid units, that `note_table` is a list,
-    /// and that its indices and the pool markers in the units are in range
-    /// (the digest still covers every byte). The reuse path needs the units
-    /// and uses `get`.
+    /// the key, the id and the presence of both skipped keys are checked as
+    /// there. What is not checked is what `get` would check inside the
+    /// skipped parts: that `units` holds valid units, that `note_table` is a
+    /// list, and that its indices and the pool markers in the units are in
+    /// range (the digest still covers every byte). The reuse path needs the
+    /// units and uses `get`.
     pub fn get_without_units(
         &self,
-        key: &Key,
+        e: &EntryRef,
     ) -> Option<(Conversion, Option<crate::check::Mix>, bool)> {
-        let path = crate::tree::dest_under(&self.out, &Self::rel(key)).ok()?;
+        let path = crate::tree::dest_under(&self.out, &Self::entry_rel(&e.key, &e.id)).ok()?;
         let raw = std::fs::read(path).ok()?;
         let body = verified_body(&raw)?;
-        let e: LeanEntry = serde_json::from_slice(body).ok()?;
+        let x: LeanEntry = serde_json::from_slice(body).ok()?;
         drop(raw);
-        if e.key != key.0 || !e.conversion.units || !e.conversion.note_table {
+        if x.key != e.key.0 || x.id != e.id || !x.conversion.units || !x.conversion.note_table {
             return None;
         }
-        let mut v = e.conversion.rest;
-        expand(&mut v, &e.pool)?;
+        let mut v = x.conversion.rest;
+        expand(&mut v, &x.pool)?;
         v["units"] = serde_json::Value::Array(Vec::new());
         let conversion = serde_json::from_value(v).ok()?;
-        Some((conversion, e.mix, e.mix_tried))
+        Some((conversion, x.mix, x.mix_tried))
     }
 
-    /// Stores a result: written beside its name and renamed into place,
-    /// retried a few times because a virus scanner on Windows can hold the
-    /// file for a moment.
+    /// Stores a result under the reads its check made. The file is `framed`
+    /// of `reference_body`, byte for byte, but the big arrays of the
+    /// conversion (`units`, `report.findings`, `output_check.findings`) are
+    /// never one `Value` or one buffer. They are taken out of `c` for the
+    /// call and put back on every path, a panic included, by [`Taken`]; the
+    /// small rest is serialised once; the arrays are written element by
+    /// element into a temporary file through a hashing writer. Pass 1 (the
+    /// table of notes and the pool counts, which the head of the file needs)
+    /// finishes before any byte is written.
     ///
-    /// The file is `framed` of `reference_body`, byte for byte, but the big
-    /// arrays of the conversion (`units`, `report.findings`,
-    /// `output_check.findings`) are never one `Value` or one buffer. They are
-    /// taken out of `c` for the call and put back on every path, a panic
-    /// included, by [`Taken`]; the small rest is serialised once; the arrays
-    /// are written element by element into the temporary file through a
-    /// hashing writer. Pass 1 (the table of notes and the pool counts, which
-    /// the head of the file needs) finishes before any byte is written. `c`
-    /// is borrowed mutably only for that take and restore.
+    /// The file is renamed into place, retried a few times because a virus
+    /// scanner on Windows can hold the file for a moment; the reads follow,
+    /// so a reader that sees the reads sees the result. An entry already
+    /// stored under the same id is left as it is: a second check with the
+    /// same reads must give the same bytes, and `Put::Differs` reports that
+    /// it did not. A `--fresh` run (`replace`) does not trust the store and
+    /// writes its results over whatever is there.
     pub fn put(
         &self,
         key: &Key,
         c: &mut Conversion,
         mix: Option<&crate::check::Mix>,
         mix_tried: bool,
-    ) -> Result<(), String> {
+        reads: &Reads,
+        replace: bool,
+    ) -> Result<(EntryRef, Put), String> {
+        let id = entry_id(reads, mix_tried);
+        let entry = EntryRef {
+            key: key.clone(),
+            id: id.clone(),
+        };
         let taken = Taken::new(c);
         let plan = Plan::new(&taken)?;
-        let dest = crate::tree::dest_under(&self.out, &Self::rel(key))?;
+        let dest = crate::tree::dest_under(&self.out, &Self::entry_rel(key, &id))?;
         if let Some(p) = dest.parent() {
             std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
         }
@@ -912,23 +1128,31 @@ impl Store {
             std::process::id(),
             std::thread::current().id()
         ));
-        if let Err(e) = write_framed(&tmp, &key.0, plan, &taken, mix, mix_tried) {
+        if let Err(e) = write_framed(&tmp, &key.0, &id, plan, &taken, mix, mix_tried) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
         drop(taken);
-        let mut last = String::new();
-        for attempt in 0..5u64 {
-            match std::fs::rename(&tmp, &dest) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    last = format!("{}: {e}", dest.display());
-                    std::thread::sleep(std::time::Duration::from_millis(40 * (attempt + 1)));
-                }
+        let new_digest = file_digest(&tmp);
+        let put = match file_digest(&dest) {
+            Some(old) if Some(&old) == new_digest.as_ref() => {
+                let _ = std::fs::remove_file(&tmp);
+                Put::Same
             }
-        }
-        let _ = std::fs::remove_file(&tmp);
-        Err(last)
+            Some(_) if !replace => {
+                let _ = std::fs::remove_file(&tmp);
+                return Ok((entry, Put::Differs));
+            }
+            _ => {
+                rename_into_place(&tmp, &dest)?;
+                Put::Written
+            }
+        };
+        let rbody = serde_json::to_vec(&ReadsFile::of(&key.0, &id, mix_tried, reads))
+            .map_err(|e| e.to_string())?;
+        let rdest = crate::tree::dest_under(&self.out, &Self::reads_rel(key, &id))?;
+        write_atomically(&rdest, &framed(&rbody))?;
+        Ok((entry, put))
     }
 
     /// Empties the store (after a mismatch).
@@ -942,31 +1166,60 @@ impl Store {
 
     /// Removes every stored result whose key is not in `live`: the results
     /// of files as they were before an edit, or of another build of the
-    /// program, which no later run of this tree can use. Files that are not
-    /// results are left alone, except a temporary file of a killed write
-    /// older than an hour. Returns how many were removed.
-    pub fn gc(&self, live: &std::collections::BTreeSet<String>) -> usize {
+    /// program, which no later run of this tree can use (and the files of
+    /// the earlier formats, which are named by keys that are not live). A
+    /// key that holds more than [`MAX_ENTRIES`] entries keeps `used` (the
+    /// entries this run took or wrote, so the entry that matches the
+    /// catalogs of this run is never the one dropped), then fills up by
+    /// id. Files that are not results are left alone, except a temporary
+    /// file of a killed write older than an hour. Returns how many files
+    /// were removed.
+    pub fn gc(
+        &self,
+        live: &std::collections::BTreeSet<String>,
+        used: &BTreeSet<EntryRef>,
+    ) -> usize {
         let Ok(dir) = crate::tree::dest_under(&self.out, DIR) else {
             return 0;
+        };
+        let stale = |e: &std::fs::DirEntry, name: &str| {
+            name.split_once(".tmp").is_some_and(|(k, _)| {
+                // `<key>.tmp…` beside a legacy file, `<id>.tmp…` in a key's
+                // folder.
+                is_key(k)
+            }) && e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > STALE_TMP)
         };
         let mut removed = 0;
         for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
+            if e.path().is_dir() {
+                if !is_key(&name) {
+                    continue;
+                }
+                if !live.contains(&name) {
+                    removed += std::fs::read_dir(e.path()).map_or(0, |d| d.count());
+                    let _ = std::fs::remove_dir_all(e.path());
+                } else {
+                    removed += self.evict(&name, &e.path(), used, &stale);
+                }
+                continue;
+            }
             let Some(key) = name.strip_suffix(".json") else {
                 // A write killed before its rename leaves `<key>.tmp<pid>-…`;
                 // one that old is no write in flight.
-                let stale = name.split_once(".tmp").is_some_and(|(k, _)| is_key(k))
-                    && e.metadata()
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.elapsed().ok())
-                        .is_some_and(|age| age > STALE_TMP);
-                if stale && std::fs::remove_file(e.path()).is_ok() {
+                if stale(&e, &name) && std::fs::remove_file(e.path()).is_ok() {
                     removed += 1;
                 }
                 continue;
             };
-            if is_key(key) && !live.contains(key) && std::fs::remove_file(e.path()).is_ok() {
+            // A file of an earlier format sits beside the folders; no key of
+            // this format names it.
+            if is_key(key) && std::fs::remove_file(e.path()).is_ok() {
                 removed += 1;
             }
         }
@@ -982,19 +1235,102 @@ impl Store {
         removed
     }
 
+    /// Removes one entry (its result, its reads, its stand-in flags): the
+    /// result of a mix the draft code no longer builds is of no use to any
+    /// run, and storing the file again would otherwise meet it under the same
+    /// id.
+    pub fn remove(&self, e: &EntryRef) {
+        let rels = [
+            Self::reads_rel(&e.key, &e.id),
+            Self::entry_rel(&e.key, &e.id),
+        ];
+        for rel in rels {
+            if let Ok(p) = crate::tree::dest_under(&self.out, &rel) {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        if let Ok(f) =
+            crate::tree::dest_under(&self.out, &format!("{FLAGS_DIR}/{}/{}", e.key.0, e.id))
+        {
+            let _ = std::fs::remove_dir_all(f);
+        }
+    }
+
+    /// Trims the folder of one live key to [`MAX_ENTRIES`] entries (see
+    /// [`gc`](Self::gc)), and removes the temporary files of killed writes.
+    /// Returns how many files were removed.
+    fn evict(
+        &self,
+        key: &str,
+        dir: &Path,
+        used: &BTreeSet<EntryRef>,
+        stale: &dyn Fn(&std::fs::DirEntry, &str) -> bool,
+    ) -> usize {
+        let mut removed = 0;
+        let mut ids = BTreeSet::new();
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if stale(&e, &name) {
+                if std::fs::remove_file(e.path()).is_ok() {
+                    removed += 1;
+                }
+                continue;
+            }
+            if let Some(id) = name
+                .strip_suffix(".json")
+                .or_else(|| name.strip_suffix(".reads"))
+            {
+                if is_key(id) {
+                    ids.insert(id.to_string());
+                }
+            }
+        }
+        if ids.len() <= MAX_ENTRIES {
+            return removed;
+        }
+        let key_used: BTreeSet<&str> = used
+            .iter()
+            .filter(|u| u.key.0 == key)
+            .map(|u| u.id.as_str())
+            .collect();
+        let mut keep: BTreeSet<&str> = ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| key_used.contains(id))
+            .collect();
+        for id in &ids {
+            if keep.len() >= MAX_ENTRIES {
+                break;
+            }
+            keep.insert(id);
+        }
+        for id in ids.iter().filter(|id| !keep.contains(id.as_str())) {
+            for ext in ["json", "reads"] {
+                if std::fs::remove_file(dir.join(format!("{id}.{ext}"))).is_ok() {
+                    removed += 1;
+                }
+            }
+            if let Ok(f) = crate::tree::dest_under(&self.out, &format!("{FLAGS_DIR}/{key}/{id}")) {
+                let _ = std::fs::remove_dir_all(f);
+            }
+        }
+        removed
+    }
+
     /// The key of the flags of file `fi` for the result `result`: the flags
     /// are a function of the result, the stand-ins, the file's place in the
     /// tree and the dialects ([`crate::refused::StandIns::flags_of`]).
     pub fn flags_key(
-        result: &Key,
+        result: &EntryRef,
         stand_ins_digest: &str,
         fi: usize,
         from: Dialect,
         to: Dialect,
     ) -> Key {
         let mut k = KeyBuilder::new();
-        k.field("format", b"flags-2");
-        k.field("result", result.0.as_bytes());
+        k.field("format", b"flags-3");
+        k.field("result", result.key.0.as_bytes());
+        k.field("entry", result.id.as_bytes());
         k.field("stand-ins", stand_ins_digest.as_bytes());
         k.field("file", &(fi as u64).to_le_bytes());
         k.field("from", from.id().as_bytes());
@@ -1002,13 +1338,20 @@ impl Store {
         k.finish()
     }
 
-    fn flags_rel(result: &Key, flags: &Key) -> String {
-        format!("{FLAGS_DIR}/{}/{}.json", result.0, flags.0)
+    fn flags_rel(result: &EntryRef, flags: &Key) -> String {
+        format!(
+            "{FLAGS_DIR}/{}/{}/{}.json",
+            result.key.0, result.id, flags.0
+        )
     }
 
     /// The stored flags, or a miss (also for a file that does not read back
     /// whole).
-    pub fn get_flags(&self, result: &Key, flags: &Key) -> Option<Vec<crate::refused::UnitFlag>> {
+    pub fn get_flags(
+        &self,
+        result: &EntryRef,
+        flags: &Key,
+    ) -> Option<Vec<crate::refused::UnitFlag>> {
         let path = crate::tree::dest_under(&self.out, &Self::flags_rel(result, flags)).ok()?;
         let raw = std::fs::read(path).ok()?;
         serde_json::from_slice(verified_body(&raw)?).ok()
@@ -1016,7 +1359,7 @@ impl Store {
 
     /// Stores flags (best effort: a flag set that is not stored is computed
     /// again next time).
-    pub fn put_flags(&self, result: &Key, flags: &Key, v: &[crate::refused::UnitFlag]) {
+    pub fn put_flags(&self, result: &EntryRef, flags: &Key, v: &[crate::refused::UnitFlag]) {
         let Ok(dest) = crate::tree::dest_under(&self.out, &Self::flags_rel(result, flags)) else {
             return;
         };
@@ -1159,14 +1502,15 @@ impl Store {
     /// and the ones computed again for the same result.
     pub fn bundle_flags(
         &self,
-        result: &Key,
+        result: &EntryRef,
         flags: &Key,
         stored: &[crate::refused::UnitFlag],
         fresh: &[crate::refused::UnitFlag],
     ) {
         let rel = format!("{MISMATCH_DIR}/flags-{}.json", flags.0);
         let body = serde_json::json!({
-            "result": result.0,
+            "result": result.key.0,
+            "entry": result.id,
             "flags": flags.0,
             "stored": stored,
             "fresh": fresh,
@@ -1176,14 +1520,14 @@ impl Store {
         }
     }
 
-    /// Whether the stored result under `key` serialises as `fresh`, without
+    /// Whether the stored result of the entry `e` serialises as `fresh`, without
     /// building the stored [`Conversion`]: the file is read and its digest
     /// and key checked as [`Store::get`] does, and its `conversion` is
     /// followed by a streaming deserialiser. `fresh` is borrowed mutably only
     /// to move its three big arrays out for the call; they are put back on
     /// every path.
     ///
-    /// **Why this equals `compare(&get(key), fresh)`.** `to_vec` of a
+    /// **Why this equals `compare(&get(e), fresh)`.** `to_vec` of a
     /// [`Conversion`] is the concatenation of its fields in declared order,
     /// and `Conversion` and [`sqldiff_model::model::Report`] are plain
     /// derived structs (no `flatten`, no untagged enum, no hand-written
@@ -1206,8 +1550,8 @@ impl Store {
     /// [`Streamed::Undecided`] when the file cannot be followed (another
     /// order of keys than `put` writes, a part that does not decode, a wrong
     /// key or digest): the caller then uses `get`.
-    pub fn compare_streamed(&self, key: &Key, fresh: &mut Conversion) -> Streamed {
-        let Ok(path) = crate::tree::dest_under(&self.out, &Self::rel(key)) else {
+    pub fn compare_streamed(&self, e: &EntryRef, fresh: &mut Conversion) -> Streamed {
+        let Ok(path) = crate::tree::dest_under(&self.out, &Self::entry_rel(&e.key, &e.id)) else {
             return Streamed::Undecided;
         };
         let Ok(raw) = std::fs::read(path) else {
@@ -1218,7 +1562,8 @@ impl Store {
         };
         let taken = Taken::new(fresh);
         let mut ctx = Ctx {
-            key: &key.0,
+            key: &e.key.0,
+            id: &e.id,
             units: &taken.units,
             report: &taken.report,
             output: &taken.output,
@@ -1256,7 +1601,7 @@ impl Store {
         }
     }
 
-    /// Compares the stored result under `key` with the `fresh` check of the
+    /// Compares the stored result of the entry `e` with the `fresh` check of the
     /// same input after it. `other_differs` is a difference found elsewhere
     /// (the mix), which makes it a mismatch whatever the conversions say.
     /// The stored conversion is followed by [`Store::compare_streamed`],
@@ -1265,21 +1610,21 @@ impl Store {
     /// a mismatch is bundled with both sides as before. A result that
     /// passed [`Store::peek`] and does not read back whole is
     /// [`Rechecked::Unread`], a mismatch, not a miss.
-    pub fn recheck(&self, key: &Key, fresh: &mut Conversion, other_differs: bool) -> Rechecked {
-        let streamed = self.compare_streamed(key, fresh);
+    pub fn recheck(&self, e: &EntryRef, fresh: &mut Conversion, other_differs: bool) -> Rechecked {
+        let streamed = self.compare_streamed(e, fresh);
         if streamed == Streamed::Equal && !other_differs {
             return Rechecked::Same;
         }
-        match self.get(key) {
+        match self.get(e) {
             None => {
-                self.bundle_unread(key, fresh);
+                self.bundle_unread(&e.key, fresh);
                 Rechecked::Unread
             }
             Some((old, ..)) => {
                 if streamed == Streamed::Undecided && !other_differs && compare(&old, fresh) {
                     Rechecked::Same
                 } else {
-                    self.bundle(key, &old, fresh);
+                    self.bundle(&e.key, &old, fresh);
                     Rechecked::Differs
                 }
             }
@@ -1400,6 +1745,7 @@ enum Arr {
 /// of the stored conversion.
 struct Ctx<'t> {
     key: &'t str,
+    id: &'t str,
     units: &'t [crate::Unit],
     report: &'t [sqldiff_model::model::Finding],
     output: &'t [sqldiff_model::model::Finding],
@@ -1612,7 +1958,7 @@ impl<'de> serde::de::Visitor<'de> for ConvSeed<'_, '_> {
     }
 }
 
-/// The file: `key`, `pool`, `conversion` in the order `put` writes them.
+/// The file: `key`, `id`, `pool`, `conversion` in the order `put` writes them.
 struct EntrySeed<'a, 't> {
     ctx: &'a mut Ctx<'t>,
 }
@@ -1639,6 +1985,12 @@ impl<'de> serde::de::Visitor<'de> for EntrySeed<'_, '_> {
                         return Err(bad("another key"));
                     }
                     key = true;
+                }
+                "id" => {
+                    let s: String = map.next_value()?;
+                    if s != self.ctx.id {
+                        return Err(bad("another id"));
+                    }
                 }
                 "pool" => self.ctx.pool = Some(map.next_value()?),
                 "conversion" => {
@@ -1787,7 +2139,13 @@ mod tests {
         let out = std::env::temp_dir().join(format!("sqldiff-flags-digest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out);
         let store = Store::of(&out);
-        let (r, k) = (Key("r".repeat(64)), Key("f".repeat(64)));
+        let (r, k) = (
+            EntryRef {
+                key: Key("r".repeat(64)),
+                id: "e".repeat(64),
+            },
+            Key("f".repeat(64)),
+        );
         store.put_flags(&r, &k, &[]);
         assert!(store.get_flags(&r, &k).is_some_and(|v| v.is_empty()));
         let path = out.join(Store::flags_rel(&r, &k));
@@ -1869,6 +2227,122 @@ mod note_table_tests {
         // An index outside the table is a miss, not a panic.
         let mut bad = json!({"units": [{"notes": [3]}], NOTE_TABLE: []});
         assert!(unshare_notes(&mut bad).is_none());
+    }
+
+    fn sample() -> Conversion {
+        crate::convert("SELECT 1;\n", Dialect::Tsql, Dialect::Postgres).unwrap()
+    }
+
+    fn reads_of(n: u8) -> Reads {
+        let mut r = Reads::default();
+        r.0.insert(
+            (ReadSide::Source, Query::Supplied),
+            Outcome::of(&format!("answer {n}")),
+        );
+        r
+    }
+
+    fn scratch(name: &str) -> (PathBuf, Store) {
+        let out = std::env::temp_dir().join(format!("sqldiff-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        let store = Store::of(&out);
+        (out, store)
+    }
+
+    #[test]
+    fn an_entry_reads_back_with_its_reads_and_a_second_write_of_other_bytes_is_refused() {
+        let (out, store) = scratch("entries");
+        let key = Key("a".repeat(64));
+        let mut c = sample();
+        c.output = "one".into();
+        let (e, put) = store
+            .put(&key, &mut c.clone(), None, true, &reads_of(1), false)
+            .unwrap();
+        assert_eq!(put, Put::Written);
+        assert_eq!(store.entries(&key), vec![(e.id.clone(), reads_of(1))]);
+        assert_eq!(store.get(&e).unwrap().0.output, "one");
+        // The same bytes again: nothing to do.
+        assert_eq!(
+            store
+                .put(&key, &mut c.clone(), None, true, &reads_of(1), false)
+                .unwrap()
+                .1,
+            Put::Same
+        );
+        // Other bytes under the same reads: refused, and the entry stays.
+        c.output = "two".into();
+        assert_eq!(
+            store
+                .put(&key, &mut c.clone(), None, true, &reads_of(1), false)
+                .unwrap()
+                .1,
+            Put::Differs
+        );
+        assert_eq!(store.get(&e).unwrap().0.output, "one");
+        // A `--fresh` run writes over it.
+        store
+            .put(&key, &mut c.clone(), None, true, &reads_of(1), true)
+            .unwrap();
+        assert_eq!(store.get(&e).unwrap().0.output, "two");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn a_reads_file_that_names_another_id_is_not_an_entry() {
+        let (out, store) = scratch("reads-id");
+        let key = Key("b".repeat(64));
+        let (e, _) = store
+            .put(&key, &mut sample(), None, true, &reads_of(1), false)
+            .unwrap();
+        let other = entry_id(&reads_of(2), true);
+        let dir = out.join(DIR).join(&key.0);
+        std::fs::copy(
+            dir.join(format!("{}.reads", e.id)),
+            dir.join(format!("{other}.reads")),
+        )
+        .unwrap();
+        std::fs::copy(
+            dir.join(format!("{}.json", e.id)),
+            dir.join(format!("{other}.json")),
+        )
+        .unwrap();
+        assert_eq!(store.entries(&key).len(), 1, "only the honest entry");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn eviction_keeps_the_entries_this_run_used_then_fills_by_id() {
+        let (out, store) = scratch("evict");
+        let key = Key("c".repeat(64));
+        let mut ids = Vec::new();
+        for n in 0..(MAX_ENTRIES as u8 + 4) {
+            let (e, _) = store
+                .put(&key, &mut sample(), None, true, &reads_of(n), false)
+                .unwrap();
+            ids.push(e);
+        }
+        // Use the entries with the largest ids: a purely sorted cut would
+        // drop exactly these.
+        let mut sorted = ids.clone();
+        sorted.sort();
+        let used: BTreeSet<EntryRef> = sorted.iter().rev().take(3).cloned().collect();
+        let live: BTreeSet<String> = [key.0.clone()].into();
+        store.gc(&live, &used);
+        let left: Vec<String> = store.entries(&key).into_iter().map(|e| e.0).collect();
+        assert_eq!(left.len(), MAX_ENTRIES);
+        for u in &used {
+            assert!(left.contains(&u.id), "a used entry was evicted");
+        }
+        // The rest are the smallest ids, and the same on every run.
+        let mut want: Vec<String> = sorted
+            .iter()
+            .take(MAX_ENTRIES - 3)
+            .map(|e| e.id.clone())
+            .collect();
+        want.extend(used.iter().map(|u| u.id.clone()));
+        want.sort();
+        assert_eq!(left, want);
+        let _ = std::fs::remove_dir_all(&out);
     }
 }
 
@@ -1980,24 +2454,29 @@ SELECT 1;
         let store = Store::of(&out);
         let key = Key(format!("{:0>64}", name.len()));
         let before = serde_json::to_vec(&c).unwrap();
-        store.put(&key, &mut c, mix, mix_tried).unwrap();
+        let (entry, _) = store
+            .put(&key, &mut c, mix, mix_tried, &Reads::default(), false)
+            .unwrap();
         assert_eq!(
             serde_json::to_vec(&c).unwrap(),
             before,
             "{name}: c restored"
         );
-        let want = framed(&reference_body(&key, &c, mix, mix_tried).unwrap());
-        let got = std::fs::read(out.join(Store::rel(&key))).unwrap();
+        let want = framed(&reference_body(&key, &entry.id, &c, mix, mix_tried).unwrap());
+        let got = std::fs::read(out.join(Store::entry_rel(&key, &entry.id))).unwrap();
         assert!(
             got == want,
             "{name}: the streamed file differs from the reference"
         );
         assert!(verified_body(&got).is_some());
-        let (back, bmix, btried) = store.get(&key).unwrap();
+        let (back, bmix, btried) = store.get(&entry).unwrap();
         assert!(compare(&back, &c), "{name}: round trip");
         assert_eq!((bmix.as_ref(), btried), (mix, mix_tried), "{name}: mix");
-        let leftovers = std::fs::read_dir(out.join(DIR)).unwrap().count();
-        assert_eq!(leftovers, 1, "{name}: no temporary file is left");
+        let leftovers = std::fs::read_dir(out.join(Store::dir_rel(&key)))
+            .unwrap()
+            .count();
+        // The result and its reads.
+        assert_eq!(leftovers, 2, "{name}: no temporary file is left");
         let _ = std::fs::remove_dir_all(&out);
     }
 
@@ -2009,9 +2488,10 @@ SELECT 1;
             "fixture has notes"
         );
         assert!(!c.report.findings.is_empty() || !c.output_check.findings.is_empty());
-        let e: Entry =
-            serde_json::from_slice(&reference_body(&Key("a".repeat(64)), &c, None, false).unwrap())
-                .unwrap();
+        let e: Entry = serde_json::from_slice(
+            &reference_body(&Key("a".repeat(64)), "id", &c, None, false).unwrap(),
+        )
+        .unwrap();
         assert!(!e.pool.is_empty(), "fixture pools a repeated string");
         let table = e.conversion[NOTE_TABLE].as_array().unwrap().len();
         assert!(table > 0, "fixture has a note table");
@@ -2076,20 +2556,24 @@ SELECT 1;
         std::fs::create_dir_all(out.join(".sqldiff")).unwrap();
         std::fs::write(out.join(DIR), b"in the way").unwrap();
         let key = Key("c".repeat(64));
-        assert!(Store::of(&out).put(&key, &mut c, None, false).is_err());
+        assert!(Store::of(&out)
+            .put(&key, &mut c, None, false, &Reads::default(), false)
+            .is_err());
         assert_eq!(serde_json::to_vec(&c).unwrap(), before);
         let _ = std::fs::remove_dir_all(&out);
     }
 
-    /// Puts `c` and returns the store, its key, the path of the file and the
+    /// Puts `c` and returns the store, its entry, the path of the file and the
     /// output directory.
-    fn stored(name: &str, c: &Conversion) -> (Store, Key, PathBuf, PathBuf) {
+    fn stored(name: &str, c: &Conversion) -> (Store, EntryRef, PathBuf, PathBuf) {
         let out = scratch(name);
         let store = Store::of(&out);
         let key = Key(format!("{:0>64}", name.len() + 40));
-        store.put(&key, &mut c.clone(), None, true).unwrap();
-        let path = out.join(Store::rel(&key));
-        (store, key, path, out)
+        let (entry, _) = store
+            .put(&key, &mut c.clone(), None, true, &Reads::default(), false)
+            .unwrap();
+        let path = out.join(Store::entry_rel(&key, &entry.id));
+        (store, entry, path, out)
     }
 
     /// A conversion with units and notes, pooled and marked strings.
@@ -2262,8 +2746,10 @@ SELECT 1;
             let src = std::fs::read_to_string(p).unwrap();
             let mut c = converted(&src);
             let key = Key(format!("{i:0>64}"));
-            store.put(&key, &mut c, None, i % 2 == 0).unwrap();
-            let (back, mix, tried) = store.get(&key).unwrap();
+            let (entry, _) = store
+                .put(&key, &mut c, None, i % 2 == 0, &Reads::default(), false)
+                .unwrap();
+            let (back, mix, tried) = store.get(&entry).unwrap();
             assert_eq!((mix, tried), (None, i % 2 == 0));
             assert!(
                 serde_json::to_vec(&back).unwrap() == serde_json::to_vec(&c).unwrap(),

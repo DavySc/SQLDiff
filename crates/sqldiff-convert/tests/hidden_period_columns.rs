@@ -389,8 +389,8 @@ fn the_stored_result_key_differs_with_the_option() {
             helpers: &[],
             text,
             draft: d,
-            source: None,
-            target: None,
+            source: false,
+            target: false,
         }
         .key()
     };

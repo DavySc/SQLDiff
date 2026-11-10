@@ -1,0 +1,55 @@
+name: T3 per-site check
+
+# The per-site check of the recorded catalog reads (W4.3, tests/site_switch.rs):
+# skipping the recording at each call site in turn must make some generated
+# edit show a stale reuse, or the site must be redundant, keyed, consumed or
+# dominated as the pinned lists say. Every shard classifies the sites of some
+# files and fails if one is not in its pinned class or has no proof. It takes
+# about an hour on one machine, so it runs here, sharded, and not in CI.
+# `every_site_the_base_tree_reads_from_is_classified...` (in CI) fails if a
+# site is in no shard's pinned lists.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/sqldiff-catalog/**"
+      - "crates/sqldiff-equiv/**"
+      - "crates/sqldiff-core/src/bind/**"
+      - "crates/sqldiff-core/src/engine.rs"
+      - "crates/sqldiff-convert/tests/site_switch.rs"
+      - "crates/sqldiff-convert/tests/support/**"
+      - ".github/workflows/t3-sites.yml"
+
+jobs:
+  shard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        # Substrings of the site keys (`file::fn@text`); together they cover
+        # every file that reads a catalog.
+        only:
+          - "core/src/"
+          - "equiv/canon.rs|equiv/call.rs"
+          - "equiv/ddl.rs|equiv/mod.rs|equiv/schema.rs|equiv/table.rs|equiv/trigger.rs|equiv/xwit.rs"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Classify the sites of the shard
+        env:
+          SQLDIFF_T3_ONLY: ${{ matrix.only }}
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: |
+          cargo test -p sqldiff-convert --test site_switch -- \
+            --exact every_site_that_reads_a_catalog_is_classified_by_the_edits \
+            --ignored --nocapture 2>&1 | tee shard.out
+          test "${PIPESTATUS[0]}" -eq 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: t3-shard-${{ strategy.job-index }}
+          path: shard.out

@@ -116,6 +116,45 @@ pub struct Model {
     pub extra: Vec<(String, String)>,
     /// Text appended to a file by a no-op edit.
     pub notes: Vec<(String, String)>,
+    /// The base catalog is given as two files (reasons name the catalogs by
+    /// their number, so every reason that names the catalog changes).
+    pub split_base: bool,
+    /// The dependents (all procedures) are left out: the catalog has no
+    /// procedure but the ones in `routines`.
+    pub no_procs: bool,
+    /// The target base catalog also holds names that differ from the
+    /// tree's only in letter case (PostgreSQL, Db2 for i).
+    pub case_clash: bool,
+    /// Only index names / only column names have another spelling in the
+    /// target base catalog (so the checks that stop at the first clash get
+    /// further).
+    pub clash_index: bool,
+    pub clash_column: bool,
+    /// Tables of other schemas with the names the tree uses are in the
+    /// source base catalog / the target base catalog.
+    pub look_a: bool,
+    pub look_b: bool,
+    /// The source base catalog holds a table of another schema named like the tree's view V0.
+    pub look_v: bool,
+    /// The base catalog of a side defines the tree's own tables again,
+    /// shaped differently.
+    pub over_a: bool,
+    pub over_b: bool,
+    /// The source / target base catalog is not given at all.
+    pub no_base_a: bool,
+    pub no_base_b: bool,
+    /// The job runs with `--no-catalog`.
+    pub no_catalog: bool,
+    /// The event of the trigger `dbo.Tr1` the base catalogs define (the
+    /// source one `AFTER INSERT`, or `AFTER UPDATE` when this is set; the
+    /// target one always `AFTER INSERT`).
+    pub tr1_update: bool,
+    /// The target `tr1` fires on UPDATE (the source one stays `AFTER INSERT`,
+    /// or `AFTER UPDATE` too with `tr1_update`).
+    pub tr1_target_update: bool,
+    /// The output of the table T0 is written by hand, with one more column
+    /// than the rules give it.
+    pub hand: bool,
 }
 
 /// The three tables the fixed dependents use.
@@ -140,6 +179,18 @@ fn col(name: &str, ty: &str, null: bool) -> Col {
 }
 
 impl Model {
+    /// [`Model::generate`], and with `hidden` a system-versioned table in
+    /// the tree from the start (so a star over a view or table is already
+    /// refused where it hides columns).
+    pub fn generate_with(seed: u64, hidden: bool) -> Model {
+        let mut m = Model::generate(seed);
+        if hidden {
+            m.tables[2].versioned = true;
+            m.tables[2].index = Some(2);
+        }
+        m
+    }
+
     pub fn generate(seed: u64) -> Model {
         let mut r = Rng::new(seed);
         let mut tables = Vec::new();
@@ -166,7 +217,17 @@ impl Model {
             tables.push(Table {
                 schema: "dbo".into(),
                 name: format!("X{i}"),
-                cols: vec![key(), col("C0", r.pick(TYPES), true)],
+                cols: vec![
+                    key(),
+                    col(
+                        "C0",
+                        {
+                            let _ = r.pick(TYPES);
+                            "nvarchar(40)"
+                        },
+                        true,
+                    ),
+                ],
                 index: None,
                 versioned: false,
             });
@@ -188,6 +249,13 @@ impl Model {
                 col("C2", "datetime2(3)", true),
             ],
         ));
+        tables.push(Table {
+            schema: "dbo".into(),
+            name: "Idx".into(),
+            cols: vec![key(), col("C0", "nvarchar(40)", true)],
+            index: Some(1),
+            versioned: false,
+        });
         tables.push(sink("SinkNN", vec![key(), col("C1", "int", false)]));
         tables.push(sink("SinkV", vec![key(), col("C0", "nvarchar(40)", true)]));
         tables.push(sink(
@@ -204,6 +272,13 @@ impl Model {
                 name: "V1".into(),
                 over: "T1".into(),
                 star: r.below(2) == 0,
+            },
+            // Always a column list: a star over it is not refused as a star
+            // view, so the table lookup of its name decides the expansion.
+            View {
+                name: "V2".into(),
+                over: "T0".into(),
+                star: false,
             },
         ];
         let routines = vec![
@@ -224,21 +299,54 @@ impl Model {
             name: "Tr0".into(),
             on: "T1".into(),
         }];
-        let base = vec![Table {
-            schema: "ext".into(),
-            name: "Ref".into(),
-            cols: vec![key(), col("Note", "nvarchar(40)", true)],
-            index: None,
-            versioned: false,
-        }];
+        let base = vec![
+            Table {
+                schema: "ext".into(),
+                name: "Ref".into(),
+                cols: vec![key(), col("Note", "nvarchar(40)", true)],
+                index: None,
+                versioned: false,
+            },
+            // A table of the default schema that only the catalog has: what
+            // a dependent reads of it (its columns) comes from the catalog,
+            // and a second schema's table of that name makes it unknown.
+            Table {
+                schema: "dbo".into(),
+                name: "Lone".into(),
+                cols: vec![key(), col("C0", "nvarchar(40)", true)],
+                index: None,
+                versioned: false,
+            },
+        ];
         Model {
             tables,
             views,
             routines,
             triggers,
             base,
-            extra: Vec::new(),
+            // An index in a file of its own: its key column's facts (can it
+            // be NULL?) come from the catalog's table, not from the file.
+            extra: vec![(
+                "indexes/dbo.IX_Sep.sql".into(),
+                "CREATE UNIQUE INDEX IX_Sep ON dbo.T1 (C1);\nGO\n".into(),
+            )],
             notes: Vec::new(),
+            split_base: false,
+            no_procs: false,
+            case_clash: false,
+            clash_index: false,
+            clash_column: false,
+            look_a: false,
+            look_b: false,
+            look_v: false,
+            over_a: false,
+            over_b: false,
+            no_base_a: false,
+            no_base_b: false,
+            no_catalog: false,
+            tr1_update: false,
+            tr1_target_update: false,
+            hand: false,
         }
     }
 
@@ -274,7 +382,24 @@ impl Model {
                 ),
             ));
         }
-        out.extend(dependents());
+        if !self.no_procs {
+            out.extend(dependents());
+        }
+        // A file that stays as it is whatever the edits do, and whose
+        // statements call things the tree does not define: whether the
+        // catalog is authoritative for functions and procedures decides
+        // what they are.
+        out.push((
+            "triggers/TrCall.sql".into(),
+            "CREATE TRIGGER dbo.TrCall ON dbo.X0 AFTER INSERT AS\nBEGIN\n  SET NOCOUNT ON;\n  EXEC dbo.GoneProc @x = 1;\n  INSERT INTO dbo.Sink (Id) SELECT dbo.GoneFn(1);\n  INSERT INTO dbo.SinkV (Id, C0) SELECT Id, C0 FROM inserted;\nEND\nGO\n".into(),
+        ));
+        // Names the tree spells one way and PostgreSQL / Db2 for i names
+        // that differ only in case from them are checked against.
+        out.push((
+            "sequences/Seq0.sql".into(),
+            "CREATE SEQUENCE dbo.Seq0 AS int START WITH 1;\nGO\n".into(),
+        ));
+        out.push(("schemas/ops.sql".into(), "CREATE SCHEMA ops;\nGO\n".into()));
         out.extend(self.extra.iter().cloned());
         for (path, note) in &self.notes {
             if let Some(f) = out.iter_mut().find(|f| &f.0 == path) {
@@ -286,12 +411,172 @@ impl Model {
 
     /// The base catalog as DDL in `d`: the source dialect for `--catalog`,
     /// the target dialect for `--catalog-b`.
+    /// The base catalog as files, in the order given on the command line.
+    pub fn base_files(&self, d: Dialect) -> Vec<String> {
+        if self.no_base_a || self.no_catalog || (d != Dialect::Tsql && self.no_base_b) {
+            return Vec::new();
+        }
+        let mut v = vec![self.base_catalog(d)];
+        if self.split_base {
+            v.push("-- a second, empty catalog file\n".to_string());
+        }
+        v
+    }
+
     pub fn base_catalog(&self, d: Dialect) -> String {
-        self.base
+        let mut s = self
+            .base
             .iter()
             .map(|t| create_table(t, d))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        if (d == Dialect::Tsql && self.look_a) || (d != Dialect::Tsql && self.look_b) {
+            // Tables of another schema with the names the tree uses.
+            for n in [
+                "Fresh", "inserted", "Lone", "More", "Other", "Sink", "SinkNN", "SinkRef", "SinkV",
+                "T0", "T1", "T2", "X0",
+            ] {
+                s.push('\n');
+                s.push_str(&create_table(
+                    &Table {
+                        schema: "ops".into(),
+                        name: n.into(),
+                        cols: vec![key(), col("C0", "nvarchar(40)", true)],
+                        index: None,
+                        versioned: false,
+                    },
+                    d,
+                ));
+            }
+        }
+        if self.look_v && d == Dialect::Tsql {
+            for n in ["V0", "V2"] {
+                s.push('\n');
+                s.push_str(&create_table(
+                    &Table {
+                        schema: "ops".into(),
+                        name: n.into(),
+                        cols: vec![key(), col("C0", "nvarchar(40)", true)],
+                        index: None,
+                        versioned: false,
+                    },
+                    d,
+                ));
+            }
+        }
+        if (d == Dialect::Tsql && self.look_a) || (d != Dialect::Tsql && self.look_b) {
+            // Views of another schema, with the names of tables and a view
+            // of the tree, that read through `*`.
+            for n in ["T0", "T1", "T2", "V0"] {
+                s.push_str(&format!(
+                    "\nCREATE VIEW {}.{} AS SELECT * FROM {}.{};\n{}",
+                    q(d, "vw"),
+                    q(d, n),
+                    q(d, "ops"),
+                    q(d, "Sink"),
+                    if d == Dialect::Tsql { "GO\n" } else { "" }
+                ));
+            }
+        }
+        if !self.tables.is_empty() {
+            // A trigger of the base catalogs on the tree's table X0, which
+            // `DropBaseTr1` drops (the source one's event is what
+            // `BaseTriggerEvent` changes, the target one's stays).
+            match d {
+                Dialect::Tsql => s.push_str(&format!(
+                    "\nCREATE TRIGGER dbo.Tr1 ON dbo.X0 AFTER {} AS\nBEGIN\n  SET NOCOUNT ON;\n  INSERT INTO dbo.X0 (Id) SELECT Id FROM inserted;\nEND\nGO\n",
+                    if self.tr1_update { "UPDATE" } else { "INSERT" }
+                )),
+                Dialect::Postgres => s.push_str(&format!("\nCREATE FUNCTION tr1() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;\nCREATE TRIGGER tr1 AFTER {} ON x0 FOR EACH ROW EXECUTE FUNCTION tr1();\n", if self.tr1_target_update { "UPDATE" } else { "INSERT" })),
+                _ => {}
+            }
+        }
+        if (d == Dialect::Tsql && self.over_a) || (d != Dialect::Tsql && self.over_b) {
+            // The tree's own tables again, with other columns; and (T-SQL)
+            // a trigger of the name the tree has.
+            for n in [
+                "T1", "T2", "Sink", "SinkNN", "SinkRef", "SinkV", "X0", "Idx",
+            ] {
+                s.push('\n');
+                s.push_str(&create_table(
+                    &Table {
+                        schema: "dbo".into(),
+                        name: n.into(),
+                        cols: vec![key(), col("Extra", "int", true)],
+                        index: None,
+                        versioned: false,
+                    },
+                    d,
+                ));
+            }
+            if d == Dialect::Tsql {
+                s.push_str("\nCREATE TRIGGER dbo.Tr0 ON dbo.X0 AFTER INSERT AS\nBEGIN\n  SET NOCOUNT ON;\n  INSERT INTO dbo.X0 (Id) SELECT Id FROM inserted;\nEND\nGO\n");
+            }
+        }
+        if (self.clash_index || self.clash_column) && d != Dialect::Tsql {
+            let other = |n: &str| match d {
+                Dialect::Postgres => format!("\"{}\"", n.to_uppercase()),
+                _ => format!("\"{n}\""),
+            };
+            if self.clash_index {
+                s.push_str("\nCREATE TABLE ext.holder (hid int PRIMARY KEY);\n");
+                for n in ["IX_Idx_1", "IX_T0_2", "IX_T1_2", "IX_T2_2"] {
+                    s.push_str(&format!("CREATE INDEX {} ON ext.holder (hid);\n", other(n)));
+                }
+            }
+            if self.clash_column {
+                s.push_str(&format!(
+                    "\nCREATE TABLE ext.holder2 ({} int PRIMARY KEY, {} int, {} int);\n",
+                    other("C0"),
+                    other("C1"),
+                    other("C2"),
+                ));
+            }
+        }
+        if self.case_clash && d != Dialect::Tsql {
+            // Other spellings of names the tree uses, as the names of
+            // tables, columns, indexes, a schema and a routine (the objects
+            // `Spellings` covers; a sequence, a trigger and a schema are
+            // checked against them too).
+            let other = |n: &str| match d {
+                Dialect::Postgres => format!("\"{}\"", n.to_uppercase()),
+                _ => format!("\"{n}\""),
+            };
+            for t in ["T0", "T1", "T2", "X0", "Idx"] {
+                s.push_str(&format!(
+                    "\nCREATE TABLE {} ({} int PRIMARY KEY, {} varchar(40), {} int, {} timestamp(3){});\n",
+                    other(t),
+                    other("Id"),
+                    other("C0"),
+                    other("C1"),
+                    other("C2"),
+                    if t == "T0" { format!(", {} varchar(40)", other("Note")) } else { String::new() },
+                ));
+                // On the T0 spelling in every case, so the table the index
+                // names is not one the tree reads by its own name.
+                s.push_str(&format!(
+                    "CREATE INDEX {} ON {} ({});\n",
+                    other(&format!("IX_{t}_{}", if t == "Idx" { 1 } else { 2 })),
+                    other("T0"),
+                    other("C1")
+                ));
+            }
+            for n in ["Seq0", "ops", "Tr0", "Ref"] {
+                s.push_str(&format!(
+                    "CREATE TABLE {} ({} int);\n",
+                    other(n),
+                    other("Id")
+                ));
+            }
+            s.push_str(&format!("CREATE SCHEMA {};\n", other("app")));
+            if d == Dialect::Postgres {
+                s.push_str(&format!(
+                    "CREATE FUNCTION {}(x int) RETURNS int LANGUAGE sql AS 'select 1';\n",
+                    other("Callee"),
+                ));
+            }
+        }
+        s
     }
 }
 
@@ -374,9 +659,39 @@ fn dependents() -> Vec<(String, String)> {
     }
     add("DropTr0".into(), "DROP TRIGGER dbo.Tr0".into());
     add("DropTg1".into(), "DROP TRIGGER dbo.Tg1".into());
+    add("DropBaseTr1".into(), "DROP TRIGGER dbo.Tr1".into());
+    // An INSERT without a column list: the columns come from the catalog's
+    // table of that name, which is refused when two schemas have one.
+    add(
+        "InsertNoList".into(),
+        "INSERT INTO dbo.SinkV SELECT Id, C0 FROM dbo.T0".into(),
+    );
+    add(
+        "InsertLone".into(),
+        "INSERT INTO dbo.Lone VALUES (1, N'a')".into(),
+    );
+    add(
+        "StarLone".into(),
+        "INSERT INTO dbo.Sink SELECT * FROM dbo.Lone".into(),
+    );
+    // A star over a table with HIDDEN period columns (the `hidden` tree) next
+    // to a catalog-only table: the star expands, or is refused, by what
+    // `Schema::table` answers for the second table.
+    add(
+        "StarHidden".into(),
+        "INSERT INTO dbo.Sink SELECT * FROM dbo.T1 AS a JOIN dbo.Lone AS b ON a.Id = b.Id".into(),
+    );
+    add(
+        "InsertNoListSink".into(),
+        "INSERT INTO dbo.Sink VALUES (1, N'a', 1, NULL)".into(),
+    );
     add(
         "ViewStar".into(),
         "INSERT INTO dbo.SinkV SELECT * FROM dbo.V0".into(),
+    );
+    add(
+        "ViewStarPlain".into(),
+        "INSERT INTO dbo.SinkV SELECT * FROM dbo.V2".into(),
     );
     add(
         "ViewFilter".into(),
@@ -412,6 +727,23 @@ fn dependents() -> Vec<(String, String)> {
     add(
         "NewSchema".into(),
         "INSERT INTO dbo.Sink (Id) SELECT Id FROM app.Other".into(),
+    );
+    add(
+        "GhostTable".into(),
+        "DELETE FROM dbo.Ghost WHERE Id = @x".into(),
+    );
+    add(
+        "GhostSchema".into(),
+        "DELETE FROM zz.Ghost WHERE Id = @x".into(),
+    );
+    add(
+        "QualMissing".into(),
+        "INSERT INTO dbo.Sink (Id) SELECT T0.Nope FROM dbo.T0".into(),
+    );
+    add("CallGone".into(), "EXEC dbo.GoneProc @x".into());
+    add(
+        "FunctionGone".into(),
+        "INSERT INTO dbo.Sink (Id) SELECT dbo.GoneFn(@x)".into(),
     );
     add(
         "MixedCase".into(),
@@ -457,9 +789,15 @@ fn ty_in(d: Dialect, ty: &str) -> String {
 fn create_table(t: &Table, d: Dialect) -> String {
     let mut s = String::new();
     let tsql = d == Dialect::Tsql;
+    // The converter puts `dbo` objects in `public`.
+    let schema = if d == Dialect::Postgres && t.schema == "dbo" {
+        "public"
+    } else {
+        &t.schema
+    };
     s.push_str(&format!(
         "CREATE TABLE {}.{} (\n",
-        q(d, &t.schema),
+        q(d, schema),
         q(d, &t.name)
     ));
     for (i, c) in t.cols.iter().enumerate() {
@@ -492,14 +830,15 @@ fn create_table(t: &Table, d: Dialect) -> String {
     } else if t.versioned {
         s.push_str("  ValidFrom timestamp NOT NULL\n");
     }
-    s.push_str(");\n");
+    if t.versioned && tsql {
+        s.push_str(&format!(
+            ") WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = {}.{}History));\n",
+            t.schema, t.name
+        ));
+    } else {
+        s.push_str(");\n");
+    }
     if tsql {
-        if t.versioned {
-            s.push_str(&format!(
-                "ALTER TABLE {}.{} SET (SYSTEM_VERSIONING = ON);\n",
-                t.schema, t.name
-            ));
-        }
         s.push_str("GO\n");
     }
     if let Some(i) = t.index {
@@ -556,6 +895,8 @@ pub enum Edit {
     AddRoutine,
     DropRoutine,
     ChangeParameterType,
+    /// The base catalog is two files instead of one.
+    SplitBase,
     /// A table in a schema that did not exist (schema appears).
     AddSchemaTable,
     AddTrigger,
@@ -568,6 +909,50 @@ pub enum Edit {
     BaseTable,
     /// The base catalog loses its table.
     BaseDrop,
+    /// Every table of the tree and of the base catalog is gone.
+    DropAllTables,
+    /// No procedure is defined any more (the dependents go with them).
+    NoProcedures,
+    /// No function is defined any more.
+    DropFunctions,
+    /// The target base catalog gains other spellings of the tree's names.
+    CaseClash,
+    /// The source base catalog gains a table named like the tree's view V0, in another schema
+    /// (`Schema::table("v0")` answers for a star over the view; the target side does not change).
+    ViewLookalike,
+    /// Only index names have another spelling there.
+    CaseClashIndex,
+    /// Only column names have another spelling there.
+    CaseClashColumn,
+    /// The source base catalog defines the tree's tables again, shaped
+    /// differently.
+    SourceOverrides,
+    /// The same for the target base catalog.
+    TargetOverrides,
+    /// The source base catalog gains tables of another schema with the
+    /// tree's names.
+    SourceLookalikes,
+    /// The same for the target base catalog.
+    TargetLookalikes,
+    /// No base catalog is given (the target side needs the source's).
+    NoBaseA,
+    /// The target base catalog is not given.
+    NoBaseB,
+    /// A table only a trigger's pseudo table reads changes type.
+    RetypeSide,
+    /// The job runs with `--no-catalog`: no side has a catalog.
+    NoCatalog,
+    /// The event of a trigger in the source base catalog changes, the
+    /// target base catalog's copy of it does not.
+    BaseTriggerEvent,
+    /// The same for the target base catalog's copy of the trigger.
+    TargetBaseTriggerEvent,
+    /// System versioning goes from the tables that have it (and comes to
+    /// another table when none has it).
+    VersioningToggle,
+    /// The target output of the table T0 is written by hand (it has a
+    /// column the source table does not).
+    HandWritten,
 }
 
 pub const ALL_EDITS: &[Edit] = &[
@@ -595,6 +980,26 @@ pub const ALL_EDITS: &[Edit] = &[
     Edit::BaseRetype,
     Edit::BaseTable,
     Edit::BaseDrop,
+    Edit::SplitBase,
+    Edit::DropAllTables,
+    Edit::NoProcedures,
+    Edit::DropFunctions,
+    Edit::CaseClash,
+    Edit::ViewLookalike,
+    Edit::CaseClashIndex,
+    Edit::CaseClashColumn,
+    Edit::SourceOverrides,
+    Edit::TargetOverrides,
+    Edit::SourceLookalikes,
+    Edit::TargetLookalikes,
+    Edit::NoBaseA,
+    Edit::NoBaseB,
+    Edit::RetypeSide,
+    Edit::NoCatalog,
+    Edit::BaseTriggerEvent,
+    Edit::TargetBaseTriggerEvent,
+    Edit::VersioningToggle,
+    Edit::HandWritten,
 ];
 
 impl Edit {
@@ -696,9 +1101,12 @@ impl Edit {
                 format!("toggle unique index on {tname}.C1")
             }
             Edit::ViewBody => {
-                let vi = r.below(m.views.len());
-                m.views[vi].star ^= true;
-                format!("view {} body", m.views[vi].name)
+                // Both views, so some dependent of each sees it.
+                let _ = r.below(m.views.len());
+                for v in &mut m.views {
+                    v.star ^= true;
+                }
+                "view bodies".to_string()
             }
             Edit::AddRoutine => {
                 m.routines.push(Routine {
@@ -766,6 +1174,96 @@ impl Edit {
                     versioned: false,
                 });
                 "base catalog: ext.More appears".into()
+            }
+            Edit::SplitBase => {
+                m.split_base = true;
+                "the base catalog is two files".into()
+            }
+            Edit::DropAllTables => {
+                m.tables.clear();
+                m.views.clear();
+                m.base.clear();
+                "no table or view at all".into()
+            }
+            Edit::NoProcedures => {
+                m.no_procs = true;
+                m.routines.retain(|r| r.function);
+                "no procedure".into()
+            }
+            Edit::DropFunctions => {
+                m.routines.retain(|r| !r.function);
+                "no function".into()
+            }
+            Edit::SourceOverrides => {
+                m.over_a = true;
+                "the source base catalog redefines tree tables".into()
+            }
+            Edit::TargetOverrides => {
+                m.over_b = true;
+                "the target base catalog redefines tree tables".into()
+            }
+            Edit::SourceLookalikes => {
+                m.look_a = true;
+                "the source base catalog has lookalike tables".into()
+            }
+            Edit::TargetLookalikes => {
+                m.look_b = true;
+                "the target base catalog has lookalike tables".into()
+            }
+            Edit::NoBaseA => {
+                m.no_base_a = true;
+                "no base catalog".into()
+            }
+            Edit::NoBaseB => {
+                m.no_base_b = true;
+                "no target base catalog".into()
+            }
+            Edit::BaseTriggerEvent => {
+                m.tr1_update = true;
+                "the source base trigger Tr1 fires on UPDATE".into()
+            }
+            Edit::VersioningToggle => {
+                if m.tables.iter().any(|t| t.versioned) {
+                    m.tables.iter_mut().for_each(|t| t.versioned = false);
+                    "no table is system-versioned".into()
+                } else {
+                    let ti = (ti + 1) % ANCHORS;
+                    m.tables[ti].versioned = true;
+                    format!("system versioning on for {}", m.tables[ti].name)
+                }
+            }
+            Edit::TargetBaseTriggerEvent => {
+                m.tr1_target_update = true;
+                "the target base trigger tr1 fires on UPDATE".into()
+            }
+            Edit::HandWritten => {
+                m.hand = true;
+                "the target output of T0 is written by hand".into()
+            }
+            Edit::NoCatalog => {
+                m.no_catalog = true;
+                "checked without a catalog".into()
+            }
+            Edit::RetypeSide => {
+                let x = m.tables.iter_mut().find(|t| t.name == "X0").unwrap();
+                x.cols[1].ty = "int".into();
+                "X0.C0 becomes int".into()
+            }
+            Edit::CaseClashIndex => {
+                m.clash_index = true;
+                "index names have other spellings in the target base catalog".into()
+            }
+            Edit::CaseClashColumn => {
+                m.clash_column = true;
+                "column names have other spellings in the target base catalog".into()
+            }
+            Edit::ViewLookalike => {
+                m.look_v = true;
+                "the source base catalog has a table named like the view V0".into()
+            }
+            Edit::CaseClash => {
+                m.case_clash = true;
+                "the target base catalog has other spellings".into()
             }
             Edit::BaseDrop => {
                 m.base.clear();

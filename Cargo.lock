@@ -588,6 +588,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqldiff-catalog",
  "sqldiff-core",
  "sqldiff-draft",
  "sqldiff-model",

@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::artifact::{exact_hash, Analyzed, Artifact};
 use crate::bind::{self, BindInput, Bindings};
 use crate::catalog::builtins::Helper;
-use crate::catalog::record::{NoSink, ReadSink, RecordingView, Side as ReadSide};
+use crate::catalog::record::{
+    NoSink, Outcome, Query, ReadSink, Reads, Recorder, RecordingView, Side as ReadSide,
+};
 use crate::catalog::{ddl, Catalog, CatalogView};
 use crate::classify::pairing_key;
 use crate::equiv;
@@ -286,6 +288,73 @@ fn side(dialect: sqldiff_syntax::Dialect, ddl: &[Artifact], facts: &[Facts]) -> 
         }
     }
     built
+}
+
+/// The catalogs of a conversion check, to ask a stored result's reads again
+/// (performance plan W4.3). A stored result is taken only if every question
+/// its check asked of a catalog has, against the catalogs of this run, the
+/// answer it had then. The answer comes from the very code the check ran
+/// (`RecordingView::ask`, `Schema::ask`) on the same cached side, never from
+/// a second derivation.
+///
+/// Answers are remembered for the life of the value, which is one catalog
+/// state: build a new one when a catalog changes.
+pub struct Replay {
+    source: Arc<BoundSide>,
+    target: Arc<BoundSide>,
+    memo: Mutex<BTreeMap<(ReadSide, Query), Option<Outcome>>>,
+}
+
+impl Replay {
+    /// The catalogs of a check of a `from` file against `opts.catalog_a` and
+    /// `opts.facts_a`, and of its `to` output against `opts.catalog_b` and
+    /// `opts.facts_b`: what `diff` and `check` build their sides from.
+    pub fn new(
+        from: sqldiff_syntax::Dialect,
+        to: sqldiff_syntax::Dialect,
+        opts: &Options,
+    ) -> Replay {
+        Replay {
+            source: side(from, &opts.catalog_a, &opts.facts_a),
+            target: side(to, &opts.catalog_b, &opts.facts_b),
+            memo: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// The answer to `q` asked of `side`'s catalog now. `None` when the
+    /// question cannot be asked again (the stored result is then not taken).
+    pub fn outcome(&self, side: ReadSide, q: &Query) -> Option<Outcome> {
+        let key = (side, q.clone());
+        if let Some(o) = self.memo.lock().ok()?.get(&key) {
+            return *o;
+        }
+        let bound = match side {
+            ReadSide::Source => &self.source,
+            ReadSide::Target | ReadSide::OwnTarget => &self.target,
+        };
+        let rec = Arc::new(Recorder::default());
+        let asked = {
+            let schema = bound.schema.for_check(side, rec.clone());
+            schema.ask(q) || RecordingView::new(&bound.view, side, &*rec).ask(q)
+        };
+        let outcome = if asked {
+            let (reads, _) = Arc::try_unwrap(rec).ok()?.finish();
+            reads.0.get(&key).copied()
+        } else {
+            None
+        };
+        self.memo.lock().ok()?.insert(key, outcome);
+        outcome
+    }
+
+    /// Whether every read of `reads` has its recorded answer against these
+    /// catalogs.
+    pub fn holds(&self, reads: &Reads) -> bool {
+        reads
+            .0
+            .iter()
+            .all(|((side, q), o)| self.outcome(*side, q) == Some(*o))
+    }
 }
 
 pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");

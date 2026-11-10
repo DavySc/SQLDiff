@@ -506,6 +506,10 @@ const SCHEMA_METHODS: &[(&str, &str)] = &[
     ("lists_stars", "HiddenTables (the `list_stars` flag)"),
     ("is_star_view", "StarView"),
     ("column_types", "ColumnNamed / SchemaTables"),
+    (
+        "ask",
+        "replay: every Schema query again, through the check's own readers",
+    ),
     ("table", "SchemaTables"),
     ("view_column_is_not_char", "ViewFamily"),
     ("table_exact", "SchemaTables"),
@@ -558,6 +562,10 @@ const RECORDING_METHODS: &[(&str, &str)] = &[
     ("routines_authoritative", "RoutinesAuthoritative"),
     ("table", "Table"),
     ("routines", "Routines"),
+    (
+        "ask",
+        "replay: a RecordingView query again, through the check's own method",
+    ),
     ("whole", "WholeCatalog"),
 ];
 

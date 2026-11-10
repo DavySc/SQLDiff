@@ -26,7 +26,9 @@ include!(concat!(env!("OUT_DIR"), "/fingerprint.rs"));
 
 pub mod check;
 pub use check::{check, gates, splice_unit, undecided, NOT_CHECKED, NOT_COMPARED};
-pub(crate) use check::{check_with_mix, not_checked, recount, span, Rebuild, U16Index, EVERY_PAIR};
+pub(crate) use check::{
+    check_with_reads, not_checked, recount, span, Checked, Rebuild, U16Index, EVERY_PAIR,
+};
 
 pub mod base;
 pub mod callees;

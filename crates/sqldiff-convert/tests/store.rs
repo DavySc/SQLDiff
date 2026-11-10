@@ -157,10 +157,18 @@ fn write_result(p: &Path, v: &serde_json::Value) {
     std::fs::write(p, framed(&serde_json::to_vec(v).unwrap())).unwrap();
 }
 
+/// The stored entries: `<key>/<id>.json`, each beside its `<id>.reads`.
 fn results(out: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(out.join(".sqldiff/results"))
-        .map(|d| d.flatten().map(|e| e.path()).collect())
+    let mut v: Vec<PathBuf> = std::fs::read_dir(out.join(".sqldiff/results"))
+        .map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>())
         .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.is_dir())
+        .flat_map(|d| std::fs::read_dir(d).unwrap().flatten().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    v.sort();
+    v
 }
 
 #[test]

@@ -5,9 +5,9 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use sqldiff_core::catalog::record::{Outcome, Query, ReadSink, Side};
+use sqldiff_core::catalog::record::{Outcome, Query, ReadSink, Reads, Side};
 use sqldiff_core::catalog::{ddl, Catalog};
-use sqldiff_core::{diff_recorded, Artifact, Dialect, Facts, Options};
+use sqldiff_core::{diff_recorded, Artifact, Dialect, Facts, Options, Replay};
 
 const T: Dialect = Dialect::Tsql;
 
@@ -208,4 +208,61 @@ fn a_hidden_table_added_to_the_target_alone_moves_a_recorded_read() {
     );
     assert!(moved(&before, &after, Side::Target));
     assert!(!moved(&before, &after, Side::Source));
+}
+
+fn options(cat_a: &Arc<Catalog>, cat_b: &Arc<Catalog>) -> Options {
+    Options {
+        facts_a: vec![Facts::new(Arc::clone(cat_a))],
+        facts_b: vec![Facts::new(Arc::clone(cat_b))],
+        ..Options::default()
+    }
+}
+
+#[test]
+fn a_replay_on_the_catalogs_of_the_check_holds_for_every_read() {
+    // R6: the answer of a replay comes from the code the check ran, so
+    // asking again against the same catalogs gives every recorded answer.
+    for (a, b) in [
+        (catalog(T, &[TABLE]), catalog(T, &[TABLE])),
+        (catalog(T, &[HIDDEN]), catalog(T, &[HIDDEN_PLUS])),
+        (
+            catalog(T, &[HIDDEN]),
+            catalog(Dialect::Postgres, &[PG_PLAIN]),
+        ),
+    ] {
+        let r = Reads(reads(&a, &b, BODY, BODY_B));
+        assert!(!r.0.is_empty());
+        let replay = Replay::new(T, T, &options(&a, &b));
+        for ((side, q), o) in &r.0 {
+            assert_eq!(
+                replay.outcome(*side, q),
+                Some(*o),
+                "{side:?} {q:?} answers differently on the catalogs it was read from"
+            );
+        }
+        assert!(replay.holds(&r));
+    }
+}
+
+#[test]
+fn a_replay_rejects_when_a_recorded_answer_moved() {
+    let same = catalog(T, &[TABLE]);
+    let r = Reads(reads(&same, &same, BODY, BODY_B));
+    // The source is unchanged and the target edited.
+    let edited = catalog(T, &[TABLE_EDITED]);
+    assert!(Replay::new(T, T, &options(&same, &same)).holds(&r));
+    assert!(!Replay::new(T, T, &options(&same, &edited)).holds(&r));
+    // Edited on the source side alone is rejected too.
+    assert!(!Replay::new(T, T, &options(&edited, &same)).holds(&r));
+}
+
+#[test]
+fn a_read_that_cannot_be_asked_again_is_not_held() {
+    let cat = catalog(T, &[TABLE]);
+    let mut r = Reads(reads(&cat, &cat, BODY, BODY_B));
+    r.0.insert(
+        (Side::Source, Query::SchemaKnown(("dbo".into(), false))),
+        Outcome::of(&true),
+    );
+    assert!(!Replay::new(T, T, &options(&cat, &cat)).holds(&r));
 }

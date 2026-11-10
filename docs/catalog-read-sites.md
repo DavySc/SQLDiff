@@ -139,7 +139,7 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 | `sqldiff-convert/src/instances.rs` | driver | 8 |
 | `sqldiff-convert/src/template.rs` | driver | 6 |
 | `sqldiff-convert/src/tree.rs` | driver | 4 |
-| `sqldiff-core/src/engine.rs` | check | 22 |
+| `sqldiff-core/src/engine.rs` | check | 26 |
 | `sqldiff-equiv/src/equiv/edit.rs` | check | 7 |
 
 ### triggers
@@ -210,6 +210,7 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 | `lists_stars` | HiddenTables (the `list_stars` flag) |
 | `is_star_view` | StarView |
 | `column_types` | ColumnNamed / SchemaTables |
+| `ask` | replay: every Schema query again, through the check's own readers |
 | `table` | SchemaTables |
 | `view_column_is_not_char` | ViewFamily |
 | `table_exact` | SchemaTables |
@@ -235,6 +236,7 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 | `routines_authoritative` | RoutinesAuthoritative |
 | `table` | Table |
 | `routines` | Routines |
+| `ask` | replay: a RecordingView query again, through the check's own method |
 | `whole` | WholeCatalog |
 
 ## `SourceReads` public methods
