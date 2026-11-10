@@ -830,14 +830,15 @@ fn create_table(t: &Table, d: Dialect) -> String {
     } else if t.versioned {
         s.push_str("  ValidFrom timestamp NOT NULL\n");
     }
-    s.push_str(");\n");
+    if t.versioned && tsql {
+        s.push_str(&format!(
+            ") WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = {}.{}History));\n",
+            t.schema, t.name
+        ));
+    } else {
+        s.push_str(");\n");
+    }
     if tsql {
-        if t.versioned {
-            s.push_str(&format!(
-                "ALTER TABLE {}.{} SET (SYSTEM_VERSIONING = ON);\n",
-                t.schema, t.name
-            ));
-        }
         s.push_str("GO\n");
     }
     if let Some(i) = t.index {

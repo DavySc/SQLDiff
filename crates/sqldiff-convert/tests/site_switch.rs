@@ -85,6 +85,7 @@ const KILLED: &[&str] = &[
     "crates/sqldiff-core/src/bind/query.rs::unresolved_bare@view.origin()",
     "crates/sqldiff-core/src/engine.rs::diff_inner@schema_a.list_stars_with(&mut schema_b);",
     "crates/sqldiff-equiv/src/equiv/call.rs::case_check@.case_check(&key(n, s.d)?, true)",
+    "crates/sqldiff-equiv/src/equiv/canon.rs::all_columns@None => self.schema.table_exact(",
     "crates/sqldiff-equiv/src/equiv/canon.rs::col_ty@.table(Self::base_table(table))",
     "crates/sqldiff-equiv/src/equiv/canon.rs::fold_check@(Some(x), None) => schema.case_check(x, false)?,",
     "crates/sqldiff-equiv/src/equiv/canon.rs::visible_star@.table(Self::base_table(&b.table))",
@@ -122,7 +123,6 @@ const REDUNDANT: &[&str] = &[
 /// condition described at the test.
 const DOMINATED: &[&str] = &[
     "crates/sqldiff-core/src/bind/query.rs::lookup_table_silent@_ => match self.input.view.table(parts) {",
-    "crates/sqldiff-equiv/src/equiv/canon.rs::all_columns@None => self.schema.table_exact(",
     "crates/sqldiff-equiv/src/equiv/canon.rs::visible_star@b.derived.is_none() && self.schema.is_star_view(&lc(Self::base_table(&b.table)))",
     "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(n), true)?;#2",
     "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(n), x.kind == \"TABLE\")?;",
