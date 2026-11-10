@@ -371,6 +371,13 @@ pub struct Canon<'a> {
     pub d: Dialect,
     pub schema: &'a Schema,
     pub unit: &'a Unit,
+    /// The unit's kind as this lowering reads it: `unit.kind` from
+    /// `Canon::new`, `Script` after `as_script`. Every read of the kind goes
+    /// through this field, never through `unit` (guarded by
+    /// `view_tests::canon_reads_kind_only_through_its_own_field`).
+    kind: UnitKind,
+    /// The unit's `sql_body` as this lowering reads it (see `kind`).
+    sql_body: bool,
     scopes: Vec<Vec<Binding>>,
     pub asm: Vec<Assumption>,
     pub discharged: Vec<String>,
@@ -467,7 +474,9 @@ impl CteScope {
 /// trigger's is the trigger, an inline table-valued function or an inlined
 /// scalar function runs in its caller's query), for a temporary procedure,
 /// and for a schema the header leaves out (the creator's default schema).
-pub(super) fn own_name(u: &Unit, c: &Call) -> Option<String> {
+/// `kind` is the kind the unit is read as (`Canon::as_script` reads a unit
+/// as a script, whatever it is), never `u.kind`.
+pub(super) fn own_name(u: &Unit, kind: UnitKind, c: &Call) -> Option<String> {
     let name = c.name.last()?.to_ascii_lowercase();
     let schema = match name.as_str() {
         "object_name" => false,
@@ -480,7 +489,7 @@ pub(super) fn own_name(u: &Unit, c: &Call) -> Option<String> {
         || !procid
         || c.distinct
         || c.star
-        || u.kind != UnitKind::Proc
+        || kind != UnitKind::Proc
     {
         return None;
     }
@@ -496,8 +505,9 @@ pub(super) fn own_name(u: &Unit, c: &Call) -> Option<String> {
 /// @@PROCID) = 1` (or `uses_quoted_identifier`) in a procedure:
 /// the running routine tests its own setting, which every converted routine
 /// is assumed to have been created with (the converter writes `true`).
-fn module_setting_test(u: &Unit, e: &Expr) -> Option<(&'static str, &'static str)> {
-    if u.dialect != Dialect::Tsql || u.kind != UnitKind::Proc {
+/// `kind` is the kind the unit is read as (see `own_name`).
+fn module_setting_test(u: &Unit, kind: UnitKind, e: &Expr) -> Option<(&'static str, &'static str)> {
+    if u.dialect != Dialect::Tsql || kind != UnitKind::Proc {
         return None;
     }
     let Expr::Bin(op, l, r) = e else { return None };
@@ -544,9 +554,15 @@ fn module_setting_test(u: &Unit, e: &Expr) -> Option<(&'static str, &'static str
 
 /// `e` with a T-SQL `OBJECT_NAME(@@PROCID)` (see `own_name`) read as the
 /// string literal it is.
-pub(super) fn own_name_literal<'e>(u: &Unit, e: &'e Expr) -> std::borrow::Cow<'e, Expr> {
+///
+/// `kind` is the kind the unit is read as (see `Canon::as_script`).
+pub(super) fn own_name_literal<'e>(
+    u: &Unit,
+    kind: UnitKind,
+    e: &'e Expr,
+) -> std::borrow::Cow<'e, Expr> {
     match e {
-        Expr::Call(c) => match own_name(u, c) {
+        Expr::Call(c) => match own_name(u, kind, c) {
             Some(s) => std::borrow::Cow::Owned(Expr::Str(s)),
             None => std::borrow::Cow::Borrowed(e),
         },
@@ -763,6 +779,8 @@ impl<'a> Canon<'a> {
             d: unit.dialect,
             schema,
             unit,
+            kind: unit.kind,
+            sql_body: unit.sql_body,
             scopes: Vec::new(),
             asm: Vec::new(),
             discharged: Vec::new(),
@@ -787,6 +805,21 @@ impl<'a> Canon<'a> {
             output: None,
             rows: false,
         }
+    }
+
+    /// The same lowering read as a script's: a default or CHECK of a table a
+    /// routine creates (a table variable) is evaluated by the statement that
+    /// writes the row, outside any routine body, so its expressions are not
+    /// lowered as PL/pgSQL or T-SQL routine statements. A unit that is not a
+    /// script is read as `UnitKind::Script` without `sql_body`; a script is
+    /// left as it is. Only the kind and `sql_body` change: every other field
+    /// of the unit is read as it is.
+    pub fn as_script(mut self) -> Self {
+        if self.kind != UnitKind::Script {
+            self.kind = UnitKind::Script;
+            self.sql_body = false;
+        }
+        self
     }
 
     pub fn reset(&mut self) {
@@ -1113,7 +1146,12 @@ impl<'a> Canon<'a> {
     }
 
     /// Whether the unit switches `t`'s versioning, or writes (or may write:
-    /// a data statement naming the column) one of its period columns.
+    /// a data statement naming the column) one of its period columns. The
+    /// second half asks whether any `Word` or `Quoted` token of a statement
+    /// that starts with INSERT, UPDATE or MERGE names a period column
+    /// (compared lower-case and unquoted); `Unit::dml_words` holds exactly
+    /// those names, summarised at lowering, so no statement's tokens are read
+    /// here.
     fn drops_period(&self, t: &super::schema::Table) -> bool {
         let switched = self.unit.calls.iter().any(|(node, _)| {
             matches!(
@@ -1128,20 +1166,10 @@ impl<'a> Canon<'a> {
             .filter(|c| c.period)
             .map(|c| c.name.as_str())
             .collect();
-        switched
-            || self.unit.stmts.iter().any(|s| {
-                s.toks
-                    .first()
-                    .is_some_and(|f| matches!(f.up.as_str(), "INSERT" | "UPDATE" | "MERGE"))
-                    && s.toks.iter().any(|x| {
-                        matches!(x.kind, super::ast::K::Word | super::ast::K::Quoted)
-                            && period.contains(
-                                &sqldiff_syntax::ast::unquote(&x.text)
-                                    .to_lowercase()
-                                    .as_str(),
-                            )
-                    })
-            })
+        let found = switched || period.iter().any(|p| self.unit.dml_words.contains(*p));
+        #[cfg(test)]
+        super::lower_tests::drops_period_agrees(self.unit, &period, switched, found);
+        found
     }
 
     fn sym(&self, name: &str) -> Option<(Term, Option<Ty>)> {
@@ -1680,7 +1708,7 @@ impl<'a> Canon<'a> {
     // ---- expressions ----------------------------------------------------
 
     pub fn expr(&mut self, e: &Expr) -> R<(Term, Option<Ty>)> {
-        if let Some(x) = module_setting_test(self.unit, e) {
+        if let Some(x) = module_setting_test(self.unit, self.kind, e) {
             self.assume(x);
             return self.expr(&Expr::Special("TRUE".into()));
         }
@@ -2151,7 +2179,7 @@ impl<'a> Canon<'a> {
     /// draw in another statement or for another caller, which the numbering
     /// does not show, so it stays not compared.
     fn fresh_allowed(&self) -> bool {
-        matches!(self.unit.kind, UnitKind::Proc | UnitKind::Script)
+        matches!(self.kind, UnitKind::Proc | UnitKind::Script)
     }
 
     /// A fresh random value (`ASM-RANDOM-FRESH`). Each draw is numbered in
@@ -2729,7 +2757,7 @@ impl<'a> Canon<'a> {
         // OBJECT_NAME(@@PROCID) and OBJECT_SCHEMA_NAME(@@PROCID): the
         // running procedure's or function's own name, as its header writes
         // it (the converter writes the same literal).
-        if let Some(part) = own_name(self.unit, c) {
+        if let Some(part) = own_name(self.unit, self.kind, c) {
             self.assume(asm::PROCID_NAME);
             return self.expr(&Expr::Str(part));
         }
@@ -3430,7 +3458,7 @@ impl<'a> Canon<'a> {
             // PostgreSQL fixes statement_timestamp() per client message, so inside a
             // routine every statement of one CALL reads the call's start: never the
             // per-statement time T-SQL's SYSDATETIME() gives.
-            (Dialect::Postgres, "statement_timestamp", 0) if self.unit.kind != UnitKind::Script => {
+            (Dialect::Postgres, "statement_timestamp", 0) if self.kind != UnitKind::Script => {
                 self.time("call")
             }
             (Dialect::Postgres, "statement_timestamp", 0) => self.time("stmt"),
@@ -5722,7 +5750,7 @@ impl<'a> Canon<'a> {
             }
         }
         // A procedure's cursor has no declared columns to cast to.
-        if self.d == Dialect::Postgres && self.unit.kind != UnitKind::Proc {
+        if self.d == Dialect::Postgres && self.kind != UnitKind::Proc {
             let items: Vec<&Expr> = match (s, o) {
                 (_, Some(o)) => o.items.iter().map(|i| &i.expr).collect(),
                 (Stmt::Select(q), None) => q.items.iter().map(|i| &i.expr).collect(),
@@ -5743,7 +5771,7 @@ impl<'a> Canon<'a> {
     /// declared result types, one for one.
     fn declared_casts(&self, items: &[&Expr]) -> R<()> {
         let u = self.unit;
-        if u.kind != UnitKind::TableFn || u.sql_body || u.ret_types.is_empty() {
+        if self.kind != UnitKind::TableFn || self.sql_body || u.ret_types.is_empty() {
             return Err("RETURN QUERY outside a PL/pgSQL function RETURNS TABLE".into());
         }
         if items.len() != u.ret_types.len() {
@@ -6028,7 +6056,7 @@ impl<'a> Canon<'a> {
             Stmt::Return(None) => Ok(n("return", vec![])),
             Stmt::Return(Some(e)) => {
                 self.single_row = true;
-                match (self.unit.kind, e) {
+                match (self.kind, e) {
                     (UnitKind::TableFn, Expr::Subquery(q)) => self.resultset(q),
                     (_, Expr::Subquery(q)) => {
                         let (q, qty) = self.query(q, QCtx::Scalar)?;
@@ -6039,7 +6067,7 @@ impl<'a> Canon<'a> {
                     _ => {
                         let v = self.expr(e)?;
                         // A T-SQL procedure returns an int status.
-                        let ret = match (self.unit.dialect, self.unit.kind) {
+                        let ret = match (self.unit.dialect, self.kind) {
                             (Dialect::Tsql, UnitKind::Proc) => Some(Ty {
                                 len: Some(32),
                                 ..Ty::of(Fam::Int)
@@ -6422,7 +6450,7 @@ impl<'a> Canon<'a> {
             let v = (self.scalar(q, many, zero), qty);
             return Ok(n("assign", vec![sym, self.conv_var(&ty, v).0]));
         }
-        match (self.d, self.unit.kind, self.unit.sql_body) {
+        match (self.d, self.kind, self.sql_body) {
             (Dialect::Postgres, UnitKind::ScalarFn, true) => {
                 let (q, qty) = self.query(sel, QCtx::Scalar)?;
                 let v = (self.scalar(q, "first", "null"), qty);
@@ -7661,7 +7689,7 @@ impl<'a> Canon<'a> {
     /// whether it may be NULL.
     fn return_code(&self, x: &Term, y: &Term) -> Option<(Term, bool)> {
         if self.unit.dialect != Dialect::Postgres
-            || self.unit.kind != UnitKind::Proc
+            || self.kind != UnitKind::Proc
             || !y.is("return")
             || !y.kids().is_empty()
             || !x.is("assign")
@@ -7705,7 +7733,8 @@ impl<'a> Canon<'a> {
 
     /// Statement list of the unit, after the cross-statement lifts.
     pub fn lift(&mut self, stmts: Vec<Item>) -> Vec<Item> {
-        let mut out: Vec<Item> = Vec::new();
+        // Merging only removes items, so the input length bounds the result.
+        let mut out: Vec<Item> = Vec::with_capacity(stmts.len());
         for mut it in stmts {
             // T-SQL: INSERT ...; SET @v = SCOPE_IDENTITY();
             let t = it.term.clone();

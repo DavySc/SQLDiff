@@ -96,13 +96,18 @@ fn side_name(a: &Analyzed) -> String {
 }
 
 /// Lowers every data statement of a unit, to compare with statements in
-/// dialect `other`.
+/// dialect `other`. A statement that does not canonicalise is compared as its
+/// tokens (a `raw` term), which it re-tokenises for the purpose
+/// ([`lower::LStmt::toks`]): the unit holds no token lists.
 fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Item> {
+    #[cfg(test)]
+    lower_tests::check_unit(unit);
     let mut c = Canon::new(unit, schema);
     c.by_name = by_name;
     c.fold_quoted = other == Dialect::Tsql;
     c.other = Some(other);
-    let mut out = Vec::new();
+    // At most one item per statement and per marker.
+    let mut out = Vec::with_capacity(unit.stmts.len() + unit.ctl.len());
     let mut stmts = unit.stmts.iter().enumerate().peekable();
     let mut ctl = unit.ctl.iter().peekable();
     loop {
@@ -152,7 +157,7 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Ite
                 n(
                     "raw",
                     std::iter::once(a(unit.dialect.id()))
-                        .chain(s.toks.iter().map(|t| {
+                        .chain(s.toks().iter().map(|t| {
                             // Only keywords and unquoted names fold; literals and
                             // quoted identifiers keep their case.
                             a(if t.kind == ast::K::Word {
@@ -181,17 +186,19 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Ite
 
 /// The binary variables a statement passes to a geography-from-WKB call, with
 /// the bytes the code before the statement fixes them to
-/// ([`known_bytes::before`]); the others are left out.
+/// ([`known_bytes::before`]); the others are left out. It takes the
+/// statement's tokens on demand ([`lower::LStmt::toks`]), once, and a
+/// statement that does not mention the call ends after one scan of them.
 fn known_wkb_args(unit: &Unit, s: &lower::LStmt) -> Vec<(String, String)> {
-    let mentions_wkb = s
-        .toks
+    let toks = s.toks();
+    let mentions_wkb = toks
         .iter()
         .any(|t| matches!(t.up.as_str(), "STGEOMFROMWKB" | "ST_GEOMFROMWKB"));
     if !mentions_wkb {
         return Vec::new();
     }
     let mut out: Vec<(String, String)> = Vec::new();
-    for t in &s.toks {
+    for t in toks.iter() {
         let name = match (unit.dialect, t.kind) {
             (Dialect::Tsql, ast::K::Var) if !t.text.starts_with("@@") => t.text[1..].to_lowercase(),
             (Dialect::Postgres, ast::K::Word)
@@ -353,14 +360,18 @@ pub fn compare_within(
     if let Some(pairs) = trigger::pairs(a, b, sa, sb, &mut out) {
         for (mut ua, mut ub, sa, sb) in pairs {
             tv_names(a, b, &mut ua, &mut ub);
-            compare_units(a, b, &ua, &ub, &sa, &sb, anchors, allowance, &mut out);
+            compare_units(
+                a, b, &mut ua, &mut ub, &sa, &sb, anchors, allowance, &mut out,
+            );
         }
         return out;
     }
     if let Some(e) = trigger::embedded(a, b, sa, sb, &mut out) {
         for (mut ua, mut ub, sa, sb) in e.pairs {
             tv_names(a, b, &mut ua, &mut ub);
-            compare_units(a, b, &ua, &ub, &sa, &sb, anchors, allowance, &mut out);
+            compare_units(
+                a, b, &mut ua, &mut ub, &sa, &sb, anchors, allowance, &mut out,
+            );
         }
         // The rest of the artifacts, with the triggers and what was written
         // for them blanked out (same offsets and lines).
@@ -424,19 +435,21 @@ fn compare_rest(
     for (mut ua, mut ub) in pairs {
         script::name_locals(&mut ua, &mut ub);
         tv_names(a, b, &mut ua, &mut ub);
-        compare_units(a, b, &ua, &ub, sa, sb, anchors, allowance, out);
+        compare_units(a, b, &mut ua, &mut ub, sa, sb, anchors, allowance, out);
     }
 }
 
 /// T-SQL against PostgreSQL or Db2 for i: the other side's temporary
-/// tables, which the T-SQL side's table variables may have become.
+/// tables, which the T-SQL side's table variables may have become. Each
+/// set is the cached one of the `Analyzed` passed in, which may be a
+/// blanked copy built from edited text (its own tree, its own set).
 fn tv_names(a: &Analyzed, b: &Analyzed, ua: &mut Unit, ub: &mut Unit) {
     let tsql = sqldiff_syntax::Dialect::Tsql;
     if a.dialect() == tsql && b.dialect() != tsql {
-        ua.other_temps = crate::classify::temp_table_names(&b.root);
+        ua.other_temps = b.temp_table_names().clone();
     }
     if b.dialect() == tsql && a.dialect() != tsql {
-        ub.other_temps = crate::classify::temp_table_names(&a.root);
+        ub.other_temps = a.temp_table_names().clone();
     }
 }
 
@@ -498,12 +511,16 @@ fn local_schema<'s>(schema: &'s Schema, u: &Unit) -> std::borrow::Cow<'s, Schema
     out
 }
 
+/// Compares one pair of units. The units are lent mutably only so that
+/// `compare_units_within` can read a result-set function's `RETURN 0` as
+/// `RETURN` in place (`zero_status`) instead of on copies; the caller does
+/// not use them afterwards.
 #[allow(clippy::too_many_arguments)]
 fn compare_units(
     a: &Analyzed,
     b: &Analyzed,
-    ua: &Unit,
-    ub: &Unit,
+    ua: &mut Unit,
+    ub: &mut Unit,
     sa: &Schema,
     sb: &Schema,
     anchors: &[Anchor],
@@ -525,12 +542,17 @@ fn budget_reason(allowance: &Allowance) -> String {
     )
 }
 
+/// `compare_units`' comparison. When a T-SQL procedure became a function
+/// RETURNS TABLE, its units' statements are rewritten in place (see
+/// `zero_status`): nothing before that point reads a `RETURN 0` statement's
+/// `ast` (the budget path and `local_schema` read nodes, tables and
+/// declarations only), and nothing after it needs the statements as they were.
 #[allow(clippy::too_many_arguments)]
 fn compare_units_within(
     a: &Analyzed,
     b: &Analyzed,
-    ua: &Unit,
-    ub: &Unit,
+    ua: &mut Unit,
+    ub: &mut Unit,
     sa: &Schema,
     sb: &Schema,
     anchors: &[Anchor],
@@ -549,7 +571,7 @@ fn compare_units_within(
         out.unknown_reasons.push(format!(
             "a routine or script segment is {why}: it and everything in it is not proven"
         ));
-        for (side, u) in [(a, ua), (b, ub)] {
+        for (side, u) in [(a, &*ua), (b, &*ub)] {
             let name = side_name(side);
             let (hs, he) = u.header_at;
             // A script segment has no routine header (`header_at` is empty).
@@ -681,15 +703,11 @@ fn compare_units_within(
     // A procedure that became a function RETURNS TABLE: its `RETURN 0`
     // sets the status every T-SQL procedure returns anyway, which nothing
     // reads from the function, so it is a plain RETURN.
-    let (za, zb);
-    let (ua, ub) = match result_set_function(ua, ub, &na, &nb) {
-        Some(Ok(())) => {
-            za = zero_status(ua);
-            zb = zero_status(ub);
-            (&za, &zb)
-        }
-        _ => (ua, ub),
-    };
+    if matches!(result_set_function(ua, ub, &na, &nb), Some(Ok(()))) {
+        zero_status(ua);
+        zero_status(ub);
+    }
+    let (ua, ub): (&Unit, &Unit) = (ua, ub);
     for (side, u, name) in [(a, ua, &na), (b, ub, &nb)] {
         for (node, what) in &u.uncovered {
             let at = side.line_of(node);
@@ -1612,11 +1630,13 @@ fn same_stmt(
     na: &str,
     nb: &str,
 ) -> Same {
-    same_stmt_in(x, y, ua, ub, sa, sb, na, nb, false)
+    same_stmt_in(x, y, ua, ub, sa, sb, na, nb, false, false)
 }
 
 /// `same_stmt`; `stored` when the expressions' values are stored in a
-/// column (computed columns), see `Canon::stored_values`.
+/// column (computed columns), see `Canon::stored_values`; `script` when each
+/// unit is read as a script's (`Canon::as_script`), as `table_pair` does for
+/// the expressions of a table a routine creates.
 #[allow(clippy::too_many_arguments)]
 fn same_stmt_in(
     x: &[ast::Tok],
@@ -1628,6 +1648,7 @@ fn same_stmt_in(
     na: &str,
     nb: &str,
     stored: bool,
+    script: bool,
 ) -> Same {
     let lowered = |toks: &[ast::Tok],
                    u: &Unit,
@@ -1636,6 +1657,9 @@ fn same_stmt_in(
      -> Result<(Term, Vec<Assumption>), String> {
         let (st, out) = ast::parse_stmt_output(toks, u.dialect)?;
         let mut c = Canon::new(u, s);
+        if script {
+            c = c.as_script();
+        }
         c.fold_quoted = other.dialect == Dialect::Tsql;
         c.stored_values = stored;
         c.other = Some(other.dialect);
@@ -2709,20 +2733,19 @@ fn table_pair(
     out: &mut Outcome,
 ) {
     use ast::K;
+    let (na, nb) = (side_name(a), side_name(b));
     // A default or CHECK is evaluated by the statement that writes the row,
     // outside any routine body: a table a routine creates (a table variable)
     // has its expressions compared as a script's, not as PL/pgSQL statements.
-    let script = |u: &Unit| {
-        (u.kind != UnitKind::Script).then(|| {
-            let mut u = u.clone();
-            u.kind = UnitKind::Script;
-            u.sql_body = false;
-            u
-        })
+    // `same_stmt_in(.., script = true)` reads each unit's kind as a script's
+    // (`Canon::as_script`) without copying the unit: nothing else of the unit
+    // differs, and `ua.dialect` and `ub.dialect` are the units' own.
+    let same = |x: &[ast::Tok], y: &[ast::Tok], sa: &Schema, sb: &Schema, stored: bool| -> Same {
+        let r = same_stmt_in(x, y, ua, ub, sa, sb, &na, &nb, stored, true);
+        #[cfg(test)]
+        view_tests::agrees_with_clone(x, y, ua, ub, sa, sb, &na, &nb, stored, &r);
+        r
     };
-    let (sua, sub) = (script(ua), script(ub));
-    let (ua, ub) = (sua.as_ref().unwrap_or(ua), sub.as_ref().unwrap_or(ub));
-    let (na, nb) = (side_name(a), side_name(b));
     let (xa, xb) = (p.xa, p.xb);
     let (la, lb) = (a.line_of(xa), b.line_of(xb));
     let what = &p.what;
@@ -2828,7 +2851,7 @@ fn table_pair(
                     v.extend(e.iter().cloned());
                     v
                 };
-                match same_stmt(&select(&ea), &select(&eb), ua, ub, sa, sb, &na, &nb) {
+                match same(&select(&ea), &select(&eb), sa, sb, false) {
                     Same::Yes(xs) => xs.into_iter().for_each(|x| add(&mut asms, x)),
                     Same::No(class, rule, w) => {
                         found = true;
@@ -2864,15 +2887,11 @@ fn table_pair(
                     v.extend(name.iter().cloned());
                     v
                 };
-                match same_stmt_in(
+                match same(
                     &select(&ea, &ta.name_toks),
                     &select(&eb, &tb.name_toks),
-                    ua,
-                    ub,
                     sa2,
                     sb2,
-                    &na,
-                    &nb,
                     true,
                 ) {
                     Same::Yes(xs) => xs.into_iter().for_each(|x| add(&mut asms, x)),
@@ -2919,15 +2938,12 @@ fn table_pair(
                     v.push(synth(K::RParen, ")"));
                     v
                 };
-                match same_stmt(
+                match same(
                     &rejected(&ea, &ta.name_toks),
                     &rejected(&eb, &tb.name_toks),
-                    ua,
-                    ub,
                     sa2,
                     sb2,
-                    &na,
-                    &nb,
+                    false,
                 ) {
                     Same::Yes(xs) => xs.into_iter().for_each(|x| add(&mut asms, x)),
                     Same::No(class, rule, w) => {
@@ -4246,7 +4262,7 @@ fn result_cursors(ua: &Unit, ub: &Unit, na: &str, nb: &str) -> Option<Result<Uni
                 {
                     return Err(format!("{name} returns rows other than a plain SELECT"));
                 }
-                if let Some(w) = lazy_call(&u.stmts[r.at].toks) {
+                if let Some(w) = lazy_call(&u.stmts[r.at].toks()) {
                     return Err(format!("a result query of {name} uses {w}, which PostgreSQL evaluates when the rows are fetched, not when the cursor is opened"));
                 }
             }
@@ -4490,9 +4506,9 @@ fn result_set_atomic(p: &Unit, np: &str, nf: &str) -> Result<(), String> {
     }
 }
 
-/// `u` with each T-SQL `RETURN 0` read as `RETURN` (see `compare_units`).
-fn zero_status(u: &Unit) -> Unit {
-    let mut u = u.clone();
+/// Reads each T-SQL `RETURN 0` of `u` as `RETURN`, in place (see
+/// `compare_units_within`).
+fn zero_status(u: &mut Unit) {
     if u.dialect == Dialect::Tsql {
         for s in &mut u.stmts {
             if matches!(&s.ast, Ok(ast::Stmt::Return(Some(ast::Expr::Num(v)))) if v == "0") {
@@ -4500,7 +4516,6 @@ fn zero_status(u: &Unit) -> Unit {
             }
         }
     }
-    u
 }
 
 fn signature(ua: &Unit, ub: &Unit, na: &str, nb: &str, out: &mut Outcome) {
@@ -5997,6 +6012,11 @@ pub fn refine_modified(
     }
     *findings = keep;
 }
+
+#[cfg(test)]
+mod lower_tests;
+#[cfg(test)]
+mod view_tests;
 
 #[cfg(test)]
 mod crossing_tests {

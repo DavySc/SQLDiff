@@ -156,11 +156,40 @@ fn load_catalog(
 
 impl ConfigArgs {
     pub fn resolve(&self) -> Result<Resolved, String> {
+        self.resolve_from(None)
+    }
+
+    /// The directory of the project config in effect when looking from `dir`
+    /// (the working directory if none): the one `--config` names, else the
+    /// nearest `sqldiff.toml`; none under `--isolated`.
+    pub fn project_dir(&self, dir: Option<&Path>) -> Option<PathBuf> {
+        let file = match (&self.config, self.isolated) {
+            (Some(f), _) => f.clone(),
+            (None, true) => return None,
+            (None, false) => {
+                let start = match dir {
+                    Some(d) => d.to_path_buf(),
+                    None => std::env::current_dir().ok()?,
+                };
+                config::find_project(&start)?
+            }
+        };
+        let file = if file.is_absolute() {
+            file
+        } else {
+            std::env::current_dir().ok()?.join(file)
+        };
+        file.parent().map(Path::to_path_buf)
+    }
+
+    /// As [`resolve`](Self::resolve), looking for the project config from
+    /// `dir` upward instead of the working directory.
+    pub fn resolve_from(&self, dir: Option<PathBuf>) -> Result<Resolved, String> {
         let sources = Sources {
             project: self.config.clone(),
             user: self.user_config.clone(),
             isolated: self.isolated,
-            cwd: None,
+            cwd: dir,
             packs: self.packs.clone(),
             cli: {
                 let mut l = config::cli_layer(&self.assume, &self.dialect_versions, None)

@@ -19,7 +19,8 @@ use sqldiff_equiv::catalog::ParamMode;
 use sqldiff_equiv::classify::{pg_rolls_back, rollback_rethrow};
 
 use crate::tok::{
-    find_word, matching, next_sig, prev_sig, sig, snake, split_commas, tokens, trimmed, T,
+    any_sig, count_tokens, find_word, lead_words, matching, next_sig, prev_sig, sig, snake,
+    split_commas, tokens, trimmed, T,
 };
 use sqldiff_units::out::Out;
 use sqldiff_units::{Note, Status};
@@ -893,9 +894,7 @@ impl<'a> Cx<'a> {
     }
 
     fn routine_once(&mut self, out: &mut Out, r: &SyntaxNode) {
-        let ts = tokens(r);
-        let s = sig(&ts);
-        let words: Vec<String> = s.iter().take(4).map(|&i| ts[i].up()).collect();
+        let words = lead_words(r, 4);
         let kind = words
             .iter()
             .find(|w| ["PROC", "PROCEDURE", "FUNCTION", "VIEW", "TRIGGER"].contains(&w.as_str()))
@@ -990,7 +989,9 @@ impl<'a> Cx<'a> {
         self.rs_cursors.clear();
         self.cursor_why = None;
         self.txn_control = false;
-        let all = tokens(r);
+        // The one full token list of the routine: the body's tokens are
+        // dropped as soon as nothing reads them, so only the header stays.
+        let mut all = tokens(r);
         self.dynamic = dynamic_sql_vars(&all);
         let mode = std::mem::replace(&mut self.mode, if func { Mode::Func } else { Mode::Proc });
         self.drop_known_dynamic(r);
@@ -998,8 +999,10 @@ impl<'a> Cx<'a> {
         let body_at = all.len()
             - r.children()
                 .find(|c| c.kind() == ROUTINE_BODY)
-                .map_or(0, |b| tokens(&b).len());
-        let ts = &all[..body_at];
+                .map_or(0, |b| count_tokens(&b));
+        all.truncate(body_at);
+        all.shrink_to_fit();
+        let ts = &all[..];
         let kw = ts
             .iter()
             .position(|t| t.is("PROC") || t.is("PROCEDURE") || t.is("FUNCTION"))
@@ -10698,25 +10701,25 @@ fn autocommit_points(body: &SyntaxNode) -> Option<Vec<usize>> {
         }
         Some(())
     }
-    let all: Vec<T> = tokens(body).into_iter().filter(|t| t.sig()).collect();
-    let banned = all.iter().any(|t| {
-        [
-            "ROLLBACK",
-            "SAVE",
-            "XACT_STATE",
-            "RAISERROR",
-            "CURSOR",
-            "GOTO",
-            "IMPLICIT_TRANSACTIONS",
-            "ISOLATION",
-        ]
-        .iter()
-        .any(|w| t.is(w))
-            || t.s.eq_ignore_ascii_case("@@TRANCOUNT")
-    }) || all
-        .windows(2)
-        .any(|w| w[0].is("XACT_ABORT") && w[1].is("OFF"))
-        || body.descendants().any(|d| d.kind() == TRY_CATCH);
+    let banned = any_sig(
+        body,
+        |t| {
+            [
+                "ROLLBACK",
+                "SAVE",
+                "XACT_STATE",
+                "RAISERROR",
+                "CURSOR",
+                "GOTO",
+                "IMPLICIT_TRANSACTIONS",
+                "ISOLATION",
+            ]
+            .iter()
+            .any(|w| t.is(w))
+                || t.s.eq_ignore_ascii_case("@@TRANCOUNT")
+        },
+        |a, b| a.is("XACT_ABORT") && b.is("OFF"),
+    ) || body.descendants().any(|d| d.kind() == TRY_CATCH);
     if banned {
         return None;
     }
@@ -10772,39 +10775,39 @@ fn autocommit_points(body: &SyntaxNode) -> Option<Vec<usize>> {
 /// after a failure and the plain conversion is equal. Checked on SQL Server
 /// 2022 and PostgreSQL 18: `eval/xact-abort/`.
 fn continuation_points(body: &SyntaxNode) -> Option<Vec<(usize, bool)>> {
-    let all: Vec<T> = tokens(body).into_iter().filter(|t| t.sig()).collect();
-    let banned = all.iter().any(|t| {
-        [
-            "ROLLBACK",
-            "COMMIT",
-            "SAVE",
-            "TRAN",
-            "TRANSACTION",
-            "XACT_STATE",
-            "RAISERROR",
-            "THROW",
-            "CURSOR",
-            "GOTO",
-            "IMPLICIT_TRANSACTIONS",
-            "ISOLATION",
-            "TRY",
-            "WAITFOR",
-            // A call's own COMMIT cannot run inside the subtransaction of
-            // an exception block (2D000), and dynamic SQL has no probed
-            // error continuation.
-            "EXEC",
-            "EXECUTE",
-        ]
-        .iter()
-        .any(|w| t.is(w))
-            || t.s.eq_ignore_ascii_case("@@TRANCOUNT")
-            || t.s.eq_ignore_ascii_case("@@ERROR")
-    }) || all
-        .windows(2)
-        .any(|w| w[0].is("XACT_ABORT") && w[1].is("ON"))
-        || body
-            .descendants()
-            .any(|d| matches!(d.kind(), TRY_CATCH | IF_STMT | LOOP_STMT));
+    let banned = any_sig(
+        body,
+        |t| {
+            [
+                "ROLLBACK",
+                "COMMIT",
+                "SAVE",
+                "TRAN",
+                "TRANSACTION",
+                "XACT_STATE",
+                "RAISERROR",
+                "THROW",
+                "CURSOR",
+                "GOTO",
+                "IMPLICIT_TRANSACTIONS",
+                "ISOLATION",
+                "TRY",
+                "WAITFOR",
+                // A call's own COMMIT cannot run inside the subtransaction of
+                // an exception block (2D000), and dynamic SQL has no probed
+                // error continuation.
+                "EXEC",
+                "EXECUTE",
+            ]
+            .iter()
+            .any(|w| t.is(w))
+                || t.s.eq_ignore_ascii_case("@@TRANCOUNT")
+                || t.s.eq_ignore_ascii_case("@@ERROR")
+        },
+        |a, b| a.is("XACT_ABORT") && b.is("ON"),
+    ) || body
+        .descendants()
+        .any(|d| matches!(d.kind(), TRY_CATCH | IF_STMT | LOOP_STMT));
     if banned {
         return None;
     }

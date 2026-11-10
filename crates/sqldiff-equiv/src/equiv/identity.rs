@@ -424,7 +424,7 @@ impl<'a> Side<'a> {
             }
             Ev::Stmt(s) => {
                 let mut plain: Option<Var> = None;
-                let mut kills: BTreeSet<Var> = self.token_writes(&s.toks);
+                let mut kills: BTreeSet<Var> = self.token_writes(&s.toks());
                 match &s.ast {
                     Ok(st) if s.msg.is_none() && s.cursor.is_none() => {
                         if let Some((t, _)) = st.assignment() {
@@ -482,7 +482,7 @@ impl<'a> Side<'a> {
                     }
                     // A statement the parser did not read (or a cursor or
                     // message statement) may write any variable it names.
-                    _ => kills.extend(self.mentioned(&s.toks)),
+                    _ => kills.extend(self.mentioned(&s.toks())),
                 }
                 if let Some(v) = plain {
                     // Only an item the statement level paired as a plain
@@ -1056,12 +1056,13 @@ fn variable_facts(ua: &Unit, ub: &Unit, sa: &Side<'_>) -> Vec<Result<Asms, Strin
     out
 }
 
-/// A label or `GOTO`: control flow the structured walk does not follow.
+/// A label or `GOTO`: control flow the structured walk does not follow. The
+/// first token of each statement is read on demand ([`LStmt::toks`]).
 fn jumps(u: &Unit) -> Option<String> {
     let goto = |t: &[super::ast::Tok]| t.first().is_some_and(|f| f.up == "GOTO");
     let hit = u.uncovered.iter().any(|(n, what)| {
         what.contains("label") || goto(&tokens(n)) || tokens(n).iter().any(|t| t.up == "GOTO")
-    }) || u.stmts.iter().any(|s| goto(&s.toks));
+    }) || u.stmts.iter().any(|s| goto(&s.toks()));
     hit.then(|| "a label or GOTO makes control flow the analysis does not follow".to_string())
 }
 
@@ -1113,7 +1114,9 @@ pub(super) fn analyze(
         memo: BTreeMap::new(),
     };
     // Event of each condition item, per side.
-    let ev_of = |s: &Side<'_>, k: usize| s.item_of.iter().position(|x| *x == Some((k, true)));
+    // `item_of` is fixed when a side is built and `classify` never changes
+    // it, so one index per side stays valid for every pair.
+    let (first_a, first_b) = (first_event_of(&an.a.item_of), first_event_of(&an.b.item_of));
     for &(i, j) in pairs {
         let (x, y) = (&ia[i], &ib[j]);
         let kind = match x.term.head() {
@@ -1124,7 +1127,7 @@ pub(super) fn analyze(
         if y.term.head() != x.term.head() {
             continue;
         }
-        let (Some(ea), Some(eb)) = (ev_of(&an.a, i), ev_of(&an.b, j)) else {
+        let (Some(&ea), Some(&eb)) = (first_a.get(&i), first_b.get(&j)) else {
             continue;
         };
         let (Ev::Ctl(ma), Ev::Ctl(mb)) = (&an.a.ev[ea], &an.b.ev[eb]) else {
@@ -1144,6 +1147,18 @@ pub(super) fn analyze(
     }
     rep.rows.sort_by_key(|r| (r.a_start, r.b_start));
     rep
+}
+
+/// For each item `k`, the first event index `e` with `item_of[e] ==
+/// Some((k, true))` (the same event `position` would find).
+fn first_event_of(item_of: &[Option<(usize, bool)>]) -> BTreeMap<usize, usize> {
+    let mut m = BTreeMap::new();
+    for (e, x) in item_of.iter().enumerate() {
+        if let Some((k, true)) = *x {
+            m.entry(k).or_insert(e);
+        }
+    }
+    m
 }
 
 fn classify(
@@ -1184,4 +1199,32 @@ fn classify(
         }
     }
     (class, asms)
+}
+
+#[cfg(test)]
+mod first_event_tests {
+    use super::first_event_of;
+
+    #[test]
+    fn index_matches_position() {
+        let v = vec![
+            None,
+            Some((2, false)),
+            Some((2, true)),
+            None,
+            Some((0, true)),
+            Some((2, true)),
+            Some((0, false)),
+            Some((3, false)),
+            Some((0, true)),
+        ];
+        let m = first_event_of(&v);
+        for k in 0..6 {
+            assert_eq!(
+                m.get(&k).copied(),
+                v.iter().position(|x| *x == Some((k, true))),
+                "k={k}"
+            );
+        }
+    }
 }

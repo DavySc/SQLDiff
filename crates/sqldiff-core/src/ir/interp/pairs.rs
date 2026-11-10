@@ -144,7 +144,7 @@ impl Interp<'_> {
                     .1
                     .signature
                     .last()
-                    .map(|x| x.0.clone())
+                    .map(|x| x.0.to_string())
                     .unwrap_or_default();
                 Ok((c, v))
             }
@@ -353,6 +353,8 @@ pub fn measure(
     let first = |i: &Interp, ticks: &mut u64| {
         let st = i.start();
         let (n, s) = st.work.into_iter().next().unwrap();
+        // The only holder of the fresh state: a move, no copy.
+        let s = Box::new(Rc::try_unwrap(s).unwrap_or_else(|shared| State::clone(&shared)));
         i.to_decision(n, s, ticks)
     };
     let root = (first(&ia, &mut ticks), first(&ib, &mut ticks));

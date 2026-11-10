@@ -587,6 +587,10 @@ fn diff_inner(
         a: (&aa, &bound_a, read_a.supplied()),
         b: Some((&ab, &bound_b, read_b.supplied())),
     });
+    // The bindings are read only by `binding_findings`, and they are large on
+    // big routines (hundreds of MB), so they are freed before the behaviour phase.
+    drop(bound_a);
+    drop(bound_b);
     absorb_residue(&mut findings, &bindf);
     findings.extend(bindf);
     for x in binda {
@@ -804,6 +808,9 @@ pub fn check_recorded(
         a: (&aa, &bound, read.supplied()),
         b: None,
     });
+    // The bindings are read only by `binding_findings`, and they are large on
+    // big routines (hundreds of MB), so they are freed before the rest of the check.
+    drop(bound);
     absorb_residue(&mut findings, &bindf);
     findings.extend(bindf);
     let diagnostics = aa.diagnostics();

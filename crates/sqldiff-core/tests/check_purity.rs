@@ -25,11 +25,27 @@
 //! - `behaviour.rs` (`sqldiff-core`) holds a test-only switch that turns its
 //!   explorer and flipped-scenario caches off; results and work counts are
 //!   the same either way.
+//! - `cfg/route_tests.rs` (`sqldiff-core`) is a test module: it reads the
+//!   corpus files (and, in an ignored test, directories named by an
+//!   environment variable) to compare the CFG's shared routes with their
+//!   oracle. It is compiled only for tests.
+//! - `view_tests.rs` (`sqldiff-equiv`) is a test module: it reads the corpus
+//!   files and `canon.rs` to compare `table_pair`'s script reading of a unit
+//!   with the clone it replaced. It is compiled only for tests.
+//! - `lower_tests.rs` (`sqldiff-equiv`) is a test module: it reads the corpus
+//!   files to compare the per-unit summary of `drops_period` with the scan of
+//!   every statement's tokens it replaced. It is compiled only for tests.
+//! - `interp/cursor_oracle.rs` (`sqldiff-core`) is a test module: it compares
+//!   the merge test's restored cursor machine with the walk it replaced, only
+//!   while a test turns it on, and counts what it checked, both in
+//!   thread-locals. It is compiled only for tests and changes no result.
 //! - `work.rs` (`sqldiff-model`): the per-file work meter, a thread-local
 //!   counter of deterministic events; `SQLDIFF_WORK` only prints it. It
 //!   counts and never changes a result.
 //! - `record.rs` (`sqldiff-catalog`): the recorder collects the check's own reads
 //!   (a write-only sink; nothing the check computes depends on it).
+//! - `artifact.rs` (`sqldiff-model`) caches `Analyzed::temp_table_names`, a
+//!   pure function of the immutable parse tree, in a private `OnceCell`.
 //! - `abstract_syntax.rs` (`sqldiff-syntax`) keeps a bounded per-thread cache of the
 //!   tokens of a node (`tokens_shared`), a pure function of the node.
 
@@ -96,11 +112,34 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ),
     ("sqldiff-equiv/src/equiv/mod.rs", &["OnceCell", "env::var"]),
     ("sqldiff-equiv/src/equiv/schema.rs", &["OnceLock", "fs::"]),
+    // Test-only: reads the corpus and `canon.rs`; counts its comparisons in a
+    // thread-local.
+    (
+        "sqldiff-equiv/src/equiv/view_tests.rs",
+        &["fs::", "thread_local!"],
+    ),
+    // Test-only: reads the corpus; counts what it checked in thread-locals.
+    (
+        "sqldiff-equiv/src/equiv/lower_tests.rs",
+        &["fs::", "thread_local!"],
+    ),
+    // Test-only: the oracle's on/off switch and its counter.
+    (
+        "sqldiff-core/src/ir/interp/cursor_oracle.rs",
+        &["thread_local!"],
+    ),
     ("sqldiff-core/src/format/tests.rs", &["fs::"]),
+    // Test-only: reads the corpus and, in an ignored test, the corpora a
+    // developer names.
+    (
+        "sqldiff-core/src/ir/cfg/route_tests.rs",
+        &["env::var", "fs::"],
+    ),
     (
         "sqldiff-core/src/ir/behaviour.rs",
         &["OnceCell", "thread_local!"],
     ),
+    ("sqldiff-model/src/artifact.rs", &["OnceCell"]),
     ("sqldiff-model/src/profile.rs", &["OnceLock"]),
     ("sqldiff-core/src/lint.rs", &["OnceLock"]),
     ("sqldiff-core/src/rule_proofs.rs", &["OnceLock"]),

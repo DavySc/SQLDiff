@@ -23,6 +23,13 @@
 //!   fault on. The restore from the nearest checkpoint is [`muted`], so the
 //!   spacing of the checkpoints does not matter; the ticks before the fault
 //!   were counted when the fault-free run was made.
+//! * The merge test of a replay (`Explorer::try_merge`) reads the fault-free
+//!   run at each candidate tick. Walking the fault-free run from the
+//!   cursor to the candidate is counted: `candidate - cursor` steps, one per
+//!   tick, charged as the walk was before the machine was restored. The
+//!   machine itself is restored from the nearest checkpoint (muted), so the
+//!   spacing of the checkpoints does not matter here either. The count is the
+//!   walk's, not the restore's.
 //! * Knobs that only cut work short, such as the bound on merge tries of a
 //!   replay (`MAX_MERGE_TRIES`), change what a scenario runs, so tuning one
 //!   moves the totals. They are listed with the cap when it exists.
