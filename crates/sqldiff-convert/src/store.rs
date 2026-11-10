@@ -44,10 +44,15 @@ pub const DIR: &str = ".sqldiff/results";
 /// Where a mismatch writes its diagnostic bundle.
 /// The state of the whole tree that the per-file checks start from.
 pub const TREE_DIR: &str = ".sqldiff/tree";
-/// The rules' drafts of the files of one tree, one file each under a folder
-/// named by the key of the tree, written as pass 1 goes. They survive a run
-/// killed in pass 1 and are dropped once the whole tree state is stored.
+/// The rules' drafts of the files of one tree (the layout before drafts were
+/// stored by their read sets): never written now, removed when found.
 pub const DRAFTS_DIR: &str = ".sqldiff/drafts";
+/// The rules' drafts, one entry per file text and read set:
+/// `<draft key>/<id>.json` (the draft) and `<id>.reads` (what pass 1 read of
+/// the tree to make it). Written as pass 1 goes, so a run killed in pass 1
+/// keeps its work, and kept across edits: a draft is taken again when its
+/// text is the same and everything it read still has its answer.
+pub const DRAFT_ENTRIES_DIR: &str = ".sqldiff/draft-entries";
 
 /// The stand-in flags of each stored result: `<result key>/<flags key>.json`.
 pub const FLAGS_DIR: &str = ".sqldiff/flags";
@@ -365,21 +370,6 @@ fn is_key(name: &str) -> bool {
 /// A temporary result file older than this belongs to a write that was
 /// killed, not to one in flight.
 const STALE_TMP: std::time::Duration = std::time::Duration::from_secs(3600);
-
-/// What a draft file holds.
-#[derive(Deserialize)]
-struct DraftEntry {
-    key: String,
-    rel: String,
-    draft: crate::Draft,
-}
-
-#[derive(Serialize)]
-struct DraftEntryRef<'a> {
-    key: &'a str,
-    rel: &'a str,
-    draft: &'a crate::Draft,
-}
 
 /// A string at least this long that occurs twice goes to the pool.
 const POOL_MIN: usize = 40;
@@ -1157,7 +1147,7 @@ impl Store {
 
     /// Empties the store (after a mismatch).
     pub fn clear(&self) {
-        for d in [DIR, TREE_DIR, DRAFTS_DIR, FLAGS_DIR] {
+        for d in [DIR, TREE_DIR, DRAFTS_DIR, DRAFT_ENTRIES_DIR, FLAGS_DIR] {
             if let Ok(p) = crate::tree::dest_under(&self.out, d) {
                 let _ = std::fs::remove_dir_all(p);
             }
@@ -1430,72 +1420,6 @@ impl Store {
             let _ = std::fs::remove_file(&tmp);
             format!("{}: {e}", dest.display())
         })
-    }
-
-    fn draft_rel(key: &TreeKey, rel: &str) -> String {
-        let h = Sha256::digest(rel.as_bytes());
-        let name: String = h.iter().map(|b| format!("{b:02x}")).collect();
-        format!("{DRAFTS_DIR}/{}/{name}.json", key.0)
-    }
-
-    /// The stored draft of file `rel` of the tree `key`. A file that does
-    /// not read back whole, or does not name its own tree and path, is a
-    /// miss.
-    pub fn get_draft(&self, key: &TreeKey, rel: &str) -> Option<crate::Draft> {
-        let path = crate::tree::dest_under(&self.out, &Self::draft_rel(key, rel)).ok()?;
-        let raw = std::fs::read(path).ok()?;
-        let e: DraftEntry = serde_json::from_slice(verified_body(&raw)?).ok()?;
-        (e.key == key.0 && e.rel == rel).then_some(e.draft)
-    }
-
-    /// Stores the draft of file `rel` of the tree `key`, whole or not at
-    /// all. Another tree's drafts are dropped first. Failing to store is
-    /// not an error: the run builds the draft itself.
-    pub fn put_draft(&self, key: &TreeKey, rel: &str, draft: &crate::Draft) {
-        let e = DraftEntryRef {
-            key: &key.0,
-            rel,
-            draft,
-        };
-        let Ok(body) = serde_json::to_vec(&e) else {
-            return;
-        };
-        let bytes = framed(&body);
-        let Ok(dest) = crate::tree::dest_under(&self.out, &Self::draft_rel(key, rel)) else {
-            return;
-        };
-        let Some(dir) = dest.parent() else { return };
-        if std::fs::create_dir_all(dir).is_err() {
-            return;
-        }
-        let tmp = dest.with_extension(format!("tmp{}", std::process::id()));
-        if std::fs::write(&tmp, &bytes).is_err() || std::fs::rename(&tmp, &dest).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-    }
-
-    /// Drops the drafts of every tree except `key`'s (a tree that changed
-    /// leaves nothing of use behind).
-    pub fn keep_drafts_of(&self, key: &TreeKey) {
-        let Ok(root) = crate::tree::dest_under(&self.out, DRAFTS_DIR) else {
-            return;
-        };
-        for e in std::fs::read_dir(root).into_iter().flatten().flatten() {
-            if e.file_name().to_string_lossy() != key.0 {
-                let _ = std::fs::remove_dir_all(e.path());
-            }
-        }
-    }
-
-    /// Drops every stored draft, and the `.sqldiff` folder if that leaves it
-    /// empty.
-    pub fn drop_drafts(&self) {
-        if let Ok(p) = crate::tree::dest_under(&self.out, DRAFTS_DIR) {
-            let _ = std::fs::remove_dir_all(&p);
-            if let Some(d) = p.parent() {
-                let _ = std::fs::remove_dir(d);
-            }
-        }
     }
 
     /// Writes what a stand-in flags mismatch found: the flags the store held
@@ -2060,6 +1984,200 @@ pub fn seed_of(tree: &TreeKey, run: u64) -> u64 {
         h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
     }
     mix(h, run)
+}
+
+// ---------------------------------------------------------------------------
+// Draft entries (performance plan W4.3, Phase B).
+// ---------------------------------------------------------------------------
+
+/// The key of a draft: everything the rules read that is not a recorded
+/// pass-1 read, named. The running build (the rules themselves), the
+/// dialects, the rule options, whether a source catalog was supplied, and the
+/// file's text. The path is not in it (a draft is not a function of the
+/// path), nor is the review ledger (hand-written output is applied after the
+/// draft), nor the base catalogs (they are part of the catalog, which the
+/// read set covers).
+pub fn draft_key(
+    build: &str,
+    from: &str,
+    to: &str,
+    rules: &str,
+    catalog_supplied: bool,
+    text: &str,
+) -> Key {
+    let mut k = KeyBuilder::new();
+    k.field("draft-build", build.as_bytes());
+    k.field("from", from.as_bytes());
+    k.field("to", to.as_bytes());
+    k.field("rules", rules.as_bytes());
+    k.field("catalog", &[catalog_supplied as u8]);
+    k.field("text", text.as_bytes());
+    k.finish()
+}
+
+/// What a draft entry file holds.
+#[derive(Deserialize)]
+struct DraftEntryFile {
+    key: String,
+    id: String,
+    draft: crate::Draft,
+}
+
+#[derive(Serialize)]
+struct DraftEntryFileRef<'a> {
+    key: &'a str,
+    id: &'a str,
+    draft: &'a crate::Draft,
+}
+
+impl Store {
+    fn draft_dir_rel(key: &Key) -> String {
+        format!("{DRAFT_ENTRIES_DIR}/{}", key.0)
+    }
+
+    /// The draft entries stored under `key` whose read sets read back whole,
+    /// with each read set, by id.
+    pub fn draft_entries(&self, key: &Key) -> Vec<(String, Reads)> {
+        let Ok(dir) = crate::tree::dest_under(&self.out, &Self::draft_dir_rel(key)) else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(id) = name.strip_suffix(".reads") else {
+                continue;
+            };
+            if !is_key(id) || !e.path().with_extension("json").is_file() {
+                continue;
+            }
+            let Some(reads) = std::fs::read(e.path()).ok().and_then(|raw| {
+                let f: ReadsFile = serde_json::from_slice(verified_body(&raw)?).ok()?;
+                f.open(&key.0, id)
+            }) else {
+                continue;
+            };
+            found.push((id.to_string(), reads));
+        }
+        found.sort_by(|x, y| x.0.cmp(&y.0));
+        found
+    }
+
+    /// The draft of entry `id` under `key`; a file that does not read back
+    /// whole, or does not name its own key and id, is a miss.
+    pub fn get_draft_entry(&self, key: &Key, id: &str) -> Option<crate::Draft> {
+        let rel = format!("{}/{id}.json", Self::draft_dir_rel(key));
+        let raw = std::fs::read(crate::tree::dest_under(&self.out, &rel).ok()?).ok()?;
+        let f: DraftEntryFile = serde_json::from_slice(verified_body(&raw)?).ok()?;
+        (f.key == key.0 && f.id == id).then_some(f.draft)
+    }
+
+    /// Stores a draft with the read set it was made under. The draft first,
+    /// then the read set, which is what lists it. An entry stored already
+    /// under the same id with other bytes is left as it is and reported
+    /// ([`Put::Differs`]): a draft is a function of its key and reads, so
+    /// that is a recorder or determinism bug.
+    pub fn put_draft_entry(
+        &self,
+        key: &Key,
+        reads: &Reads,
+        draft: &crate::Draft,
+    ) -> Result<(String, Put), String> {
+        let id = entry_id(reads, false);
+        let body = serde_json::to_vec(&DraftEntryFileRef {
+            key: &key.0,
+            id: &id,
+            draft,
+        })
+        .map_err(|e| e.to_string())?;
+        let bytes = framed(&body);
+        let dest = crate::tree::dest_under(
+            &self.out,
+            &format!("{}/{id}.json", Self::draft_dir_rel(key)),
+        )?;
+        let put = match std::fs::read(&dest) {
+            Ok(old) if old == bytes => Put::Same,
+            // An entry that reads back whole and holds another draft.
+            Ok(old)
+                if verified_body(&old)
+                    .and_then(|b| serde_json::from_slice::<DraftEntryFile>(b).ok())
+                    .is_some_and(|f| f.key == key.0 && f.id == id) =>
+            {
+                return Ok((id, Put::Differs));
+            }
+            // Missing, or damaged: written again.
+            _ => {
+                write_atomically(&dest, &bytes)?;
+                Put::Written
+            }
+        };
+        let rbody = serde_json::to_vec(&ReadsFile::of(&key.0, &id, false, reads))
+            .map_err(|e| e.to_string())?;
+        let rdest = crate::tree::dest_under(
+            &self.out,
+            &format!("{}/{id}.reads", Self::draft_dir_rel(key)),
+        )?;
+        write_atomically(&rdest, &framed(&rbody))?;
+        Ok((id, put))
+    }
+
+    /// Removes the draft entries of keys not in `live` (files as they were
+    /// before an edit, or of another build), keeps at most [`MAX_ENTRIES`]
+    /// of the others (those in `used` first, then by id), and removes the
+    /// folder of the earlier draft layout. Returns how many files went.
+    pub fn gc_drafts(&self, live: &BTreeSet<String>, used: &BTreeSet<(String, String)>) -> usize {
+        let mut removed = 0;
+        if let Ok(old) = crate::tree::dest_under(&self.out, DRAFTS_DIR) {
+            if old.exists() {
+                let _ = std::fs::remove_dir_all(&old);
+                removed += 1;
+            }
+        }
+        let Ok(root) = crate::tree::dest_under(&self.out, DRAFT_ENTRIES_DIR) else {
+            return removed;
+        };
+        for e in std::fs::read_dir(root).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !is_key(&name) {
+                continue;
+            }
+            if !live.contains(&name) {
+                removed += std::fs::read_dir(e.path()).map_or(0, |d| d.count());
+                let _ = std::fs::remove_dir_all(e.path());
+                continue;
+            }
+            let mut ids = BTreeSet::new();
+            for f in std::fs::read_dir(e.path()).into_iter().flatten().flatten() {
+                let n = f.file_name().to_string_lossy().into_owned();
+                if let Some(id) = n.strip_suffix(".json").or_else(|| n.strip_suffix(".reads")) {
+                    if is_key(id) {
+                        ids.insert(id.to_string());
+                    }
+                }
+            }
+            if ids.len() <= MAX_ENTRIES {
+                continue;
+            }
+            let mut keep: BTreeSet<&str> = ids
+                .iter()
+                .map(String::as_str)
+                .filter(|id| used.contains(&(name.clone(), id.to_string())))
+                .collect();
+            for id in &ids {
+                if keep.len() >= MAX_ENTRIES {
+                    break;
+                }
+                keep.insert(id);
+            }
+            for id in ids.iter().filter(|id| !keep.contains(id.as_str())) {
+                for ext in ["json", "reads"] {
+                    if std::fs::remove_file(e.path().join(format!("{id}.{ext}"))).is_ok() {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+        removed
+    }
 }
 
 /// The file holding the run counter of a store.

@@ -407,8 +407,8 @@ CREATE TRIGGER {} BEFORE TRUNCATE ON {table}
             Some(p.into_iter().map(Ident::plain).collect())
         };
         let found = self.catalog.and_then(|cat| {
-            let main = cat.table(&lookup(name_t)?)?;
-            let hist = lookup(&t.history).and_then(|p| cat.table(&p));
+            let main = cat.table_wide(&lookup(name_t)?)?;
+            let hist = lookup(&t.history).and_then(|p| cat.table_wide(&p));
             Some((main, hist))
         });
         let Some((main, hist)) = found else {
@@ -587,7 +587,7 @@ impl Cx<'_> {
                 return None;
             }
             let idents: Vec<Ident> = parts.iter().map(|p| Ident::plain(p.clone())).collect();
-            let t = cat.table(&idents)?;
+            let t = cat.table_wide(&idents)?;
             if self.historyless(t) {
                 return Some(None);
             }

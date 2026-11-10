@@ -307,8 +307,29 @@ pub fn try_compare(
     Ok(())
 }
 
+/// The draft entries of a run's store, by path below the output folder.
+pub fn draft_entries(out: &Path) -> std::collections::BTreeSet<String> {
+    let root = out.join(".sqldiff/draft-entries");
+    let mut found = std::collections::BTreeSet::new();
+    for k in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+        for f in std::fs::read_dir(k.path()).into_iter().flatten().flatten() {
+            if f.path().extension().is_some_and(|e| e == "json") {
+                found.insert(format!(
+                    "{}/{}",
+                    k.file_name().to_string_lossy(),
+                    f.file_name().to_string_lossy()
+                ));
+            }
+        }
+    }
+    found
+}
+
 /// What one edit showed.
 pub struct Outcome {
+    /// Drafts the resumed run built (stored entries it did not have), and
+    /// the files in the tree: a draft taken from a stored entry writes none.
+    pub drafts_built: (usize, usize),
     /// Files the resumed run took from the store, and files it listed.
     pub reused: (usize, usize),
     /// The files it checked again.
@@ -344,12 +365,14 @@ pub fn try_one_in(to: Dialect, seed: u64, edit: &Edit, hidden: bool) -> Outcome 
     f.write(&model);
     f.run("res", false);
     let before = per_file(&f.dir.join("res"));
+    let drafts_before = draft_entries(&f.dir.join("res"));
     let old_files = model.files();
     let mut r = Rng::new(seed ^ 0xA5A5);
     let what = edit.apply(&mut model, &mut r);
     f.write(&model);
     if let Err(e) = f.try_run("res", false) {
         return Outcome {
+            drafts_built: (0, 0),
             reused: (0, 0),
             again: Vec::new(),
             dependents_changed: Vec::new(),
@@ -375,7 +398,14 @@ pub fn try_one_in(to: Dialect, seed: u64, edit: &Edit, hidden: bool) -> Outcome 
         .map(|(path, _)| path.clone())
         .collect();
     let (reused, again) = reuse(&f.dir.join("res"));
+    let drafts_built = (
+        draft_entries(&f.dir.join("res"))
+            .difference(&drafts_before)
+            .count(),
+        reused.1,
+    );
     Outcome {
+        drafts_built,
         reused,
         again,
         dependents_changed,

@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 
+use sqldiff_equiv::catalog::record::{Outcome, Query, ReadSink, Side, NO_SINK};
 use sqldiff_syntax::{ast, Dialect, SyntaxKind, SyntaxNode};
 
 /// The first table variable of the tree that maps to a temporary table name.
@@ -28,6 +29,8 @@ pub struct Claim {
 #[derive(Debug, Default)]
 pub struct Claims {
     by_table: BTreeMap<String, Claim>,
+    /// The digest of `by_table`, made when first asked.
+    digest: std::sync::OnceLock<Outcome>,
 }
 
 impl Claims {
@@ -43,8 +46,14 @@ impl Claims {
         c
     }
 
+    /// The digest of every claim: what a recorded read of the claims holds.
+    pub fn digest(&self) -> Outcome {
+        *self.digest.get_or_init(|| Outcome::of(&self.by_table))
+    }
+
     /// Adds the claims of one parsed T-SQL file.
     pub fn add_root(&mut self, root: &SyntaxNode, file: &str) {
+        self.digest = std::sync::OnceLock::new();
         for n in root.descendants() {
             if n.kind() != SyntaxKind::STATEMENT || !table_variable_declare(&n) {
                 continue;
@@ -74,6 +83,52 @@ impl Claims {
         self.by_table
             .get(&table.to_lowercase())
             .filter(|c| !same_routine(c.routine.as_deref(), routine))
+    }
+}
+
+/// The claims as pass 1 reads them. The one question ([`Claims::clash`])
+/// is recorded as [`Query::ClaimsAll`] of the draft side: the digest of the
+/// whole claims table. A file whose draft asked is built again when any
+/// claim of the tree changes, and a file that declares no table variable
+/// never asks. The wide form on purpose: no per-site test of the generated
+/// trees reaches a clash yet, and a narrow query nothing proves is not
+/// recorded.
+#[derive(Clone, Copy)]
+pub struct ClaimReads<'a> {
+    claims: &'a Claims,
+    sink: &'a dyn ReadSink,
+}
+
+impl<'a> ClaimReads<'a> {
+    /// The claims, recording nothing.
+    pub fn new(claims: &'a Claims) -> Self {
+        ClaimReads {
+            claims,
+            sink: &NO_SINK,
+        }
+    }
+
+    /// The claims, recording every question to `sink`.
+    pub fn recording(claims: &'a Claims, sink: &'a dyn ReadSink) -> Self {
+        ClaimReads { claims, sink }
+    }
+
+    /// [`Claims::clash`], recorded.
+    pub fn clash(&self, table: &str, routine: Option<&str>) -> Option<&'a Claim> {
+        if self.sink.active() && !self.sink.holds(Side::Draft, &Query::ClaimsAll) {
+            self.sink
+                .record(Side::Draft, &Query::ClaimsAll, self.claims.digest());
+        }
+        self.claims.clash(table, routine)
+    }
+}
+
+/// Asks a recorded [`Query::ClaimsAll`] of `claims` again, with the digest
+/// of the answer; `None` for any other query.
+pub fn replay_claims(claims: &Claims, q: &Query) -> Option<Outcome> {
+    match q {
+        Query::ClaimsAll => Some(claims.digest()),
+        _ => None,
     }
 }
 

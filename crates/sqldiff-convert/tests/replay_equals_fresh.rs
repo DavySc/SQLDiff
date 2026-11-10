@@ -76,6 +76,34 @@ fn recheck_at_most(e: &Edit) -> usize {
     }
 }
 
+/// The most drafts an edit may make a resume build again (P7 of the Phase B
+/// review): a draft is taken from its stored entry unless its text changed
+/// or something it asked of the source catalog or the claims has another
+/// answer. As measured on both dialects and both seeds.
+///
+/// Today every pass-1 read records the whole source catalog (the sound
+/// fallback: no per-site test proves a narrow form yet, see
+/// `SourceReads::table_wide`), and every file reads it, so an edit that
+/// changes the source catalog in any way rebuilds every draft, and one that
+/// does not (a comment, the target side only, the order of the tables)
+/// rebuilds none but the edited file. The bounds tighten, edit by edit, as
+/// narrow forms are proven: lowering a bound is how a better recording shows.
+fn drafts_at_most(e: &Edit) -> usize {
+    match e {
+        Edit::NoOpReorderTables
+        | Edit::CaseClash
+        | Edit::CaseClashIndex
+        | Edit::CaseClashColumn
+        | Edit::TargetOverrides
+        | Edit::TargetLookalikes
+        | Edit::NoBaseB
+        | Edit::TargetBaseTriggerEvent
+        | Edit::HandWritten => 0,
+        Edit::NoOpComment => 1,
+        _ => usize::MAX / 2,
+    }
+}
+
 fn every_edit(to: Dialect) {
     let mut lines = Vec::new();
     // Per edit, whether some seed showed it on a dependent (the probe).
@@ -105,11 +133,20 @@ fn every_edit(to: Dialect) {
                     o.again.len(),
                     o.again
                 );
+                let drafts_max = drafts_at_most(e);
+                assert!(
+                    o.drafts_built.0 <= drafts_max,
+                    "{to:?} seed {seed} {e:?}: {} drafts built again, at most {drafts_max} expected",
+                    o.drafts_built.0
+                );
                 *shown.entry(format!("{e:?}")).or_default() |= !o.dependents_changed.is_empty();
             }
             lines.push(format!(
-                "{to:?} seed {seed} {e:?}: reused {reused} of {total}, {} dependents change",
-                o.dependents_changed.len()
+                "{to:?} seed {seed} {e:?}: reused {reused} of {total}, {} dependents change, \
+                 {} of {} drafts built",
+                o.dependents_changed.len(),
+                o.drafts_built.0,
+                o.drafts_built.1
             ));
         }
     }
