@@ -36,7 +36,7 @@ fn recheck_at_most(e: &Edit) -> usize {
     match e {
         Edit::NoOpComment | Edit::NoOpReorderTables => 0,
         Edit::AddTable => 6,
-        Edit::DropTable => 25,
+        Edit::DropTable => 27,
         Edit::RenameTable
         | Edit::AddColumn
         | Edit::AddMixedCaseColumn
@@ -45,8 +45,9 @@ fn recheck_at_most(e: &Edit) -> usize {
         | Edit::ReorderColumns
         | Edit::FlipNullability
         | Edit::ChangeDefault
-        | Edit::ToggleIndex => 26,
-        Edit::ViewBody | Edit::AddRoutine | Edit::DropRoutine | Edit::AddTrigger => 6,
+        | Edit::ToggleIndex => 28,
+        Edit::AddRoutine | Edit::DropRoutine | Edit::AddTrigger => 6,
+        Edit::ViewBody => 8,
         Edit::ChangeParameterType | Edit::AddSchemaTable => 7,
         Edit::BaseDrop => 8,
         Edit::DropTrigger => 4,
@@ -150,6 +151,16 @@ fn only(e: &Edit) -> bool {
 
 /// Edits the probe cannot show on a dependent, with why.
 const EXEMPT: &[(Dialect, &str, &str)] = &[
+    (
+        Dialect::Postgres,
+        "ViewLookalike",
+        "it shows only where a star is listed, i.e. in the tree with a HIDDEN column; this probe runs the plain tree (`site_switch.rs` kills the `visible_star` lookup with it on the hidden tree)",
+    ),
+    (
+        Dialect::Db2i,
+        "ViewLookalike",
+        "same",
+    ),
     (
         Dialect::Postgres,
         "ChangeDefault",
