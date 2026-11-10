@@ -276,3 +276,49 @@ fn a_tree_held_in_the_store_gives_the_tree_held_whole() {
     };
     assert_eq!(statuses(&held), statuses(&whole));
 }
+
+/// A caller resolved before its callee goes bad gets only the "not proven"
+/// note, not the assumptions the callee seemed to carry before (the calls
+/// are resolved callees first), and the notes do not depend on file names.
+#[test]
+fn a_call_through_an_unproven_chain_carries_no_assumptions_of_it() {
+    let mid = "CREATE FUNCTION App.Mid(@Code nvarchar(5))
+RETURNS int
+AS
+BEGIN
+    RETURN App.GetCode(@Code);
+END;
+";
+    let caller = "CREATE PROCEDURE App.AddItem @Id int, @Code nvarchar(5)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    UPDATE App.Items SET CodeId = App.Mid(@Code) WHERE Id = @Id;
+END;
+";
+    let mut seen = Vec::new();
+    // Caller first, then callee last: the order in which the old rounds
+    // left the middle function's assumptions on the caller.
+    for (name, p, m, f) in [
+        ("chain-a", "a.sql", "b.sql", "c.sql"),
+        ("chain-z", "z.sql", "y.sql", "x.sql"),
+    ] {
+        let fx = Fixture::new(name, &[("t.sql", TABLES), (f, BAD), (m, mid), (p, caller)]);
+        let t = fx.convert();
+        let u = unit(&t, m, mid, "RETURN App");
+        assert_eq!(u.status, Status::Unproven, "{:#?}", u.notes);
+        let u = unit(&t, p, caller, CALL);
+        assert_eq!(u.status, Status::Unproven, "{:#?}", u.notes);
+        assert!(
+            u.notes
+                .iter()
+                .all(|n| n.status != Status::Assumptions || !n.rule.ends_with("app.getcode")),
+            "{:#?}",
+            u.notes
+        );
+        let r: Vec<String> = u.notes.iter().map(|n| n.rule.to_string()).collect();
+        seen.push(r);
+    }
+    assert_eq!(seen[0], seen[1]);
+}
