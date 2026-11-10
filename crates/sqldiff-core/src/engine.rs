@@ -126,6 +126,10 @@ pub struct Options {
     /// the `align.bound` exit with a work-budget witness. A count, never a
     /// time, so a result stays a function of the input.
     pub statement_work_cap: Option<u64>,
+    /// Where routine-pair results of the behaviour model are kept between
+    /// runs (W4.4); `None`, the default, keeps nothing. A performance
+    /// handle: a result is the same with or without it.
+    pub pair_cache: Option<crate::ir::behaviour::PairCacheHandle>,
 }
 
 impl Default for Options {
@@ -148,6 +152,7 @@ impl Default for Options {
             work_caps: None,
             alignment_bound: None,
             statement_work_cap: None,
+            pair_cache: None,
         }
     }
 }

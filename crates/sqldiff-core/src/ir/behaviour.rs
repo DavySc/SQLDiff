@@ -23,6 +23,8 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
+use serde::{Deserialize, Serialize};
+
 use sqldiff_syntax::{ast, Dialect, SyntaxNode};
 
 use super::cfg::{Cfg, Effect, NodeId};
@@ -297,7 +299,55 @@ pub struct Env {
     /// `Some`: `pairs()` and `feasible()` match a condition's text across
     /// the sides only when every condition with that text is in such a pair.
     pub identified: Option<std::sync::Arc<BTreeSet<(usize, usize)>>>,
+    /// Where stored pair results are kept (`PairCache`); a performance
+    /// handle, never part of what a pair result depends on.
+    pub pair_cache: Option<PairCacheHandle>,
 }
+
+/// A store of routine-pair results (W4.4 step 2). Bytes in, bytes out: the
+/// caller frames, verifies and evicts; the reuse decision is made in
+/// [`analyze_runs`], never here.
+pub trait PairCache: Send + Sync {
+    /// The build the keys are made under (part of every key).
+    fn build(&self) -> &str;
+    fn get(&self, key: &str) -> Option<Vec<u8>>;
+    fn put(&self, key: &str, bytes: &[u8]);
+    /// Whether a result about to be reused is built again and compared
+    /// (the sampled re-check).
+    fn recheck(&self, key: &str) -> bool;
+    /// What happened to a pair, for the report.
+    fn note(&self, event: PairEvent, key: &str);
+}
+
+/// What `analyze_runs` did with one pair, reported to the cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairEvent {
+    /// Taken from the cache.
+    Reused,
+    /// Built (not found, or the entry state did not allow the stored one).
+    Built,
+    /// Taken, built again and found equal.
+    Verified,
+    /// Taken, built again and found different: the fresh result was used.
+    Mismatch,
+}
+
+#[derive(Clone)]
+pub struct PairCacheHandle(pub std::sync::Arc<dyn PairCache>);
+
+impl std::fmt::Debug for PairCacheHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PairCacheHandle")
+    }
+}
+
+impl PartialEq for PairCacheHandle {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for PairCacheHandle {}
 
 /// Assumptions whose flip changes the scenarios (and so is re-run, not relabelled).
 pub const RERUN_ASSUMPTIONS: [&str; 2] = ["ASM-NO-CALLER-TXN", "ASM-TSQL-CALLER-XACT-ABORT-OFF"];
@@ -313,6 +363,7 @@ impl Env {
             work_budgets: None,
             work_caps: None,
             identified: None,
+            pair_cache: None,
         }
     }
 
@@ -327,6 +378,7 @@ impl Env {
             work_budgets: opts.work_budgets,
             work_caps: opts.work_caps,
             identified: None,
+            pair_cache: opts.pair_cache.clone(),
             ..Env::from_flips(&opts.flips)
         }
     }
@@ -1357,7 +1409,7 @@ fn feasible_with<K: Eq>(a: &[(K, bool)], fa: &[bool], b: &[(K, bool)], fb: &[boo
 
 /// Behavioural findings, the assumptions they rest on, and a structured
 /// witness per finding.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Behaviour {
     pub findings: Vec<Finding>,
     pub assumptions: Vec<Assumption>,
@@ -1401,6 +1453,9 @@ struct Collector<'x, 'a> {
     /// Shared with the file loop, which extends it only between pairs, when
     /// no collector holds it: read through `contains` only.
     prior: Rc<HashSet<String>>,
+    /// Every unsalted print tested against `prior`, with the answer: a
+    /// pair result depends on `prior` only through these.
+    prior_tested: RefCell<BTreeMap<String, bool>>,
     salt: String,
     /// Statements where a path of some scenario was cut by a budget, per
     /// side (see `Outcome::cut`).
@@ -1549,6 +1604,7 @@ impl<'x, 'a> Collector<'x, 'a> {
             keys,
             incomplete: false,
             prior: Rc::new(HashSet::new()),
+            prior_tested: RefCell::new(BTreeMap::new()),
             salt: String::new(),
             cut_a: BTreeSet::new(),
             cut_b: BTreeSet::new(),
@@ -1569,6 +1625,14 @@ impl<'x, 'a> Collector<'x, 'a> {
         c.splits = splits(&c.sa, &c.sb, true);
         c.splits.extend(splits(&c.sb, &c.sa, false));
         c
+    }
+
+    /// Whether an earlier pair already has this print (recorded, see
+    /// `prior_tested`).
+    fn in_prior(&self, fp: &str) -> bool {
+        let hit = self.prior.contains(fp);
+        self.prior_tested.borrow_mut().insert(fp.to_string(), hit);
+        hit
     }
 
     /// Marks the routine as cut by a work budget, and remembers which one ran
@@ -2060,7 +2124,7 @@ impl<'x, 'a> Collector<'x, 'a> {
             .iter()
             .enumerate()
             .any(|(i, f)| f.fingerprint == fp && Some(i) != replace)
-            || self.prior.contains(&fp)
+            || self.in_prior(&fp)
         {
             fp = print(
                 &format!("{}{}|", self.salt, d.anchor),
@@ -2508,15 +2572,15 @@ pub fn analyze_runs(
     };
     // The file cap is a function of the file: its units and the largest unit
     // cap, known before the first unit runs.
-    let largest = if env.work_caps.is_some() {
-        0
+    let unit_caps: Vec<u64> = if env.work_caps.is_some() {
+        Vec::new()
     } else {
         m.pairs
             .iter()
             .map(|(x, y)| unit_work_cap(pair_statements(a, b, Some(x.clone()), Some(y.clone()))))
-            .max()
-            .unwrap_or(0)
+            .collect()
     };
+    let largest = unit_caps.iter().copied().max().unwrap_or(0);
     let file_work = FileWork {
         start,
         cap: file_work_cap(m.pairs.len().max(1) as u64, largest),
@@ -2525,30 +2589,107 @@ pub fn analyze_runs(
     let mut out = Behaviour::default();
     let mut prior: Rc<HashSet<String>> = Rc::new(HashSet::new());
     let mut all_compared = m.only_a.is_empty() && m.only_b.is_empty();
-    for (x, y) in &m.pairs {
+    // Stored pair results are consulted only when a cache is attached; the
+    // caps they are judged against are the current file's (never stored).
+    let caps = env.pair_cache.as_ref().map(|_| PairCaps {
+        unit_caps: unit_caps.clone(),
+        file_cap: file_work.cap,
+    });
+    for (i, (x, y)) in m.pairs.iter().enumerate() {
         let name = sqldiff_syntax::ast::routine_name(x).unwrap_or_default();
+        let entry_spent = file_spent.get();
+        let entry_work = sqldiff_model::work::now().total().saturating_sub(start);
         let before = runs.is_some().then(|| {
             // Sorted at once: the order of the set is never read.
             #[allow(clippy::disallowed_methods)]
             let mut v: Vec<String> = prior.iter().cloned().collect();
             v.sort();
-            (
-                file_spent.get(),
-                sqldiff_model::work::now().total().saturating_sub(start),
-                v,
-            )
+            (entry_spent, entry_work, v)
         });
-        let (r, stats) = analyze_pair(
-            a,
-            b,
-            env,
-            Some(x.clone()),
-            Some(y.clone()),
-            &format!("{name}|"),
-            &prior,
-            &file_spent,
-            file_work,
-        );
+        let fresh = || {
+            analyze_pair(
+                a,
+                b,
+                env,
+                Some(x.clone()),
+                Some(y.clone()),
+                &format!("{name}|"),
+                &prior,
+                &file_spent,
+                file_work,
+            )
+        };
+        let (r, stats) = match (&env.pair_cache, &caps) {
+            (Some(cache), Some(caps)) => {
+                let key = pair_key(a, b, x, y, env, cache.0.build());
+                let taken = cache
+                    .0
+                    .get(&key)
+                    .and_then(|bytes| serde_json::from_slice::<StoredPair>(&bytes).ok())
+                    .filter(|sp| sp.reusable(entry_spent, entry_work, &prior, caps, i, env));
+                match taken {
+                    Some(sp) if !cache.0.recheck(&key) => {
+                        // Advance the file's shared state exactly as the
+                        // pair would have.
+                        file_spent.set(entry_spent + sp.spent);
+                        sqldiff_model::work::spend(
+                            sqldiff_model::work::Site::BehaviourDiffs,
+                            sp.work,
+                        );
+                        cache.0.note(PairEvent::Reused, &key);
+                        (
+                            sp.behaviour,
+                            PairStats {
+                                spent: sp.spent,
+                                cut: false,
+                                tested: sp.tested,
+                            },
+                        )
+                    }
+                    Some(sp) => {
+                        // Sampled: build it again; the fresh result wins.
+                        let (r, stats) = fresh();
+                        let rebuilt =
+                            StoredPair::of(&r, &stats, entry_work, start, caps.unit_cap(env, i));
+                        let same = rebuilt.same_as(&sp);
+                        cache.0.note(
+                            if same {
+                                PairEvent::Verified
+                            } else {
+                                PairEvent::Mismatch
+                            },
+                            &key,
+                        );
+                        if !same && !stats.cut {
+                            if let Ok(bytes) = serde_json::to_vec(&rebuilt) {
+                                cache.0.put(&key, &bytes);
+                            }
+                        }
+                        (r, stats)
+                    }
+                    None => {
+                        let (r, stats) = fresh();
+                        cache.0.note(PairEvent::Built, &key);
+                        // A pair cut by a budget depends on where the file
+                        // stood; only a complete one is kept.
+                        if !stats.cut {
+                            let sp = StoredPair::of(
+                                &r,
+                                &stats,
+                                entry_work,
+                                start,
+                                caps.unit_cap(env, i),
+                            );
+                            if let Ok(bytes) = serde_json::to_vec(&sp) {
+                                cache.0.put(&key, &bytes);
+                            }
+                        }
+                        (r, stats)
+                    }
+                }
+            }
+            _ => fresh(),
+        };
         if let (Some(runs), Some((spent_before, work_before, prior_before))) =
             (runs.as_deref_mut(), before)
         {
@@ -2589,6 +2730,193 @@ pub fn analyze_runs(
     all_compared &= m.only_a.is_empty() && m.only_b.is_empty();
     out.txn_compared = all_compared;
     out
+}
+
+/// The caps a stored pair is judged against, computed for the file being
+/// checked (never read from an entry).
+struct PairCaps {
+    /// Each pair's unit work cap (empty when `Env::work_caps` fixes them).
+    unit_caps: Vec<u64>,
+    /// The file cap before a unit's own cap is taken into account.
+    file_cap: u64,
+}
+
+impl PairCaps {
+    fn unit_cap(&self, env: &Env, i: usize) -> u64 {
+        env.work_caps.map_or_else(|| self.unit_caps[i], |c| c.0)
+    }
+
+    /// `Collector::file_cap` for pair `i`.
+    fn file_cap(&self, env: &Env, i: usize) -> u64 {
+        match env.work_caps {
+            Some((_, f)) => f,
+            None => self.file_cap.max(self.unit_caps[i]),
+        }
+    }
+}
+
+/// A routine pair's result as the cache keeps it: the behaviour, what the
+/// pair spent of the file's shared budgets, and everything its result read
+/// of the file's state. Only a pair no budget cut is kept.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredPair {
+    behaviour: Behaviour,
+    /// `diff` calls the pair spent, and the work it metered.
+    spent: u64,
+    work: u64,
+    /// The unit work cap it ran under.
+    unit_cap: u64,
+    /// The unsalted prints it tested against the earlier pairs' findings,
+    /// with the answer then.
+    tested: Vec<(String, bool)>,
+}
+
+impl StoredPair {
+    fn of(
+        r: &Behaviour,
+        stats: &PairStats,
+        entry_work: u64,
+        start: u64,
+        unit_cap: u64,
+    ) -> StoredPair {
+        StoredPair {
+            behaviour: r.clone(),
+            spent: stats.spent,
+            work: sqldiff_model::work::now()
+                .total()
+                .saturating_sub(start)
+                .saturating_sub(entry_work),
+            unit_cap,
+            tested: stats.tested.clone(),
+        }
+    }
+
+    fn same_as(&self, other: &StoredPair) -> bool {
+        match (serde_json::to_vec(self), serde_json::to_vec(other)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
+    }
+
+    /// Whether the stored result is what the pair would return now, at this
+    /// place in the file. The strict inequalities leave no room for a cut
+    /// the stored run did not see (`spend` and `outcomes` both test `>=`).
+    fn reusable(
+        &self,
+        entry_spent: u64,
+        entry_work: u64,
+        prior: &HashSet<String>,
+        caps: &PairCaps,
+        i: usize,
+        env: &Env,
+    ) -> bool {
+        let file_diffs = env.work_budgets.unwrap_or((ROUTINE_DIFFS, FILE_DIFFS)).1;
+        self.unit_cap == caps.unit_cap(env, i)
+            && entry_spent.saturating_add(self.spent) < file_diffs
+            && entry_work.saturating_add(self.work) < caps.file_cap(env, i)
+            && self
+                .tested
+                .iter()
+                .all(|(fp, was)| prior.contains(fp) == *was)
+    }
+}
+
+/// The key of a routine pair's result: everything the pair reads of the
+/// files (design `w4-4-routine-units.md`, section H and the review P1). The
+/// byte and line positions of the routines are in the key, so a result is
+/// taken only where it stands as it did; rebasing positions is a later step.
+fn pair_key(
+    a: &Analyzed,
+    b: &Analyzed,
+    ra: &SyntaxNode,
+    rb: &SyntaxNode,
+    env: &Env,
+    build: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let mut field = |tag: &str, bytes: &[u8]| {
+        h.update((tag.len() as u64).to_le_bytes());
+        h.update(tag.as_bytes());
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    };
+    field("format", b"pair-1");
+    field("build", build.as_bytes());
+    for (tag, an, r, other) in [("a", a, ra, b), ("b", b, rb, a)] {
+        field(
+            &format!("{tag}.dialect"),
+            format!("{:?}", an.dialect()).as_bytes(),
+        );
+        field(&format!("{tag}.version"), an.artifact.version.as_bytes());
+        field(&format!("{tag}.path"), an.artifact.path.as_bytes());
+        field(&format!("{tag}.object"), an.object.as_bytes());
+        field(&format!("{tag}.side"), format!("{:?}", an.side).as_bytes());
+        field(
+            &format!("{tag}.excerpt"),
+            an.excerpt_lines.to_string().as_bytes(),
+        );
+        // The tree that is lowered: kind and text of every token.
+        let mut tree = Sha256::new();
+        for t in r.descendants_with_tokens().filter_map(|e| e.into_token()) {
+            tree.update(format!("{:?}", t.kind()).as_bytes());
+            tree.update([0]);
+            tree.update(t.text().as_bytes());
+            tree.update([1]);
+        }
+        field(&format!("{tag}.tree"), &tree.finalize());
+        let loc = an.node_location(r);
+        field(
+            &format!("{tag}.position"),
+            format!(
+                "{}:{} {}..{}",
+                loc.start_line, loc.start_col, loc.byte_start, loc.byte_end
+            )
+            .as_bytes(),
+        );
+        let mut temps: Vec<String> = other_temps(an, other).into_iter().collect();
+        temps.sort();
+        field(
+            &format!("{tag}.other_temps"),
+            temps.join("\u{1}").as_bytes(),
+        );
+    }
+    // `Env` field by field, so a new field cannot be left out.
+    let Env {
+        caller_txn,
+        xact_abort,
+        commit_level,
+        skip_witnesses,
+        work_budgets,
+        work_caps,
+        identified,
+        pair_cache: _,
+    } = env;
+    field(
+        "env",
+        format!("{caller_txn} {xact_abort} {commit_level:?} {skip_witnesses} {work_budgets:?} {work_caps:?}")
+            .as_bytes(),
+    );
+    // The identified condition pairs of this routine pair only.
+    let inside = |r: &SyntaxNode, at: usize| {
+        let t = r.text_range();
+        usize::from(t.start()) <= at && at < usize::from(t.end())
+    };
+    let subset: Option<Vec<(usize, usize)>> = identified.as_ref().map(|set| {
+        set.iter()
+            .copied()
+            .filter(|&(x, y)| inside(ra, x) && inside(rb, y))
+            .collect()
+    });
+    field("identified", format!("{subset:?}").as_bytes());
+    // The salt of the pair's collision fingerprints.
+    field(
+        "name",
+        sqldiff_syntax::ast::routine_name(ra)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The analysis of one pair of routines (or, with `None`, of the statements
@@ -2646,6 +2974,12 @@ fn analyze_pair(
     let stats = PairStats {
         spent: c.spent.get(),
         cut: c.out_of_budget.get(),
+        tested: c
+            .prior_tested
+            .borrow()
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect(),
     };
     (c.out, stats)
 }
@@ -2654,6 +2988,9 @@ fn analyze_pair(
 struct PairStats {
     spent: u64,
     cut: bool,
+    /// Unsalted prints tested against the earlier pairs' findings, with the
+    /// answer.
+    tested: Vec<(String, bool)>,
 }
 
 /// Where a routine pair stands in its file's shared budgets when it runs
@@ -3531,5 +3868,375 @@ mod pair_tests {
             cuts.len() > 3,
             "the budgets cut different numbers of pairs: {cuts:?}"
         );
+    }
+
+    /// A routine of the perturbation files: it uses a temp table, calls the
+    /// routine `callee`, branches, and writes.
+    fn t_routine(name: &str, temp: &str, callee: &str, lit: u32) -> String {
+        format!(
+            "CREATE PROCEDURE dbo.{name} @x int AS\nBEGIN\nSET NOCOUNT ON;\nCREATE TABLE #{temp} (id int);\nINSERT INTO #{temp} VALUES (@x);\nEXEC dbo.{callee} @x;\nIF @x > {lit} UPDATE dbo.t SET c = c + 1 WHERE id = @x; ELSE INSERT INTO dbo.t (id, c) VALUES (@x, {lit});\nEND;\nGO\n"
+        )
+    }
+
+    fn p_routine(name: &str, temp: &str, callee: &str, lit: u32) -> String {
+        format!(
+            "CREATE PROCEDURE {name}(x int) LANGUAGE plpgsql AS $$\nBEGIN\nCREATE TEMP TABLE {temp} (id int);\nINSERT INTO {temp} VALUES (x);\nCALL {callee}(x);\nIF x > {lit} THEN UPDATE t SET c = c + 1 WHERE id = x; ELSE INSERT INTO t (id, c) VALUES (x, {lit}); END IF;\nEND;\n$$;\n"
+        )
+    }
+
+    type Routines = Vec<(String, String)>;
+
+    /// Routines `r0..r6` (each calling its successor, the last one calling
+    /// `late`, which is not defined), under `edit`.
+    fn files(edit: &dyn Fn(&mut Routines)) -> (String, String) {
+        let mut v: Routines = (0..7u32)
+            .map(|i| {
+                let callee = if i < 6 {
+                    format!("r{}", i + 1)
+                } else {
+                    "late".into()
+                };
+                (
+                    t_routine(&format!("r{i}"), &format!("tmp{i}"), &callee, 10 + i),
+                    p_routine(&format!("r{i}"), &format!("tmp{i}"), &callee, 10 + i),
+                )
+            })
+            .collect();
+        edit(&mut v);
+        (
+            v.iter().map(|x| x.0.as_str()).collect(),
+            v.iter().map(|x| x.1.as_str()).collect(),
+        )
+    }
+
+    fn pair_k(a: &str, b: &str, k: usize) -> String {
+        let (_, runs) = analysed(a, b, &Env::default());
+        let r = &runs[k];
+        format!("{:?} {} {}", r.behaviour, r.spent, r.cut)
+    }
+
+    /// EXPLORATION: which perturbations of the rest of the file change pair 3.
+    #[test]
+    fn explore_perturbations() {
+        let (a0, b0) = files(&|_| {});
+        let base = pair_k(&a0, &b0, 3);
+        type Edit = Box<dyn Fn(&mut Routines)>;
+        let cases: Vec<(&str, Edit)> = vec![
+            (
+                "literal in r1 (before)",
+                Box::new(|v| {
+                    v[1].0 = v[1].0.replace("11", "12");
+                    v[1].1 = v[1].1.replace("11", "12");
+                }),
+            ),
+            (
+                "literal in r5 (after)",
+                Box::new(|v| {
+                    v[5].0 = v[5].0.replace("15", "16");
+                    v[5].1 = v[5].1.replace("15", "16");
+                }),
+            ),
+            (
+                "r5 writes another table",
+                Box::new(|v| {
+                    v[5].0 = v[5].0.replace("dbo.t ", "dbo.u ");
+                    v[5].1 = v[5].1.replace(" t ", " u ");
+                }),
+            ),
+            (
+                "late routine defined at the end",
+                Box::new(|v| {
+                    v.push((
+                        t_routine("late", "tmpz", "r0", 99),
+                        p_routine("late", "tmpz", "r0", 99),
+                    ));
+                }),
+            ),
+            (
+                "a later routine uses a temp table named like pair 3's",
+                Box::new(|v| {
+                    v.push((
+                        t_routine("z1", "tmp3", "r0", 98),
+                        p_routine("z1", "tmp3", "r0", 98),
+                    ));
+                }),
+            ),
+            (
+                "a later routine uses a temp table pair 3 does not",
+                Box::new(|v| {
+                    v.push((
+                        t_routine("z1", "tmp9", "r0", 98),
+                        p_routine("z1", "tmp9", "r0", 98),
+                    ));
+                }),
+            ),
+            (
+                "unrelated routine appended",
+                Box::new(|v| {
+                    v.push((
+                        t_routine("z2", "tmpy", "r0", 97),
+                        p_routine("z2", "tmpy", "r0", 97),
+                    ));
+                }),
+            ),
+        ];
+        // Pair 3 reads a temp table it does not create (a caller's).
+        let reads = |v: &mut Routines| {
+            v[3].0 = v[3]
+                .0
+                .replace("EXEC dbo.r4 @x;", "SELECT id FROM #tmp9; EXEC dbo.r4 @x;");
+            v[3].1 = v[3]
+                .1
+                .replace("CALL r4(x);", "PERFORM id FROM tmp9; CALL r4(x);");
+        };
+        let (a1, b1) = files(&reads);
+        let base1 = pair_k(&a1, &b1, 3);
+        for (name, creator) in [
+            ("reader, nobody creates tmp9", false),
+            ("reader, a later routine creates tmp9", true),
+        ] {
+            let (a, b) = files(&|v: &mut Routines| {
+                reads(v);
+                if creator {
+                    v.push((
+                        t_routine("z1", "tmp9", "r0", 98),
+                        p_routine("z1", "tmp9", "r0", 98),
+                    ));
+                }
+            });
+            eprintln!(
+                "PERTURB {name}: pair 3 {}",
+                if pair_k(&a, &b, 3) == base1 {
+                    "same as reader alone"
+                } else {
+                    "CHANGED"
+                }
+            );
+        }
+        for (name, edit) in &cases {
+            let (a, b) = files(&**edit);
+            let same = pair_k(&a, &b, 3) == base;
+            eprintln!(
+                "PERTURB {name}: pair 3 {}",
+                if same { "unchanged" } else { "CHANGED" }
+            );
+        }
+    }
+
+    /// A cache in memory, counting what happened.
+    #[derive(Default)]
+    struct MemCache {
+        map: std::sync::Mutex<BTreeMap<String, Vec<u8>>>,
+        events: std::sync::Mutex<Vec<PairEvent>>,
+        recheck: bool,
+    }
+
+    impl PairCache for MemCache {
+        fn build(&self) -> &str {
+            "test-build"
+        }
+        fn get(&self, key: &str) -> Option<Vec<u8>> {
+            self.map.lock().unwrap().get(key).cloned()
+        }
+        fn put(&self, key: &str, bytes: &[u8]) {
+            self.map.lock().unwrap().insert(key.into(), bytes.to_vec());
+        }
+        fn recheck(&self, _: &str) -> bool {
+            self.recheck
+        }
+        fn note(&self, event: PairEvent, _: &str) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    impl MemCache {
+        fn count(&self, e: PairEvent) -> usize {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|x| **x == e)
+                .count()
+        }
+        fn reset_events(&self) {
+            self.events.lock().unwrap().clear();
+        }
+    }
+
+    fn with_cache(env: &Env, cache: &std::sync::Arc<MemCache>) -> Env {
+        Env {
+            pair_cache: Some(PairCacheHandle(cache.clone())),
+            ..env.clone()
+        }
+    }
+
+    fn shown(runs: &[PairRun], out: &Behaviour) -> String {
+        let mut s = format!("{out:?}\n");
+        for r in runs {
+            s += &format!(
+                "{} {} {} {} {} {}\n",
+                r.file_spent_before,
+                r.file_spent_after,
+                r.work_before,
+                r.work_after,
+                r.spent,
+                r.cut
+            );
+        }
+        s
+    }
+
+    /// Cold and warm runs with a cache equal the run without one, in the
+    /// whole behaviour and in every pair's place in the file's budgets.
+    /// Returns how many pairs the warm run took from the cache.
+    fn cached_equals_fresh(a: &str, b: &str, env: &Env, label: &str) -> usize {
+        let (fresh, fresh_runs) = analysed(a, b, env);
+        let cache = std::sync::Arc::new(MemCache::default());
+        let cached_env = with_cache(env, &cache);
+        let (cold, cold_runs) = analysed(a, b, &cached_env);
+        assert_eq!(
+            shown(&cold_runs, &cold),
+            shown(&fresh_runs, &fresh),
+            "{label}: cold"
+        );
+        assert_eq!(
+            cache.count(PairEvent::Reused),
+            0,
+            "{label}: cold run reused"
+        );
+        cache.reset_events();
+        let (warm, warm_runs) = analysed(a, b, &cached_env);
+        assert_eq!(
+            shown(&warm_runs, &warm),
+            shown(&fresh_runs, &fresh),
+            "{label}: warm"
+        );
+        cache.count(PairEvent::Reused)
+    }
+
+    #[test]
+    fn a_cached_pair_equals_the_fresh_one_under_every_budget() {
+        let (a, b) = (tsql(6, 3), pg(6, 3, Some(3)));
+        let hits = cached_equals_fresh(&a, &b, &Env::default(), "default budgets");
+        assert_eq!(hits, 6, "every pair is taken when no budget binds");
+        let (_, runs) = analysed(&a, &b, &Env::default());
+        let mut taken = 0;
+        for r in &runs {
+            for d in [r.file_spent_before, r.file_spent_after] {
+                for e in [d.saturating_sub(1), d, d + 1] {
+                    let env = Env {
+                        work_budgets: Some((1 << 21, e)),
+                        ..Env::default()
+                    };
+                    taken += cached_equals_fresh(&a, &b, &env, &format!("diff budget {e}"));
+                }
+            }
+            for d in [r.work_before, r.work_after] {
+                for e in [d.saturating_sub(1), d, d + 1] {
+                    let env = Env {
+                        work_caps: Some((u64::MAX / 2, e)),
+                        ..Env::default()
+                    };
+                    taken += cached_equals_fresh(&a, &b, &env, &format!("work cap {e}"));
+                }
+            }
+        }
+        assert!(taken > 0, "the budget runs took something from the cache");
+    }
+
+    #[test]
+    fn an_edit_rebuilds_only_the_pair_it_changes() {
+        let (a, b) = (tsql(6, 3), pg(6, 3, Some(3)));
+        let cache = std::sync::Arc::new(MemCache::default());
+        let env = with_cache(&Env::default(), &cache);
+        let _ = analysed(&a, &b, &env);
+        cache.reset_events();
+        // The same length: one literal of the last routine, on both sides.
+        let a2 = a.replacen("c + 5 WHERE", "c + 6 WHERE", 1);
+        let b2 = b.replacen("c + 5 WHERE", "c + 6 WHERE", 1);
+        assert_ne!(a, a2);
+        let (cached, cached_runs) = analysed(&a2, &b2, &env);
+        let (fresh, fresh_runs) = analysed(&a2, &b2, &Env::default());
+        assert_eq!(shown(&cached_runs, &cached), shown(&fresh_runs, &fresh));
+        assert_eq!(cache.count(PairEvent::Reused), 5);
+        assert_eq!(cache.count(PairEvent::Built), 1);
+    }
+
+    #[test]
+    fn a_sampled_pair_is_built_again_and_compared() {
+        let (a, b) = (tsql(4, 3), pg(4, 3, None));
+        let cache = std::sync::Arc::new(MemCache {
+            recheck: true,
+            ..MemCache::default()
+        });
+        let env = with_cache(&Env::default(), &cache);
+        let (first, _) = analysed(&a, &b, &env);
+        cache.reset_events();
+        let (second, _) = analysed(&a, &b, &env);
+        assert_eq!(format!("{first:?}"), format!("{second:?}"));
+        assert_eq!(cache.count(PairEvent::Verified), 4);
+        assert_eq!(cache.count(PairEvent::Reused), 0);
+        assert_eq!(cache.count(PairEvent::Mismatch), 0);
+    }
+
+    #[test]
+    fn the_key_follows_what_the_pair_reads() {
+        let (a, b) = (tsql(3, 2), pg(3, 2, None));
+        let cache = std::sync::Arc::new(MemCache::default());
+        let env = with_cache(&Env::default(), &cache);
+        let _ = analysed(&a, &b, &env);
+        // Another environment, other budgets: nothing is taken.
+        cache.reset_events();
+        let caller = Env {
+            caller_txn: true,
+            ..env.clone()
+        };
+        let _ = analysed(&a, &b, &caller);
+        assert_eq!(cache.count(PairEvent::Reused), 0, "another Env");
+        cache.reset_events();
+        let _ = analysed(
+            &a,
+            &b,
+            &with_cache(
+                &Env {
+                    skip_witnesses: true,
+                    ..Env::default()
+                },
+                &cache,
+            ),
+        );
+        assert_eq!(cache.count(PairEvent::Reused), 0, "skip_witnesses");
+        // A tree-neutral change to the draft (a trailing comment in a routine
+        // moves nothing else): the edited routine alone is built.
+        cache.reset_events();
+        let b2 = b.replacen("END;\n$$;", "-- c\nEND;\n$$;", 1);
+        let _ = analysed(&a, &b2, &env);
+        assert_eq!(cache.count(PairEvent::Built), 3, "the draft's lines shifted: pairs below and the edited one rebuild, positions are in the key");
+    }
+
+    #[test]
+    fn a_collision_that_disappears_rebuilds_the_pair_that_had_it() {
+        let (a, b) = (tsql(3, 2), pg(3, 2, None));
+        let cache = std::sync::Arc::new(MemCache::default());
+        let env = with_cache(&Env::default(), &cache);
+        let _ = analysed(&a, &b, &env);
+        // Routine p0 writes another table (the same length): the findings of
+        // p1 no longer meet p0's prints, so p1 salts nothing now, and what
+        // was stored for it (a collision) is not what it returns.
+        let head = |s: &str, from: &str| s.find(from).unwrap();
+        let (ia, ib) = (
+            head(&a, "CREATE PROCEDURE dbo.p1"),
+            head(&b, "CREATE PROCEDURE p1("),
+        );
+        let a2 = format!("{}{}", a[..ia].replace("dbo.t ", "dbo.u "), &a[ia..]);
+        let b2 = format!("{}{}", b[..ib].replace(" t ", " u "), &b[ib..]);
+        assert_ne!(a, a2);
+        assert_ne!(b, b2);
+        cache.reset_events();
+        let (cached, cached_runs) = analysed(&a2, &b2, &env);
+        let (fresh, fresh_runs) = analysed(&a2, &b2, &Env::default());
+        assert_eq!(shown(&cached_runs, &cached), shown(&fresh_runs, &fresh));
+        assert_eq!(cache.count(PairEvent::Built), 2, "p0 and p1");
+        assert_eq!(cache.count(PairEvent::Reused), 1, "p2 keeps its collision");
     }
 }

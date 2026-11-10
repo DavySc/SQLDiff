@@ -1703,6 +1703,8 @@ mod tests {
             work_caps,
             alignment_bound,
             statement_work_cap,
+            // A performance handle: no result depends on it.
+            pair_cache: _,
         } = Options::default();
         let base = Options {
             excerpt_lines,
@@ -1722,6 +1724,7 @@ mod tests {
             work_caps,
             alignment_bound,
             statement_work_cap,
+            pair_cache: None,
         };
         let artifact = || Artifact::new("schema.sql", Dialect::Tsql, "CREATE TABLE t (id int);");
         let changes: Vec<Change<Options>> = vec![
