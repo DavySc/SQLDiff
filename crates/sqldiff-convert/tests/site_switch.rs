@@ -87,6 +87,7 @@ const KILLED: &[&str] = &[
     "crates/sqldiff-equiv/src/equiv/call.rs::case_check@.case_check(&key(n, s.d)?, true)",
     "crates/sqldiff-equiv/src/equiv/canon.rs::col_ty@.table(Self::base_table(table))",
     "crates/sqldiff-equiv/src/equiv/canon.rs::fold_check@(Some(x), None) => schema.case_check(x, false)?,",
+    "crates/sqldiff-equiv/src/equiv/canon.rs::visible_star@.table(Self::base_table(&b.table))",
     "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(&c.name), false)?;",
     "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(&i.name), false)?;",
     "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(n), false)?;",
@@ -132,15 +133,6 @@ const DOMINATED: &[&str] = &[
 /// Sites whose read sets change but that no generated edit kills: work for
 /// the generator.
 const GAP: &[&str] = &[];
-
-/// Sites whose answer changes a stored result in a way no output shows: the
-/// run after the edit, built fresh, shows the same report entry and the same
-/// converted text for those files as the run before (`SHOWN`), so a resume
-/// that took the stale result could not differ from a fresh run in anything
-/// the run writes. Found by the run, per edit, from the answers the site
-/// alone records.
-const STORE_ONLY: &[&str] =
-    &["crates/sqldiff-equiv/src/equiv/canon.rs::visible_star@.table(Self::base_table(&b.table))"];
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -229,8 +221,6 @@ fn run_tree(
 /// union over its entries: `side query` to the set of answer digests.
 /// The pseudo question under which [`Answers`] holds a hash of a file's stored result.
 const RESULT: &str = "\0result";
-/// What a run shows of the file (its report entry and its converted text).
-const SHOWN: &str = "\0shown";
 const TEXT: &str = "\0text";
 /// The pseudo question that holds the paths of the files whose converted text is a file's stored result.
 const PATH: &str = "\0path";
@@ -352,7 +342,6 @@ fn run_tree_answers(
             })
         })
         .unwrap_or_default();
-    let shown_files = per_file(&out);
     for (key, q) in answers.iter_mut() {
         let Some(text) = q.get(TEXT).and_then(|t| t.iter().next()).cloned() else {
             continue;
@@ -371,13 +360,6 @@ fn run_tree_answers(
             .map(|(p, _)| p.clone())
             .collect();
         let _ = key;
-        // What the run shows of those files.
-        let shown: String = found
-            .iter()
-            .map(|p| shown_files.get(p).cloned().unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join("\n");
-        q.insert(SHOWN.to_string(), BTreeSet::from([shown]));
         q.insert(PATH.to_string(), found);
     }
     (ids, seen, qs, answers)
@@ -488,18 +470,11 @@ fn every_site_the_base_tree_reads_from_is_classified_and_the_classified_sites_ex
         .chain(DOMINATED)
         .chain(KEYED)
         .chain(CONSUMED)
-        .chain(STORE_ONLY)
         .copied()
         .collect();
     assert_eq!(
         known.len(),
-        KILLED.len()
-            + REDUNDANT.len()
-            + GAP.len()
-            + DOMINATED.len()
-            + KEYED.len()
-            + CONSUMED.len()
-            + STORE_ONLY.len(),
+        KILLED.len() + REDUNDANT.len() + GAP.len() + DOMINATED.len() + KEYED.len() + CONSUMED.len(),
         "a site is in two classes"
     );
     let keys = keys_of(&base_sites());
@@ -575,8 +550,8 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
     assert!(all.len() >= 20, "only {} sites seen", all.len());
     let mut skipped_base: BTreeMap<(Dialect, bool), BTreeMap<String, BTreeSet<String>>> =
         BTreeMap::new();
-    let (mut killed, mut redundant, mut gap, mut dom, mut so) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut killed, mut redundant, mut gap, mut dom) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for site in &all {
         let name = keys[site].clone();
         if only
@@ -591,10 +566,6 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
         }
         if CONSUMED.contains(&name.as_str()) {
             println!("{name}: CONSUMED");
-            continue;
-        }
-        if STORE_ONLY.contains(&name.as_str()) {
-            println!("{name}: STORE_ONLY");
             continue;
         }
         // Redundant: the read sets are the same on every tree the site reads
@@ -675,7 +646,6 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
         // result). A site that is never in that case is not proven.
         let mut dominated = true;
         let mut mattered = false;
-        let mut store_mattered = false;
         'dom: for ((d, h, e), (_, _, rq, edit_ans)) in trees.iter().zip(&reference) {
             // `--no-catalog` changes every file's store key (the supplied
             // bit; `a_changed_supplied_bit_finds_nothing_stored`): nothing is
@@ -746,12 +716,6 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
                 if lost == 0 {
                     continue;
                 }
-                // What the fresh run after the edit shows of the file is what
-                // the run before showed: a stale stored result is not visible.
-                if old.get(SHOWN).is_some() && old.get(SHOWN) == new.get(SHOWN) {
-                    store_mattered = true;
-                    continue;
-                }
                 mattered = true;
                 // The file checked again?
                 let paths = new.get(PATH).cloned().unwrap_or_default();
@@ -773,9 +737,6 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
         if dominated && mattered {
             println!("{name}: DOMINATED");
             dom.push(name);
-        } else if dominated && store_mattered {
-            println!("{name}: STORE_ONLY");
-            so.push(name);
         } else if let Some(b) = chain_kill(site, &trees, &reference) {
             // The stored entries of a run made after an edit are what the
             // next resume takes: some sites show only there.
@@ -787,7 +748,7 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
         }
     }
     println!(
-        "KILLED = {killed:#?}\nREDUNDANT = {redundant:#?}\nDOMINATED = {dom:#?}\nSTORE_ONLY = {so:#?}\nGAP = {gap:#?}"
+        "KILLED = {killed:#?}\nREDUNDANT = {redundant:#?}\nDOMINATED = {dom:#?}\nGAP = {gap:#?}"
     );
     if only.is_some() {
         // A shard (`SQLDIFF_T3_ONLY`, as the workflow `t3-sites` runs them):
@@ -805,7 +766,6 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
         wrong(&killed, KILLED, "KILLED");
         wrong(&redundant, REDUNDANT, "REDUNDANT");
         wrong(&dom, DOMINATED, "DOMINATED");
-        wrong(&so, STORE_ONLY, "STORE_ONLY");
         assert!(gap.is_empty(), "sites with no proof: {gap:?}");
         return;
     }
@@ -821,8 +781,6 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
     assert_eq!(redundant, sorted(REDUNDANT), "redundant sites");
     dom.sort();
     assert_eq!(dom, sorted(DOMINATED), "dominated sites");
-    so.sort();
-    assert_eq!(so, sorted(STORE_ONLY), "store-only sites");
     assert_eq!(gap, sorted(GAP), "gap sites");
 }
 

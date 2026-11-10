@@ -134,7 +134,7 @@ pub struct Model {
     /// source base catalog / the target base catalog.
     pub look_a: bool,
     pub look_b: bool,
-    /// Both base catalogs hold a table of another schema named like the tree's view V0.
+    /// The source base catalog holds a table of another schema named like the tree's view V0.
     pub look_v: bool,
     /// The base catalog of a side defines the tree's own tables again,
     /// shaped differently.
@@ -272,6 +272,13 @@ impl Model {
                 name: "V1".into(),
                 over: "T1".into(),
                 star: r.below(2) == 0,
+            },
+            // Always a column list: a star over it is not refused as a star
+            // view, so the table lookup of its name decides the expansion.
+            View {
+                name: "V2".into(),
+                over: "T0".into(),
+                star: false,
             },
         ];
         let routines = vec![
@@ -442,18 +449,20 @@ impl Model {
                 ));
             }
         }
-        if self.look_v {
-            s.push('\n');
-            s.push_str(&create_table(
-                &Table {
-                    schema: "ops".into(),
-                    name: "V0".into(),
-                    cols: vec![key(), col("C0", "nvarchar(40)", true)],
-                    index: None,
-                    versioned: false,
-                },
-                d,
-            ));
+        if self.look_v && d == Dialect::Tsql {
+            for n in ["V0", "V2"] {
+                s.push('\n');
+                s.push_str(&create_table(
+                    &Table {
+                        schema: "ops".into(),
+                        name: n.into(),
+                        cols: vec![key(), col("C0", "nvarchar(40)", true)],
+                        index: None,
+                        versioned: false,
+                    },
+                    d,
+                ));
+            }
         }
         if (d == Dialect::Tsql && self.look_a) || (d != Dialect::Tsql && self.look_b) {
             // Views of another schema, with the names of tables and a view
@@ -665,6 +674,13 @@ fn dependents() -> Vec<(String, String)> {
         "StarLone".into(),
         "INSERT INTO dbo.Sink SELECT * FROM dbo.Lone".into(),
     );
+    // A star over a table with HIDDEN period columns (the `hidden` tree) next
+    // to a catalog-only table: the star expands, or is refused, by what
+    // `Schema::table` answers for the second table.
+    add(
+        "StarHidden".into(),
+        "INSERT INTO dbo.Sink SELECT * FROM dbo.T1 AS a JOIN dbo.Lone AS b ON a.Id = b.Id".into(),
+    );
     add(
         "InsertNoListSink".into(),
         "INSERT INTO dbo.Sink VALUES (1, N'a', 1, NULL)".into(),
@@ -672,6 +688,10 @@ fn dependents() -> Vec<(String, String)> {
     add(
         "ViewStar".into(),
         "INSERT INTO dbo.SinkV SELECT * FROM dbo.V0".into(),
+    );
+    add(
+        "ViewStarPlain".into(),
+        "INSERT INTO dbo.SinkV SELECT * FROM dbo.V2".into(),
     );
     add(
         "ViewFilter".into(),
@@ -896,7 +916,8 @@ pub enum Edit {
     DropFunctions,
     /// The target base catalog gains other spellings of the tree's names.
     CaseClash,
-    /// Both base catalogs gain a table named like the tree's view V0, in another schema.
+    /// The source base catalog gains a table named like the tree's view V0, in another schema
+    /// (`Schema::table("v0")` answers for a star over the view; the target side does not change).
     ViewLookalike,
     /// Only index names have another spelling there.
     CaseClashIndex,
@@ -1237,7 +1258,7 @@ impl Edit {
             }
             Edit::ViewLookalike => {
                 m.look_v = true;
-                "both base catalogs have a table named like the view V0".into()
+                "the source base catalog has a table named like the view V0".into()
             }
             Edit::CaseClash => {
                 m.case_clash = true;

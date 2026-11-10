@@ -21,8 +21,8 @@ use support::harness::{one, Fixture};
 const SEEDS: &[u64] = &[7, 21];
 
 /// The most files an edit may make a resume check again: the files that read
-/// what it changed, as measured, plus two for the sample (one stored file in
-/// 50, seeded). A file that reads nothing the edit touched is taken from the
+/// what it changed, as measured (the harness runs without the sampled
+/// re-check, so nothing is added for it). A file that reads nothing the edit touched is taken from the
 /// store, so a bound that is too low means a read is recorded too widely, and
 /// the test failing on a bound too high is not what it is for: lowering a
 /// bound is how a better recording shows.
@@ -33,7 +33,7 @@ const SEEDS: &[u64] = &[7, 21];
 /// expands a star reads; the narrow edits (a view, a routine, a trigger,
 /// a schema, the base catalog) check a handful.
 fn recheck_at_most(e: &Edit) -> usize {
-    let measured = match e {
+    match e {
         Edit::NoOpComment | Edit::NoOpReorderTables => 0,
         Edit::AddTable => 6,
         Edit::DropTable => 25,
@@ -47,7 +47,8 @@ fn recheck_at_most(e: &Edit) -> usize {
         | Edit::ChangeDefault
         | Edit::ToggleIndex => 26,
         Edit::ViewBody | Edit::AddRoutine | Edit::DropRoutine | Edit::AddTrigger => 6,
-        Edit::ChangeParameterType | Edit::AddSchemaTable | Edit::BaseDrop => 7,
+        Edit::ChangeParameterType | Edit::AddSchemaTable => 7,
+        Edit::BaseDrop => 8,
         Edit::DropTrigger => 4,
         Edit::VersioningOn
         | Edit::DropAllTables
@@ -71,8 +72,7 @@ fn recheck_at_most(e: &Edit) -> usize {
         Edit::BaseRetype => 6,
         Edit::BaseTable => 5,
         Edit::SplitBase => 13,
-    };
-    measured.saturating_add(2)
+    }
 }
 
 fn every_edit(to: Dialect) {
@@ -84,10 +84,9 @@ fn every_edit(to: Dialect) {
             let o = one(to, seed, e);
             let (reused, total) = o.reused;
             if e.is_no_op() {
-                // The edited file is checked again, and one stored file in
-                // fifty is checked again as a sample.
+                // Only the edited file is checked again.
                 assert!(
-                    reused + 1 + total.div_ceil(50) >= total,
+                    reused + 1 >= total,
                     "{to:?} seed {seed} {e:?}: only {reused} of {total} reused"
                 );
             } else {
@@ -97,7 +96,7 @@ fn every_edit(to: Dialect) {
                 // reused results too.)
                 // T2, reuse side: only the files that read what the edit
                 // changed are checked again (the bound is what a run
-                // measured, and two more for the sample of one file in 50).
+                // measured).
                 let at_most = recheck_at_most(e);
                 assert!(
                     o.again.len() <= at_most,
@@ -151,12 +150,6 @@ fn only(e: &Edit) -> bool {
 
 /// Edits the probe cannot show on a dependent, with why.
 const EXEMPT: &[(Dialect, &str, &str)] = &[
-    (
-        Dialect::Postgres,
-        "ViewLookalike",
-        "it changes the stored result of a file only in what no output shows (`site_switch.rs`: STORE_ONLY)",
-    ),
-    (Dialect::Db2i, "ViewLookalike", "same"),
     (
         Dialect::Postgres,
         "ChangeDefault",
