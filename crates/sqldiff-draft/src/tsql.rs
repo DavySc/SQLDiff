@@ -60,6 +60,13 @@ thread_local! {
     static NO_CONTINUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether neither variant switch is on (no [`without_continuation`], no
+/// [`with_plain_routines`] on this thread): the draft built now is the
+/// pass-1 one, which a stored draft entry stands for.
+pub fn variant_switches_off() -> bool {
+    !NO_CONTINUE.with(|c| c.get()) && PLAIN_AT.with(|p| p.borrow().is_empty())
+}
+
 /// Runs `f` with the exception blocks of [`continuation_points`] switched off.
 pub fn without_continuation<T>(f: impl FnOnce() -> T) -> T {
     struct Reset;
