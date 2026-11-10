@@ -53,6 +53,8 @@ pub const DRAFTS_DIR: &str = ".sqldiff/drafts";
 /// keeps its work, and kept across edits: a draft is taken again when its
 /// text is the same and everything it read still has its answer.
 pub const DRAFT_ENTRIES_DIR: &str = ".sqldiff/draft-entries";
+/// Where the per-pair behaviour results live (W4.4 step 2).
+pub const PAIR_ENTRIES_DIR: &str = ".sqldiff/pair-entries";
 
 /// The stand-in flags of each stored result: `<result key>/<flags key>.json`.
 pub const FLAGS_DIR: &str = ".sqldiff/flags";
@@ -1147,7 +1149,14 @@ impl Store {
 
     /// Empties the store (after a mismatch).
     pub fn clear(&self) {
-        for d in [DIR, TREE_DIR, DRAFTS_DIR, DRAFT_ENTRIES_DIR, FLAGS_DIR] {
+        for d in [
+            DIR,
+            TREE_DIR,
+            DRAFTS_DIR,
+            DRAFT_ENTRIES_DIR,
+            PAIR_ENTRIES_DIR,
+            FLAGS_DIR,
+        ] {
             if let Ok(p) = crate::tree::dest_under(&self.out, d) {
                 let _ = std::fs::remove_dir_all(p);
             }
@@ -3105,5 +3114,178 @@ SELECT 1;
             "enabling preserve_order would reorder the stored bytes"
         );
         assert!(v.as_object().unwrap().contains_key(NOTE_TABLE));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-pair behaviour results (performance plan W4.4, step 2).
+// ---------------------------------------------------------------------------
+
+/// How many pair results one store keeps after a run: the ones this run used,
+/// then others by key. A bound on disk, never a decision about a result.
+pub const MAX_PAIR_ENTRIES: usize = 200_000;
+
+/// The pair results of one output tree: a file per pair key under
+/// [`PAIR_ENTRIES_DIR`], framed like every stored file and naming its own
+/// key, so a file copied under another name or edited afterwards is a miss.
+/// It implements the core's [`sqldiff_core::ir::behaviour::PairCache`].
+pub struct PairStore {
+    out: PathBuf,
+    build: String,
+    recheck: crate::tree::Recheck,
+    seed: u64,
+    /// Once set, nothing more is written (a stopped job writes nothing).
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    used: std::sync::Mutex<BTreeSet<String>>,
+    counts: [std::sync::atomic::AtomicUsize; 4],
+}
+
+/// How many pair results a run reused, built, built again to compare and
+/// found different.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PairCounts {
+    pub reused: usize,
+    pub built: usize,
+    pub verified: usize,
+    pub mismatched: usize,
+}
+
+impl PairStore {
+    /// The pair store of `out` for a build, with the run's re-check policy
+    /// and seed.
+    pub fn new(
+        out: &Path,
+        build: &str,
+        recheck: crate::tree::Recheck,
+        seed: u64,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> PairStore {
+        PairStore {
+            cancel,
+            out: out.to_path_buf(),
+            build: build.to_string(),
+            recheck,
+            seed,
+            used: Default::default(),
+            counts: Default::default(),
+        }
+    }
+
+    fn rel(key: &str) -> String {
+        format!("{PAIR_ENTRIES_DIR}/{key}.json")
+    }
+
+    /// What the run did so far.
+    pub fn counts(&self) -> PairCounts {
+        use std::sync::atomic::Ordering::Relaxed;
+        PairCounts {
+            reused: self.counts[0].load(Relaxed),
+            built: self.counts[1].load(Relaxed),
+            verified: self.counts[2].load(Relaxed),
+            mismatched: self.counts[3].load(Relaxed),
+        }
+    }
+
+    /// Removes the results the run did not use beyond [`MAX_PAIR_ENTRIES`]
+    /// (the used ones are kept first, the rest by key). Returns how many
+    /// files went.
+    pub fn gc(&self) -> usize {
+        let Ok(root) = crate::tree::dest_under(&self.out, PAIR_ENTRIES_DIR) else {
+            return 0;
+        };
+        let used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        let mut others: Vec<String> = Vec::new();
+        let mut removed = 0;
+        for e in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(key) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if is_key(key) && !used.contains(key) {
+                others.push(key.to_string());
+            } else if !is_key(key) && std::fs::remove_file(e.path()).is_ok() {
+                // A temporary file of a write that was cut short.
+                removed += 1;
+            }
+        }
+        others.sort();
+        let room = MAX_PAIR_ENTRIES.saturating_sub(used.len());
+        for key in others.iter().skip(room) {
+            if std::fs::remove_file(root.join(format!("{key}.json"))).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+}
+
+impl sqldiff_core::ir::behaviour::PairCache for PairStore {
+    fn build(&self) -> &str {
+        &self.build
+    }
+
+    fn get(&self, key: &str) -> Option<Vec<u8>> {
+        if !is_key(key) {
+            return None;
+        }
+        let raw = std::fs::read(crate::tree::dest_under(&self.out, &Self::rel(key)).ok()?).ok()?;
+        let body = verified_body(&raw)?;
+        let rest = body.strip_prefix(key.as_bytes())?.strip_prefix(b"\n")?;
+        self.used
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string());
+        Some(rest.to_vec())
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) {
+        if !is_key(key)
+            || self
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return;
+        }
+        let Ok(dest) = crate::tree::dest_under(&self.out, &Self::rel(key)) else {
+            return;
+        };
+        let mut body = Vec::with_capacity(key.len() + 1 + bytes.len());
+        body.extend_from_slice(key.as_bytes());
+        body.push(b'\n');
+        body.extend_from_slice(bytes);
+        // A write that fails is a result not stored; the next run builds it.
+        if write_atomically(&dest, &framed(&body)).is_ok() {
+            self.used
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key.to_string());
+        }
+    }
+
+    fn recheck(&self, key: &str) -> bool {
+        match self.recheck {
+            crate::tree::Recheck::None => false,
+            crate::tree::Recheck::All => true,
+            // About one in fifty, by the key and the run's seed.
+            crate::tree::Recheck::Sample => {
+                let h = key
+                    .bytes()
+                    .take(16)
+                    .fold(0u64, |h, b| h.wrapping_mul(131).wrapping_add(u64::from(b)));
+                mix(self.seed, h) % 50 == 0
+            }
+        }
+    }
+
+    fn note(&self, event: sqldiff_core::ir::behaviour::PairEvent, _key: &str) {
+        use sqldiff_core::ir::behaviour::PairEvent as E;
+        let i = match event {
+            E::Reused => 0,
+            E::Built => 1,
+            E::Verified => 2,
+            E::Mismatch => 3,
+        };
+        self.counts[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }

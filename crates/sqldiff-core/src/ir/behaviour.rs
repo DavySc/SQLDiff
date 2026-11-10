@@ -2622,12 +2622,19 @@ pub fn analyze_runs(
         let (r, stats) = match (&env.pair_cache, &caps) {
             (Some(cache), Some(caps)) => {
                 let key = pair_key(a, b, x, y, env, cache.0.build());
+                let bases = PairBases::of(a, b, x, y);
                 let taken = cache
                     .0
                     .get(&key)
                     .and_then(|bytes| serde_json::from_slice::<StoredPair>(&bytes).ok())
                     .filter(|sp| sp.reusable(entry_spent, entry_work, &prior, caps, i, env));
                 match taken {
+                    Some(sp) if bases.shifted(&sp.behaviour, true).is_none() => {
+                        // Offsets that do not move back: built, not trusted.
+                        let (r, stats) = fresh();
+                        cache.0.note(PairEvent::Built, &key);
+                        (r, stats)
+                    }
                     Some(sp) if !cache.0.recheck(&key) => {
                         // Advance the file's shared state exactly as the
                         // pair would have.
@@ -2638,7 +2645,7 @@ pub fn analyze_runs(
                         );
                         cache.0.note(PairEvent::Reused, &key);
                         (
-                            sp.behaviour,
+                            bases.shifted(&sp.behaviour, true).unwrap_or_default(),
                             PairStats {
                                 spent: sp.spent,
                                 cut: false,
@@ -2649,9 +2656,15 @@ pub fn analyze_runs(
                     Some(sp) => {
                         // Sampled: build it again; the fresh result wins.
                         let (r, stats) = fresh();
-                        let rebuilt =
-                            StoredPair::of(&r, &stats, entry_work, start, caps.unit_cap(env, i));
-                        let same = rebuilt.same_as(&sp);
+                        let rebuilt = StoredPair::of(
+                            &r,
+                            &stats,
+                            entry_work,
+                            start,
+                            caps.unit_cap(env, i),
+                            &bases,
+                        );
+                        let same = rebuilt.as_ref().is_some_and(|rb| rb.same_as(&sp));
                         cache.0.note(
                             if same {
                                 PairEvent::Verified
@@ -2660,8 +2673,8 @@ pub fn analyze_runs(
                             },
                             &key,
                         );
-                        if !same && !stats.cut {
-                            if let Ok(bytes) = serde_json::to_vec(&rebuilt) {
+                        if let (false, false, Some(rb)) = (same, stats.cut, &rebuilt) {
+                            if let Ok(bytes) = serde_json::to_vec(rb) {
                                 cache.0.put(&key, &bytes);
                             }
                         }
@@ -2679,8 +2692,9 @@ pub fn analyze_runs(
                                 entry_work,
                                 start,
                                 caps.unit_cap(env, i),
+                                &bases,
                             );
-                            if let Ok(bytes) = serde_json::to_vec(&sp) {
+                            if let Some(Ok(bytes)) = sp.map(|sp| serde_json::to_vec(&sp)) {
                                 cache.0.put(&key, &bytes);
                             }
                         }
@@ -2772,15 +2786,20 @@ struct StoredPair {
 }
 
 impl StoredPair {
+    /// The pair's result as it is stored: byte offsets relative to the
+    /// start of each routine (`bases`). `None` when a position lies outside
+    /// the routine it belongs to or in another file: such a result is not
+    /// kept, since it would not move with the routine.
     fn of(
         r: &Behaviour,
         stats: &PairStats,
         entry_work: u64,
         start: u64,
         unit_cap: u64,
-    ) -> StoredPair {
-        StoredPair {
-            behaviour: r.clone(),
+        bases: &PairBases,
+    ) -> Option<StoredPair> {
+        Some(StoredPair {
+            behaviour: bases.shifted(r, false)?,
             spent: stats.spent,
             work: sqldiff_model::work::now()
                 .total()
@@ -2788,7 +2807,7 @@ impl StoredPair {
                 .saturating_sub(entry_work),
             unit_cap,
             tested: stats.tested.clone(),
-        }
+        })
     }
 
     fn same_as(&self, other: &StoredPair) -> bool {
@@ -2821,10 +2840,76 @@ impl StoredPair {
     }
 }
 
+/// Where the two routines of a pair stand in their files: the byte range of
+/// each (side A, side B) and the path of its file.
+struct PairBases {
+    a: (std::ops::Range<usize>, String),
+    b: (std::ops::Range<usize>, String),
+}
+
+impl PairBases {
+    fn of(a: &Analyzed, b: &Analyzed, x: &SyntaxNode, y: &SyntaxNode) -> PairBases {
+        let (la, lb) = (a.node_location(x), b.node_location(y));
+        PairBases {
+            a: (la.byte_start..la.byte_end, la.path),
+            b: (lb.byte_start..lb.byte_end, lb.path),
+        }
+    }
+
+    /// `r` with every byte offset moved from the file's to the routine's
+    /// frame (`to_file` false) or back (`to_file` true). Offsets are in
+    /// finding locations and in the compared ranges; line and column
+    /// positions are in the key and need no move. `None` when an offset is
+    /// not inside its routine, or a location names another file.
+    fn shifted(&self, r: &Behaviour, to_file: bool) -> Option<Behaviour> {
+        let mut r = r.clone();
+        let side = |s: crate::model::Side| {
+            if s == crate::model::Side::A {
+                &self.a
+            } else {
+                &self.b
+            }
+        };
+        let mv = |range: &std::ops::Range<usize>, base: &std::ops::Range<usize>| {
+            if to_file {
+                let (s, e) = (
+                    base.start.checked_add(range.start)?,
+                    base.start.checked_add(range.end)?,
+                );
+                (range.start <= range.end).then_some(s..e)
+            } else {
+                (range.start >= base.start && range.end >= range.start && range.end <= base.end)
+                    .then(|| range.start - base.start..range.end - base.start)
+            }
+        };
+        for f in &mut r.findings {
+            for loc in [&mut f.a, &mut f.b].into_iter().flatten() {
+                let (base, path) = side(loc.side);
+                if !to_file && loc.path != *path {
+                    return None;
+                }
+                let m = mv(&(loc.byte_start..loc.byte_end), base)?;
+                (loc.byte_start, loc.byte_end) = (m.start, m.end);
+            }
+        }
+        for (ranges, (base, _)) in [
+            (&mut r.txn_compared_a, &self.a),
+            (&mut r.txn_compared_b, &self.b),
+        ] {
+            for range in ranges.iter_mut() {
+                *range = mv(range, base)?;
+            }
+        }
+        Some(r)
+    }
+}
+
 /// The key of a routine pair's result: everything the pair reads of the
 /// files (design `w4-4-routine-units.md`, section H and the review P1). The
-/// byte and line positions of the routines are in the key, so a result is
-/// taken only where it stands as it did; rebasing positions is a later step.
+/// line and column where each routine starts and the length of its text are
+/// in the key; its byte offset is not: the stored result holds byte offsets
+/// relative to the routine and a reuse adds the routine's offset
+/// ([`PairBases`]), so a routine moves in its file without losing its result.
 fn pair_key(
     a: &Analyzed,
     b: &Analyzed,
@@ -2869,8 +2954,10 @@ fn pair_key(
         field(
             &format!("{tag}.position"),
             format!(
-                "{}:{} {}..{}",
-                loc.start_line, loc.start_col, loc.byte_start, loc.byte_end
+                "{}:{} len {}",
+                loc.start_line,
+                loc.start_col,
+                loc.byte_end - loc.byte_start
             )
             .as_bytes(),
         );
@@ -2897,7 +2984,13 @@ fn pair_key(
         format!("{caller_txn} {xact_abort} {commit_level:?} {skip_witnesses} {work_budgets:?} {work_caps:?}")
             .as_bytes(),
     );
-    // The identified condition pairs of this routine pair only.
+    // The identified condition pairs of this routine pair only, by offset
+    // from the start of each routine: the pair reads them as positions in
+    // its own routines, so a routine that moves in its file keeps its key.
+    let (sa, sb) = (
+        usize::from(ra.text_range().start()),
+        usize::from(rb.text_range().start()),
+    );
     let inside = |r: &SyntaxNode, at: usize| {
         let t = r.text_range();
         usize::from(t.start()) <= at && at < usize::from(t.end())
@@ -2906,6 +2999,7 @@ fn pair_key(
         set.iter()
             .copied()
             .filter(|&(x, y)| inside(ra, x) && inside(rb, y))
+            .map(|(x, y)| (x - sa, y - sb))
             .collect()
     });
     field("identified", format!("{subset:?}").as_bytes());
@@ -3909,24 +4003,44 @@ mod pair_tests {
         )
     }
 
-    fn pair_k(a: &str, b: &str, k: usize) -> String {
-        let (_, runs) = analysed(a, b, &Env::default());
-        let r = &runs[k];
-        format!("{:?} {} {}", r.behaviour, r.spent, r.cut)
-    }
-
-    /// EXPLORATION: which perturbations of the rest of the file change pair 3.
+    /// The soundness of the key: a cache primed on one file serves every
+    /// edit of it that leaves a pair's key alone, and what it serves is what
+    /// a fresh analysis gives. The edits are the ones that could reach a pair
+    /// from outside its routine: text before and after it, a table another
+    /// routine writes, a routine defined later, and a temporary table that a
+    /// later routine creates or that a pair reads without creating.
     #[test]
-    fn explore_perturbations() {
-        let (a0, b0) = files(&|_| {});
-        let base = pair_k(&a0, &b0, 3);
+    fn a_cache_primed_on_one_file_serves_any_edit_of_it_as_a_fresh_run_would() {
         type Edit = Box<dyn Fn(&mut Routines)>;
+        let reads = |v: &mut Routines| {
+            v[3].0 = v[3]
+                .0
+                .replace("EXEC dbo.r4 @x;", "SELECT id FROM #tmp9; EXEC dbo.r4 @x;");
+            v[3].1 = v[3]
+                .1
+                .replace("CALL r4(x);", "PERFORM id FROM tmp9; CALL r4(x);");
+        };
+        let append = |name: &'static str, temp: &'static str, callee: &'static str, lit: u32| {
+            Box::new(move |v: &mut Routines| {
+                v.push((
+                    t_routine(name, temp, callee, lit),
+                    p_routine(name, temp, callee, lit),
+                ));
+            }) as Edit
+        };
         let cases: Vec<(&str, Edit)> = vec![
             (
                 "literal in r1 (before)",
                 Box::new(|v| {
                     v[1].0 = v[1].0.replace("11", "12");
                     v[1].1 = v[1].1.replace("11", "12");
+                }),
+            ),
+            (
+                "longer literal in r1 (before; later routines move)",
+                Box::new(|v| {
+                    v[1].0 = v[1].0.replace("11", "1100");
+                    v[1].1 = v[1].1.replace("11", "1100");
                 }),
             ),
             (
@@ -3945,82 +4059,47 @@ mod pair_tests {
             ),
             (
                 "late routine defined at the end",
-                Box::new(|v| {
-                    v.push((
-                        t_routine("late", "tmpz", "r0", 99),
-                        p_routine("late", "tmpz", "r0", 99),
-                    ));
-                }),
+                append("late", "tmpz", "r0", 99),
             ),
             (
                 "a later routine uses a temp table named like pair 3's",
-                Box::new(|v| {
-                    v.push((
-                        t_routine("z1", "tmp3", "r0", 98),
-                        p_routine("z1", "tmp3", "r0", 98),
-                    ));
-                }),
+                append("z1", "tmp3", "r0", 98),
             ),
             (
                 "a later routine uses a temp table pair 3 does not",
-                Box::new(|v| {
+                append("z1", "tmp9", "r0", 98),
+            ),
+            ("unrelated routine appended", append("z2", "tmpy", "r0", 97)),
+            ("pair 3 reads a temp table nobody creates", Box::new(reads)),
+            (
+                "pair 3 reads a temp table a later routine creates",
+                Box::new(move |v| {
+                    reads(v);
                     v.push((
                         t_routine("z1", "tmp9", "r0", 98),
                         p_routine("z1", "tmp9", "r0", 98),
-                    ));
-                }),
-            ),
-            (
-                "unrelated routine appended",
-                Box::new(|v| {
-                    v.push((
-                        t_routine("z2", "tmpy", "r0", 97),
-                        p_routine("z2", "tmpy", "r0", 97),
                     ));
                 }),
             ),
         ];
-        // Pair 3 reads a temp table it does not create (a caller's).
-        let reads = |v: &mut Routines| {
-            v[3].0 = v[3]
-                .0
-                .replace("EXEC dbo.r4 @x;", "SELECT id FROM #tmp9; EXEC dbo.r4 @x;");
-            v[3].1 = v[3]
-                .1
-                .replace("CALL r4(x);", "PERFORM id FROM tmp9; CALL r4(x);");
-        };
-        let (a1, b1) = files(&reads);
-        let base1 = pair_k(&a1, &b1, 3);
-        for (name, creator) in [
-            ("reader, nobody creates tmp9", false),
-            ("reader, a later routine creates tmp9", true),
-        ] {
-            let (a, b) = files(&|v: &mut Routines| {
-                reads(v);
-                if creator {
-                    v.push((
-                        t_routine("z1", "tmp9", "r0", 98),
-                        p_routine("z1", "tmp9", "r0", 98),
-                    ));
-                }
-            });
-            eprintln!(
-                "PERTURB {name}: pair 3 {}",
-                if pair_k(&a, &b, 3) == base1 {
-                    "same as reader alone"
-                } else {
-                    "CHANGED"
-                }
-            );
-        }
+        let (a0, b0) = files(&|_| {});
+        let mut served = 0;
         for (name, edit) in &cases {
+            let cache = std::sync::Arc::new(MemCache::default());
+            let env = with_cache(&Env::default(), &cache);
+            let _ = analysed(&a0, &b0, &env);
+            cache.reset_events();
             let (a, b) = files(&**edit);
-            let same = pair_k(&a, &b, 3) == base;
-            eprintln!(
-                "PERTURB {name}: pair 3 {}",
-                if same { "unchanged" } else { "CHANGED" }
+            let (cached, cached_runs) = analysed(&a, &b, &env);
+            let (fresh, fresh_runs) = analysed(&a, &b, &Env::default());
+            assert_eq!(
+                shown(&cached_runs, &cached),
+                shown(&fresh_runs, &fresh),
+                "{name}"
             );
+            served += cache.count(PairEvent::Reused);
         }
+        assert!(served > 0, "no case reused a pair: the test proves nothing");
     }
 
     /// A cache in memory, counting what happened.
@@ -4157,6 +4236,75 @@ mod pair_tests {
         assert_ne!(a, a2);
         let (cached, cached_runs) = analysed(&a2, &b2, &env);
         let (fresh, fresh_runs) = analysed(&a2, &b2, &Env::default());
+        assert_eq!(shown(&cached_runs, &cached), shown(&fresh_runs, &fresh));
+        assert_eq!(cache.count(PairEvent::Reused), 5);
+        assert_eq!(cache.count(PairEvent::Built), 1);
+    }
+
+    /// A routine that moves in its file (an edit of an earlier routine made
+    /// the text longer, on the same lines) keeps its stored result, and the
+    /// result's byte offsets follow it.
+    #[test]
+    fn a_pair_that_moves_in_its_file_keeps_its_result_with_the_new_offsets() {
+        let (a, b) = (tsql(6, 3), pg(6, 3, Some(3)));
+        let cache = std::sync::Arc::new(MemCache::default());
+        let env = with_cache(&Env::default(), &cache);
+        let _ = analysed(&a, &b, &env);
+        cache.reset_events();
+        // Longer text on one line of the first routine only.
+        let a2 = a.replacen("c + 0 WHERE", "c + 1000 WHERE", 1);
+        let b2 = b.replacen("c + 0 WHERE", "c + 1000 WHERE", 1);
+        assert_ne!(a, a2);
+        let (cached, cached_runs) = analysed(&a2, &b2, &env);
+        let (fresh, fresh_runs) = analysed(&a2, &b2, &Env::default());
+        assert_eq!(shown(&cached_runs, &cached), shown(&fresh_runs, &fresh));
+        // The offsets are observed: some finding has a location, and they
+        // are the fresh ones (the comparison above is of the whole result).
+        assert!(
+            fresh
+                .findings
+                .iter()
+                .any(|f| f.a.is_some() || f.b.is_some()),
+            "the shapes below prove nothing without a located finding"
+        );
+        assert_eq!(cache.count(PairEvent::Reused), 5);
+        assert_eq!(cache.count(PairEvent::Built), 1);
+    }
+
+    /// The identified condition pairs are positions in the file, and a
+    /// routine that moves keeps its key: the key holds them by offset from
+    /// the routine's start. (A set that does not move with its routine is
+    /// another key, so a pair is built again, never taken wrongly.)
+    #[test]
+    fn identified_pairs_move_with_their_routines() {
+        let (a, b) = (tsql(6, 3), pg(6, 3, Some(3)));
+        let a2 = a.replacen("c + 0 WHERE", "c + 1000 WHERE", 1);
+        let b2 = b.replacen("c + 0 WHERE", "c + 1000 WHERE", 1);
+        assert_ne!(a, a2);
+        // One identified pair inside every routine, as the file stands.
+        let set = |a: &str, b: &str| {
+            let mut s = BTreeSet::new();
+            for (x, y) in a
+                .match_indices("CREATE PROCEDURE")
+                .zip(b.match_indices("CREATE PROCEDURE"))
+            {
+                s.insert((x.0 + 20, y.0 + 20));
+            }
+            std::sync::Arc::new(s)
+        };
+        let cache = std::sync::Arc::new(MemCache::default());
+        let env = |a: &str, b: &str| Env {
+            identified: Some(set(a, b)),
+            ..with_cache(&Env::default(), &cache)
+        };
+        let _ = analysed(&a, &b, &env(&a, &b));
+        cache.reset_events();
+        let (cached, cached_runs) = analysed(&a2, &b2, &env(&a2, &b2));
+        let plain = Env {
+            identified: Some(set(&a2, &b2)),
+            ..Env::default()
+        };
+        let (fresh, fresh_runs) = analysed(&a2, &b2, &plain);
         assert_eq!(shown(&cached_runs, &cached), shown(&fresh_runs, &fresh));
         assert_eq!(cache.count(PairEvent::Reused), 5);
         assert_eq!(cache.count(PairEvent::Built), 1);

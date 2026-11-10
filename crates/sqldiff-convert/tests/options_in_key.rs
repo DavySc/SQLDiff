@@ -39,6 +39,7 @@ const FIELDS: &[(&str, &str)] = &[
     ("work_caps", "constant: the built-in caps"),
     ("alignment_bound", "constant: the built-in bound"),
     ("statement_work_cap", "constant: no statement-level allowance"),
+    ("pair_cache", "set by the converter: a performance handle only. A pair result is keyed by everything the pair reads (`pair_key`), so it changes how long a check takes, never what it says"),
 ];
 
 #[test]
@@ -61,8 +62,9 @@ fn every_option_is_classified() {
         work_caps: _,
         alignment_bound: _,
         statement_work_cap: _,
+        pair_cache: _,
     } = Options::default();
-    assert_eq!(FIELDS.len(), 17);
+    assert_eq!(FIELDS.len(), 18);
 }
 
 /// The field names assigned at the top level of the `Options { .. }` literals
