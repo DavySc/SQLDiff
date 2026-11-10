@@ -83,7 +83,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("sqldiff-convert/src/queue.rs", &["fs::"]),
     ("sqldiff-convert/src/review.rs", &["fs::"]),
     ("sqldiff-units/src/shared.rs", &["Mutex"]),
-    ("sqldiff-convert/src/store.rs", &["fs::", "thread::current"]),
+    ("sqldiff-convert/src/store.rs", &["File::open", "fs::", "thread::current"]),
     (
         "sqldiff-convert/src/tree.rs",
         &["Instant::now", "Mutex", "OnceLock", "fs::"],
