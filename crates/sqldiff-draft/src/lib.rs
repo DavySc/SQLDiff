@@ -95,6 +95,12 @@ pub fn rewrite_in_tree_recorded(
     options: RuleOptions,
     sink: &dyn ReadSink,
 ) -> Draft {
+    // Only the pass-1 draft is a function of the text and the recorded
+    // reads: the variant switches are thread-local and not in the key.
+    debug_assert!(
+        tsql::variant_switches_off(),
+        "a draft entry is recorded only from the pass-1 build"
+    );
     rewrite_core(
         text,
         from,
