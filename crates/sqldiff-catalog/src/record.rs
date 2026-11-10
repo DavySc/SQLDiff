@@ -100,6 +100,12 @@ pub enum Query {
     /// need to know whether any column could be a `bit`; it changes only when
     /// a type shape appears or disappears, not on every column edit.
     ColumnTypes,
+    /// Pass 1 only (`Side::Draft`): every claim of the tree's table
+    /// variables on a temporary table name (`Claims`), as one digest. Asked
+    /// of the tree's claims, not of a catalog, so it is replayed by the
+    /// draft crate. The wide form of the one question pass 1 asks
+    /// (`Claims::clash`).
+    ClaimsAll,
     /// The sound fallback for a read that has no narrow form: the whole
     /// catalog. A file that records it re-checks on any edit, as today.
     WholeCatalog,
@@ -450,6 +456,10 @@ impl<'a> RecordingView<'a> {
 /// recording read digests the whole table text on every call, the cost
 /// recording had in pass 2 before the table digest was cached.
 pub struct SourceDigests {
+    /// The catalog these caches were built for (its address): another one is
+    /// refused by [`SourceReads::recording`], because a cache paired with a
+    /// catalog it was not made for would hand out stale digests.
+    owner: usize,
     tables: Vec<std::sync::OnceLock<Outcome>>,
     whole: std::sync::OnceLock<Outcome>,
     types: std::sync::OnceLock<Vec<(String, Vec<u32>)>>,
@@ -459,6 +469,7 @@ impl SourceDigests {
     /// Empty caches sized for `cat`. Use them with this catalog only.
     pub fn new(cat: &Catalog) -> Self {
         SourceDigests {
+            owner: cat as *const Catalog as usize,
             tables: cat.tables.iter().map(|_| Default::default()).collect(),
             whole: Default::default(),
             types: Default::default(),
@@ -515,6 +526,10 @@ impl<'a> SourceReads<'a> {
         sink: &'a dyn ReadSink,
         digests: &'a SourceDigests,
     ) -> Self {
+        assert!(
+            digests.owner == cat as *const Catalog as usize,
+            "SourceDigests used with a catalog it was not built for"
+        );
         SourceReads {
             cat,
             dialect,
@@ -523,8 +538,19 @@ impl<'a> SourceReads<'a> {
         }
     }
 
-    /// Records `q` with the digest `d` makes, unless the sink holds it.
+    /// Records `q` with the digest `d` makes, unless the sink holds it or the
+    /// site switch skips this call site (a narrow read under test).
+    #[track_caller]
     fn rec_with(&self, q: impl FnOnce() -> Query, d: impl FnOnce() -> Outcome) {
+        if site_skipped() {
+            return;
+        }
+        self.rec_always(q, d);
+    }
+
+    /// [`rec_with`](Self::rec_with) for a read that is never skipped: the
+    /// wide fallback, whose omission no edit is meant to show.
+    fn rec_always(&self, q: impl FnOnce() -> Query, d: impl FnOnce() -> Outcome) {
         if !self.sink.active() {
             return;
         }
@@ -535,6 +561,7 @@ impl<'a> SourceReads<'a> {
         self.sink.record(Side::Draft, &q, d());
     }
 
+    #[track_caller]
     fn rec<T: std::fmt::Debug + ?Sized>(&self, q: impl FnOnce() -> Query, answer: &T) {
         self.rec_with(q, || Outcome::of(answer));
     }
@@ -547,7 +574,10 @@ impl<'a> SourceReads<'a> {
         }
     }
 
-    /// A table by name.
+    /// A table by name. Records the narrow `Table(parts)` query: only a site
+    /// whose recording a per-site test proves (T3) may call this; any other
+    /// uses [`table_wide`](Self::table_wide).
+    #[track_caller]
     pub fn table(&self, parts: &[Ident]) -> Option<&'a Table> {
         let at = crate::table_position(self.dialect, self.cat, parts);
         let a = at.map(|i| &self.cat.tables[i]);
@@ -565,7 +595,24 @@ impl<'a> SourceReads<'a> {
         a
     }
 
+    /// A table by name, recording `WholeCatalog` instead of the table: the
+    /// sound fallback for a site no per-site test proves yet. A draft that
+    /// read it is built again on any edit of the catalog.
+    pub fn table_wide(&self, parts: &[Ident]) -> Option<&'a Table> {
+        let a = crate::table_position(self.dialect, self.cat, parts).map(|i| &self.cat.tables[i]);
+        self.rec_always(|| Query::WholeCatalog, || self.whole_digest());
+        a
+    }
+
+    /// [`triggers_named`](Self::triggers_named), recording `WholeCatalog`.
+    pub fn triggers_named_wide(&self, schema: Option<&str>, name: &str) -> Vec<&'a crate::Trigger> {
+        let a = self.cat.triggers_named(self.dialect, schema, name);
+        self.rec_always(|| Query::WholeCatalog, || self.whole_digest());
+        a
+    }
+
     /// The triggers a name matches, as [`Catalog::triggers_named`].
+    #[track_caller]
     pub fn triggers_named(&self, schema: Option<&str>, name: &str) -> Vec<&'a crate::Trigger> {
         let a = self.cat.triggers_named(self.dialect, schema, name);
         self.rec(
@@ -577,6 +624,7 @@ impl<'a> SourceReads<'a> {
 
     /// The distinct column types of the catalog, sorted (`(base, arguments)`).
     /// Records [`Query::ColumnTypes`], not the whole catalog.
+    #[track_caller]
     pub fn column_types(&self) -> std::borrow::Cow<'a, [(String, Vec<u32>)]> {
         let types = match self.digests {
             Some(d) => std::borrow::Cow::Borrowed(
@@ -588,15 +636,29 @@ impl<'a> SourceReads<'a> {
         types
     }
 
+    /// [`column_types`](Self::column_types), recording `WholeCatalog` instead
+    /// of `ColumnTypes`: the sound fallback until a per-site test proves the
+    /// narrow query.
+    pub fn column_types_wide(&self) -> std::borrow::Cow<'a, [(String, Vec<u32>)]> {
+        let types = match self.digests {
+            Some(d) => std::borrow::Cow::Borrowed(
+                d.types.get_or_init(|| column_types_of(self.cat)).as_slice(),
+            ),
+            None => std::borrow::Cow::Owned(column_types_of(self.cat)),
+        };
+        self.rec_always(|| Query::WholeCatalog, || self.whole_digest());
+        types
+    }
+
     /// Every table: records `WholeCatalog`.
     pub fn tables(&self) -> &'a [Table] {
-        self.rec_with(|| Query::WholeCatalog, || self.whole_digest());
+        self.rec_always(|| Query::WholeCatalog, || self.whole_digest());
         &self.cat.tables
     }
 
     /// Every routine: records `WholeCatalog`.
     pub fn routines(&self) -> &'a [Routine] {
-        self.rec_with(|| Query::WholeCatalog, || self.whole_digest());
+        self.rec_always(|| Query::WholeCatalog, || self.whole_digest());
         &self.cat.routines
     }
 

@@ -207,14 +207,39 @@ pub(crate) struct Binder<'a> {
     trigger: Option<TriggerCtx>,
     /// `#variable_conflict use_column` in a PL/pgSQL body: a name that is
     /// both a column and a variable means the column. (`use_variable` is
-    /// left to the default check, which reports the name.)
-    pg_conflict_directive: bool,
+    /// left to the default check, which reports the name.) The directive
+    /// belongs to the function that holds it: the byte ranges of the
+    /// routines of the artifact whose text carries it. Outside every
+    /// routine (a `DO` block, a script) the directive of the whole text
+    /// counts, as before.
+    pg_conflict_routines: Vec<(usize, usize)>,
+    pg_conflict_outside: bool,
     /// T-SQL GOTO labels of the current batch.
     goto_labels: Vec<String>,
     /// Every routine the artifact creates, wherever it is: a call inside a
     /// routine body is resolved when the body runs, possibly after a routine
     /// defined further down was created.
     later: LocalView,
+}
+
+/// Whether `text` holds a `#variable_conflict use_column` directive.
+fn has_use_column(text: &str) -> bool {
+    text.to_ascii_lowercase()
+        .split("#variable_conflict")
+        .skip(1)
+        .any(|r| r.trim_start().starts_with("use_column"))
+}
+
+impl Binder<'_> {
+    /// Whether the function holding byte `at` says `#variable_conflict
+    /// use_column` (PostgreSQL scopes the directive to one function).
+    fn pg_conflict_directive_at(&self, at: usize) -> bool {
+        self.pg_conflict_outside
+            || self
+                .pg_conflict_routines
+                .iter()
+                .any(|&(s, e)| s <= at && at < e)
+    }
 }
 
 /// Binds one parsed artifact.
@@ -231,13 +256,24 @@ pub fn bind(a: &Analyzed, input: &BindInput) -> Bound {
         local: LocalView::new(a.dialect()),
         ordinals: HashMap::new(),
         trigger: None,
-        pg_conflict_directive: a
-            .artifact
-            .text
-            .to_ascii_lowercase()
-            .split("#variable_conflict")
-            .skip(1)
-            .any(|r| r.trim_start().starts_with("use_column")),
+        pg_conflict_routines: a
+            .root
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::ROUTINE)
+            .filter(|n| {
+                let r = n.text_range();
+                has_use_column(&a.artifact.text[usize::from(r.start())..usize::from(r.end())])
+            })
+            .map(|n| {
+                let r = n.text_range();
+                (usize::from(r.start()), usize::from(r.end()))
+            })
+            .collect(),
+        pg_conflict_outside: has_use_column(&a.artifact.text)
+            && !a
+                .root
+                .descendants()
+                .any(|n| n.kind() == SyntaxKind::ROUTINE),
         goto_labels: Vec::new(),
         later: LocalView::new(a.dialect()),
     };

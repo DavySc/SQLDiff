@@ -5,6 +5,10 @@
 //! is that of exactly the code that writes a draft. A check never calls into
 //! it except to build a draft again (`Rebuild`).
 
+use sqldiff_equiv::catalog::record::{
+    Query, ReadSink, Reads, Recorder, Side, SourceDigests, SourceReads,
+};
+use sqldiff_equiv::catalog::Catalog;
 use sqldiff_syntax::parse;
 use sqldiff_syntax::Dialect;
 use sqldiff_units::out;
@@ -65,10 +69,88 @@ pub fn rewrite_in_tree_plain(
     text: &str,
     from: Dialect,
     to: Dialect,
-    source: Option<&sqldiff_equiv::catalog::Catalog>,
+    source: Option<&Catalog>,
     claims: Option<&table_vars::Claims>,
     options: RuleOptions,
     plain_at: &[usize],
+) -> Draft {
+    rewrite_core(text, from, to, source, claims, options, plain_at, None)
+}
+
+/// What pass 1 read of the tree while it built one draft is recorded to
+/// `sink` (side [`Side::Draft`]): every question to the source catalog
+/// (`SourceReads`, with the shared `digests` of that catalog) and to the
+/// tree's claims (`ClaimReads`). The draft is exactly the one
+/// [`rewrite_in_tree`] gives for the same arguments; both rule variants (the
+/// one with exception blocks and the plain one) and dynamic SQL record to the
+/// one sink, so the read set is the union of all of them. Only the pass-1
+/// call of the tree run records: a draft rebuilt for a pick of plain routines
+/// ([`rewrite_in_tree_plain`]) is not a function of these reads alone.
+pub fn rewrite_in_tree_recorded(
+    text: &str,
+    from: Dialect,
+    to: Dialect,
+    source: Option<(&Catalog, &SourceDigests)>,
+    claims: &table_vars::Claims,
+    options: RuleOptions,
+    sink: &dyn ReadSink,
+) -> Draft {
+    rewrite_core(
+        text,
+        from,
+        to,
+        source.map(|(c, _)| c),
+        Some(claims),
+        options,
+        &[],
+        Some((sink, source.map(|(_, d)| d))),
+    )
+}
+
+/// Whether every question of a stored draft's read set (`reads`) has the
+/// same answer now, asked of the source catalog (with its `digests`) and
+/// the tree's `claims` through the methods the rules used. A question that
+/// is not a pass-1 one, or one about a catalog when there is none, does
+/// not hold.
+pub fn draft_reads_hold(
+    reads: &Reads,
+    source: Option<(&Catalog, &SourceDigests)>,
+    claims: &table_vars::Claims,
+) -> bool {
+    for ((side, q), want) in &reads.0 {
+        if *side != Side::Draft {
+            return false;
+        }
+        let got = match q {
+            Query::ClaimsAll => table_vars::replay_claims(claims, q),
+            _ => match source {
+                Some((c, d)) => {
+                    let rec = Recorder::default();
+                    if !SourceReads::recording(c, Dialect::Tsql, &rec, d).ask(q) {
+                        return false;
+                    }
+                    rec.snapshot().0 .0.get(&(Side::Draft, q.clone())).copied()
+                }
+                None => return false,
+            },
+        };
+        if got != Some(*want) {
+            return false;
+        }
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rewrite_core(
+    text: &str,
+    from: Dialect,
+    to: Dialect,
+    source: Option<&Catalog>,
+    claims: Option<&table_vars::Claims>,
+    options: RuleOptions,
+    plain_at: &[usize],
+    recording: Option<(&dyn ReadSink, Option<&SourceDigests>)>,
 ) -> Draft {
     let root = parse(text, from).syntax();
     let own;
@@ -83,6 +165,19 @@ pub fn rewrite_in_tree_plain(
             &own
         }
     };
+    fn reads<'a>(
+        c: &'a Catalog,
+        recording: Option<(&'a dyn ReadSink, Option<&'a SourceDigests>)>,
+    ) -> SourceReads<'a> {
+        match recording {
+            Some((sink, Some(d))) => SourceReads::recording(c, Dialect::Tsql, sink, d),
+            _ => SourceReads::new(c, Dialect::Tsql),
+        }
+    }
+    let claim_reads = match recording {
+        Some((sink, _)) => table_vars::ClaimReads::recording(claims, sink),
+        None => table_vars::ClaimReads::new(claims),
+    };
     let run = || {
         guarded(&root, text, || match (from, to) {
             (Dialect::Tsql, Dialect::Postgres | Dialect::Db2i) => {
@@ -92,10 +187,8 @@ pub fn rewrite_in_tree_plain(
                     to,
                     // The one place the tree's catalog enters pass 1: wrapped, so
                     // that every read after it is a `SourceReads` method.
-                    source.map(|c| {
-                        sqldiff_equiv::catalog::record::SourceReads::new(c, Dialect::Tsql)
-                    }),
-                    claims,
+                    source.map(|c| reads(c, recording)),
+                    claim_reads,
                     options,
                 )
             }

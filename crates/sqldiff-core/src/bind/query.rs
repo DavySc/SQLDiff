@@ -2629,7 +2629,7 @@ impl<'a> Binder<'a> {
         };
         match (var, matches.first()) {
             (Some(i), Some((s, c))) => {
-                if d == Dialect::Postgres && !self.pg_conflict_directive {
+                if d == Dialect::Postgres && !self.pg_conflict_directive_at(span.0) {
                     let dn = self.out.decls[i].name.clone();
                     let msg = format!(
                         "`{}` is both PL/pgSQL variable `{dn}` (line {}) and column {}.{}; with the default plpgsql.variable_conflict = error the statement fails with \"column reference is ambiguous\".",
