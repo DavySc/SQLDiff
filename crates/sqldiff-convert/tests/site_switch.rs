@@ -298,19 +298,20 @@ fn per_key(qs: &BTreeMap<String, Vec<String>>) -> BTreeMap<String, BTreeSet<Stri
 /// runs of a file, the stored one (`old`, before the edit) and the checked
 /// one (`new`, after it). A stored entry is taken exactly when every read it
 /// holds has the answer it had, so an entry without `v` is taken stale only
-/// if `v`'s answer changed and no read that remains (`kept`) changed with
-/// it. Whatever the reason a kept read changes (it asks the same question of
-/// the other side, a whole-catalog digest, the table a view reads), the
-/// entry is refused then, and the file is checked again. A read missing from
-/// one of the two runs counts as changed.
+/// if the check still asks `v`, `v`'s answer changed, and no read the entry
+/// keeps (`kept`) changed with it. Whatever the reason a kept read changes
+/// (it asks the same question of the other side, a whole-catalog digest, the
+/// table a view reads, the same question from another call site), the entry
+/// is refused then, and the file is checked again. A kept read the checked
+/// run no longer asks is not counted: its new answer is not known.
 fn depends(
-    v: &str,
+    v: &String,
     kept: &BTreeSet<String>,
     old: &BTreeMap<String, BTreeSet<String>>,
     new: &BTreeMap<String, BTreeSet<String>>,
 ) -> bool {
-    let changed = |q: &String| old.get(q) != new.get(q);
-    !changed(&v.to_string()) || kept.iter().any(changed)
+    let changed = |q: &String| new.contains_key(q) && old.get(q) != new.get(q);
+    !new.contains_key(v) || !changed(v) || kept.iter().any(changed)
 }
 
 #[test]
@@ -405,6 +406,8 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
     }
     let keys = keys_of(&all);
     assert!(all.len() >= 20, "only {} sites seen", all.len());
+    let mut skipped_base: BTreeMap<(Dialect, bool), BTreeMap<String, BTreeSet<String>>> =
+        BTreeMap::new();
     let (mut killed, mut redundant, mut gap, mut dom) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for site in &all {
@@ -486,21 +489,22 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
             killed.push(name);
             continue;
         }
-        // Dominated: on every edited tree the site reads from, every read
-        // that vanishes when the site is skipped and whose answer the edit
-        // changes goes with a read that remains in the same file and that
-        // the edit changes too (see [`depends`]): a stored entry without the
-        // vanished read cannot then hold after the edit.
+        // Dominated: the stored entry of a file is the one the unedited
+        // tree makes with the site skipped. For every edit, every read that
+        // entry lacks (the base run has it, the skipped base run does not),
+        // that the edited run asks too and whose answer the edit changes,
+        // goes with a read the entry keeps that the edit changes as well (see
+        // [`depends`]): the entry is refused then, whatever the site gave.
         let mut dominated = true;
-        'dom: for ((d, h, e), (_, seen, rq, edit_ans)) in trees.iter().zip(&reference) {
+        'dom: for ((d, h, e), (_, _, rq, edit_ans)) in trees.iter().zip(&reference) {
             // `--no-catalog` changes every file's store key (the supplied
             // bit; `a_changed_supplied_bit_finds_nothing_stored`): nothing is
             // reused across it, whatever the read sets hold.
-            if e.is_none() || !seen.contains(site) || matches!(e, Some(Edit::NoCatalog)) {
+            if e.is_none() || matches!(e, Some(Edit::NoCatalog)) {
                 continue;
             }
             // The stored run: the same tree before the edit.
-            let Some((_, _, _, base_ans)) = trees
+            let Some((_, bseen, bq, base_ans)) = trees
                 .iter()
                 .zip(&reference)
                 .find(|((td, th, te), _)| td == d && th == h && te.is_none())
@@ -508,28 +512,42 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
             else {
                 continue;
             };
-            site_switch::skip(site.clone());
-            let (_, _, sq) = run_tree_with_reads(*d, *h, *e);
-            site_switch::off();
-            let (rk, sk) = (per_key(rq), per_key(&sq));
-            for (k, reads) in &rk {
-                // A file whose key is new has no stored entry to reuse.
-                let Some(old) = base_ans.get(k) else {
+            if !bseen.contains(site) {
+                continue;
+            }
+            let skipped = skipped_base
+                .entry((*d, *h))
+                .or_insert_with(|| {
+                    site_switch::skip(site.clone());
+                    let (_, _, sq) = run_tree_with_reads(*d, *h, None);
+                    site_switch::off();
+                    per_key(&sq)
+                })
+                .clone();
+            let (rk, bk) = (per_key(rq), per_key(bq));
+            for (k, old) in base_ans {
+                // A file whose key is new after the edit has no stored
+                // entry to take.
+                let (Some(reads), Some(base_reads)) = (rk.get(k), bk.get(k)) else {
                     continue;
                 };
                 let new = edit_ans.get(k).cloned().unwrap_or_default();
-                let kept = sk.get(k).cloned().unwrap_or_default();
-                for v in reads.difference(&kept) {
+                let kept = skipped.get(k).cloned().unwrap_or_default();
+                for v in base_reads.difference(&kept).filter(|v| reads.contains(*v)) {
                     if !depends(v, &kept, old, &new) {
                         println!(
-                            "  {name}: {d:?} hidden={h} {e:?}: {v} changes and no read of the file that remains does"
+                            "  {name}: {d:?} hidden={h} {e:?}: {v} changes and no read the stored entry keeps does"
                         );
+                        if std::env::var("SQLDIFF_T3_VERBOSE").is_ok() {
+                            println!("    file {k}, reads that remain: {kept:#?}");
+                        }
                         dominated = false;
                         break 'dom;
                     }
                 }
             }
         }
+        skipped_base.clear();
         if dominated {
             println!("{name}: DOMINATED");
             dom.push(name);

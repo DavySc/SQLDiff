@@ -621,6 +621,10 @@ fn dependents() -> Vec<(String, String)> {
         "INSERT INTO dbo.SinkV SELECT Id, C0 FROM dbo.T0".into(),
     );
     add(
+        "InsertNoListSink".into(),
+        "INSERT INTO dbo.Sink VALUES (1, N'a', 1, NULL)".into(),
+    );
+    add(
         "ViewStar".into(),
         "INSERT INTO dbo.SinkV SELECT * FROM dbo.V0".into(),
     );
