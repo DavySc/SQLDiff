@@ -577,7 +577,7 @@ const SOURCE_METHODS: &[(&str, &str)] = &[
     ),
     (
         "recording",
-        "builder with a live sink (Phase B; nothing builds it yet)",
+        "builder with a live sink (the tree run's pass 1, `sqldiff-draft/src/lib.rs`)",
     ),
     ("table", "pass 1 `Table(parts)`"),
     ("triggers_named", "pass 1 `TriggersNamed`"),

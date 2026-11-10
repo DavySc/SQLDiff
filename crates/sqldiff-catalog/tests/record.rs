@@ -625,4 +625,14 @@ mod source_reads {
         assert!(!r.ask(&Query::SchemaTables("a".into())));
         assert!(rec.finish().0 .0.is_empty());
     }
+
+    #[test]
+    #[should_panic(expected = "not built for")]
+    fn digests_paired_with_another_catalog_are_refused() {
+        let a = catalog(SQL);
+        let b = catalog(SQL);
+        let d = SourceDigests::new(&a);
+        let rec = Recorder::default();
+        let _ = SourceReads::recording(&b, Dialect::Tsql, &rec, &d);
+    }
 }

@@ -456,6 +456,10 @@ impl<'a> RecordingView<'a> {
 /// recording read digests the whole table text on every call, the cost
 /// recording had in pass 2 before the table digest was cached.
 pub struct SourceDigests {
+    /// The catalog these caches were built for (its address): another one is
+    /// refused by [`SourceReads::recording`], because a cache paired with a
+    /// catalog it was not made for would hand out stale digests.
+    owner: usize,
     tables: Vec<std::sync::OnceLock<Outcome>>,
     whole: std::sync::OnceLock<Outcome>,
     types: std::sync::OnceLock<Vec<(String, Vec<u32>)>>,
@@ -465,6 +469,7 @@ impl SourceDigests {
     /// Empty caches sized for `cat`. Use them with this catalog only.
     pub fn new(cat: &Catalog) -> Self {
         SourceDigests {
+            owner: cat as *const Catalog as usize,
             tables: cat.tables.iter().map(|_| Default::default()).collect(),
             whole: Default::default(),
             types: Default::default(),
@@ -521,6 +526,10 @@ impl<'a> SourceReads<'a> {
         sink: &'a dyn ReadSink,
         digests: &'a SourceDigests,
     ) -> Self {
+        assert!(
+            digests.owner == cat as *const Catalog as usize,
+            "SourceDigests used with a catalog it was not built for"
+        );
         SourceReads {
             cat,
             dialect,
@@ -530,8 +539,9 @@ impl<'a> SourceReads<'a> {
     }
 
     /// Records `q` with the digest `d` makes, unless the sink holds it.
+    #[track_caller]
     fn rec_with(&self, q: impl FnOnce() -> Query, d: impl FnOnce() -> Outcome) {
-        if !self.sink.active() {
+        if !self.sink.active() || site_skipped() {
             return;
         }
         let q = q();
@@ -541,6 +551,7 @@ impl<'a> SourceReads<'a> {
         self.sink.record(Side::Draft, &q, d());
     }
 
+    #[track_caller]
     fn rec<T: std::fmt::Debug + ?Sized>(&self, q: impl FnOnce() -> Query, answer: &T) {
         self.rec_with(q, || Outcome::of(answer));
     }
@@ -554,6 +565,7 @@ impl<'a> SourceReads<'a> {
     }
 
     /// A table by name.
+    #[track_caller]
     pub fn table(&self, parts: &[Ident]) -> Option<&'a Table> {
         let at = crate::table_position(self.dialect, self.cat, parts);
         let a = at.map(|i| &self.cat.tables[i]);
@@ -572,6 +584,7 @@ impl<'a> SourceReads<'a> {
     }
 
     /// The triggers a name matches, as [`Catalog::triggers_named`].
+    #[track_caller]
     pub fn triggers_named(&self, schema: Option<&str>, name: &str) -> Vec<&'a crate::Trigger> {
         let a = self.cat.triggers_named(self.dialect, schema, name);
         self.rec(
@@ -583,6 +596,7 @@ impl<'a> SourceReads<'a> {
 
     /// The distinct column types of the catalog, sorted (`(base, arguments)`).
     /// Records [`Query::ColumnTypes`], not the whole catalog.
+    #[track_caller]
     pub fn column_types(&self) -> std::borrow::Cow<'a, [(String, Vec<u32>)]> {
         let types = match self.digests {
             Some(d) => std::borrow::Cow::Borrowed(
@@ -595,12 +609,14 @@ impl<'a> SourceReads<'a> {
     }
 
     /// Every table: records `WholeCatalog`.
+    #[track_caller]
     pub fn tables(&self) -> &'a [Table] {
         self.rec_with(|| Query::WholeCatalog, || self.whole_digest());
         &self.cat.tables
     }
 
     /// Every routine: records `WholeCatalog`.
+    #[track_caller]
     pub fn routines(&self) -> &'a [Routine] {
         self.rec_with(|| Query::WholeCatalog, || self.whole_digest());
         &self.cat.routines

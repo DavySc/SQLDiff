@@ -324,6 +324,46 @@ fn run_tree_answers(
             }
         }
     }
+    // The drafts of pass 1 (Phase B): the same view, so a pass-1 site whose
+    // skipped read changes a draft's read set is classified like a check's.
+    // A draft entry's key is a hash of the file's text (the pseudo question
+    // `RESULT` holds a hash of the draft itself).
+    let drafts = f.dir.join("res/.sqldiff/draft-entries");
+    for k in std::fs::read_dir(drafts).into_iter().flatten().flatten() {
+        for e in std::fs::read_dir(k.path()).unwrap().flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if !n.ends_with(".reads") {
+                continue;
+            }
+            let key = format!("draft-{}", k.file_name().to_string_lossy());
+            let id = format!("{key}/{n}");
+            let raw = std::fs::read_to_string(e.path()).unwrap_or_default();
+            let v: serde_json::Value =
+                serde_json::from_str(raw.get(65..).unwrap_or("null")).unwrap_or_default();
+            let mut reads = Vec::new();
+            for r in v["reads"].as_array().into_iter().flatten() {
+                let q = format!("{} {}", r[0], r[1]);
+                answers
+                    .entry(key.clone())
+                    .or_default()
+                    .entry(q.clone())
+                    .or_default()
+                    .insert(r[2].to_string());
+                reads.push(q);
+            }
+            let body = std::fs::read(e.path().with_extension("json")).unwrap_or_default();
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&body.get(65..), &mut h);
+            answers
+                .entry(key.clone())
+                .or_default()
+                .entry(RESULT.to_string())
+                .or_default()
+                .insert(std::hash::Hasher::finish(&h).to_string());
+            qs.insert(id.clone(), reads);
+            ids.insert(id);
+        }
+    }
     // The files of the run, to say which file a stored result is of: the
     // path whose converted text holds the result's text.
     let out = f.dir.join("res");

@@ -76,6 +76,53 @@ fn recheck_at_most(e: &Edit) -> usize {
     }
 }
 
+/// The most drafts an edit may make a resume build again (P7 of the Phase B
+/// review): a draft is taken from its stored entry unless its text changed
+/// or something it asked of the source catalog or the claims has another
+/// answer. As measured on both dialects and both seeds. A larger count is a
+/// recorded read that is wider than intended, and fails here.
+///
+/// The edits that can change the catalog's set of column types (a table or
+/// column goes or changes type, a view loses what it was typed from, a
+/// HIDDEN period column appears, no catalog at all) rebuild every draft that
+/// asks `ColumnTypes`, which in the generator's trees is every file: the type
+/// set is one whole-catalog fact by design (the bit rules need to know
+/// whether any column could be a `bit`). They are bounded by the whole tree.
+fn drafts_at_most(e: &Edit) -> usize {
+    match e {
+        Edit::NoOpReorderTables
+        | Edit::CaseClash
+        | Edit::CaseClashIndex
+        | Edit::CaseClashColumn
+        | Edit::TargetOverrides
+        | Edit::TargetLookalikes
+        | Edit::NoBaseB
+        | Edit::TargetBaseTriggerEvent
+        | Edit::HandWritten => 0,
+        Edit::NoOpComment | Edit::NoProcedures => 1,
+        Edit::AddRoutine | Edit::DropRoutine => 6,
+        Edit::AddTable | Edit::BaseRetype | Edit::RetypeSide | Edit::ChangeParameterType => 7,
+        Edit::AddSchemaTable | Edit::BaseDrop | Edit::BaseTable | Edit::SplitBase => 8,
+        Edit::DropFunctions | Edit::ViewLookalike | Edit::SourceLookalikes => 5,
+        Edit::AddTrigger | Edit::DropTrigger | Edit::BaseTriggerEvent | Edit::SourceOverrides => 7,
+        Edit::ViewBody | Edit::NoBaseA => 9,
+        Edit::AddColumn
+        | Edit::AddMixedCaseColumn
+        | Edit::ReorderColumns
+        | Edit::FlipNullability
+        | Edit::ChangeDefault
+        | Edit::ToggleIndex => 24,
+        Edit::DropTable
+        | Edit::RenameTable
+        | Edit::DropColumn
+        | Edit::RetypeColumn
+        | Edit::VersioningOn
+        | Edit::VersioningToggle
+        | Edit::DropAllTables
+        | Edit::NoCatalog => usize::MAX / 2,
+    }
+}
+
 fn every_edit(to: Dialect) {
     let mut lines = Vec::new();
     // Per edit, whether some seed showed it on a dependent (the probe).
@@ -104,6 +151,12 @@ fn every_edit(to: Dialect) {
                     "{to:?} seed {seed} {e:?}: {} files checked again, at most {at_most} expected: {:?}",
                     o.again.len(),
                     o.again
+                );
+                let drafts_max = drafts_at_most(e);
+                assert!(
+                    o.drafts_built.0 <= drafts_max,
+                    "{to:?} seed {seed} {e:?}: {} drafts built again, at most {drafts_max} expected",
+                    o.drafts_built.0
                 );
                 *shown.entry(format!("{e:?}")).or_default() |= !o.dependents_changed.is_empty();
             }

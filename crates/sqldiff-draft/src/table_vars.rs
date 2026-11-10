@@ -103,9 +103,10 @@ impl<'a> ClaimReads<'a> {
     }
 
     /// [`Claims::clash`], recorded.
+    #[track_caller]
     pub fn clash(&self, table: &str, routine: Option<&str>) -> Option<&'a Claim> {
         let a = self.claims.clash(table, routine);
-        if self.sink.active() {
+        if self.sink.active() && !sqldiff_equiv::catalog::record::site_skipped() {
             let q = clash_query(table, routine);
             if !self.sink.holds(Side::Draft, &q) {
                 self.sink.record(Side::Draft, &q, Outcome::of(&a));
