@@ -108,8 +108,11 @@ fn every_edit(to: Dialect) {
                 *shown.entry(format!("{e:?}")).or_default() |= !o.dependents_changed.is_empty();
             }
             lines.push(format!(
-                "{to:?} seed {seed} {e:?}: reused {reused} of {total}, {} dependents change",
-                o.dependents_changed.len()
+                "{to:?} seed {seed} {e:?}: reused {reused} of {total}, {} dependents change, \
+                 {} of {} drafts built",
+                o.dependents_changed.len(),
+                o.drafts_built.0,
+                o.drafts_built.1
             ));
         }
     }

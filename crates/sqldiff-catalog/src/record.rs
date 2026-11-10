@@ -100,6 +100,12 @@ pub enum Query {
     /// need to know whether any column could be a `bit`; it changes only when
     /// a type shape appears or disappears, not on every column edit.
     ColumnTypes,
+    /// Pass 1 only (`Side::Draft`): the claim on a temporary table name by
+    /// a routine other than the one asked from (`Claims::clash`): the
+    /// lower-case table name and the lower-case routine, none in a script.
+    /// The answer is the whole claim, or none. Asked of the tree's claims,
+    /// not of a catalog, so it is replayed by the draft crate.
+    ClaimClash(String, Option<String>),
     /// The sound fallback for a read that has no narrow form: the whole
     /// catalog. A file that records it re-checks on any edit, as today.
     WholeCatalog,

@@ -1184,14 +1184,27 @@ pub(crate) fn verify_tree_state(
     None
 }
 
-/// Where pass 1 keeps and finds the rules' drafts of the tree `key`.
+/// Where pass 1 keeps and finds the rules' drafts: one entry per file text
+/// and read set (`Store::put_draft_entry`), so an edit of one file, or of a
+/// catalog object, leaves the drafts of the files that did not read it.
 pub(crate) struct DraftCache<'a> {
     pub store: &'a crate::store::Store,
-    pub key: &'a crate::store::TreeKey,
+    /// The running build, which is part of every draft key.
+    pub build: &'a str,
     /// Take stored drafts (not with `--fresh`).
     pub read: bool,
     /// Picks the drafts taken that are built again and compared.
     pub seed: u64,
+}
+
+/// How pass 1 got one file's draft.
+enum Got {
+    /// Built, and stored under this id when there is a store.
+    Built(Option<String>),
+    /// Taken from a stored entry (its id and read set).
+    Taken(String, Reads),
+    /// A stored draft the run cannot trust: the message.
+    Bad(String),
 }
 
 /// Builds the state the checks start from. See [`tree_key`]. Fails when a
@@ -1228,9 +1241,15 @@ pub(crate) fn build_tree_state(
         inputs.iter().map(|i| (i.rel.as_str(), i.text.as_str())),
         a.from,
     );
-    // Pass 1: rules only. With a draft cache, each draft is stored as soon
-    // as it is built, and one stored by an earlier run of the same tree (a
-    // run killed in this pass) is taken instead of built again.
+    // Pass 1: rules only. With a draft cache, a file's draft is taken from an
+    // entry made from the same text whose read set still holds (every
+    // question the rules asked of the source catalog and the claims has the
+    // answer it had), else built with its reads recorded and stored as soon
+    // as it is built (a run killed in this pass keeps its work).
+    let digests = source
+        .as_deref()
+        .map(sqldiff_core::catalog::record::SourceDigests::new);
+    let source_reads = source.as_deref().zip(digests.as_ref());
     let rewrite = |i: &Input| {
         crate::rewrite_in_tree(
             &i.text,
@@ -1241,36 +1260,123 @@ pub(crate) fn build_tree_state(
             a.rules,
         )
     };
-    let built = parallel(jobs, inputs, |i| {
-        if let Some(c) = drafts_of {
-            if c.read {
-                // A damaged stored draft is a miss: it is built again.
-                if let Some(d) = c
+    let record = |i: &Input| {
+        let rec = sqldiff_core::catalog::record::Recorder::default();
+        let d = sqldiff_draft::rewrite_in_tree_recorded(
+            &i.text,
+            a.from,
+            a.to,
+            source_reads,
+            &claims,
+            a.rules,
+            &rec,
+        );
+        (d, rec.finish().0)
+    };
+    let keys: Vec<Option<crate::store::Key>> = inputs
+        .iter()
+        .map(|i| {
+            drafts_of.map(|c| {
+                crate::store::draft_key(
+                    c.build,
+                    a.from.id(),
+                    a.to.id(),
+                    &format!("{:?}", a.rules),
+                    source.is_some(),
+                    &i.text,
+                )
+            })
+        })
+        .collect();
+    let work: Vec<(&Input, &Option<crate::store::Key>)> = inputs.iter().zip(&keys).collect();
+    let built = parallel(jobs, &work, |(i, dkey)| {
+        let (Some(c), Some(dkey)) = (drafts_of, dkey) else {
+            return (rewrite(i), Got::Built(None));
+        };
+        if c.read {
+            let mut first: Option<(String, Reads, crate::Draft)> = None;
+            for (id, reads) in c.store.draft_entries(dkey) {
+                if !sqldiff_draft::draft_reads_hold(&reads, source_reads, &claims) {
+                    continue;
+                }
+                // A damaged stored draft is a miss.
+                let Some(d) = c
                     .store
-                    .get_draft(c.key, &i.rel)
+                    .get_draft_entry(dkey, &id)
                     .filter(|d| d.well_formed(&i.text))
-                {
-                    return (d, true);
+                else {
+                    continue;
+                };
+                match &first {
+                    None => first = Some((id, reads, d)),
+                    // Two entries that both hold must be the same draft: a
+                    // draft is a function of its text and its reads.
+                    Some((e, _, f)) if f.canonical() != d.canonical() => {
+                        return (
+                            d,
+                            Got::Bad(format!(
+                                "two stored drafts of {} both hold against the catalog and \
+                                 differ ({e} and {id}); its store is emptied: run again",
+                                i.rel
+                            )),
+                        );
+                    }
+                    Some(_) => {}
                 }
             }
+            if let Some((id, reads, d)) = first {
+                return (d, Got::Taken(id, reads));
+            }
         }
-        let d = rewrite(i);
-        if let Some(c) = drafts_of {
-            c.store.put_draft(c.key, &i.rel, &d);
+        let (d, reads) = record(i);
+        match c.store.put_draft_entry(dkey, &reads, &d) {
+            Ok((_, crate::store::Put::Differs)) => {
+                return (
+                    d,
+                    Got::Bad(format!(
+                        "a stored draft of {} has the same text and reads as the one built \
+                         now and differs; its store is emptied: run again",
+                        i.rel
+                    )),
+                )
+            }
+            Ok((id, _)) => return (d, Got::Built(Some(id))),
+            Err(e) => eprintln!("sqldiff: draft not stored: {e}"),
         }
-        (d, false)
+        (d, Got::Built(None))
     });
-    let reused: Vec<(usize, usize)> = built
+    let mut drafts: Vec<crate::Draft> = Vec::with_capacity(built.len());
+    // Per file: the entry it came from or was written to (id), and whether
+    // that entry was taken (with its reads).
+    let mut taken: Vec<Option<(String, Reads)>> = Vec::with_capacity(built.len());
+    let mut entry_ids: Vec<Option<String>> = Vec::with_capacity(built.len());
+    for (d, got) in built {
+        match got {
+            Got::Bad(why) => return Err(why),
+            Got::Taken(id, reads) => {
+                entry_ids.push(Some(id.clone()));
+                taken.push(Some((id, reads)));
+            }
+            Got::Built(id) => {
+                entry_ids.push(id);
+                taken.push(None);
+            }
+        }
+        drafts.push(d);
+    }
+    let reused: Vec<(usize, usize)> = taken
         .iter()
         .enumerate()
-        .filter_map(|(i, (_, hit))| hit.then_some((i, 0)))
+        .filter_map(|(i, t)| t.is_some().then_some((i, 0)))
         .collect();
-    let mut drafts: Vec<crate::Draft> = built.into_iter().map(|(d, _)| d).collect();
     // A stored draft is trusted like a stored result: a sample of the ones
-    // taken is built again and compared, byte for byte as it prints.
+    // taken is built again and compared, byte for byte as it prints, and
+    // the reads of the new build must be the reads it was stored under.
     if let Some(c) = drafts_of {
         for idx in a.recheck.pick(&reused, c.seed) {
-            if rewrite(&inputs[idx]).canonical() != drafts[idx].canonical() {
+            let (fresh, reads) = record(&inputs[idx]);
+            let same_reads = taken[idx].as_ref().is_some_and(|(_, r)| *r == reads);
+            if fresh.canonical() != drafts[idx].canonical() || !same_reads {
                 return Err(format!(
                     "the stored draft of {} differs from one built again from the same \
                      input; its store is emptied: run again",
@@ -1278,6 +1384,17 @@ pub(crate) fn build_tree_state(
                 ));
             }
         }
+        let live: std::collections::BTreeSet<String> = keys
+            .iter()
+            .flatten()
+            .map(|k| k.as_str().to_string())
+            .collect();
+        let used: std::collections::BTreeSet<(String, String)> = keys
+            .iter()
+            .zip(&entry_ids)
+            .filter_map(|(k, id)| Some((k.as_ref()?.as_str().to_string(), id.clone()?)))
+            .collect();
+        c.store.gc_drafts(&live, &used);
     }
     crate::mem::release();
     // Hand-written output replaces the rules' before anything is checked,
@@ -1375,24 +1492,15 @@ fn convert_files(
                 }
                 return Err(why);
             }
-            if let Some(c) = cache {
-                c.store.drop_drafts();
-            }
             st
         }
         None => {
-            let drafts_of = match (cache, &tree_key) {
-                (Some(c), Some(k)) => {
-                    c.store.keep_drafts_of(k);
-                    Some(DraftCache {
-                        store: &c.store,
-                        key: k,
-                        read: !c.fresh,
-                        seed,
-                    })
-                }
-                _ => None,
-            };
+            let drafts_of = cache.map(|c| DraftCache {
+                store: &c.store,
+                build: &c.build,
+                read: !c.fresh,
+                seed,
+            });
             let built = build_tree_state(a, out, inputs, jobs, ledger, base, drafts_of.as_ref());
             let mut st = match built {
                 Ok(st) => st,
@@ -1403,18 +1511,12 @@ fn convert_files(
                     return Err(why);
                 }
             };
-            // A job stopped while it built writes nothing into the folder.
-            if let Err(e) = hooks.stop_if_cancelled() {
-                if let Some(c) = cache {
-                    c.store.drop_drafts();
-                }
-                return Err(e);
-            }
+            // A job stopped while it built writes nothing more into the folder.
+            hooks.stop_if_cancelled()?;
             if let (Some(c), Some(k)) = (cache, &tree_key) {
                 st.key = k.as_str().to_string();
-                match c.store.put_tree(k, &st) {
-                    Ok(()) => c.store.drop_drafts(),
-                    Err(e) => eprintln!("sqldiff: tree state not stored: {e}"),
+                if let Err(e) = c.store.put_tree(k, &st) {
+                    eprintln!("sqldiff: tree state not stored: {e}");
                 }
             }
             st
@@ -4098,9 +4200,11 @@ mod tree_state_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Drafts stored as pass 1 goes: a second build of the same tree takes
-    /// them (a run killed in pass 1 keeps its work), builds the one that
-    /// does not read back, and fails on a stored draft that differs.
+    /// Drafts stored as pass 1 goes, by file text and read set: a second
+    /// build takes them (a run killed in pass 1 keeps its work), builds the
+    /// one that does not read back, and fails on a stored draft that differs
+    /// from one built again; an edit of one file, or of a table another file
+    /// reads, leaves the drafts of the files that did not read it.
     #[test]
     fn stored_drafts_are_taken_rebuilt_or_refused() {
         let dir = std::env::temp_dir().join(format!("sqldiff-drafts-{}", std::process::id()));
@@ -4117,107 +4221,133 @@ mod tree_state_tests {
         let (inputs, _) = read(&a).unwrap();
         let out = dir.join("out");
         let store = crate::store::Store::of(&out);
-        let mut kb = crate::store::TreeKeyBuilder::new();
-        kb.field("test", b"drafts");
-        let key = kb.finish();
         let cache = |read, seed| DraftCache {
             store: &store,
-            key: &key,
+            build: "test-build",
             read,
             seed,
         };
-        let drafts_dir = out.join(crate::store::DRAFTS_DIR).join(key.as_str());
-        let count = || std::fs::read_dir(&drafts_dir).map_or(0, |d| d.count());
+        let root = out.join(crate::store::DRAFT_ENTRIES_DIR);
+        let files = || -> Vec<std::path::PathBuf> {
+            let mut v = Vec::new();
+            for k in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+                for f in std::fs::read_dir(k.path()).unwrap().flatten() {
+                    if f.path().extension().is_some_and(|e| e == "json") {
+                        v.push(f.path());
+                    }
+                }
+            }
+            v.sort();
+            v
+        };
         // The first build stores one draft per file.
         let first =
             build_tree_state(&a, &out, &inputs, 1, None, None, Some(&cache(true, 1))).unwrap();
-        assert_eq!(count(), 2);
+        assert_eq!(files().len(), 2);
         // The second takes them and is the same state.
         let second =
             build_tree_state(&a, &out, &inputs, 1, None, None, Some(&cache(true, 1))).unwrap();
         assert!(first.same_as(&second));
-        // A draft that does not read back is built again.
-        let one = std::fs::read_dir(&drafts_dir)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        std::fs::write(&one, "{").unwrap();
+        assert_eq!(files().len(), 2, "nothing new was written");
+        // A draft that does not read back is built again (and stored whole).
+        std::fs::write(&files()[0], "{").unwrap();
         let third =
             build_tree_state(&a, &out, &inputs, 1, None, None, Some(&cache(true, 1))).unwrap();
         assert!(first.same_as(&third));
         // A draft edited into other valid JSON (same length, so its ranges still
-        // fit), its digest left as it was, is
-        // not trusted: it is built again whatever the sample picks, so every
-        // seed gives the same state (without the digest check a draft is
-        // only found out when the sample happens to cover its file).
-        for e in std::fs::read_dir(&drafts_dir).unwrap().flatten() {
-            let mut bytes = std::fs::read(e.path()).unwrap();
-            let mut v: serde_json::Value = serde_json::from_slice(&bytes[65..]).unwrap();
-            let t = v["draft"]["raw"]["text"].as_str().unwrap().to_lowercase();
-            v["draft"]["raw"]["text"] = t.into();
-            bytes.truncate(65);
-            bytes.extend(serde_json::to_vec(&v).unwrap());
-            std::fs::write(e.path(), bytes).unwrap();
-        }
+        // fit), its digest left as it was, is not trusted: it is built again
+        // whatever the sample picks, so every seed gives the same state.
+        let edit_all = || {
+            for f in files() {
+                let mut bytes = std::fs::read(&f).unwrap();
+                let mut v: serde_json::Value = serde_json::from_slice(&bytes[65..]).unwrap();
+                let t = v["draft"]["raw"]["text"].as_str().unwrap().to_lowercase();
+                v["draft"]["raw"]["text"] = t.into();
+                bytes.truncate(65);
+                bytes.extend(serde_json::to_vec(&v).unwrap());
+                std::fs::write(f, bytes).unwrap();
+            }
+        };
+        edit_all();
         for seed in 0..8 {
             let st = build_tree_state(&a, &out, &inputs, 1, None, None, Some(&cache(true, seed)))
                 .unwrap_or_else(|e| panic!("seed {seed}: an edited draft was trusted: {e}"));
             assert!(first.same_as(&st), "seed {seed}");
             // Built again, so the drafts are whole once more; edit them back
             // for the next seed.
-            for e in std::fs::read_dir(&drafts_dir).unwrap().flatten() {
-                let mut bytes = std::fs::read(e.path()).unwrap();
-                let mut v: serde_json::Value = serde_json::from_slice(&bytes[65..]).unwrap();
-                let t = v["draft"]["raw"]["text"].as_str().unwrap().to_lowercase();
-                v["draft"]["raw"]["text"] = t.into();
-                bytes.truncate(65);
-                bytes.extend(serde_json::to_vec(&v).unwrap());
-                std::fs::write(e.path(), bytes).unwrap();
-            }
+            edit_all();
         }
         // Whole again for the steps below.
+        std::fs::remove_dir_all(&root).unwrap();
         let again =
             build_tree_state(&a, &out, &inputs, 1, None, None, Some(&cache(true, 1))).unwrap();
         assert!(first.same_as(&again));
+        // An edit of p.sql leaves a.sql's draft: one new entry, a.sql's taken,
+        // and the old p.sql entry is dropped as stale.
+        std::fs::write(
+            src.join("p.sql"),
+            "CREATE PROCEDURE dbo.p AS\nBEGIN\n  UPDATE dbo.t SET a = 2;\nEND\n",
+        )
+        .unwrap();
+        let (edited, _) = read(&a).unwrap();
+        let before = files();
+        build_tree_state(&a, &out, &edited, 1, None, None, Some(&cache(true, 1))).unwrap();
+        let after = files();
+        assert_eq!(after.len(), 2);
+        assert_eq!(
+            before.iter().filter(|f| after.contains(f)).count(),
+            1,
+            "a.sql's entry is kept, p.sql's is replaced"
+        );
+        // Back to the original text: rebuilt, stored, same state as the first.
+        let back =
+            build_tree_state(&a, &out, &inputs, 1, None, None, Some(&cache(true, 1))).unwrap();
+        assert!(first.same_as(&back));
         // A stored draft that differs from the one built again is refused:
-        // here p.sql's file holds a.sql's draft under p.sql's name. Both files
-        // are sampled (one in fifty, at least one, of two reused).
-        let by_rel = |rel: &str| {
-            std::fs::read_dir(&drafts_dir)
-                .unwrap()
-                .map(|e| e.unwrap().path())
+        // here p.sql's entry holds a.sql's draft (the digest recomputed, so
+        // the file reads back whole). Every file taken is sampled (one in
+        // fifty, at least one, of two reused).
+        let by_text = |needle: &str| {
+            files()
+                .into_iter()
                 .find(|p| {
                     let v: serde_json::Value =
                         serde_json::from_slice(&std::fs::read(p).unwrap()[65..]).unwrap();
-                    v["rel"] == rel
+                    v["draft"]["raw"]["text"].as_str().unwrap().contains(needle)
                 })
                 .unwrap()
         };
-        let (fa, fp) = (by_rel("a.sql"), by_rel("p.sql"));
+        let (fa, fp) = (by_text("CREATE TABLE"), by_text("PROCEDURE"));
         let mut v: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&fa).unwrap()[65..]).unwrap();
-        v["rel"] = "p.sql".into();
+        let id = fp.file_stem().unwrap().to_string_lossy().into_owned();
+        v["id"] = id.into();
+        v["key"] = fp
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into();
         std::fs::write(&fp, crate::store::framed(&serde_json::to_vec(&v).unwrap())).unwrap();
         let err = (0..8)
             .find_map(|seed| {
                 build_tree_state(&a, &out, &inputs, 1, None, None, Some(&cache(true, seed))).err()
             })
             .expect("a wrong stored draft is found by the sample");
-        assert!(err.contains("p.sql"), "{err}");
+        assert!(err.contains("p.sql") || err.contains("a.sql"), "{err}");
         // Built again once the folder is emptied.
         store.clear();
         let fourth =
             build_tree_state(&a, &out, &inputs, 1, None, None, Some(&cache(true, 1))).unwrap();
         assert!(first.same_as(&fourth));
-        // --fresh takes nothing.
+        // --fresh takes nothing (and finds the entries it writes unchanged).
         let fresh =
             build_tree_state(&a, &out, &inputs, 1, None, None, Some(&cache(false, 1))).unwrap();
         assert!(first.same_as(&fresh));
-        // Dropping leaves no folder behind.
-        store.drop_drafts();
-        assert!(!out.join(".sqldiff").exists());
+        // Clearing leaves no folder behind.
+        store.clear();
+        assert!(!out.join(".sqldiff/draft-entries").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

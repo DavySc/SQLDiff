@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 
+use sqldiff_equiv::catalog::record::{Outcome, Query, ReadSink, Side, NO_SINK};
 use sqldiff_syntax::{ast, Dialect, SyntaxKind, SyntaxNode};
 
 /// The first table variable of the tree that maps to a temporary table name.
@@ -74,6 +75,63 @@ impl Claims {
         self.by_table
             .get(&table.to_lowercase())
             .filter(|c| !same_routine(c.routine.as_deref(), routine))
+    }
+}
+
+/// The claims as pass 1 reads them: the one question
+/// ([`Claims::clash`]) goes to a sink as a [`Query::ClaimClash`] of the
+/// draft side with the digest of its answer (the whole claim, or none), so
+/// a stored draft can be checked against the claims of another run.
+#[derive(Clone, Copy)]
+pub struct ClaimReads<'a> {
+    claims: &'a Claims,
+    sink: &'a dyn ReadSink,
+}
+
+impl<'a> ClaimReads<'a> {
+    /// The claims, recording nothing.
+    pub fn new(claims: &'a Claims) -> Self {
+        ClaimReads {
+            claims,
+            sink: &NO_SINK,
+        }
+    }
+
+    /// The claims, recording every question to `sink`.
+    pub fn recording(claims: &'a Claims, sink: &'a dyn ReadSink) -> Self {
+        ClaimReads { claims, sink }
+    }
+
+    /// [`Claims::clash`], recorded.
+    pub fn clash(&self, table: &str, routine: Option<&str>) -> Option<&'a Claim> {
+        let a = self.claims.clash(table, routine);
+        if self.sink.active() {
+            let q = clash_query(table, routine);
+            if !self.sink.holds(Side::Draft, &q) {
+                self.sink.record(Side::Draft, &q, Outcome::of(&a));
+            }
+        }
+        a
+    }
+}
+
+/// The question [`ClaimReads::clash`] records: names in lower case, as
+/// `Claims::clash` compares them.
+fn clash_query(table: &str, routine: Option<&str>) -> Query {
+    Query::ClaimClash(
+        table.to_lowercase(),
+        routine.map(|r| r.to_ascii_lowercase()),
+    )
+}
+
+/// Asks a recorded [`Query::ClaimClash`] of `claims` again, with the digest
+/// of the answer; `None` for any other query.
+pub fn replay_clash(claims: &Claims, q: &Query) -> Option<Outcome> {
+    match q {
+        Query::ClaimClash(table, routine) => {
+            Some(Outcome::of(&claims.clash(table, routine.as_deref())))
+        }
+        _ => None,
     }
 }
 

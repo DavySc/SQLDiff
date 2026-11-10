@@ -99,7 +99,7 @@ pub(crate) fn convert(
     src: &str,
     to: Dialect,
     catalog: Option<SourceReads<'_>>,
-    claims: &crate::table_vars::Claims,
+    claims: crate::table_vars::ClaimReads<'_>,
     options: sqldiff_units::RuleOptions,
 ) -> Out {
     let mut cx = Cx {
@@ -405,7 +405,7 @@ struct Cx<'a> {
     /// The temporary table names the tree's table variables claim, by the
     /// routine that first declared one: a table variable that would take
     /// another routine's name is refused.
-    claims: &'a crate::table_vars::Claims,
+    claims: crate::table_vars::ClaimReads<'a>,
     /// Db2: labels of the enclosing WHILE loops (LEAVE/ITERATE need one).
     loops: Vec<String>,
     /// Db2: loop labels handed out in this routine or script.
