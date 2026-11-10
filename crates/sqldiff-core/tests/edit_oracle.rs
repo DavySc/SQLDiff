@@ -631,3 +631,107 @@ fn an_unmentioned_changed_parameter_still_reaches_the_changed_jump() {
         r.findings
     );
 }
+
+/// Jump marks at the start of a sibling, not only inside one: a bare
+/// RAISERROR / RAISE NOTICE statement between the generated ones (the same
+/// lines on both sides, so they are not edits), at every nesting level, and
+/// a bare RETURN at the end of some IF bodies. Under the oracle,
+/// `earlier_siblings_with_marks` and `deciding_conditions` are compared with
+/// the original walks (`*_reference` in `equiv::edit`) on every call.
+#[test]
+fn marks_at_sibling_starts_agree_with_the_original_walk() {
+    std::env::set_var("SQLDIFF_EDIT_ORACLE", "1");
+    let _guard = serial();
+    let before = shared_answer_counts();
+    let mut rng = Rng(0x3a7c);
+    let mut compared = 0usize;
+    for case in 0..40 {
+        let tsql = case % 2 == 0;
+        let d = if tsql {
+            Dialect::Tsql
+        } else {
+            Dialect::Postgres
+        };
+        let n = 6 + rng.below(18);
+        let mut ids = 0;
+        let nodes = gen(&mut rng, 0, &mut ids, tsql, n);
+        let pct = 5 + rng.below(41);
+        let edited: Vec<bool> = (0..ids).map(|_| rng.below(100) < pct).collect();
+        // Where the marks go: after the routine's line i when `at[i]`.
+        let lines = routine(&nodes, &edited, false, tsql).lines().count();
+        let at: Vec<u64> = (0..lines).map(|_| rng.below(4)).collect();
+        let (raise, ret) = if tsql {
+            ("RAISERROR('m', 0, 1);", "RETURN;")
+        } else {
+            ("RAISE NOTICE 'm';", "RETURN;")
+        };
+        let marked = |text: String| -> String {
+            let mut out = String::new();
+            let mut in_body = false;
+            for (i, l) in text.lines().enumerate() {
+                out.push_str(l);
+                out.push('\n');
+                if l.starts_with("CREATE TABLE #t") || l == "BEGIN" && !tsql {
+                    in_body = true;
+                    continue;
+                }
+                let opens = l.ends_with(" BEGIN") || l.ends_with(" THEN") || l.ends_with(" LOOP");
+                if !in_body
+                    || l.starts_with("END $$")
+                    || l.ends_with("END") && tsql && i + 1 == text.lines().count()
+                {
+                    continue;
+                }
+                match at[i] {
+                    0 => {
+                        out.push_str(raise);
+                        out.push('\n');
+                    }
+                    1 if opens && l.starts_with("IF") => {
+                        out.push_str(raise);
+                        out.push('\n');
+                    }
+                    _ => {}
+                }
+                // A bare RETURN as the last statement of an IF body.
+                if at[i] == 3 && (l == "END" || l == "END IF;") && out.ends_with(&format!("{l}\n"))
+                {
+                    let cut = out.len() - l.len() - 1;
+                    out.truncate(cut);
+                    out.push_str(ret);
+                    out.push('\n');
+                    out.push_str(l);
+                    out.push('\n');
+                }
+            }
+            out
+        };
+        let (a, b) = (
+            marked(routine(&nodes, &edited, false, tsql)),
+            marked(routine(&nodes, &edited, true, tsql)),
+        );
+        let ddl = if tsql {
+            "CREATE TABLE dbo.t1 (a int);"
+        } else {
+            "CREATE TABLE t1 (a int);"
+        };
+        let opts = Options {
+            catalog_a: vec![Artifact::new("catalog.sql", d, ddl)],
+            catalog_b: vec![Artifact::new("catalog.sql", d, ddl)],
+            ..Options::default()
+        };
+        for (x, y) in [(&a, &b), (&b, &a)] {
+            let r = diff(
+                &Artifact::new("a.sql", d, x.as_str()),
+                &Artifact::new("b.sql", d, y.as_str()),
+                &opts,
+            );
+            compared += r.findings.len();
+        }
+    }
+    assert!(
+        compared > 100,
+        "the generated cases produce findings ({compared})"
+    );
+    expect_answers(before, 100, 10);
+}
