@@ -48,6 +48,9 @@ pub fn run(a: Args) -> Result<ExitCode, String> {
     }
     print!("{}", tree::summary(&w.tree.report));
     println!("time: {:.1} s", w.tree.report.run.seconds);
+    if let Some(l) = tree::pair_results_line(&w.tree.report) {
+        println!("{l}");
+    }
     print!("{}", sqldiff_convert::queue::summary(&w.queue));
     // The proof counts are in the summary above (`proof: R of S routines
     // confirmed`), printed once.

@@ -3767,7 +3767,18 @@ fn proof_lines(r: &Report) -> Option<(String, Option<String>)> {
 }
 
 /// The summary line of a run under `--recheck none`.
-const UNVERIFIED_REUSE: &str = "unverified reuse: --recheck none; nothing taken from the store in this run (results, drafts, tree state) was built again to compare";
+/// The line of what the per-pair behaviour cache did in this run, for the
+/// terminal. It is not part of the written reports: those do not depend on
+/// what an earlier run left in the store.
+pub fn pair_results_line(r: &Report) -> Option<String> {
+    let p = r.run.pair_results.as_ref()?;
+    Some(format!(
+        "routine-pair results: {} taken from the store, {} built, {} built again to compare, {} differed",
+        p.reused, p.built, p.verified, p.mismatched
+    ))
+}
+
+const UNVERIFIED_REUSE: &str = "unverified reuse: --recheck none; nothing taken from the store in this run (results, drafts, tree state, routine-pair results) was built again to compare";
 
 pub fn summary(r: &Report) -> String {
     let mut s = String::new();
@@ -3898,7 +3909,7 @@ pub fn markdown(r: &Report) -> String {
     if r.run.recheck == Recheck::None {
         let _ = writeln!(
             s,
-            "**Unverified reuse (`--recheck none`):** anything this run took from the result store was trusted as stored, not built again to compare.\n"
+            "**Unverified reuse (`--recheck none`):** anything this run took from the result store (including routine-pair results) was trusted as stored, not built again to compare.\n"
         );
     }
     let _ = writeln!(s, "```\n{}```\n", summary(r));

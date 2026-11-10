@@ -4429,6 +4429,74 @@ mod pair_tests {
         assert_eq!(cache.count(PairEvent::Built), 1);
     }
 
+    /// A T-SQL table variable meets the temporary table it is converted to
+    /// only when the PostgreSQL file has one of that name, in whatever
+    /// routine: the pair's key holds the other side's temp names. Here the
+    /// table exists in one version of the file (made by another routine)
+    /// and not in the other; the stale result of `r0` would differ.
+    #[test]
+    fn a_temp_table_another_routine_makes_changes_the_pair_that_uses_the_variable() {
+        let tv = sqldiff_equiv::classify::table_variable_table(Some("dbo.r0"), "@t");
+        let a = "CREATE PROCEDURE dbo.r0 @x int AS\nBEGIN\nDECLARE @t TABLE (id int);\nINSERT INTO @t VALUES (@x);\nINSERT INTO dbo.u SELECT id FROM @t;\nEND;\nGO\nCREATE PROCEDURE dbo.z @x int AS\nBEGIN\nINSERT INTO dbo.u VALUES (@x);\nEND;\nGO\n".to_string();
+        let b = |made: &str| {
+            format!(
+                "CREATE PROCEDURE r0(x int) LANGUAGE plpgsql AS $$\nBEGIN\nINSERT INTO {tv} VALUES (x);\nINSERT INTO u SELECT id FROM {tv};\nEND;\n$$;\nCREATE PROCEDURE z(x int) LANGUAGE plpgsql AS $$\nBEGIN\nCREATE TEMP TABLE pg_temp.{made} (id int);\nINSERT INTO u VALUES (x);\nEND;\n$$;\n"
+            )
+        };
+        let (with, without) = (b(&tv), b("something_else"));
+        let (w, w_runs) = analysed(&a, &with, &Env::default());
+        let (wo, wo_runs) = analysed(&a, &without, &Env::default());
+        assert_ne!(
+            shown(&w_runs, &w),
+            shown(&wo_runs, &wo),
+            "the fixture must make the table's presence matter"
+        );
+        let cache = std::sync::Arc::new(MemCache::default());
+        let env = with_cache(&Env::default(), &cache);
+        let _ = analysed(&a, &with, &env);
+        cache.reset_events();
+        let (got, got_runs) = analysed(&a, &without, &env);
+        assert_eq!(shown(&got_runs, &got), shown(&wo_runs, &wo));
+        // `r0` is built again; `z` reads no table variable and is in the key
+        // by its own text and the same temp names, so it is rebuilt too: the
+        // names are the whole file's.
+        assert!(cache.count(PairEvent::Built) >= 1);
+        assert_eq!(cache.count(PairEvent::Reused), 0);
+    }
+
+    /// A condition identified across the sides (the same decision on both)
+    /// and one that is not give different verdicts, so a stored result is
+    /// only for the identified set it was made under: the key holds the
+    /// pair's subset of it.
+    #[test]
+    fn another_identified_set_for_the_same_text_rebuilds_the_pair() {
+        let a = "CREATE PROCEDURE dbo.r0 @x int AS\nBEGIN\nIF dbo.f(@x) > 0 UPDATE dbo.t SET c = 1 WHERE id = @x; ELSE UPDATE dbo.t SET c = 2 WHERE id = @x;\nEND;\nGO\nCREATE PROCEDURE dbo.r1 @x int AS\nBEGIN\nINSERT INTO dbo.u VALUES (@x);\nEND;\nGO\n";
+        let b = "CREATE PROCEDURE r0(x int) LANGUAGE plpgsql AS $$\nBEGIN\nIF f(x) > 0 THEN UPDATE t SET c = 2 WHERE id = x; ELSE UPDATE t SET c = 1 WHERE id = x; END IF;\nEND;\n$$;\nCREATE PROCEDURE r1(x int) LANGUAGE plpgsql AS $$\nBEGIN\nINSERT INTO u VALUES (x);\nEND;\n$$;\n";
+        // Every pair of offsets inside the two routines: all identified.
+        let all: BTreeSet<(usize, usize)> = (0..a.len())
+            .flat_map(|x| (0..b.len()).map(move |y| (x, y)))
+            .collect();
+        let identified = |set: BTreeSet<(usize, usize)>| Env {
+            identified: Some(std::sync::Arc::new(set)),
+            ..Env::default()
+        };
+        let (all_env, none_env) = (identified(all), identified(BTreeSet::new()));
+        let (x, x_runs) = analysed(a, b, &all_env);
+        let (y, y_runs) = analysed(a, b, &none_env);
+        assert_ne!(
+            shown(&x_runs, &x),
+            shown(&y_runs, &y),
+            "the fixture must make the identified set matter"
+        );
+        let cache = std::sync::Arc::new(MemCache::default());
+        let _ = analysed(a, b, &with_cache(&all_env, &cache));
+        cache.reset_events();
+        let (got, got_runs) = analysed(a, b, &with_cache(&none_env, &cache));
+        assert_eq!(shown(&got_runs, &got), shown(&y_runs, &y));
+        assert_eq!(cache.count(PairEvent::Reused), 0);
+        assert_eq!(cache.count(PairEvent::Built), 2);
+    }
+
     #[test]
     fn a_sampled_pair_is_built_again_and_compared() {
         let (a, b) = (tsql(4, 3), pg(4, 3, None));
