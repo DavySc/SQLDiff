@@ -1195,6 +1195,14 @@ pub(crate) struct DraftCache<'a> {
     pub read: bool,
     /// Picks the drafts taken that are built again and compared.
     pub seed: u64,
+    /// A job stopped while it builds writes nothing more into the folder.
+    pub hooks: Option<&'a Hooks>,
+}
+
+impl DraftCache<'_> {
+    fn stopped(&self) -> bool {
+        self.hooks.is_some_and(|h| h.cancelled())
+    }
 }
 
 /// How pass 1 got one file's draft.
@@ -1329,6 +1337,9 @@ pub(crate) fn build_tree_state(
             }
         }
         let (d, reads) = record(i);
+        if c.stopped() {
+            return (d, Got::Built(None));
+        }
         match c.store.put_draft_entry(dkey, &reads, &d) {
             Ok((_, crate::store::Put::Differs)) => {
                 return (
@@ -1394,7 +1405,9 @@ pub(crate) fn build_tree_state(
             .zip(&entry_ids)
             .filter_map(|(k, id)| Some((k.as_ref()?.as_str().to_string(), id.clone()?)))
             .collect();
-        c.store.gc_drafts(&live, &used);
+        if !c.stopped() {
+            c.store.gc_drafts(&live, &used);
+        }
     }
     crate::mem::release();
     // Hand-written output replaces the rules' before anything is checked,
@@ -1500,6 +1513,7 @@ fn convert_files(
                 build: &c.build,
                 read: !c.fresh,
                 seed,
+                hooks: Some(hooks),
             });
             let built = build_tree_state(a, out, inputs, jobs, ledger, base, drafts_of.as_ref());
             let mut st = match built {
@@ -4226,6 +4240,7 @@ mod tree_state_tests {
             build: "test-build",
             read,
             seed,
+            hooks: None,
         };
         let root = out.join(crate::store::DRAFT_ENTRIES_DIR);
         let files = || -> Vec<std::path::PathBuf> {

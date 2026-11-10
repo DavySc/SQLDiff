@@ -635,4 +635,48 @@ mod source_reads {
         let rec = Recorder::default();
         let _ = SourceReads::recording(&b, Dialect::Tsql, &rec, &d);
     }
+
+    #[test]
+    fn the_wide_reads_record_the_whole_catalog_whatever_the_site() {
+        let cat = catalog(SQL);
+        let d = SourceDigests::new(&cat);
+        let whole = {
+            let rec = Recorder::default();
+            SourceReads::recording(&cat, Dialect::Tsql, &rec, &d).tables();
+            rec.finish().0
+        };
+        assert_eq!(whole.0.len(), 1);
+        assert!(whole.0.contains_key(&(Side::Draft, Query::WholeCatalog)));
+        let reads = |f: &dyn Fn(&SourceReads)| {
+            let rec = Recorder::default();
+            f(&SourceReads::recording(&cat, Dialect::Tsql, &rec, &d));
+            rec.finish().0
+        };
+        // Same answers as the narrow forms, recorded as the whole catalog.
+        assert_eq!(
+            reads(&|r| {
+                let _ = r.table_wide(&name("a"));
+            }),
+            whole
+        );
+        assert_eq!(
+            reads(&|r| {
+                let _ = r.table_wide(&name("zzz"));
+            }),
+            whole
+        );
+        assert_eq!(reads(&|r| drop(r.column_types_wide())), whole);
+        assert_eq!(
+            reads(&|r| {
+                let _ = r.routines();
+            }),
+            whole
+        );
+        let r = SourceReads::new(&cat, Dialect::Tsql);
+        assert_eq!(
+            r.table_wide(&name("a")).map(|t| t.name.clone()),
+            Some("a".into())
+        );
+        assert_eq!(r.column_types_wide(), r.column_types());
+    }
 }

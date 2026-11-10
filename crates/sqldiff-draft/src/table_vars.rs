@@ -29,6 +29,8 @@ pub struct Claim {
 #[derive(Debug, Default)]
 pub struct Claims {
     by_table: BTreeMap<String, Claim>,
+    /// The digest of `by_table`, made when first asked.
+    digest: std::sync::OnceLock<Outcome>,
 }
 
 impl Claims {
@@ -44,8 +46,14 @@ impl Claims {
         c
     }
 
+    /// The digest of every claim: what a recorded read of the claims holds.
+    pub fn digest(&self) -> Outcome {
+        *self.digest.get_or_init(|| Outcome::of(&self.by_table))
+    }
+
     /// Adds the claims of one parsed T-SQL file.
     pub fn add_root(&mut self, root: &SyntaxNode, file: &str) {
+        self.digest = std::sync::OnceLock::new();
         for n in root.descendants() {
             if n.kind() != SyntaxKind::STATEMENT || !table_variable_declare(&n) {
                 continue;
@@ -78,10 +86,13 @@ impl Claims {
     }
 }
 
-/// The claims as pass 1 reads them: the one question
-/// ([`Claims::clash`]) goes to a sink as a [`Query::ClaimClash`] of the
-/// draft side with the digest of its answer (the whole claim, or none), so
-/// a stored draft can be checked against the claims of another run.
+/// The claims as pass 1 reads them. The one question ([`Claims::clash`])
+/// is recorded as [`Query::ClaimsAll`] of the draft side: the digest of the
+/// whole claims table. A file whose draft asked is built again when any
+/// claim of the tree changes, and a file that declares no table variable
+/// never asks. The wide form on purpose: no per-site test of the generated
+/// trees reaches a clash yet, and a narrow query nothing proves is not
+/// recorded.
 #[derive(Clone, Copy)]
 pub struct ClaimReads<'a> {
     claims: &'a Claims,
@@ -103,35 +114,20 @@ impl<'a> ClaimReads<'a> {
     }
 
     /// [`Claims::clash`], recorded.
-    #[track_caller]
     pub fn clash(&self, table: &str, routine: Option<&str>) -> Option<&'a Claim> {
-        let a = self.claims.clash(table, routine);
-        if self.sink.active() && !sqldiff_equiv::catalog::record::site_skipped() {
-            let q = clash_query(table, routine);
-            if !self.sink.holds(Side::Draft, &q) {
-                self.sink.record(Side::Draft, &q, Outcome::of(&a));
-            }
+        if self.sink.active() && !self.sink.holds(Side::Draft, &Query::ClaimsAll) {
+            self.sink
+                .record(Side::Draft, &Query::ClaimsAll, self.claims.digest());
         }
-        a
+        self.claims.clash(table, routine)
     }
 }
 
-/// The question [`ClaimReads::clash`] records: names in lower case, as
-/// `Claims::clash` compares them.
-fn clash_query(table: &str, routine: Option<&str>) -> Query {
-    Query::ClaimClash(
-        table.to_lowercase(),
-        routine.map(|r| r.to_ascii_lowercase()),
-    )
-}
-
-/// Asks a recorded [`Query::ClaimClash`] of `claims` again, with the digest
+/// Asks a recorded [`Query::ClaimsAll`] of `claims` again, with the digest
 /// of the answer; `None` for any other query.
-pub fn replay_clash(claims: &Claims, q: &Query) -> Option<Outcome> {
+pub fn replay_claims(claims: &Claims, q: &Query) -> Option<Outcome> {
     match q {
-        Query::ClaimClash(table, routine) => {
-            Some(Outcome::of(&claims.clash(table, routine.as_deref())))
-        }
+        Query::ClaimsAll => Some(claims.digest()),
         _ => None,
     }
 }

@@ -103,8 +103,7 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 |---|---|---|
 | `sqldiff-core/src/bind/mod.rs` | check | 2 |
 | `sqldiff-core/src/bind/query.rs` | check | 9 |
-| `sqldiff-draft/src/tsql.rs` | pass 1 | 4 |
-| `sqldiff-draft/src/tsql/temporal.rs` | pass 1 | 3 |
+| `sqldiff-draft/src/tsql.rs` | pass 1 | 1 |
 | `sqldiff-equiv/src/equiv/call.rs` | check | 5 |
 | `sqldiff-equiv/src/equiv/canon.rs` | check | 24 |
 | `sqldiff-equiv/src/equiv/edit.rs` | check | 2 |
@@ -148,7 +147,6 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 | file | stage | count |
 |---|---|---|
 | `sqldiff-convert/src/plan.rs` | driver | 1 |
-| `sqldiff-draft/src/tsql/trigger.rs` | pass 1 | 1 |
 | `sqldiff-equiv/src/equiv/mod.rs` | check | 3 |
 
 ### schema fields
@@ -243,10 +241,13 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 | method | becomes |
 |---|---|
 | `new` | builder (the driver's one call; `sqldiff-draft/src/lib.rs`) |
-| `recording` | builder with a live sink (Phase B; nothing builds it yet) |
+| `recording` | builder with a live sink (the tree run's pass 1, `sqldiff-draft/src/lib.rs`) |
 | `table` | pass 1 `Table(parts)` |
+| `table_wide` | pass 1 `WholeCatalog` (the narrow form waits for a T3 proof) |
+| `triggers_named_wide` | pass 1 `WholeCatalog` (the narrow form waits for a T3 proof) |
 | `triggers_named` | pass 1 `TriggersNamed` |
 | `column_types` | pass 1 `ColumnTypes` |
+| `column_types_wide` | pass 1 `WholeCatalog` (the narrow form waits for a T3 proof) |
 | `tables` | pass 1 `WholeCatalog` |
 | `routines` | pass 1 `WholeCatalog` |
 | `ask` | replay: a pass-1 query again, through the draft's own method |

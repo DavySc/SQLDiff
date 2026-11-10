@@ -580,8 +580,20 @@ const SOURCE_METHODS: &[(&str, &str)] = &[
         "builder with a live sink (the tree run's pass 1, `sqldiff-draft/src/lib.rs`)",
     ),
     ("table", "pass 1 `Table(parts)`"),
+    (
+        "table_wide",
+        "pass 1 `WholeCatalog` (the narrow form waits for a T3 proof)",
+    ),
+    (
+        "triggers_named_wide",
+        "pass 1 `WholeCatalog` (the narrow form waits for a T3 proof)",
+    ),
     ("triggers_named", "pass 1 `TriggersNamed`"),
     ("column_types", "pass 1 `ColumnTypes`"),
+    (
+        "column_types_wide",
+        "pass 1 `WholeCatalog` (the narrow form waits for a T3 proof)",
+    ),
     ("tables", "pass 1 `WholeCatalog`"),
     ("routines", "pass 1 `WholeCatalog`"),
     (

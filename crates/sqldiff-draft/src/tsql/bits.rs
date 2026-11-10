@@ -830,7 +830,7 @@ impl Cx<'_> {
     fn catalog_types(&self) -> &[(String, Vec<u32>)] {
         self.catalog_types.get_or_init(|| {
             self.type_catalog()
-                .map(|c| c.column_types().into_owned())
+                .map(|c| c.column_types_wide().into_owned())
                 .unwrap_or_default()
         })
     }

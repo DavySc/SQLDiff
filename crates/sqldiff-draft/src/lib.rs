@@ -122,7 +122,7 @@ pub fn draft_reads_hold(
             return false;
         }
         let got = match q {
-            Query::ClaimClash(..) => table_vars::replay_clash(claims, q),
+            Query::ClaimsAll => table_vars::replay_claims(claims, q),
             _ => match source {
                 Some((c, d)) => {
                     let rec = Recorder::default();

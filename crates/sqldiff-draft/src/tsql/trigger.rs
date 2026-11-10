@@ -467,7 +467,7 @@ impl Cx<'_> {
             [n] => (None, n.as_str()),
             _ => unreachable!(),
         };
-        let defs = cat.triggers_named(schema, tname);
+        let defs = cat.triggers_named_wide(schema, tname);
         let shown = self.source(&ts[first..=last]).trim().to_string();
         let Some(def) = defs.first().copied().cloned() else {
             return no(format!("DROP TRIGGER: PostgreSQL drops a trigger ON its table, and no CREATE TRIGGER {shown} in the converted files says which table that is"));

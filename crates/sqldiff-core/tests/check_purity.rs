@@ -46,6 +46,8 @@
 //!   (a write-only sink; nothing the check computes depends on it); its
 //!   `SourceDigests` memoise, in `OnceLock`s, the digests and the column-type
 //!   set of one immutable catalog (pure functions of that catalog).
+//! - `table_vars.rs` (`sqldiff-draft`) memoises the digest of a claim set in a
+//!   `OnceLock` (a pure function of the claims, reset when a root is added).
 //! - `artifact.rs` (`sqldiff-model`) caches `Analyzed::temp_table_names`, a
 //!   pure function of the immutable parse tree, in a private `OnceCell`.
 //! - `abstract_syntax.rs` (`sqldiff-syntax`) keeps a bounded per-thread cache of the
@@ -100,6 +102,8 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("sqldiff-catalog/src/ddl.rs", &["fs::"]),
     // The read recorder (W4.3): a sink the check writes to, not a source it reads from.
     ("sqldiff-catalog/src/record.rs", &["Mutex", "OnceLock"]),
+    // `Claims::digest` memoises, in a `OnceLock`, the digest of one immutable claim set.
+    ("sqldiff-draft/src/table_vars.rs", &["OnceLock"]),
     ("sqldiff-core/src/engine.rs", &["Mutex", "OnceLock"]),
     (
         "sqldiff-equiv/src/equiv/canon.rs",

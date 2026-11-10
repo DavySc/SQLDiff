@@ -4235,7 +4235,7 @@ impl<'a> Cx<'a> {
             [.., t] => vec![Ident::plain(t.clone())],
             [] => return None,
         };
-        cat.table(&parts)
+        cat.table_wide(&parts)
     }
 
     /// How many of the DELETE's FROM tables have column `name`, by the
@@ -4253,7 +4253,7 @@ impl<'a> Cx<'a> {
                 [.., t] => vec![Ident::plain(t.clone())],
                 [] => return None,
             };
-            let t = cat.table(&parts)?;
+            let t = cat.table_wide(&parts)?;
             n += usize::from(t.column(Dialect::Tsql, &Ident::plain(name)).is_some());
         }
         Some(n)
@@ -13111,7 +13111,7 @@ impl Cx<'_> {
             [.., t] => vec![Ident::plain(t.clone())],
             [] => return None,
         };
-        let t = cat.table(&parts)?;
+        let t = cat.table_wide(&parts)?;
         t.columns_known.then_some(t)
     }
 
