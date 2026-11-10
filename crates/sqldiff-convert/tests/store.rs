@@ -106,8 +106,22 @@ fn tree_of(dir: &Path) -> Vec<(String, String)> {
                 stack.push(p);
             } else {
                 let text = std::fs::read_to_string(&p).unwrap();
+                // The per-pair cache counts (`run.pair_results`, a block of
+                // four numbers) differ between runs by design, like the marks.
+                let mut in_pairs = false;
                 let text = text
                     .lines()
+                    .filter(|l| {
+                        let t = l.trim_start();
+                        if t.starts_with("\"pair_results\":") {
+                            in_pairs = true;
+                        }
+                        let skip = in_pairs;
+                        if in_pairs && t.starts_with('}') {
+                            in_pairs = false;
+                        }
+                        !skip
+                    })
                     .filter(|l| !l.trim_start().starts_with("\"reused\":"))
                     .map(|l| {
                         let t = l.trim_start();
