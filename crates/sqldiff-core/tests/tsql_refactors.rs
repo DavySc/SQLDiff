@@ -831,3 +831,55 @@ fn where_predicates_keep_sorting_in_a_query() {
     );
     assert!(matches!(v, Equal | Eua), "{v:?}");
 }
+
+/// A CASE, IIF or nested select list inside a WHERE, ON or HAVING predicate
+/// is not ordered by the optimizer (it evaluates a CASE's WHEN terms in
+/// order): the guard behind its division is a guard.
+#[test]
+fn a_guard_reordered_inside_a_scalar_nested_in_a_predicate_is_never_equal() {
+    let q = |body: &str| format!("CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN {body} END");
+    let g = "@y <> 0 AND @x / @y > 1";
+    let h = "@x / @y > 1 AND @y <> 0";
+    let rows: Vec<(&str, String, String)> = vec![
+        (
+            "where-case",
+            "SELECT Qty FROM dbo.Stock WHERE CASE WHEN ItemId <> 0 AND Qty / ItemId > 1 THEN 1 ELSE 0 END = 1;".into(),
+            "SELECT Qty FROM dbo.Stock WHERE CASE WHEN Qty / ItemId > 1 AND ItemId <> 0 THEN 1 ELSE 0 END = 1;".into(),
+        ),
+        (
+            "where-iif",
+            "SELECT Qty FROM dbo.Stock WHERE IIF(ItemId <> 0 AND Qty / ItemId > 1, 1, 0) = 1;".into(),
+            "SELECT Qty FROM dbo.Stock WHERE IIF(Qty / ItemId > 1 AND ItemId <> 0, 1, 0) = 1;".into(),
+        ),
+        (
+            "where-eq-case",
+            format!("SELECT Qty FROM dbo.Stock WHERE Qty = CASE WHEN {g} THEN 1 ELSE 0 END;"),
+            format!("SELECT Qty FROM dbo.Stock WHERE Qty = CASE WHEN {h} THEN 1 ELSE 0 END;"),
+        ),
+        (
+            "where-scalar-subquery",
+            format!("SELECT Qty FROM dbo.Stock WHERE Qty = (SELECT CASE WHEN {g} THEN 1 ELSE 0 END);"),
+            format!("SELECT Qty FROM dbo.Stock WHERE Qty = (SELECT CASE WHEN {h} THEN 1 ELSE 0 END);"),
+        ),
+        (
+            "having-max-case",
+            "SELECT ItemId FROM dbo.Stock GROUP BY ItemId HAVING MAX(CASE WHEN Qty <> 0 AND ItemId / Qty > 1 THEN 1 ELSE 0 END) = 1;".into(),
+            "SELECT ItemId FROM dbo.Stock GROUP BY ItemId HAVING MAX(CASE WHEN ItemId / Qty > 1 AND Qty <> 0 THEN 1 ELSE 0 END) = 1;".into(),
+        ),
+        (
+            "on-case",
+            "SELECT s.Qty FROM dbo.Stock s JOIN dbo.Item i ON CASE WHEN s.Qty <> 0 AND i.ItemId / s.Qty > 1 THEN 1 ELSE 0 END = 1;".into(),
+            "SELECT s.Qty FROM dbo.Stock s JOIN dbo.Item i ON CASE WHEN i.ItemId / s.Qty > 1 AND s.Qty <> 0 THEN 1 ELSE 0 END = 1;".into(),
+        ),
+    ];
+    for (name, a, b) in rows {
+        let (a, b) = (q(&a), q(&b));
+        for (x, y, dir) in [(&a, &b, "A to B"), (&b, &a, "B to A")] {
+            let v = verdict(x, y);
+            assert!(
+                !matches!(v, Equal | Eua),
+                "{name} ({dir}): {v:?}; a row with a zero divisor: A is guarded, B raises error 8134"
+            );
+        }
+    }
+}

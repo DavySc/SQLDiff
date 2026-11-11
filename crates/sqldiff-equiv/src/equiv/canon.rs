@@ -414,7 +414,9 @@ pub struct Canon<'a> {
     /// Lowering a WHERE, ON or HAVING predicate (`pred`): the optimizer
     /// orders its terms, so the operands of its AND / OR are sorted
     /// (`binary`). Everywhere else (IF, WHILE, CASE, SET, RETURN, VALUES,
-    /// a select list) they run in source order.
+    /// a select list, and a CASE, IIF, call argument or nested query's
+    /// select list inside a predicate: `expr` clears the flag there) they
+    /// run in source order.
     in_pred: bool,
     /// The select list of the query lowered last, when its `*` items were
     /// written out (`visible_star`); `None` when it was lowered as written.
@@ -1747,6 +1749,26 @@ impl<'a> Canon<'a> {
     // ---- expressions ----------------------------------------------------
 
     pub fn expr(&mut self, e: &Expr) -> R<(Term, Option<Ty>)> {
+        // The optimizer orders the terms of a WHERE, ON or HAVING predicate,
+        // not the AND inside a CASE, an IIF or another call's argument, or
+        // the select list of a query nested in it: those run in source order
+        // as everywhere else (`in_pred`). A nested query's own WHERE sets
+        // the flag again (`pred`).
+        if self.in_pred
+            && matches!(
+                e,
+                Expr::Case(..) | Expr::Call(_) | Expr::Exists(_) | Expr::Subquery(_)
+            )
+        {
+            let was = std::mem::replace(&mut self.in_pred, false);
+            let r = self.expr_in(e);
+            self.in_pred = was;
+            return r;
+        }
+        self.expr_in(e)
+    }
+
+    fn expr_in(&mut self, e: &Expr) -> R<(Term, Option<Ty>)> {
         if let Some(x) = module_setting_test(self.unit, self.kind, e) {
             self.assume(x);
             return self.expr(&Expr::Special("TRUE".into()));
