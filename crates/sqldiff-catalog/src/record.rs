@@ -609,13 +609,6 @@ impl<'a> SourceReads<'a> {
         a
     }
 
-    /// [`triggers_named`](Self::triggers_named), recording `WholeCatalog`.
-    pub fn triggers_named_wide(&self, schema: Option<&str>, name: &str) -> Vec<&'a crate::Trigger> {
-        let a = self.cat.triggers_named(self.dialect, schema, name);
-        self.rec_always(|| Query::WholeCatalog, || self.whole_digest());
-        a
-    }
-
     /// The triggers a name matches, as [`Catalog::triggers_named`].
     #[track_caller]
     pub fn triggers_named(&self, schema: Option<&str>, name: &str) -> Vec<&'a crate::Trigger> {

@@ -50,7 +50,7 @@ fn recheck_at_most(e: &Edit) -> usize {
         Edit::ViewBody => 8,
         Edit::ChangeParameterType | Edit::AddSchemaTable => 7,
         Edit::BaseDrop => 8,
-        Edit::DropTrigger => 4,
+        Edit::DropTrigger | Edit::RetargetTrigger => 6,
         Edit::VersioningOn
         | Edit::DropAllTables
         | Edit::NoProcedures
@@ -69,7 +69,9 @@ fn recheck_at_most(e: &Edit) -> usize {
         | Edit::NoCatalog
         | Edit::VersioningToggle
         | Edit::HandWritten => usize::MAX / 2,
-        Edit::AddBitColumn | Edit::RetypeSink | Edit::AddStatusRoutine => usize::MAX / 2,
+        Edit::AddBitColumn | Edit::RetypeSink | Edit::AddStatusRoutine | Edit::RetargetTrigger => {
+            usize::MAX / 2
+        }
         Edit::BaseTriggerEvent | Edit::TargetBaseTriggerEvent => 5,
         Edit::BaseRetype => 6,
         Edit::BaseTable => 5,
@@ -235,6 +237,7 @@ const EXEMPT: &[(Dialect, &str, &str)] = &[
         "DROP TRIGGER is compared only from T-SQL to PostgreSQL",
     ),
     (Dialect::Db2i, "DropTrigger", "same"),
+    (Dialect::Db2i, "RetargetTrigger", "same"),
     (
         Dialect::Postgres,
         "TargetOverrides",
