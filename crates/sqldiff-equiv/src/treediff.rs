@@ -23,6 +23,12 @@ struct Unit {
     header_hash: String,
     children: Vec<Unit>,
     effectful: bool,
+    /// Where the unit runs is observable even though running it is not an
+    /// effect the comparison tracks: a statement of kind `Other` (PRINT,
+    /// RAISE NOTICE, BREAK, CONTINUE) or a compound holding one. A message
+    /// is shown in order with the rows-affected counts of the writes around
+    /// it, and a loop exit decides what runs after it.
+    placed: bool,
 }
 
 fn build_unit(node: SyntaxNode, a: &Analyzed) -> Unit {
@@ -52,6 +58,7 @@ fn build_unit(node: SyntaxNode, a: &Analyzed) -> Unit {
     }
     let kind = stmt_kind(&node, d);
     let effectful = kind.is_effectful() || children.iter().any(|c| c.effectful);
+    let placed = kind == StmtKind::Other || children.iter().any(|c| c.placed);
     Unit {
         full: loose_hash(&toks),
         strict: strict_hash(&toks),
@@ -62,6 +69,7 @@ fn build_unit(node: SyntaxNode, a: &Analyzed) -> Unit {
         header,
         children,
         effectful,
+        placed,
     }
 }
 
@@ -599,7 +607,7 @@ impl Ctx<'_, '_> {
         let crossed = self.crossed_txn_statement(x, y);
         let (class, verdict) = if x.kind.is_txn_control() || crossed.is_some() {
             (ChangeClass::Transactional, Verdict::Different)
-        } else if x.effectful {
+        } else if x.effectful || x.placed {
             (ChangeClass::Semantic, Verdict::Unknown)
         } else {
             self.out.structural += 1;

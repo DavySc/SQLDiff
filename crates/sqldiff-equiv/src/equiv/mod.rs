@@ -5972,6 +5972,16 @@ pub fn refine_modified(
             keep.push(f);
             continue;
         }
+        let prefixes = |it: &Item| -> Vec<bool> {
+            it.nodes.iter().flat_map(second::string_prefixes).collect()
+        };
+        if prefixes(&ia[i]) != prefixes(&ib[j]) {
+            // The terms read N'x' and 'x' as one string, which is right
+            // across dialects; in one dialect the type of a literal, and
+            // whether a character survives, depends on the prefix.
+            keep.push(f);
+            continue;
+        }
         let mut sub = Outcome::default();
         compare_pair(a, b, &ia[i], &ib[j], None, &mut sub);
         if std::env::var_os("SQLDIFF_DEBUG_TERMS").is_some() {

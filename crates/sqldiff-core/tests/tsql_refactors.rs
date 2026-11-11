@@ -616,6 +616,30 @@ const NEVER_EQUAL: &[(&str, &str, &str, &str)] = &[
         "SET NOCOUNT OFF; INSERT INTO dbo.Orders (Qty) VALUES (1); SELECT 5; SET NOCOUNT ON; INSERT INTO dbo.Orders (Qty) VALUES (2);",
     ),
     (
+        "print-moved-after-write",
+        "Stock has one row: A prints, then sends the count of the UPDATE; B sends the count first",
+        "PRINT 'x'; UPDATE dbo.Stock SET Qty = 1;",
+        "UPDATE dbo.Stock SET Qty = 1; PRINT 'x';",
+    ),
+    (
+        "print-moved-with-renamed-local",
+        "as above, beside a renamed local",
+        "DECLARE @a int = 1; PRINT 'x'; UPDATE dbo.Stock SET Qty = @a;",
+        "DECLARE @b int = 1; UPDATE dbo.Stock SET Qty = @b; PRINT 'x';",
+    ),
+    (
+        "national-literals-swapped-in-select-list",
+        "A returns column 1 as nvarchar and column 2 as varchar, B the reverse (the result types differ)",
+        "SELECT N'x', 'x';",
+        "SELECT 'x', N'x';",
+    ),
+    (
+        "national-prefix-dropped",
+        "the literal is nvarchar in A and varchar in B: N'\u{436}' keeps its character, '\u{436}' stores '?' under a Latin1 collation",
+        "SELECT N'\u{436}';",
+        "SELECT '\u{436}';",
+    ),
+    (
         "divide-after-its-guard",
         "@y = 0: A is false at the guard and never divides, B raises error 8134",
         "CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN IF @y <> 0 AND @x / @y > 1 SELECT 1; END",
