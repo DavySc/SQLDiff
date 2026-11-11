@@ -490,7 +490,9 @@ fn diff_inner(
         // statement lowering may clear the structural findings of a pair it
         // proves equal as a whole. It runs last, so it sees what the edit
         // search and the refinement left.
-        if td.findings.iter().any(equiv::second::removable) {
+        if td.findings.iter().any(equiv::second::removable)
+            && equiv::second::eligible(&aa, &ab).is_none()
+        {
             let sec =
                 equiv::compare_within(&aa, &ab, &schema_a, &schema_b, &opts.anchors, &allowance);
             if equiv::second::refusal(&aa, &ab, &sec).is_none() {

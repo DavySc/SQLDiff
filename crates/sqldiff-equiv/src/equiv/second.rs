@@ -139,14 +139,24 @@ fn has_execute_as(a: &Analyzed) -> bool {
     headers(a).iter().any(|h| h.iter().any(|t| t == "EXECUTE"))
 }
 
-/// Why the lowering's result may not clear structural findings, or `None`
-/// when it may. `sec` is `compare_within` on the pair.
-pub fn refusal(a: &Analyzed, b: &Analyzed, sec: &Outcome) -> Option<&'static str> {
+/// Why a pair cannot be cleared whatever the lowering finds, or `None`: the
+/// strict signature and the token shape. Cheap, so the engine asks before it
+/// pays for the lowering.
+pub fn eligible(a: &Analyzed, b: &Analyzed) -> Option<&'static str> {
     if !same_headers(a, b) {
         return Some("routine headers differ");
     }
     if !same_tokens(a, b) {
         return Some("the pair does more than rename variables and reorder");
+    }
+    None
+}
+
+/// Why the lowering's result may not clear structural findings, or `None`
+/// when it may. `sec` is `compare_within` on the pair.
+pub fn refusal(a: &Analyzed, b: &Analyzed, sec: &Outcome) -> Option<&'static str> {
+    if let Some(why) = eligible(a, b) {
+        return Some(why);
     }
     if !sec.findings.is_empty()
         || !sec.unknown_reasons.is_empty()
