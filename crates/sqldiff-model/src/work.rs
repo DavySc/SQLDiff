@@ -69,9 +69,13 @@ pub enum Site {
     /// Statement pairs compared (`compare_pair`): one unit per pair, in a
     /// cross-dialect comparison or a refinement.
     PairCompares,
+    /// Tree nodes visited by the joint exploration of a routine pair's guard
+    /// atoms (`equiv::path`): each run under a partial valuation visits the
+    /// nodes it passes.
+    PathNodes,
 }
 
-const SITES: usize = 10;
+const SITES: usize = 11;
 
 const NAMES: [&str; SITES] = [
     "explorer_steps",
@@ -84,6 +88,7 @@ const NAMES: [&str; SITES] = [
     "gap_scores",
     "items_built",
     "pair_compares",
+    "path_nodes",
 ];
 
 /// The counts of one scope.
@@ -295,6 +300,7 @@ const SITE_LIST: [Site; SITES] = [
     Site::GapScores,
     Site::ItemsBuilt,
     Site::PairCompares,
+    Site::PathNodes,
 ];
 
 /// Runs `f` without counting: work that only re-creates a state whose cost

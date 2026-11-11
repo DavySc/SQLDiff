@@ -526,6 +526,17 @@ fn diff_inner(
                 }
             }
         }
+        // Path summaries (T-SQL against T-SQL step 2a, `equiv::path`): a
+        // routine pair the guards and writes of which do the same on every
+        // execution loses the structural findings no witness backs.
+        if td.findings.iter().any(equiv::second::removable) {
+            let before = td.findings.len();
+            let mut cleared = equiv::path::clear(&aa, &ab, &schema_a, &schema_b, &mut td.findings);
+            if td.findings.len() < before {
+                td.structural += before - td.findings.len();
+                eq.receipts.append(&mut cleared);
+            }
+        }
         findings.extend(td.findings);
         receipts.append(&mut td.receipts);
         receipts.append(&mut eq.receipts);

@@ -3856,7 +3856,7 @@ impl<'a> Canon<'a> {
     /// are both known and need no conversion (both numeric, both string with
     /// at most one column, or one family), or against NULL. A call, cast,
     /// arithmetic, subquery or any operand of unknown type can raise.
-    fn raise_free(&mut self, e: &Expr) -> bool {
+    pub(super) fn raise_free(&mut self, e: &Expr) -> bool {
         let plain = |x: &Expr| {
             matches!(
                 x,
