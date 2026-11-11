@@ -223,8 +223,22 @@ pub struct RunInfo {
     /// (`--recheck`).
     #[serde(default)]
     pub recheck: Recheck,
+    /// What the per-pair behaviour cache did (W4.4): results taken from the
+    /// store, built, built again to compare, and found different. Absent
+    /// when the run had no such cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_results: Option<PairResults>,
     /// One entry per file, in report order.
     pub files: Vec<RunFile>,
+}
+
+/// The per-pair behaviour results of one run (see `RunInfo::pair_results`).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PairResults {
+    pub reused: usize,
+    pub built: usize,
+    pub verified: usize,
+    pub mismatched: usize,
 }
 
 /// How one file's check went in this run.
@@ -769,6 +783,7 @@ fn convert_kept(
             build: crate::instances::build_hash()?,
             check_build: crate::instances::check_build_hash(),
             fresh,
+            pairs: Default::default(),
         }),
         _ => None,
     };
@@ -913,6 +928,14 @@ fn convert_kept(
         run: RunInfo {
             seconds: (started.elapsed().as_secs_f64() * 100.0).round() / 100.0,
             recheck: a.recheck,
+            pair_results: cache.as_ref().and_then(|c| {
+                c.pairs.lock().unwrap().map(|p| PairResults {
+                    reused: p.reused,
+                    built: p.built,
+                    verified: p.verified,
+                    mismatched: p.mismatched,
+                })
+            }),
             files: run_files,
         },
         unreadable,
@@ -1548,6 +1571,21 @@ fn convert_files(
         helpers: a.helpers.clone(),
         ..Options::default()
     };
+    // The per-pair behaviour results (W4.4): read and written by the checks
+    // of this run, never in a fresh run. They change how long a check takes,
+    // not what it says.
+    let pair_store = cache.filter(|c| !c.fresh).map(|c| {
+        Arc::new(crate::store::PairStore::new(
+            out,
+            &c.check_build,
+            a.recheck,
+            seed,
+            hooks.cancel.clone(),
+        ))
+    });
+    if let Some(ps) = &pair_store {
+        opts.pair_cache = Some(sqldiff_core::ir::behaviour::PairCacheHandle(ps.clone()));
+    }
     // The tree state's own catalogs: pass 1 and the keys read these, never
     // the opaque handles in `opts`.
     let source = source.map(Arc::new);
@@ -1985,12 +2023,26 @@ fn convert_files(
     });
     crate::mem::release();
     let mut found = mismatch.into_inner().unwrap();
+    if let (Some(ps), Some(c)) = (&pair_store, cache) {
+        let n = ps.counts();
+        if n.mismatched > 0 {
+            found.push(format!(
+                "{} stored per-pair behaviour result(s) differ from a fresh analysis of the \
+                 same pair; the fresh ones were stored. The store is emptied: run again.",
+                n.mismatched
+            ));
+        }
+        *c.pairs.lock().unwrap() = Some(n);
+    }
     if !found.is_empty() {
         if let Some(c) = cache {
             c.store.clear();
         }
         found.sort();
         return Err(found.join("\n"));
+    }
+    if let Some(ps) = pair_store.as_ref().filter(|_| !hooks.cancelled()) {
+        ps.gc();
     }
     let done: Vec<(Held, f64, bool, bool)> = done
         .into_iter()
@@ -2038,6 +2090,9 @@ struct Cache {
     check_build: String,
     /// Reuse nothing; store every result again.
     fresh: bool,
+    /// What the per-pair behaviour results did in this run, once pass 2
+    /// has gone to its end (`RunInfo::pair_results`).
+    pairs: std::sync::Mutex<Option<crate::store::PairCounts>>,
 }
 
 /// Reads the review ledger in `out`, if there is one.
@@ -3712,7 +3767,18 @@ fn proof_lines(r: &Report) -> Option<(String, Option<String>)> {
 }
 
 /// The summary line of a run under `--recheck none`.
-const UNVERIFIED_REUSE: &str = "unverified reuse: --recheck none; nothing taken from the store in this run (results, drafts, tree state) was built again to compare";
+/// The line of what the per-pair behaviour cache did in this run, for the
+/// terminal. It is not part of the written reports: those do not depend on
+/// what an earlier run left in the store.
+pub fn pair_results_line(r: &Report) -> Option<String> {
+    let p = r.run.pair_results.as_ref()?;
+    Some(format!(
+        "routine-pair results: {} taken from the store, {} built, {} built again to compare, {} differed",
+        p.reused, p.built, p.verified, p.mismatched
+    ))
+}
+
+const UNVERIFIED_REUSE: &str = "unverified reuse: --recheck none; nothing taken from the store in this run (results, drafts, tree state, routine-pair results) was built again to compare";
 
 pub fn summary(r: &Report) -> String {
     let mut s = String::new();
@@ -3843,7 +3909,7 @@ pub fn markdown(r: &Report) -> String {
     if r.run.recheck == Recheck::None {
         let _ = writeln!(
             s,
-            "**Unverified reuse (`--recheck none`):** anything this run took from the result store was trusted as stored, not built again to compare.\n"
+            "**Unverified reuse (`--recheck none`):** anything this run took from the result store (including routine-pair results) was trusted as stored, not built again to compare.\n"
         );
     }
     let _ = writeln!(s, "```\n{}```\n", summary(r));

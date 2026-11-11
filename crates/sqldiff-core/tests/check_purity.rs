@@ -89,7 +89,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("sqldiff-units/src/shared.rs", &["Mutex"]),
     (
         "sqldiff-convert/src/store.rs",
-        &["File::open", "fs::", "thread::current"],
+        &["File::open", "Mutex", "fs::", "thread::current"],
     ),
     (
         "sqldiff-convert/src/tree.rs",
@@ -144,9 +144,12 @@ const ALLOWED: &[(&str, &[&str])] = &[
         "sqldiff-core/src/ir/cfg/route_tests.rs",
         &["env::var", "fs::"],
     ),
+    // `Mutex`: only the test module's in-memory pair cache
+    // (`pair_tests::MemCache`); the pair cache itself is a handle the caller
+    // supplies, and its results are keyed by everything a pair reads.
     (
         "sqldiff-core/src/ir/behaviour.rs",
-        &["OnceCell", "thread_local!"],
+        &["Mutex", "OnceCell", "thread_local!"],
     ),
     ("sqldiff-model/src/artifact.rs", &["OnceCell"]),
     ("sqldiff-model/src/profile.rs", &["OnceLock"]),
