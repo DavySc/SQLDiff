@@ -10,7 +10,7 @@ use sqldiff_convert::plan::Select;
 use sqldiff_convert::tree::{self, Hooks};
 use sqldiff_core::Dialect;
 
-use super::edits::{Edit, Model, Rng};
+use super::edits::{Edit, Model, Rng, Tree};
 
 pub struct Fixture {
     pub dir: PathBuf,
@@ -353,13 +353,13 @@ pub fn one(to: Dialect, seed: u64, edit: &Edit) -> Outcome {
 /// [`one`] that reports a resume that differs from a fresh run in `verdict`
 /// instead of panicking.
 pub fn try_one(to: Dialect, seed: u64, edit: &Edit) -> Outcome {
-    try_one_in(to, seed, edit, false)
+    try_one_in(to, seed, edit, Tree::Plain)
 }
 
 /// [`try_one`] on a tree that has a system-versioned table from the start
 /// when `hidden`.
-pub fn try_one_in(to: Dialect, seed: u64, edit: &Edit, hidden: bool) -> Outcome {
-    let tag = format!("{to:?}-{seed}-{edit:?}-{hidden}");
+pub fn try_one_in(to: Dialect, seed: u64, edit: &Edit, hidden: Tree) -> Outcome {
+    let tag = format!("{to:?}-{seed}-{edit:?}-{hidden:?}");
     let f = Fixture::new(&tag, to);
     let mut model = Model::generate_with(seed, hidden);
     f.write(&model);
@@ -422,9 +422,9 @@ pub fn try_two_in(
     seed: u64,
     first: &Edit,
     second: &Edit,
-    hidden: bool,
+    hidden: Tree,
 ) -> Result<(), String> {
-    let tag = format!("{to:?}-{seed}-{first:?}-{second:?}-{hidden}");
+    let tag = format!("{to:?}-{seed}-{first:?}-{second:?}-{hidden:?}");
     let f = Fixture::new(&tag, to);
     let mut model = Model::generate_with(seed, hidden);
     f.write(&model);

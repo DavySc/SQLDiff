@@ -399,7 +399,7 @@ pub fn compare_within(
 
 /// The artifact with the given byte ranges overwritten by spaces (line
 /// breaks kept), so offsets and line numbers stay those of the original.
-fn blanked(
+pub fn blanked(
     art: &crate::artifact::Artifact,
     ranges: &[(usize, usize)],
 ) -> crate::artifact::Artifact {
