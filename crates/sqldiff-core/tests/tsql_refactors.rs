@@ -1005,4 +1005,33 @@ GO
         !matches!(v, Equal | Eua),
         "a changed value in another routine: {v:?}"
     );
+    // The scoped path keeps the same-dialect guards: a SET NOCOUNT moved
+    // inside the live routine and a guard swapped around a division are
+    // not cleared because an unread routine sits beside them.
+    let routine =
+        |body: &str| format!("CREATE PROCEDURE dbo.Live @x int, @y int AS BEGIN {body} END\nGO\n");
+    let ins = "INSERT INTO dbo.Orders (Qty) VALUES (1);";
+    for (name, a, b) in [
+        (
+            "SET NOCOUNT moved",
+            routine(&format!("SET NOCOUNT ON; {ins}")),
+            routine(&format!("{ins} SET NOCOUNT ON;")),
+        ),
+        (
+            "guard swap",
+            routine(&format!("IF @y <> 0 AND @x / @y > 1 {ins}")),
+            routine(&format!("IF @x / @y > 1 AND @y <> 0 {ins}")),
+        ),
+    ] {
+        for (x, y) in [
+            (format!("{a}{unread}"), format!("{b}{unread}")),
+            (format!("{unread}{b}"), format!("{unread}{a}")),
+        ] {
+            let v = verdict(&x, &y);
+            assert!(
+                !matches!(v, Equal | Eua),
+                "{name} beside an unread routine: {v:?}"
+            );
+        }
+    }
 }

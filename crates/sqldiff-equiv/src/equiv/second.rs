@@ -234,6 +234,9 @@ fn noted_in_place(a: &Analyzed, b: &Analyzed, sec: &Outcome) -> bool {
         .all(|(&ra, &rb)| slice(&ta, ra) == slice(&tb, rb))
 }
 
+/// Byte ranges of routines in one artifact.
+type Ranges = Vec<(usize, usize)>;
+
 /// The byte ranges of the routines the lowering need not read: when every
 /// removable finding lies inside a routine, on side A inside routine i of A
 /// or on side B inside routine i of B (routines paired by position, which
@@ -248,8 +251,8 @@ pub fn unread_routines(
     a: &Analyzed,
     b: &Analyzed,
     findings: &[Finding],
-) -> Option<(Vec<(usize, usize)>, Vec<(usize, usize)>)> {
-    let ranges = |x: &Analyzed| -> Vec<(usize, usize)> {
+) -> Option<(Ranges, Ranges)> {
+    let ranges = |x: &Analyzed| -> Ranges {
         x.root
             .descendants()
             .filter(|n| n.kind() == SyntaxKind::ROUTINE)
