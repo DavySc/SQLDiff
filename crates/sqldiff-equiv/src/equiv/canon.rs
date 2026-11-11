@@ -964,6 +964,22 @@ impl<'a> Canon<'a> {
         }
     }
 
+    /// Records `ASM-UNTYPED-STORE`: a value whose type is unknown is stored
+    /// into a destination of known (or unknown) type. Against another
+    /// dialect the two sides may convert it differently, which is what the
+    /// assumption says. Against the same dialect it is vacuous: the stored
+    /// term is wrapped with the destination type, so the two sides compare
+    /// equal only when the source term and the destination are the same, and
+    /// the same term converted into the same destination by one dialect's
+    /// rules gives the same value (a pair that differs in either does not
+    /// compare equal, with or without the assumption). Not recorded then.
+    fn assume_store(&mut self, x: (&str, &str)) {
+        if self.other == Some(self.d) {
+            return;
+        }
+        self.assume(x);
+    }
+
     fn discharge(&mut self, s: String) {
         if !self.discharged.contains(&s) {
             self.discharged.push(s);
@@ -1403,7 +1419,7 @@ impl<'a> Canon<'a> {
     ) -> (Term, Option<Ty>) {
         let Some(d) = dst else {
             if !matches!(v.0.head(), "null") {
-                self.assume(asm::UNTYPED_STORE);
+                self.assume_store(asm::UNTYPED_STORE);
             }
             return v;
         };
@@ -2447,11 +2463,11 @@ impl<'a> Canon<'a> {
                 Fam::Int | Fam::Exact | Fam::Float | Fam::VarChar | Fam::Char
             );
             if how != How::Cast || castable {
-                self.assume(if how == How::Cast {
-                    asm::UNTYPED_CAST
+                if how == How::Cast {
+                    self.assume(asm::UNTYPED_CAST);
                 } else {
-                    asm::UNTYPED_STORE
-                });
+                    self.assume_store(asm::UNTYPED_STORE);
+                }
                 return (n(head, vec![Self::ty_term(&to), v.0]), to);
             }
         }

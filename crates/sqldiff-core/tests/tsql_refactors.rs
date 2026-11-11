@@ -15,8 +15,10 @@
 //!
 //! Known gaps visible in the pins: `total-guard-clause` and
 //! `select-into-variable-to-set` are equal in truth and reported `Different`
-//! (statements with no counterpart); `rename-local` and
-//! `swap-and-operands` are equal in truth and reported `Unknown`.
+//! (statements with no counterpart; path summaries, step 2). `rename-local`
+//! and `swap-and-operands` were `Unknown` before step 1 (the second opinion
+//! of the statement lowering, `equiv::second`) and are now `Equal` and
+//! `EqualUnderAssumptions`.
 
 use sqldiff_core::{diff, Artifact, Dialect, Options, Verdict};
 use Verdict::{Different, Equal, EqualUnderAssumptions as Eua, Unknown};
@@ -121,7 +123,7 @@ fn cases() -> Vec<Case> {
             why: "@Price is local; every use is renamed, no caller can see it",
             a: r(),
             b: r().replace("@Price", "@UnitPrice"),
-            pinned: Unknown,
+            pinned: Equal,
         },
         Case {
             name: "swap-and-operands",
@@ -132,7 +134,7 @@ fn cases() -> Vec<Case> {
                 "@Qty > 0 AND @CustomerId IS NOT NULL",
                 "@CustomerId IS NOT NULL AND @Qty > 0",
             ),
-            pinned: Unknown,
+            pinned: Eua,
         },
         Case {
             name: "total-guard-clause",
@@ -298,6 +300,30 @@ fn cases() -> Vec<Case> {
             pinned: Unknown,
         },
         Case {
+            name: "declared-type-precision",
+            truth: Truth::Different,
+            why: "datetime2(7) keeps SYSDATETIME()'s seventh fraction digit, datetime2(6) rounds it away: SELECT @at returns different values",
+            a: "CREATE PROCEDURE dbo.Stamp AS BEGIN DECLARE @at datetime2(7) = SYSDATETIME(); SELECT @at; END".into(),
+            b: "CREATE PROCEDURE dbo.Stamp AS BEGIN DECLARE @at datetime2(6) = SYSDATETIME(); SELECT @at; END".into(),
+            pinned: Unknown,
+        },
+        Case {
+            name: "swap-declared-types",
+            truth: Truth::Different,
+            why: "SELECT @a, @b returns an int then a money in A and a money then an int in B (set a = 1)",
+            a: "CREATE PROCEDURE dbo.Types AS BEGIN DECLARE @a int = 1, @b money = 2; SELECT @a, @b; END".into(),
+            b: "CREATE PROCEDURE dbo.Types AS BEGIN DECLARE @a money = 1, @b int = 2; SELECT @a, @b; END".into(),
+            pinned: Unknown,
+        },
+        Case {
+            name: "swap-subtract-operands",
+            truth: Truth::Different,
+            why: "Qty = 5, Price = 2: A stores 3, B stores -3",
+            a: "CREATE PROCEDURE dbo.Sub @Qty int, @Price int AS BEGIN INSERT INTO dbo.Orders (Qty) VALUES (@Qty - @Price); END".into(),
+            b: "CREATE PROCEDURE dbo.Sub @Qty int, @Price int AS BEGIN INSERT INTO dbo.Orders (Qty) VALUES (@Price - @Qty); END".into(),
+            pinned: Different,
+        },
+        Case {
             name: "narrow-local-type",
             truth: Truth::Different,
             why: "Item 1 has Price 1000.00: money converts into decimal(5,2) with an overflow error in B; or Price 1.2345 stores Total 1.23 * Qty in B",
@@ -443,4 +469,116 @@ fn a_mutant_of_a_refactored_side_is_never_equal() {
             );
         }
     }
+}
+
+/// Step 1 clears structural findings only for a pair whose routine headers
+/// are token-identical (strict same-dialect signature): the same body change
+/// that is cleared above must not be, once the signature moves too. Every
+/// pair here is a caller-visible change and may never come out equal.
+const SIGNATURE_WITNESSES: &[(&str, &str, &str)] = &[
+    (
+        "rename-parameter",
+        "@CustomerId int, @Qty int",
+        "@CustId int, @Qty int",
+    ),
+    (
+        "add-default",
+        "@CustomerId int, @Qty int",
+        "@CustomerId int, @Qty int = 1",
+    ),
+    (
+        "widen-type",
+        "@CustomerId int, @Qty int",
+        "@CustomerId bigint, @Qty int",
+    ),
+    (
+        "add-output",
+        "@CustomerId int, @Qty int",
+        "@CustomerId int, @Qty int OUTPUT",
+    ),
+    (
+        "reorder",
+        "@CustomerId int, @Qty int",
+        "@Qty int, @CustomerId int",
+    ),
+];
+
+#[test]
+fn a_signature_change_next_to_a_cleared_rename_is_never_equal() {
+    let renamed = |params: &str| {
+        place_order(params, "@UnitPrice money", GUARD).replace("@Price", "@UnitPrice")
+    };
+    for (name, from, to) in SIGNATURE_WITNESSES {
+        let a = place_order(from, DECL, GUARD);
+        let b = renamed(to);
+        for (x, y, dir) in [(&a, &b, "A to B"), (&b, &a, "B to A")] {
+            let v = verdict(x, y);
+            assert!(!matches!(v, Equal | Eua), "{name} ({dir}): {v:?}");
+        }
+    }
+}
+
+#[test]
+fn a_rename_beside_a_header_naming_execute_as_is_not_cleared() {
+    // Both headers are identical, so the signature holds; the ownership-chain
+    // premise is only vacuous for two callers' contexts, so a routine that
+    // names EXECUTE keeps the structural findings.
+    for opt in ["WITH EXECUTE AS CALLER", "WITH EXECUTE AS OWNER"] {
+        let with = |p: String| p.replacen("\nAS\n", &format!("\n{opt}\nAS\n"), 1);
+        let a = with(reference());
+        let b = with(reference().replace("@Price", "@UnitPrice"));
+        assert_ne!(a, reference());
+        let v = verdict(&a, &b);
+        assert!(!matches!(v, Equal), "{opt}: {v:?}");
+        assert_eq!(v, Unknown, "{opt}");
+    }
+}
+
+#[test]
+fn the_cleared_rename_names_no_assumption_it_does_not_need() {
+    let opts = Options {
+        catalog_a: vec![Artifact::new("catalog.sql", T, DDL)],
+        catalog_b: vec![Artifact::new("catalog.sql", T, DDL)],
+        ..Options::default()
+    };
+    let r = sqldiff_core::with_engine_stack(|| {
+        diff(
+            &Artifact::new("a.sql", T, reference()),
+            &Artifact::new("b.sql", T, reference().replace("@Price", "@UnitPrice")),
+            &opts,
+        )
+    });
+    let ids: Vec<&str> = r.assumptions.iter().map(|x| x.id.as_str()).collect();
+    assert!(r.findings.is_empty(), "{:?}", r.findings);
+    assert!(
+        !ids.contains(&"ASM-UNTYPED-STORE") && !ids.contains(&"ASM-TSQL-OWNERSHIP-CHAIN"),
+        "{ids:?}"
+    );
+}
+
+#[test]
+fn a_fresh_and_a_repeated_comparison_render_the_same_bytes() {
+    let opts = Options {
+        catalog_a: vec![Artifact::new("catalog.sql", T, DDL)],
+        catalog_b: vec![Artifact::new("catalog.sql", T, DDL)],
+        ..Options::default()
+    };
+    let run = || {
+        sqldiff_core::with_engine_stack(|| {
+            let r = diff(
+                &Artifact::new("a.sql", T, reference()),
+                &Artifact::new(
+                    "b.sql",
+                    T,
+                    reference().replace(
+                        "@Qty > 0 AND @CustomerId IS NOT NULL",
+                        "@CustomerId IS NOT NULL AND @Qty > 0",
+                    ),
+                ),
+                &opts,
+            );
+            serde_json::to_string(&r).unwrap()
+        })
+    };
+    assert_eq!(run(), run());
 }

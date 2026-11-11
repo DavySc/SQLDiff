@@ -27,6 +27,7 @@ pub mod objcheck;
 pub mod options;
 pub mod schema;
 pub mod script;
+pub mod second;
 pub mod table;
 pub mod term;
 mod trigger;
