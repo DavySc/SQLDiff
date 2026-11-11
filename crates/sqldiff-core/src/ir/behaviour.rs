@@ -534,6 +534,43 @@ impl DiffCache {
 
 const NO_POS: u32 = u32::MAX;
 
+/// The write (`Insert:T`) behind effect `key`, when it cannot be matched by
+/// occurrence number between the sides: it occurs more than once on a side
+/// and a different number of times on the other. Effects are keyed by their
+/// occurrence in document order, so a write hoisted out of both branches of
+/// an IF (twice in A, once in B) has its first occurrence in A paired with
+/// B's only one, though A's first sits in the branch the path did not take.
+/// Comparing those keys one by one would report a fate difference the
+/// routines do not have. [`executed_fates`] compares such a write by what
+/// actually ran instead. Same dialect only: across dialects the counts differ
+/// by construction (a script's batches against one DO block) and the pairing
+/// is the conversion's own.
+fn ambiguous_base<'k>(sa: &SideIr, sb: &SideIr, key: &'k str) -> Option<&'k str> {
+    if sa.a.dialect() != sb.a.dialect() {
+        return None;
+    }
+    let (base, _) = key.rsplit_once('#')?;
+    let (ca, cb) = (sa.bases.get(base), sb.bases.get(base));
+    (ca != cb && ca.max(cb).is_some_and(|&c| c > 1)).then_some(base)
+}
+
+/// The fates of the occurrences of write `base` that ran in `o`, in
+/// occurrence order (document order, which is execution order on a path
+/// without a loop), as (key, fate); the failing statement itself (`skip`) is
+/// compared by its own rule.
+fn executed_fates(o: &Outcome, base: &str, skip: Option<&str>) -> Vec<(String, Fate)> {
+    let mut v: Vec<(usize, String, Fate)> = o
+        .effects
+        .iter()
+        .filter_map(|(k, f)| {
+            let (b, n) = k.rsplit_once('#')?;
+            (b == base && Some(&**k) != skip).then_some((n.parse().ok()?, k.to_string(), *f))
+        })
+        .collect();
+    v.sort_by_key(|x| x.0);
+    v.into_iter().map(|(_, k, f)| (k, f)).collect()
+}
+
 /// What the diff of two sides' outcomes looks up for every key, by effect
 /// slot, and the differences of shared fate arrays already found.
 struct Align {
@@ -721,10 +758,17 @@ fn diff(
                 *slot = Some(((ia, ib), name(), fa, fb));
             }
         };
+        let mut ambiguous: Vec<String> = Vec::new();
         match differing(&oa.effects, &ob.effects, al) {
             Differing::Slots(v) => {
                 for i in v {
                     if Some(i) == fault_slot {
+                        continue;
+                    }
+                    if let Some(b) = ambiguous_base(sa, sb, oa.effects.name(i)) {
+                        if !ambiguous.iter().any(|x| x == b) {
+                            ambiguous.push(b.to_string());
+                        }
                         continue;
                     }
                     let (ia, ib) = (al.pos_a[i], al.pos_b[i]);
@@ -746,6 +790,12 @@ fn diff(
                     if Some(k) == fault_key {
                         continue;
                     }
+                    if let Some(b) = ambiguous_base(sa, sb, k) {
+                        if !ambiguous.iter().any(|x| x == b) {
+                            ambiguous.push(b.to_string());
+                        }
+                        continue;
+                    }
                     let (Some(&(ia, _)), Some(&(ib, _))) = (sa.at.get(k), sb.at.get(k)) else {
                         continue;
                     };
@@ -756,6 +806,37 @@ fn diff(
                         oa.effects.get(k).copied(),
                         ob.effects.get(k).copied(),
                     );
+                }
+            }
+        }
+        // A write that cannot be matched by occurrence: the k-th occurrence
+        // that ran on one side against the k-th on the other. A different
+        // number that ran is a control divergence, a different fate a fate
+        // divergence.
+        for b in &ambiguous {
+            let (xa, xb) = (
+                executed_fates(oa, b, fault_key),
+                executed_fates(ob, b, fault_key),
+            );
+            let pos = |s: &SideIr, k: &str| s.at.get(k).map_or(0, |&(p, _)| p);
+            for n in 0..xa.len().max(xb.len()) {
+                match (xa.get(n), xb.get(n)) {
+                    (Some((ka, fa)), Some((kb, fb))) if fa != fb => {
+                        consider(
+                            pos(sa, ka),
+                            pos(sb, kb),
+                            &|| ka.clone(),
+                            Some(*fa),
+                            Some(*fb),
+                        );
+                    }
+                    (Some((ka, fa)), None) => {
+                        consider(pos(sa, ka), pos(sa, ka), &|| ka.clone(), Some(*fa), None);
+                    }
+                    (None, Some((kb, fb))) => {
+                        consider(pos(sb, kb), pos(sb, kb), &|| kb.clone(), None, Some(*fb));
+                    }
+                    _ => {}
                 }
             }
         }

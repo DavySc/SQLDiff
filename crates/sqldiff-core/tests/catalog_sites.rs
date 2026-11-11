@@ -333,8 +333,8 @@ const SITES: &[Site] = &[
         id: "C1",
         file: "sqldiff-equiv/src/equiv/call.rs",
         anchor: "fn switches(",
-        query: "`Table(parts)` on both sides",
-        note: "Versioning declared on the table and its history table on the other side.",
+        query: "`Table(parts)` on both sides, and `WholeCatalog` for the target's triggers",
+        note: "Versioning declared on the table and its history table on the other side; the PostgreSQL triggers the statement switches must exist in the target catalog (`RecordingView::whole`, no narrow form yet).",
     },
     Site {
         id: "C2",
@@ -584,12 +584,9 @@ const SOURCE_METHODS: &[(&str, &str)] = &[
         "table_wide",
         "pass 1 `WholeCatalog` (the narrow form waits for a T3 proof)",
     ),
-    (
-        "triggers_named_wide",
-        "pass 1 `WholeCatalog` (the narrow form waits for a T3 proof)",
-    ),
     ("triggers_named", "pass 1 `TriggersNamed`"),
     ("column_types", "pass 1 `ColumnTypes`"),
+    ("procedure_named", "pass 1 `ProcedureNamed`"),
     (
         "column_types_wide",
         "pass 1 `WholeCatalog` (unused; the narrow form is proven by T3)",

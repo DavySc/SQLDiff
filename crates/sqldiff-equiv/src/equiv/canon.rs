@@ -411,6 +411,13 @@ pub struct Canon<'a> {
     /// an unqualified PostgreSQL call may then be the conversion of a T-SQL
     /// `dbo` function (`user_fn`).
     pub other: Option<Dialect>,
+    /// Lowering a WHERE, ON or HAVING predicate (`pred`): the optimizer
+    /// orders its terms, so the operands of its AND / OR are sorted
+    /// (`binary`). Everywhere else (IF, WHILE, CASE, SET, RETURN, VALUES,
+    /// a select list, and a CASE, IIF, call argument or nested query's
+    /// select list inside a predicate: `expr` clears the flag there) they
+    /// run in source order.
+    in_pred: bool,
     /// The select list of the query lowered last, when its `*` items were
     /// written out (`visible_star`); `None` when it was lowered as written.
     listed: Option<Vec<SelItem>>,
@@ -800,6 +807,7 @@ impl<'a> Canon<'a> {
             known_bytes: Vec::new(),
             stored_values: false,
             other: None,
+            in_pred: false,
             listed: None,
             names: Vec::new(),
             output: None,
@@ -962,6 +970,31 @@ impl<'a> Canon<'a> {
         if !self.asm.iter().any(|y| y.id == x.0) {
             self.asm.push(asm::make(x));
         }
+    }
+
+    /// Records `ASM-UNTYPED-STORE`: a value whose type is unknown is stored
+    /// into a destination of known (or unknown) type. Against another
+    /// dialect the two sides may convert it differently, which is what the
+    /// assumption says. Against the same dialect it is vacuous at both sites
+    /// it is recorded at, for different reasons:
+    /// - the source type is unknown and the destination is known: the term
+    ///   is wrapped with the destination type, so the two sides compare equal
+    ///   only when the source term and the destination type are the same, and
+    ///   one dialect's rules convert the same term into the same type the
+    ///   same way;
+    /// - the destination type is unknown (no catalog): the term is returned
+    ///   unwrapped, and the destination is the same named column or variable
+    ///   of the same database on both sides, so one dialect's conversion into
+    ///   it is the same (a variable's declared type is part of the term it is
+    ///   assigned from).
+    ///
+    /// A pair that differs in the source term or the destination does not
+    /// compare equal, with or without the assumption. Not recorded then.
+    fn assume_store(&mut self, x: (&str, &str)) {
+        if self.other == Some(self.d) {
+            return;
+        }
+        self.assume(x);
     }
 
     fn discharge(&mut self, s: String) {
@@ -1403,7 +1436,7 @@ impl<'a> Canon<'a> {
     ) -> (Term, Option<Ty>) {
         let Some(d) = dst else {
             if !matches!(v.0.head(), "null") {
-                self.assume(asm::UNTYPED_STORE);
+                self.assume_store(asm::UNTYPED_STORE);
             }
             return v;
         };
@@ -1565,6 +1598,14 @@ impl<'a> Canon<'a> {
         Ok((self.bare_bool(t, ty), ty))
     }
 
+    /// A WHERE, ON or HAVING predicate (see `in_pred`).
+    fn pred(&mut self, e: &Expr) -> R<(Term, Option<Ty>)> {
+        let was = std::mem::replace(&mut self.in_pred, true);
+        let r = self.cond(e);
+        self.in_pred = was;
+        r
+    }
+
     fn bare_bool(&self, t: Term, ty: Option<Ty>) -> Term {
         if self.is_bool(&ty) && matches!(t.head(), "col" | "sym") {
             let (x, y, op) = order_operands("=", t, n("num", vec![a("1")]));
@@ -1708,6 +1749,26 @@ impl<'a> Canon<'a> {
     // ---- expressions ----------------------------------------------------
 
     pub fn expr(&mut self, e: &Expr) -> R<(Term, Option<Ty>)> {
+        // The optimizer orders the terms of a WHERE, ON or HAVING predicate,
+        // not the AND inside a CASE, an IIF or another call's argument, or
+        // the select list of a query nested in it: those run in source order
+        // as everywhere else (`in_pred`). A nested query's own WHERE sets
+        // the flag again (`pred`).
+        if self.in_pred
+            && matches!(
+                e,
+                Expr::Case(..) | Expr::Call(_) | Expr::Exists(_) | Expr::Subquery(_)
+            )
+        {
+            let was = std::mem::replace(&mut self.in_pred, false);
+            let r = self.expr_in(e);
+            self.in_pred = was;
+            return r;
+        }
+        self.expr_in(e)
+    }
+
+    fn expr_in(&mut self, e: &Expr) -> R<(Term, Option<Ty>)> {
         if let Some(x) = module_setting_test(self.unit, self.kind, e) {
             self.assume(x);
             return self.expr(&Expr::Special("TRUE".into()));
@@ -2447,11 +2508,11 @@ impl<'a> Canon<'a> {
                 Fam::Int | Fam::Exact | Fam::Float | Fam::VarChar | Fam::Char
             );
             if how != How::Cast || castable {
-                self.assume(if how == How::Cast {
-                    asm::UNTYPED_CAST
+                if how == How::Cast {
+                    self.assume(asm::UNTYPED_CAST);
                 } else {
-                    asm::UNTYPED_STORE
-                });
+                    self.assume_store(asm::UNTYPED_STORE);
+                }
                 return (n(head, vec![Self::ty_term(&to), v.0]), to);
             }
         }
@@ -3788,6 +3849,48 @@ impl<'a> Canon<'a> {
         Ok((n("win", vec![t]), ty))
     }
 
+    /// Whether evaluating the condition `e` can never raise an error, so that
+    /// the order of the operands of an AND / OR cannot change which error
+    /// happens (`binary`). Conservative: only AND, OR, NOT, `IS [NOT] NULL`
+    /// of a plain operand, and a comparison of two plain operands whose types
+    /// are both known and need no conversion (both numeric, both string with
+    /// at most one column, or one family), or against NULL. A call, cast,
+    /// arithmetic, subquery or any operand of unknown type can raise.
+    fn raise_free(&mut self, e: &Expr) -> bool {
+        let plain = |x: &Expr| {
+            matches!(
+                x,
+                Expr::Name(_) | Expr::Var(_) | Expr::Num(_) | Expr::Str(_) | Expr::Null
+            )
+        };
+        match e {
+            Expr::Bin(o, l, r) if o == "AND" || o == "OR" => {
+                self.raise_free(l) && self.raise_free(r)
+            }
+            Expr::Unary(o, x) if o.eq_ignore_ascii_case("NOT") => self.raise_free(x),
+            Expr::IsNull(x, _) => plain(x),
+            Expr::Bin(o, l, r)
+                if matches!(o.as_str(), "=" | "<>" | "<" | ">" | "<=" | ">=")
+                    && plain(l)
+                    && plain(r) =>
+            {
+                if matches!(l.as_ref(), Expr::Null) || matches!(r.as_ref(), Expr::Null) {
+                    return true;
+                }
+                let (Ok((_, Some(lt))), Ok((_, Some(rt)))) = (self.expr(l), self.expr(r)) else {
+                    return false;
+                };
+                let both_names = matches!((l.as_ref(), r.as_ref()), (Expr::Name(_), Expr::Name(_)));
+                if lt.is_string() && rt.is_string() {
+                    // Two columns of different collations raise (Msg 468).
+                    return !both_names;
+                }
+                (lt.is_numeric() && rt.is_numeric()) || (lt.fam == rt.fam && !lt.is_string())
+            }
+            _ => false,
+        }
+    }
+
     fn binary(&mut self, op: &str, l: &Expr, r: &Expr) -> R<(Term, Option<Ty>)> {
         if self.d == Dialect::Postgres && op == "+" {
             if let Some(t) = self.pg_date_add(l, r, false)? {
@@ -3803,6 +3906,19 @@ impl<'a> Canon<'a> {
             let head = op.to_lowercase();
             let mut parts = Vec::new();
             let mut todo: Vec<&Expr> = vec![r, l];
+            // Against another dialect the operands are sorted: neither
+            // dialect promises an evaluation order, and a conversion may not
+            // be held to the source's. Within one dialect, outside a WHERE,
+            // ON or HAVING predicate (an IF or WHILE condition, a CASE or
+            // IIF, a SET, RETURN or VALUES expression, a select list) the
+            // source's order is the one that runs (SQL Server short-circuits
+            // these left to right in practice), so a guard moved behind what
+            // it guards (`@y <> 0 AND @x / @y > 1`) is a change: operands are
+            // sorted there only when none of them can raise. In a WHERE, ON
+            // or HAVING the optimizer orders the predicates, so they are
+            // sorted as before.
+            let same = self.other == Some(self.d) && !self.in_pred;
+            let mut sortable = true;
             while let Some(side) = todo.pop() {
                 if let Expr::Bin(o, sl, sr) = side {
                     if o == op {
@@ -3811,6 +3927,9 @@ impl<'a> Canon<'a> {
                         continue;
                     }
                 }
+                if same && sortable && !self.raise_free(side) {
+                    sortable = false;
+                }
                 let (t, _) = self.cond(side)?;
                 if t.is(&head) {
                     parts.extend(t.kids().iter().cloned());
@@ -3818,7 +3937,9 @@ impl<'a> Canon<'a> {
                     parts.push(t);
                 }
             }
-            parts.sort();
+            if sortable {
+                parts.sort();
+            }
             return Ok((n(&head, parts), Some(Ty::of(Fam::Bool))));
         }
         let (mut lt, mut lty) = self.expr(l)?;
@@ -4816,7 +4937,7 @@ impl<'a> Canon<'a> {
                 let l = self.table_ref(left)?;
                 let r = self.table_ref(right)?;
                 let on = match on {
-                    Some(e) => self.cond(e)?.0,
+                    Some(e) => self.pred(e)?.0,
                     None => a("-"),
                 };
                 Ok(n("join", vec![a(kind.to_lowercase()), l, r, on]))
@@ -5328,7 +5449,7 @@ impl<'a> Canon<'a> {
             items.clear();
         }
         let where_ = match &s.where_ {
-            Some(w) => self.cond(w)?.0,
+            Some(w) => self.pred(w)?.0,
             None => a("-"),
         };
         let mut group = Vec::new();
@@ -5361,7 +5482,7 @@ impl<'a> Canon<'a> {
             a("distinct")
         };
         let having = match &s.having {
-            Some(h) => self.cond(h)?.0,
+            Some(h) => self.pred(h)?.0,
             None => a("-"),
         };
         let order = self.order_terms(&s.order_by, None)?;
@@ -5996,7 +6117,7 @@ impl<'a> Canon<'a> {
                 let r = (|| {
                     let kv = self.update_sets(&table, sets)?;
                     let w = match where_ {
-                        Some(w) => self.cond(w)?.0,
+                        Some(w) => self.pred(w)?.0,
                         None => a("-"),
                     };
                     Ok(n("update", vec![a(table.clone()), n("set", kv), w]))
@@ -6912,7 +7033,7 @@ impl<'a> Canon<'a> {
         whens: &[super::ast::When],
     ) -> R<Term> {
         // ON: conjunction of target.col = source value.
-        let on_t = self.cond(on)?.0;
+        let on_t = self.pred(on)?.0;
         let conj: Vec<Term> = if on_t.is("and") {
             on_t.kids().to_vec()
         } else {
@@ -7126,7 +7247,7 @@ impl<'a> Canon<'a> {
                 .into_iter()
                 .reduce(|l, r| Expr::Bin("AND".into(), Box::new(l), Box::new(r)))
             {
-                Some(w) => self.cond(&w)?.0,
+                Some(w) => self.pred(&w)?.0,
                 None => a("-"),
             };
             let kv = self.update_sets(&table, sets)?;
@@ -7405,7 +7526,7 @@ impl<'a> Canon<'a> {
                 let table = b.table.clone();
                 self.scopes.last_mut().unwrap().push(b);
                 let w = match where_ {
-                    Some(w) => self.cond(w)?.0,
+                    Some(w) => self.pred(w)?.0,
                     None => a("-"),
                 };
                 return Ok(n("delete", vec![a(table), w]));

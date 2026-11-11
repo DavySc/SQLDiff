@@ -486,6 +486,46 @@ fn diff_inner(
             &mut eq,
             &allowance,
         );
+        // Second opinion (T-SQL against T-SQL step 1, `equiv::second`): the
+        // statement lowering may clear the structural findings of a pair it
+        // proves equal as a whole. It runs last, so it sees what the edit
+        // search and the refinement left.
+        if td.findings.iter().any(equiv::second::removable)
+            && equiv::second::eligible(&aa, &ab).is_none()
+        {
+            // Only the routines that hold a removable finding are lowered.
+            let scoped = equiv::second::unread_routines(&aa, &ab, &td.findings).map(|(ra, rb)| {
+                (
+                    equiv::blanked(aa.artifact, &ra),
+                    equiv::blanked(ab.artifact, &rb),
+                )
+            });
+            let sec = match &scoped {
+                Some((xa, xb)) => {
+                    let (la, lb) = (
+                        Analyzed::new(xa, aa.side, aa.excerpt_lines),
+                        Analyzed::new(xb, ab.side, ab.excerpt_lines),
+                    );
+                    equiv::compare_within(&la, &lb, &schema_a, &schema_b, &opts.anchors, &allowance)
+                }
+                None => {
+                    equiv::compare_within(&aa, &ab, &schema_a, &schema_b, &opts.anchors, &allowance)
+                }
+            };
+            if equiv::second::refusal(&aa, &ab, &sec).is_none() {
+                let before = td.findings.len();
+                let mut cleared = equiv::second::clear(&mut td.findings);
+                if td.findings.len() < before {
+                    td.structural += before - td.findings.len();
+                    for x in sec.normalizations {
+                        if !eq.normalizations.contains(&x) {
+                            eq.normalizations.push(x);
+                        }
+                    }
+                    eq.receipts.append(&mut cleared);
+                }
+            }
+        }
         findings.extend(td.findings);
         receipts.append(&mut td.receipts);
         receipts.append(&mut eq.receipts);

@@ -24,7 +24,7 @@ Inventory for the recorded-catalog-reads series (performance plan W4.3). It list
 | A4 | `sqldiff-equiv/src/equiv/schema.rs` | `types_from_source && !t.star_outputs` | `ViewFamily(name)` | Views typed from a source: every non-view table of the source's name under `eq_ignore_ascii_case`, and their columns; two views of a name give an empty map. A flag digest would be too coarse. |
 | A5 | `sqldiff-equiv/src/equiv/schema.rs` | `if d == Dialect::Postgres {` | `Spellings(lower name)` | PostgreSQL spellings over schemas, routine schemas and names, table schemas and names, columns, keys and indexes: seven sources. |
 | A6 | `sqldiff-equiv/src/equiv/call.rs` | `fn exists(target: &Target, view: RecordingView` | `SchemaKnown(part)`, `Table(parts)`, `Routines(parts)`, and the scan at the end | Comment targets. The `tables.iter().any(..)` scan is `RecordingView::whole` (`WholeCatalog`) in PR 2a. |
-| C1 | `sqldiff-equiv/src/equiv/call.rs` | `fn switches(` | `Table(parts)` on both sides | Versioning declared on the table and its history table on the other side. |
+| C1 | `sqldiff-equiv/src/equiv/call.rs` | `fn switches(` | `Table(parts)` on both sides, and `WholeCatalog` for the target's triggers | Versioning declared on the table and its history table on the other side; the PostgreSQL triggers the statement switches must exist in the target catalog (`RecordingView::whole`, no narrow form yet). |
 | C2 | `sqldiff-equiv/src/equiv/call.rs` | `fn comments(` | `Table(parts)`, `Routines(parts)` | COMMENT ON targets. |
 | C3 | `sqldiff-equiv/src/equiv/call.rs` | `fn callee<'v>(` | `Routines(parts)` | The routine a CALL names. |
 | K1 | `sqldiff-equiv/src/equiv/canon.rs` | `fn user_fn(` | `Routines(parts)` | A user function in an expression. |
@@ -74,7 +74,7 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 
 | file | stage | count |
 |---|---|---|
-| `sqldiff-equiv/src/equiv/call.rs` | check | 4 |
+| `sqldiff-equiv/src/equiv/call.rs` | check | 5 |
 | `sqldiff-equiv/src/equiv/mod.rs` | check | 3 |
 
 ### authoritative
@@ -103,8 +103,8 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 |---|---|---|
 | `sqldiff-core/src/bind/mod.rs` | check | 2 |
 | `sqldiff-core/src/bind/query.rs` | check | 9 |
-| `sqldiff-draft/src/tsql.rs` | pass 1 | 1 |
-| `sqldiff-equiv/src/equiv/call.rs` | check | 5 |
+| `sqldiff-draft/src/tsql.rs` | pass 1 | 2 |
+| `sqldiff-equiv/src/equiv/call.rs` | check | 6 |
 | `sqldiff-equiv/src/equiv/canon.rs` | check | 24 |
 | `sqldiff-equiv/src/equiv/edit.rs` | check | 2 |
 | `sqldiff-equiv/src/equiv/eval.rs` | check | 5 |
@@ -147,6 +147,8 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 | file | stage | count |
 |---|---|---|
 | `sqldiff-convert/src/plan.rs` | driver | 1 |
+| `sqldiff-draft/src/tsql/trigger.rs` | pass 1 | 1 |
+| `sqldiff-equiv/src/equiv/call.rs` | check | 1 |
 | `sqldiff-equiv/src/equiv/mod.rs` | check | 3 |
 
 ### schema fields
@@ -164,7 +166,7 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 
 | file | stage | count |
 |---|---|---|
-| `sqldiff-draft/src/tsql.rs` | pass 1 | 9 |
+| `sqldiff-draft/src/tsql.rs` | pass 1 | 8 |
 | `sqldiff-draft/src/tsql/bits.rs` | pass 1 | 1 |
 | `sqldiff-draft/src/tsql/paging.rs` | pass 1 | 1 |
 | `sqldiff-draft/src/tsql/temporal.rs` | pass 1 | 4 |
@@ -244,9 +246,9 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 | `recording` | builder with a live sink (the tree run's pass 1, `sqldiff-draft/src/lib.rs`) |
 | `table` | pass 1 `Table(parts)` |
 | `table_wide` | pass 1 `WholeCatalog` (the narrow form waits for a T3 proof) |
-| `triggers_named_wide` | pass 1 `WholeCatalog` (the narrow form waits for a T3 proof) |
 | `triggers_named` | pass 1 `TriggersNamed` |
 | `column_types` | pass 1 `ColumnTypes` |
+| `procedure_named` | pass 1 `ProcedureNamed` |
 | `column_types_wide` | pass 1 `WholeCatalog` (unused; the narrow form is proven by T3) |
 | `tables` | pass 1 `WholeCatalog` |
 | `routines` | pass 1 `WholeCatalog` |

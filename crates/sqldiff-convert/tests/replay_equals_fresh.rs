@@ -36,7 +36,7 @@ fn recheck_at_most(e: &Edit) -> usize {
     match e {
         Edit::NoOpComment | Edit::NoOpReorderTables => 0,
         Edit::AddTable => 6,
-        Edit::DropTable => 27,
+        Edit::DropTable => 28,
         Edit::RenameTable
         | Edit::AddColumn
         | Edit::AddMixedCaseColumn
@@ -45,12 +45,12 @@ fn recheck_at_most(e: &Edit) -> usize {
         | Edit::ReorderColumns
         | Edit::FlipNullability
         | Edit::ChangeDefault
-        | Edit::ToggleIndex => 28,
+        | Edit::ToggleIndex => 29,
         Edit::AddRoutine | Edit::DropRoutine | Edit::AddTrigger => 6,
         Edit::ViewBody => 8,
         Edit::ChangeParameterType | Edit::AddSchemaTable => 7,
         Edit::BaseDrop => 8,
-        Edit::DropTrigger => 4,
+        Edit::DropTrigger | Edit::RetargetTrigger => 4,
         Edit::VersioningOn
         | Edit::DropAllTables
         | Edit::NoProcedures
@@ -68,8 +68,11 @@ fn recheck_at_most(e: &Edit) -> usize {
         | Edit::RetypeSide
         | Edit::NoCatalog
         | Edit::VersioningToggle
+        | Edit::HistoryDropped
+        | Edit::HistoryDroppedLoneTarget
+        | Edit::HistoryDroppedMovedTrigger
         | Edit::HandWritten => usize::MAX / 2,
-        Edit::AddBitColumn => usize::MAX / 2,
+        Edit::AddBitColumn | Edit::RetypeSink | Edit::AddStatusRoutine => usize::MAX / 2,
         Edit::BaseTriggerEvent | Edit::TargetBaseTriggerEvent => 5,
         Edit::BaseRetype => 6,
         Edit::BaseTable => 5,
@@ -82,13 +85,12 @@ fn recheck_at_most(e: &Edit) -> usize {
 /// or something it asked of the source catalog or the claims has another
 /// answer. As measured on both dialects and both seeds.
 ///
-/// Today every pass-1 read records the whole source catalog (the sound
-/// fallback: no per-site test proves a narrow form yet, see
-/// `SourceReads::table_wide`), and every file reads it, so an edit that
-/// changes the source catalog in any way rebuilds every draft, and one that
-/// does not (a comment, the target side only, the order of the tables)
-/// rebuilds none but the edited file. The bounds tighten, edit by edit, as
-/// narrow forms are proven: lowering a bound is how a better recording shows.
+/// Pass-1 reads are recorded narrow for the table lookups (`Table(parts)`),
+/// the callee lookup (`ProcedureNamed`) and the type set (`ColumnTypes`);
+/// the sites with no killing generated edit yet (`table_wide`,
+/// `column_owners`, the `temporal.rs` lookups, `tables`) still record `WholeCatalog` and rebuild
+/// on any edit, but this generator's trees do not reach them. Lowering a
+/// bound is how a better recording shows.
 fn drafts_at_most(e: &Edit) -> usize {
     match e {
         Edit::NoOpReorderTables
@@ -101,18 +103,16 @@ fn drafts_at_most(e: &Edit) -> usize {
         | Edit::TargetBaseTriggerEvent
         | Edit::HandWritten => 0,
         Edit::NoOpComment => 1,
-        // The distinct column types of the catalog (`ColumnTypes`, the one
-        // narrow pass-1 read) do not change when a column of a type the
-        // catalog has already comes, goes (in these trees) or changes its
-        // nullability, default, position or index: the drafts that read
-        // nothing else wide are taken from their entries. As measured: 67
-        // on PostgreSQL, 34 on Db2 for i, of about 93 files.
+        // A column edit that keeps the set of column types changes the
+        // read of the table it edits and of the drafts that name it. As
+        // measured: 19 to 22 on PostgreSQL, 8 to 9 on Db2 for i, of about 93
+        // files.
         Edit::AddColumn
         | Edit::AddMixedCaseColumn
         | Edit::ReorderColumns
         | Edit::FlipNullability
         | Edit::ChangeDefault
-        | Edit::ToggleIndex => 68,
+        | Edit::ToggleIndex => 24,
         _ => usize::MAX / 2,
     }
 }
@@ -238,6 +238,7 @@ const EXEMPT: &[(Dialect, &str, &str)] = &[
         "DROP TRIGGER is compared only from T-SQL to PostgreSQL",
     ),
     (Dialect::Db2i, "DropTrigger", "same"),
+    (Dialect::Db2i, "RetargetTrigger", "same"),
     (
         Dialect::Postgres,
         "TargetOverrides",

@@ -155,6 +155,44 @@ pub struct Model {
     /// The output of the table T0 is written by hand, with one more column
     /// than the rules give it.
     pub hand: bool,
+    /// Versioned tables are written with `SYSTEM_VERSIONING = ON` and no
+    /// `HISTORY_TABLE`: the catalog shows them versioned, and the rules
+    /// refuse the CREATE TABLE.
+    pub no_history: bool,
+    /// The target base catalog has a plain table `dbo.t2` (no triggers).
+    pub lone_t2: bool,
+    /// The target base catalog's `t2` also has `t2_versioning_truncate`.
+    pub lone_truncate: bool,
+    /// That trigger is on another table of the target base catalog.
+    pub moved_truncate: bool,
+    /// Raw text appended to the PostgreSQL base catalog.
+    pub pg_extra: String,
+}
+
+/// Which base tree the generator starts from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Tree {
+    /// No system-versioned table.
+    Plain,
+    /// A system-versioned table in the tree from the start.
+    Hidden,
+    /// `Hidden`, but the table has no `HISTORY_TABLE` (its CREATE TABLE is
+    /// refused) and the target base catalog has a `t2` with both triggers.
+    Refused,
+}
+
+impl Tree {
+    pub const ALL: [Tree; 3] = [Tree::Plain, Tree::Hidden, Tree::Refused];
+}
+
+impl From<bool> for Tree {
+    fn from(hidden: bool) -> Tree {
+        if hidden {
+            Tree::Hidden
+        } else {
+            Tree::Plain
+        }
+    }
 }
 
 /// The three tables the fixed dependents use.
@@ -182,11 +220,20 @@ impl Model {
     /// [`Model::generate`], and with `hidden` a system-versioned table in
     /// the tree from the start (so a star over a view or table is already
     /// refused where it hides columns).
-    pub fn generate_with(seed: u64, hidden: bool) -> Model {
+    pub fn generate_with(seed: u64, tree: impl Into<Tree>) -> Model {
         let mut m = Model::generate(seed);
-        if hidden {
+        let tree = tree.into();
+        if tree != Tree::Plain {
             m.tables[2].versioned = true;
             m.tables[2].index = Some(2);
+        }
+        if tree == Tree::Refused {
+            // The versioned table has no HISTORY_TABLE, so the rules refuse
+            // its CREATE TABLE and the target tree has no `t2`; the target
+            // base catalog has a `t2` with both versioning triggers.
+            m.no_history = true;
+            m.lone_t2 = true;
+            m.lone_truncate = true;
         }
         m
     }
@@ -347,6 +394,11 @@ impl Model {
             tr1_update: false,
             tr1_target_update: false,
             hand: false,
+            no_history: false,
+            lone_t2: false,
+            lone_truncate: false,
+            moved_truncate: false,
+            pg_extra: String::new(),
         }
     }
 
@@ -354,10 +406,14 @@ impl Model {
     pub fn files(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for t in &self.tables {
-            out.push((
-                format!("tables/{}.{}.sql", t.schema, t.name),
-                create_table(t, Dialect::Tsql),
-            ));
+            let mut text = create_table(t, Dialect::Tsql);
+            if self.no_history && t.versioned {
+                // Versioned, with SQL Server naming the history table.
+                let at = text.find(" (HISTORY_TABLE").expect("a history table");
+                let end = text[at..].find("));").expect("its end") + at;
+                text.replace_range(at..end + 1, "");
+            }
+            out.push((format!("tables/{}.{}.sql", t.schema, t.name), text));
         }
         for v in &self.views {
             let body = if v.star {
@@ -486,6 +542,53 @@ impl Model {
                 ));
             }
         }
+        if d == Dialect::Postgres && !self.pg_extra.is_empty() {
+            s.push('\n');
+            s.push_str(&self.pg_extra);
+        }
+        if self.lone_t2 && d != Dialect::Tsql {
+            // A plain table of the name the converted versioned table has,
+            // with its trigger `t2_versioning`, and `t2_versioning_truncate`
+            // on it (`lone_truncate`) or on another table (`moved_truncate`)
+            // or nowhere.
+            s.push('\n');
+            s.push_str(&create_table(
+                &Table {
+                    schema: "dbo".into(),
+                    name: "T2".into(),
+                    cols: vec![key()],
+                    index: None,
+                    versioned: false,
+                },
+                d,
+            ));
+            if d == Dialect::Postgres {
+                s.push_str(
+                "CREATE FUNCTION t2_versioning() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;\nCREATE TRIGGER t2_versioning BEFORE UPDATE ON t2 FOR EACH ROW EXECUTE FUNCTION t2_versioning();\n",
+                );
+                let fun = "CREATE FUNCTION t2_versioning_truncate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;\n";
+                let trg = |on: &str| {
+                    format!("CREATE TRIGGER t2_versioning_truncate BEFORE UPDATE ON {on} FOR EACH ROW EXECUTE FUNCTION t2_versioning_truncate();\n")
+                };
+                if self.moved_truncate {
+                    s.push_str(&create_table(
+                        &Table {
+                            schema: "dbo".into(),
+                            name: "Other2".into(),
+                            cols: vec![key()],
+                            index: None,
+                            versioned: false,
+                        },
+                        d,
+                    ));
+                    s.push_str(fun);
+                    s.push_str(&trg("other2"));
+                } else if self.lone_truncate {
+                    s.push_str(fun);
+                    s.push_str(&trg("t2"));
+                }
+            }
+        }
         if !self.tables.is_empty() {
             // A trigger of the base catalogs on the tree's table X0, which
             // `DropBaseTr1` drops (the source one's event is what
@@ -611,6 +714,13 @@ fn dependents() -> Vec<(String, String)> {
             format!("Positional{k}"),
             format!("INSERT INTO dbo.T{k} VALUES (@x, N'a', 1, '2020-01-01')"),
         );
+        // Switching versioning off reads the table's period and history
+        // table from the source catalog, and the converted table from the
+        // target one (`VersioningOn` / `VersioningToggle`).
+        add(
+            format!("VersioningOff{k}"),
+            format!("ALTER TABLE dbo.T{k} SET (SYSTEM_VERSIONING = OFF)"),
+        );
         add(
             format!("Defaults{k}"),
             format!("INSERT INTO dbo.T{k} (Id) VALUES (@x)"),
@@ -665,6 +775,17 @@ fn dependents() -> Vec<(String, String)> {
             format!("UPDATE t SET C0 = s.C0 FROM dbo.T{k} AS t JOIN dbo.T{n} AS s ON s.C1 = t.C1"),
         );
     }
+    // The same switch, naming the table with other quoting and case: the
+    // draft looks it up with plain identifiers, the equivalence check with
+    // the spelling's quoting.
+    add(
+        "VersioningOffQuoted".into(),
+        "ALTER TABLE [dbo].[t2] SET (SYSTEM_VERSIONING = OFF)".into(),
+    );
+    add(
+        "VersioningOffLower".into(),
+        "ALTER TABLE dbo.t2 SET (SYSTEM_VERSIONING = OFF)".into(),
+    );
     add("DropTr0".into(), "DROP TRIGGER dbo.Tr0".into());
     add("DropTg1".into(), "DROP TRIGGER dbo.Tg1".into());
     add("DropBaseTr1".into(), "DROP TRIGGER dbo.Tr1".into());
@@ -689,6 +810,21 @@ fn dependents() -> Vec<(String, String)> {
         "StarHidden".into(),
         "INSERT INTO dbo.Sink SELECT * FROM dbo.T1 AS a JOIN dbo.Lone AS b ON a.Id = b.Id".into(),
     );
+    // A fraction assigned to a column of a table that only this statement's
+    // typing looks up (`entry_table`): T-SQL truncates it, so the converted
+    // text wraps it in `trunc()` while the column is an integer.
+    // `RetypeSink` makes `Sink.C1` a decimal, and `AddTable` makes `Fresh`.
+    add(
+        "UpdateFractionSink".into(),
+        "UPDATE dbo.Sink SET C1 = 1.5 WHERE Id = @x".into(),
+    );
+    add(
+        "UpdateFractionFresh".into(),
+        "UPDATE dbo.Fresh SET C0 = 1.5 WHERE Id = @x".into(),
+    );
+    // A call of a procedure that returns a status gets a `return_code`
+    // argument (`AddStatusRoutine` defines it).
+    add("CallStatus".into(), "EXEC dbo.Status @x".into());
     add(
         "InsertNoListSink".into(),
         "INSERT INTO dbo.Sink VALUES (1, N'a', 1, NULL)".into(),
@@ -872,8 +1008,14 @@ fn routine(r: &Routine) -> String {
             r.name, r.param, r.reads
         );
     }
+    // `Status` is the one procedure that returns a value (a status).
+    let ret = if r.name == "Status" {
+        "  RETURN 1;\n"
+    } else {
+        ""
+    };
     format!(
-        "CREATE PROCEDURE dbo.{} @x {}\nAS\nBEGIN\n  SET NOCOUNT ON;\n  INSERT INTO dbo.Sink (Id) VALUES (@x);\nEND\nGO\n",
+        "CREATE PROCEDURE dbo.{} @x {}\nAS\nBEGIN\n  SET NOCOUNT ON;\n  INSERT INTO dbo.Sink (Id) VALUES (@x);\n{ret}END\nGO\n",
         r.name, r.param
     )
 }
@@ -909,10 +1051,25 @@ pub enum Edit {
     AddSchemaTable,
     AddTrigger,
     DropTrigger,
+    /// The first trigger (`Tr0`) moves to another table: a `DROP TRIGGER` of
+    /// it names that table in PostgreSQL.
+    RetargetTrigger,
     /// System versioning on (a HIDDEN column appears; A1).
     VersioningOn,
+    /// `T2` is system-versioned with no `HISTORY_TABLE` (the rules refuse its
+    /// CREATE TABLE, so the target tree has no `t2`).
+    HistoryDropped,
+    /// The same, and the target base catalog has a plain `t2` with one of
+    /// the two versioning triggers.
+    HistoryDroppedLoneTarget,
+    /// The same, with `t2_versioning_truncate` on another table.
+    HistoryDroppedMovedTrigger,
     /// A column of the base catalog (both dialects) changes type.
     BaseRetype,
+    /// The fixed table `Sink` (named by one dependent only) has a non-integer `C1`.
+    RetypeSink,
+    /// A procedure that returns a status appears (its callers get `return_code`).
+    AddStatusRoutine,
     /// The base catalog gains a table a dependent reads.
     BaseTable,
     /// The base catalog loses its table.
@@ -987,8 +1144,14 @@ pub const ALL_EDITS: &[Edit] = &[
     Edit::AddSchemaTable,
     Edit::AddTrigger,
     Edit::DropTrigger,
+    Edit::RetargetTrigger,
     Edit::VersioningOn,
+    Edit::HistoryDropped,
+    Edit::HistoryDroppedLoneTarget,
+    Edit::HistoryDroppedMovedTrigger,
     Edit::BaseRetype,
+    Edit::RetypeSink,
+    Edit::AddStatusRoutine,
     Edit::BaseTable,
     Edit::BaseDrop,
     Edit::SplitBase,
@@ -1165,6 +1328,11 @@ impl Edit {
                 });
                 format!("add trigger Tg1 on {on}")
             }
+            Edit::RetargetTrigger => {
+                let g = &mut m.triggers[0];
+                g.on = "Sink".into();
+                format!("trigger {} moves to Sink", g.name)
+            }
             Edit::DropTrigger => {
                 m.triggers.clear();
                 "drop trigger Tr0".into()
@@ -1173,9 +1341,38 @@ impl Edit {
                 m.tables[ti].versioned = true;
                 format!("system versioning on for {tname}")
             }
+            Edit::HistoryDropped
+            | Edit::HistoryDroppedLoneTarget
+            | Edit::HistoryDroppedMovedTrigger => {
+                m.tables[2].versioned = true;
+                m.tables[2].index = Some(2);
+                m.no_history = true;
+                m.lone_t2 = !matches!(self, Edit::HistoryDropped);
+                m.lone_truncate = false;
+                m.moved_truncate = matches!(self, Edit::HistoryDroppedMovedTrigger);
+                "T2 is system-versioned without a HISTORY_TABLE".into()
+            }
             Edit::BaseRetype => {
                 m.base[0].cols[1].ty = "int".into();
                 "base catalog: ext.Ref.Note becomes int".into()
+            }
+            Edit::AddStatusRoutine => {
+                m.routines.push(Routine {
+                    name: "Status".into(),
+                    reads: "T2".into(),
+                    param: "int".into(),
+                    function: false,
+                });
+                "add routine Status (returns a status)".into()
+            }
+            Edit::RetypeSink => {
+                let sink = m
+                    .tables
+                    .iter_mut()
+                    .find(|t| t.name == "Sink")
+                    .expect("the fixed table Sink");
+                sink.cols[2].ty = "decimal(10,2)".into();
+                "Sink.C1 becomes decimal(10,2)".into()
             }
             Edit::BaseTable => {
                 m.base.push(Table {
