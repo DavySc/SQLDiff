@@ -5197,7 +5197,8 @@ mod line_guard_tests {
 
     #[test]
     fn a_line_number_reaches_the_output_only_where_it_moves_with_the_routine() {
-        let src = include_str!("behaviour.rs");
+        // CRLF checkouts (Windows CI) read the file with `\r\n`.
+        let src = include_str!("behaviour.rs").replace("\r\n", "\n");
         let code = src.split("\n#[cfg(test)]\nmod cap_tests").next().unwrap();
         let mut func = String::new();
         let mut bad = Vec::new();
