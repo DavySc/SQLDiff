@@ -81,12 +81,14 @@ const KEYED: &[&str] = &[
 /// same table under every spelling of its name; guarded by
 /// [`the_switch_lookups_find_the_table_the_draft_converted`].
 ///
-/// The PostgreSQL side's lookup (`pv.table(&pparts)`) is NOT consumed: a
-/// versioned table whose CREATE TABLE the rules refuse is defined by nothing
-/// in the target tree, so the target base catalog decides the lookup while
-/// the draft's text stays the same (review of this change, with a repro). It
-/// is a GAP until an edit pairs such a table with a target base table that
-/// appears and goes.
+/// The PostgreSQL side's reads in `switches` (the table lookup, the trigger
+/// list and the trigger's table) are not consumed: a versioned table whose
+/// CREATE TABLE the rules refuse is defined by nothing in the target tree, so
+/// the target base catalog decides them while the draft's text stays the same.
+/// They are DOMINATED, by the generator's `HistoryDropped` and
+/// `HistoryDroppedLoneTarget` edits: the converted table goes (or a plain `t2`
+/// with one of the two versioning triggers takes its place), the check's
+/// result changes, and the reads that change with it are asked again.
 const CONSUMED: &[&str] = &[
     "crates/sqldiff-equiv/src/equiv/call.rs::switches@let Lookup::Found(table) = tv.table(&parts) else {",
     "crates/sqldiff-equiv/src/equiv/mod.rs::table_pair@sa.with_ddl(&p.ddl.0, a.dialect()),",
@@ -151,6 +153,9 @@ const REDUNDANT: &[&str] = &[
 const DOMINATED: &[&str] = &[
     "crates/sqldiff-core/src/bind/query.rs::lookup_table_silent@_ => match self.input.view.table(parts) {",
     "crates/sqldiff-equiv/src/equiv/canon.rs::visible_star@b.derived.is_none() && self.schema.is_star_view(&lc(Self::base_table(&b.table)))",
+    "crates/sqldiff-equiv/src/equiv/call.rs::switches@let pt = match pv.table(&pparts) {",
+    "crates/sqldiff-equiv/src/equiv/call.rs::switches@let triggers = &pv.whole().triggers;",
+    "crates/sqldiff-equiv/src/equiv/call.rs::switches@matches!(pv.table(&parts), Lookup::Found(tt) if std::ptr::eq(tt, pt))",
     "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(n), true)?;#2",
     "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(n), x.kind == \"TABLE\")?;",
     "crates/sqldiff-equiv/src/equiv/trigger.rs::pairs_for@.with_images(&tr.table, &names)",
@@ -159,8 +164,7 @@ const DOMINATED: &[&str] = &[
 
 /// Sites whose read sets change but that no generated edit kills: work for
 /// the generator.
-const GAP: &[&str] =
-    &["crates/sqldiff-equiv/src/equiv/call.rs::switches@match pv.table(&pparts) {"];
+const GAP: &[&str] = &[];
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -486,6 +490,33 @@ fn the_switch_lookups_find_the_table_the_draft_converted() {
                 .contains("disable trigger t2_versioning"),
             "{name} does not switch T2's triggers:\n{sql}"
         );
+    }
+}
+
+/// A versioned table whose CREATE TABLE is refused (no `HISTORY_TABLE`) leaves
+/// the target tree without it: the switch is not compared, whether the target
+/// base catalog has no such table or a plain one with only one of the two
+/// versioning triggers.
+#[test]
+fn a_switch_of_a_table_the_target_does_not_have_is_not_compared() {
+    for (edit, why) in [
+        (Edit::HistoryDropped, "has no table"),
+        (
+            Edit::HistoryDroppedLoneTarget,
+            "has no trigger t2_versioning_truncate",
+        ),
+    ] {
+        let f = Fixture::new(&format!("switch-refused-{edit:?}"), Dialect::Postgres);
+        let mut m = Model::generate_with(SEED, true);
+        edit.apply(&mut m, &mut Rng::new(SEED ^ 0xA5A5));
+        f.write(&m);
+        f.run("a", true);
+        let files = per_file(&f.dir.join("a"));
+        let text = files.get("dependents/VersioningOff2.sql").unwrap();
+        let (report, _) = text.split_once('\n').unwrap();
+        let j: serde_json::Value = serde_json::from_str(report).unwrap();
+        assert_eq!(j["status"], "unproven", "{edit:?}: {report}");
+        assert!(report.contains(why), "{edit:?}: {report}");
     }
 }
 

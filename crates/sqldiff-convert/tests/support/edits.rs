@@ -155,6 +155,12 @@ pub struct Model {
     /// The output of the table T0 is written by hand, with one more column
     /// than the rules give it.
     pub hand: bool,
+    /// Versioned tables are written with `SYSTEM_VERSIONING = ON` and no
+    /// `HISTORY_TABLE`: the catalog shows them versioned, and the rules
+    /// refuse the CREATE TABLE.
+    pub no_history: bool,
+    /// The target base catalog has a plain table `dbo.t2` (no triggers).
+    pub lone_t2: bool,
 }
 
 /// The three tables the fixed dependents use.
@@ -347,6 +353,8 @@ impl Model {
             tr1_update: false,
             tr1_target_update: false,
             hand: false,
+            no_history: false,
+            lone_t2: false,
         }
     }
 
@@ -354,10 +362,14 @@ impl Model {
     pub fn files(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for t in &self.tables {
-            out.push((
-                format!("tables/{}.{}.sql", t.schema, t.name),
-                create_table(t, Dialect::Tsql),
-            ));
+            let mut text = create_table(t, Dialect::Tsql);
+            if self.no_history && t.versioned {
+                // Versioned, with SQL Server naming the history table.
+                let at = text.find(" (HISTORY_TABLE").expect("a history table");
+                let end = text[at..].find("));").expect("its end") + at;
+                text.replace_range(at..end + 1, "");
+            }
+            out.push((format!("tables/{}.{}.sql", t.schema, t.name), text));
         }
         for v in &self.views {
             let body = if v.star {
@@ -484,6 +496,27 @@ impl Model {
                     q(d, "Sink"),
                     if d == Dialect::Tsql { "GO\n" } else { "" }
                 ));
+            }
+        }
+        if self.lone_t2 && d != Dialect::Tsql {
+            // A plain table of the name the converted versioned table has,
+            // with one of its triggers (`t2_versioning`) but not the other
+            // (`t2_versioning_truncate`).
+            s.push('\n');
+            s.push_str(&create_table(
+                &Table {
+                    schema: "dbo".into(),
+                    name: "T2".into(),
+                    cols: vec![key()],
+                    index: None,
+                    versioned: false,
+                },
+                d,
+            ));
+            if d == Dialect::Postgres {
+                s.push_str(
+                "CREATE FUNCTION t2_versioning() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;\nCREATE TRIGGER t2_versioning BEFORE UPDATE ON t2 FOR EACH ROW EXECUTE FUNCTION t2_versioning();\n",
+                );
             }
         }
         if !self.tables.is_empty() {
@@ -953,6 +986,12 @@ pub enum Edit {
     RetargetTrigger,
     /// System versioning on (a HIDDEN column appears; A1).
     VersioningOn,
+    /// `T2` is system-versioned with no `HISTORY_TABLE` (the rules refuse its
+    /// CREATE TABLE, so the target tree has no `t2`).
+    HistoryDropped,
+    /// The same, and the target base catalog has a plain `t2` with one of
+    /// the two versioning triggers.
+    HistoryDroppedLoneTarget,
     /// A column of the base catalog (both dialects) changes type.
     BaseRetype,
     /// The fixed table `Sink` (named by one dependent only) has a non-integer `C1`.
@@ -1035,6 +1074,8 @@ pub const ALL_EDITS: &[Edit] = &[
     Edit::DropTrigger,
     Edit::RetargetTrigger,
     Edit::VersioningOn,
+    Edit::HistoryDropped,
+    Edit::HistoryDroppedLoneTarget,
     Edit::BaseRetype,
     Edit::RetypeSink,
     Edit::AddStatusRoutine,
@@ -1226,6 +1267,13 @@ impl Edit {
             Edit::VersioningOn => {
                 m.tables[ti].versioned = true;
                 format!("system versioning on for {tname}")
+            }
+            Edit::HistoryDropped | Edit::HistoryDroppedLoneTarget => {
+                m.tables[2].versioned = true;
+                m.tables[2].index = Some(2);
+                m.no_history = true;
+                m.lone_t2 = matches!(self, Edit::HistoryDroppedLoneTarget);
+                "T2 is system-versioned without a HISTORY_TABLE".into()
             }
             Edit::BaseRetype => {
                 m.base[0].cols[1].ty = "int".into();
