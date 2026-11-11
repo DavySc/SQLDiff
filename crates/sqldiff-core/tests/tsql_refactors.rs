@@ -1240,3 +1240,260 @@ fn a_write_whose_count_differs_keeps_its_true_behaviour_witness() {
         }
     }
 }
+
+// ---- path summaries (PR 2a, `equiv::path`) --------------------------------
+
+const PO: &str = "INSERT INTO dbo.Orders (Qty) VALUES (1);";
+const PS: &str = "INSERT INTO dbo.Stock (ItemId, Qty) VALUES (1, 2);";
+const PI: &str = "INSERT INTO dbo.Item (ItemId, Price) VALUES (1, 3);";
+
+fn pproc(body: &str) -> String {
+    format!("CREATE PROCEDURE dbo.P @a int, @b int, @o int OUTPUT AS BEGIN {body} END")
+}
+
+fn pverdicts(a: &str, b: &str) -> [Verdict; 2] {
+    [verdict(&pproc(a), &pproc(b)), verdict(&pproc(b), &pproc(a))]
+}
+
+/// Guard rewrites with the same events on every execution are proved equal
+/// by the path summary. Each carries its argument.
+#[test]
+fn path_summaries_prove_guard_rewrites_equal() {
+    let cases: Vec<(&str, &str, String, String, Verdict)> = vec![
+        (
+            "nested-if-to-and",
+            "the INSERT runs exactly when both tests are true",
+            format!("IF @a > 0 BEGIN IF @b > 0 {PO} END"),
+            format!("IF @a > 0 AND @b > 0 {PO}"),
+            Equal,
+        ),
+        (
+            "early-return-to-if-else",
+            "@a > 0: both run the first INSERT only; otherwise both run the second",
+            format!("IF @a > 0 BEGIN {PO} RETURN; END {PS}"),
+            format!("IF @a > 0 {PO} ELSE {PS}"),
+            Equal,
+        ),
+        (
+            "hoist-out-of-both-branches",
+            "the Orders INSERT runs first on every path, then the branch-specific one",
+            format!("IF @a > 0 BEGIN {PO} {PS} END ELSE BEGIN {PO} {PI} END"),
+            format!("{PO} IF @a > 0 {PS} ELSE {PI}"),
+            Equal,
+        ),
+        (
+            "guard-clause-with-null-test",
+            "NULL or non-positive raises on both sides, a positive value inserts; the caller-transaction analysis rests on ASM-NO-CALLER-TXN",
+            format!("IF @a IS NULL OR @a <= 0 BEGIN RAISERROR('bad', 16, 1); RETURN; END {PO}"),
+            format!("IF @a > 0 {PO} ELSE RAISERROR('bad', 16, 1);"),
+            Eua,
+        ),
+        (
+            "store-through-a-declared-copy",
+            "@x holds @a on every path, so the nested test is the conjunction",
+            format!("DECLARE @x int = @a; IF @x > 0 BEGIN IF @b > 0 {PO} END"),
+            format!("DECLARE @x int = @a; IF @x > 0 AND @b > 0 {PO}"),
+            Equal,
+        ),
+    ];
+    for (name, why, a, b, want) in cases {
+        let got = pverdicts(&a, &b);
+        assert_eq!(got, [want, want], "{name} ({why})");
+    }
+}
+
+/// Pairs that differ on at least one execution: the path summary must never
+/// clear them, in either direction. Each carries the witness.
+#[test]
+fn path_summaries_never_clear_a_different_pair() {
+    let call = "EXEC dbo.Q @x;";
+    let cases: Vec<(&str, &str, String, String)> = vec![
+        (
+            "comparison-flipped",
+            "@a = 0: A skips the INSERT, B runs it",
+            format!("IF @a > 0 {PO}"),
+            format!("IF @a >= 0 {PO}"),
+        ),
+        (
+            "return-value-changed",
+            "A returns status 1, B status 2",
+            format!("{PO} RETURN 1;"),
+            format!("{PO} RETURN 2;"),
+        ),
+        (
+            "output-assignment-dropped",
+            "A sets @o to 1, B leaves the caller's value",
+            format!("SET @o = 1; {PO}"),
+            PO.to_string(),
+        ),
+        (
+            "event-order-swapped",
+            "the rows are written in the other order, visible by a trigger or a key conflict",
+            format!("{PO} {PS}"),
+            format!("{PS} {PO}"),
+        ),
+        (
+            "early-return-keeps-running",
+            "@a > 0: A runs the first INSERT only, B runs both",
+            format!("IF @a > 0 BEGIN {PO} RETURN; END {PS}"),
+            format!("IF @a > 0 {PO} {PS}"),
+        ),
+        (
+            "null-test-against-comparison",
+            "@a NULL: A inserts into Orders, B into Stock",
+            format!("IF @a IS NULL {PO} ELSE {PS}"),
+            format!("IF @a > 0 {PS} ELSE {PO}"),
+        ),
+        (
+            "national-prefix-inside-an-if-rewrite",
+            "N'ж' is stored as nvarchar, 'ж' becomes '?' in a varchar column",
+            "IF @a > 0 BEGIN IF @b > 0 INSERT INTO dbo.Orders (Note) VALUES (N'ж'); END".into(),
+            "IF @a > 0 AND @b > 0 INSERT INTO dbo.Orders (Note) VALUES ('ж');".into(),
+        ),
+        (
+            "national-prefix-through-a-variable",
+            "the variable holds nvarchar text in A and varchar text in B",
+            "DECLARE @s nvarchar(10); SET @s = N'ж'; IF @a > 0 INSERT INTO dbo.Orders (Note) VALUES (@s);".into(),
+            "DECLARE @s nvarchar(10); SET @s = 'ж'; IF @a > 0 INSERT INTO dbo.Orders (Note) VALUES (@s);".into(),
+        ),
+        (
+            "call-argument-through-a-variable",
+            "the callee gets @a in A and @b in B",
+            format!("DECLARE @x int; SET @x = @a; {call}"),
+            format!("DECLARE @x int; SET @x = @b; {call}"),
+        ),
+        (
+            "return-null-variable-against-fall-through",
+            "RETURN of a NULL int returns 0 with a warning in A; B falls through (no warning)",
+            format!("DECLARE @v int; {PO} RETURN @v;"),
+            format!("DECLARE @v int; {PO}"),
+        ),
+        (
+            "declare-with-initializer-moved-into-a-branch",
+            "@a <= 0: A has @v = 5 and writes Qty 5, B writes NULL",
+            format!("DECLARE @v int = 5; IF @a > 0 SET @a = 1; INSERT INTO dbo.Orders (Qty) VALUES (@v);"),
+            format!("DECLARE @v int; IF @a > 0 BEGIN SET @v = 5; SET @a = 1; END INSERT INTO dbo.Orders (Qty) VALUES (@v);"),
+        ),
+        (
+            "raising-assignment-inlined",
+            "@a = 300: A fails at the DECLARE before writing, B writes",
+            format!("DECLARE @v tinyint = @a; {PO}"),
+            PO.to_string(),
+        ),
+        (
+            "read-assigned-before-a-delete",
+            "A reads the count before the DELETE, B after",
+            "DECLARE @n int; SELECT @n = COUNT(*) FROM dbo.Stock; DELETE FROM dbo.Stock; INSERT INTO dbo.Orders (Qty) VALUES (@n);".into(),
+            "DECLARE @n int; DELETE FROM dbo.Stock; SELECT @n = COUNT(*) FROM dbo.Stock; INSERT INTO dbo.Orders (Qty) VALUES (@n);".into(),
+        ),
+        (
+            "output-clause-dropped",
+            "A returns the deleted rows, B does not",
+            "DELETE FROM dbo.Stock OUTPUT deleted.ItemId;".into(),
+            "DELETE FROM dbo.Stock;".into(),
+        ),
+        (
+            "sysdatetime-shared-against-inlined",
+            "the two INSERTs see one clock reading in A and two in B",
+            "DECLARE @t datetime2 = SYSDATETIME(); INSERT INTO dbo.Orders (Note) VALUES (@t); INSERT INTO dbo.Orders (Note) VALUES (@t);".into(),
+            "INSERT INTO dbo.Orders (Note) VALUES (SYSDATETIME()); INSERT INTO dbo.Orders (Note) VALUES (SYSDATETIME());".into(),
+        ),
+    ];
+    for (name, why, a, b) in cases {
+        for (dir, v) in ["A to B", "B to A"].iter().zip(pverdicts(&a, &b)) {
+            assert!(
+                !matches!(v, Equal | Eua),
+                "{name} ({dir}): {v:?}; witness: {why}"
+            );
+        }
+    }
+}
+
+/// A routine proved equal by its paths is cleared next to a routine that
+/// holds a witnessed difference: the first loses its findings, the second
+/// keeps its own, and the file is not equal.
+#[test]
+fn path_summaries_clear_per_routine() {
+    let routine = |name: &str, body: &str| {
+        format!("CREATE PROCEDURE dbo.{name} @a int, @b int AS BEGIN\n{body}\nEND\nGO\n")
+    };
+    let nested = format!("IF @a > 0 BEGIN IF @b > 0 {PO} END");
+    let flat = format!("IF @a > 0 AND @b > 0 {PO}");
+    let (before_a, before_b) = (routine("One", &nested), routine("One", &flat));
+    let changed_a = routine("Two", &format!("IF @a > 0 {PS}"));
+    let changed_b = routine("Two", &format!("IF @a >= 0 {PS}"));
+    let opts = Options {
+        catalog_a: vec![Artifact::new("catalog.sql", T, DDL)],
+        catalog_b: vec![Artifact::new("catalog.sql", T, DDL)],
+        ..Options::default()
+    };
+    let run = |a: String, b: String| {
+        sqldiff_core::with_engine_stack(|| {
+            diff(
+                &Artifact::new("a.sql", T, a),
+                &Artifact::new("b.sql", T, b),
+                &opts,
+            )
+        })
+    };
+    // Alone, the rewrite is equal.
+    let r = run(before_a.clone(), before_b.clone());
+    assert_eq!(r.verdict(), Equal, "{:#?}", r.findings);
+    // Next to a real change in another routine, the file is different, and
+    // no structural finding of the first routine (lines 1 to 3) remains.
+    for (a, b) in [
+        (
+            format!("{before_a}{changed_a}"),
+            format!("{before_b}{changed_b}"),
+        ),
+        (
+            format!("{changed_a}{before_a}"),
+            format!("{changed_b}{before_b}"),
+        ),
+    ] {
+        let r = run(a.clone(), b.clone());
+        assert!(!matches!(r.verdict(), Equal | Eua), "{:#?}", r.findings);
+        let first_len = before_a.lines().count();
+        let in_first = |l: &Option<_>, offset: usize| {
+            l.as_ref().is_some_and(|l: &sqldiff_core::model::Location| {
+                l.start_line > offset && l.start_line <= offset + first_len
+            })
+        };
+        let offset = if a.starts_with("CREATE PROCEDURE dbo.One") {
+            0
+        } else {
+            changed_a.lines().count()
+        };
+        for f in &r.findings {
+            if f.rule.starts_with("stmt.") || f.rule == "header.modified" {
+                assert!(
+                    !(in_first(&f.a, offset) || in_first(&f.b, offset)),
+                    "a finding of the proved routine remains: {f:#?}"
+                );
+            }
+        }
+    }
+}
+
+/// A fresh comparison and a repeated one render the same bytes.
+#[test]
+fn path_summary_results_are_deterministic() {
+    let a = pproc(&format!("IF @a > 0 BEGIN IF @b > 0 {PO} END"));
+    let b = pproc(&format!("IF @a > 0 AND @b > 0 {PO}"));
+    let opts = Options {
+        catalog_a: vec![Artifact::new("catalog.sql", T, DDL)],
+        catalog_b: vec![Artifact::new("catalog.sql", T, DDL)],
+        ..Options::default()
+    };
+    let run = || {
+        sqldiff_core::with_engine_stack(|| {
+            serde_json::to_string(&diff(
+                &Artifact::new("a.sql", T, a.clone()),
+                &Artifact::new("b.sql", T, b.clone()),
+                &opts,
+            ))
+            .unwrap()
+        })
+    };
+    assert_eq!(run(), run());
+}

@@ -108,7 +108,7 @@ fn masked(a: &Analyzed) -> Vec<String> {
 
 /// The significant tokens of every `DECLARE` statement of `a`, in order,
 /// variable names masked: a declared type, length, default or table shape.
-fn declarations(a: &Analyzed) -> Vec<Vec<String>> {
+pub fn declarations(a: &Analyzed) -> Vec<Vec<String>> {
     a.root
         .descendants()
         .filter(|n| n.kind().is_unit() && cst::starts_with_kw(n, "DECLARE"))
@@ -296,7 +296,7 @@ pub fn unread_routines(
 }
 
 /// Whether any routine header of `a` names `EXECUTE` (`EXECUTE AS ...`).
-fn has_execute_as(a: &Analyzed) -> bool {
+pub fn has_execute_as(a: &Analyzed) -> bool {
     headers(a).iter().any(|h| h.iter().any(|t| t == "EXECUTE"))
 }
 

@@ -25,6 +25,7 @@ pub mod literal;
 pub mod lower;
 pub mod objcheck;
 pub mod options;
+pub mod path;
 pub mod schema;
 pub mod script;
 pub mod second;
