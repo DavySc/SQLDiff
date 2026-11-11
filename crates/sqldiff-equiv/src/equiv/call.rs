@@ -952,6 +952,24 @@ fn switches(x: &Switch, t: &Side, y: &Switch, p: &Side) -> R<Verdict> {
                 .join(", ")
         ));
     }
+    // The triggers must exist on the PostgreSQL table. They are made by the
+    // converted CREATE TABLE; when the rules refuse that statement (a period
+    // with no HISTORY_TABLE, say) the T-SQL catalog still shows the table
+    // versioned, and a table of that name in the target catalog has no such
+    // triggers: the T-SQL statement succeeds and the PostgreSQL one fails.
+    let triggers = &pv.whole().triggers;
+    for (_, name) in &want {
+        let there = triggers.iter().any(|t| {
+            t.name.eq_ignore_ascii_case(name) && t.table.last().is_some_and(|l| same(l, &last.text))
+        });
+        if !there {
+            return Err(format!(
+                "{}'s catalog has no trigger {name} on {}: the converted CREATE TABLE makes it, and it was not converted or is not in the catalog",
+                p.name,
+                shown(&y.table)
+            ));
+        }
+    }
     Ok(Verdict::Equal(vec![asm::make(asms::SWITCH)]))
 }
 

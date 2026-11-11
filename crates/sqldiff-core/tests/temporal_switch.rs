@@ -48,10 +48,21 @@ CREATE TABLE Sales.Plain (
 );
 ";
 
+/// The triggers the converted CREATE TABLE of `Sales.Groups` makes.
+const TRIGGERS_P: &str = "CREATE FUNCTION Sales.Groups_versioning() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+CREATE TRIGGER Groups_versioning BEFORE UPDATE ON Sales.Groups FOR EACH ROW EXECUTE FUNCTION Sales.Groups_versioning();
+CREATE TRIGGER Groups_versioning_truncate BEFORE TRUNCATE ON Sales.Groups FOR EACH STATEMENT EXECUTE FUNCTION Sales.Groups_versioning();
+CREATE TRIGGER Groups_period_update BEFORE UPDATE ON Sales.Groups FOR EACH ROW EXECUTE FUNCTION Sales.Groups_versioning();
+";
+
 fn run(a: &str, b: &str) -> Report {
+    run_with(a, b, &format!("{CAT_P}{TRIGGERS_P}"))
+}
+
+fn run_with(a: &str, b: &str, cat_p: &str) -> Report {
     let o = Options {
         catalog_a: vec![Artifact::new("cat.sql", T, CAT_T)],
-        catalog_b: vec![Artifact::new("cat.pg.sql", P, CAT_P)],
+        catalog_b: vec![Artifact::new("cat.pg.sql", P, cat_p)],
         ..Options::default()
     };
     diff(
@@ -110,6 +121,23 @@ fn switching_versioning_matches_switching_the_triggers() {
     for (a, b) in [(OFF_T, OFF_P), (ON_T, ON_P)] {
         let r = equal(a, b);
         assert!(asms(&r).contains(&"ASM-TEMPORAL-SWITCH"), "{:?}", asms(&r));
+    }
+}
+
+/// A PostgreSQL table of the name without the versioning triggers (the
+/// CREATE TABLE that makes them was refused, or the catalog is another's)
+/// is not switched by the statement: SQL Server's succeeds, PostgreSQL's
+/// names triggers that do not exist.
+#[test]
+fn a_table_without_the_versioning_triggers_is_not_compared() {
+    for (a, b) in [(OFF_T, OFF_P), (ON_T, ON_P)] {
+        let r = run_with(&proc_t(a), &proc_p(b), CAT_P);
+        assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
+        assert!(
+            format!("{r:?}").contains("has no trigger"),
+            "{:?}",
+            r.verdict()
+        );
     }
 }
 
