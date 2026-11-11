@@ -31,6 +31,28 @@ struct Unit {
     placed: bool,
 }
 
+/// Whether a declaration does something where it stands: it has an
+/// initializer (it runs as an assignment, every time control reaches it) or
+/// declares a cursor (the variables its query reads are read there). A plain
+/// `DECLARE @a int` or `DECLARE @t TABLE (...)` does nothing at its place.
+fn declaration_runs(node: &SyntaxNode) -> bool {
+    let mut depth = 0i32;
+    for t in ast::sig_tokens(node) {
+        match t.kind() {
+            SyntaxKind::L_PAREN => depth += 1,
+            SyntaxKind::R_PAREN => depth -= 1,
+            _ if depth == 0 => {
+                let w = t.text().to_ascii_uppercase();
+                if matches!(w.as_str(), "=" | ":=" | "DEFAULT" | "CURSOR") {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 fn build_unit(node: SyntaxNode, a: &Analyzed) -> Unit {
     let d = a.dialect();
     let header = norm_of(ast::header_tokens(&node).into_iter(), d);
@@ -58,7 +80,9 @@ fn build_unit(node: SyntaxNode, a: &Analyzed) -> Unit {
     }
     let kind = stmt_kind(&node, d);
     let effectful = kind.is_effectful() || children.iter().any(|c| c.effectful);
-    let placed = kind == StmtKind::Other || children.iter().any(|c| c.placed);
+    let placed = kind == StmtKind::Other
+        || (kind == StmtKind::Declare && declaration_runs(&node))
+        || children.iter().any(|c| c.placed);
     Unit {
         full: loose_hash(&toks),
         strict: strict_hash(&toks),

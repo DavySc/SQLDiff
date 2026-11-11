@@ -155,8 +155,10 @@ pub fn string_prefixes(n: &sqldiff_syntax::SyntaxNode) -> Vec<bool> {
 
 /// The string-literal prefixes of each statement of `a` (its own tokens,
 /// not those of a statement nested in it), one entry per statement that has
-/// any, sorted: a statement moved whole keeps its entry, a literal moved
-/// within or between statements changes one.
+/// any, in document order. Not sorted: a literal moved within a statement or
+/// between statements changes the sequence, and so does a statement moved
+/// past another whose literals have other prefixes (refused, never cleared).
+/// Statements whose literals all have the same prefix may still swap.
 fn national_units(a: &Analyzed) -> Vec<Vec<bool>> {
     fn own(n: &sqldiff_syntax::SyntaxNode, out: &mut Vec<bool>) {
         for e in n.children_with_tokens() {
@@ -174,7 +176,7 @@ fn national_units(a: &Analyzed) -> Vec<Vec<bool>> {
             }
         }
     }
-    let mut v: Vec<Vec<bool>> = a
+    let v: Vec<Vec<bool>> = a
         .root
         .descendants()
         .filter(|n| n.kind().is_unit())
@@ -185,7 +187,6 @@ fn national_units(a: &Analyzed) -> Vec<Vec<bool>> {
         })
         .filter(|f| !f.is_empty())
         .collect();
-    v.sort_unstable();
     v
 }
 

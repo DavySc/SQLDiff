@@ -640,6 +640,48 @@ const NEVER_EQUAL: &[(&str, &str, &str, &str)] = &[
         "SELECT '\u{436}';",
     ),
     (
+        "national-prefixes-swapped-between-statements",
+        "A's first result is the nvarchar value, B's first result the varchar value (a non-Latin character shows as ?)",
+        "SELECT N'\u{436}'; SELECT '\u{436}';",
+        "SELECT '\u{436}'; SELECT N'\u{436}';",
+    ),
+    (
+        "national-prefixes-swapped-between-statements-ascii",
+        "the first result column is nvarchar in A and varchar in B",
+        "SELECT N'x'; SELECT 'x';",
+        "SELECT 'x'; SELECT N'x';",
+    ),
+    (
+        "national-prefixes-swapped-with-renamed-local",
+        "as above, beside a renamed local",
+        "DECLARE @a int = 1; SELECT N'\u{436}', @a; SELECT '\u{436}', @a;",
+        "DECLARE @b int = 1; SELECT '\u{436}', @b; SELECT N'\u{436}', @b;",
+    ),
+    (
+        "declare-with-subquery-moved-after-delete",
+        "Stock has one row: A reads count 1 at the DECLARE, B reads 0 after the DELETE",
+        "DECLARE @a int = (SELECT COUNT(*) FROM dbo.Stock); DELETE FROM dbo.Stock; INSERT INTO dbo.Orders (Qty) VALUES (@a);",
+        "DELETE FROM dbo.Stock; DECLARE @a int = (SELECT COUNT(*) FROM dbo.Stock); INSERT INTO dbo.Orders (Qty) VALUES (@a);",
+    ),
+    (
+        "declare-with-clock-moved-after-waitfor",
+        "B's value is one second later than A's",
+        "DECLARE @t datetime2 = SYSDATETIME(); WAITFOR DELAY '00:00:01'; INSERT INTO dbo.Orders (Note) VALUES (CONVERT(varchar(30), @t, 121));",
+        "WAITFOR DELAY '00:00:01'; DECLARE @t datetime2 = SYSDATETIME(); INSERT INTO dbo.Orders (Note) VALUES (CONVERT(varchar(30), @t, 121));",
+    ),
+    (
+        "declare-with-initializer-moved-into-loop",
+        "A counts to 3 and inserts 3; B resets the variable on every pass and inserts 1",
+        "DECLARE @s int = 0; DECLARE @i int = 0; WHILE @i < 3 BEGIN SET @s = @s + 1; SET @i = @i + 1; END; INSERT INTO dbo.Orders (Qty) VALUES (@s);",
+        "DECLARE @i int = 0; WHILE @i < 3 BEGIN DECLARE @s int = 0; SET @s = @s + 1; SET @i = @i + 1; END; INSERT INTO dbo.Orders (Qty) VALUES (@s);",
+    ),
+    (
+        "cursor-declared-after-the-variable-it-reads-changes",
+        "the cursor reads @v when it is declared: A filters on 1, B on 5",
+        "DECLARE @v int = 1; DECLARE c CURSOR FOR SELECT ItemId FROM dbo.Stock WHERE Qty > @v; SET @v = 5; OPEN c; CLOSE c; DEALLOCATE c;",
+        "DECLARE @v int = 1; SET @v = 5; DECLARE c CURSOR FOR SELECT ItemId FROM dbo.Stock WHERE Qty > @v; OPEN c; CLOSE c; DEALLOCATE c;",
+    ),
+    (
         "divide-after-its-guard",
         "@y = 0: A is false at the guard and never divides, B raises error 8134",
         "CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN IF @y <> 0 AND @x / @y > 1 SELECT 1; END",
