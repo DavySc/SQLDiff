@@ -948,6 +948,9 @@ pub enum Edit {
     AddSchemaTable,
     AddTrigger,
     DropTrigger,
+    /// The first trigger (`Tr0`) moves to another table: a `DROP TRIGGER` of
+    /// it names that table in PostgreSQL.
+    RetargetTrigger,
     /// System versioning on (a HIDDEN column appears; A1).
     VersioningOn,
     /// A column of the base catalog (both dialects) changes type.
@@ -1030,6 +1033,7 @@ pub const ALL_EDITS: &[Edit] = &[
     Edit::AddSchemaTable,
     Edit::AddTrigger,
     Edit::DropTrigger,
+    Edit::RetargetTrigger,
     Edit::VersioningOn,
     Edit::BaseRetype,
     Edit::RetypeSink,
@@ -1209,6 +1213,11 @@ impl Edit {
                     on: on.clone(),
                 });
                 format!("add trigger Tg1 on {on}")
+            }
+            Edit::RetargetTrigger => {
+                let g = &mut m.triggers[0];
+                g.on = "Sink".into();
+                format!("trigger {} moves to Sink", g.name)
             }
             Edit::DropTrigger => {
                 m.triggers.clear();
