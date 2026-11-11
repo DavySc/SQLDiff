@@ -5538,6 +5538,64 @@ fn observable(
             if text(&ba) == text(&bb) {
                 return Err("both versions run the same code".into());
             }
+            // The branches are compared by their effect level, not by what they
+            // do. When the IF itself was restructured (a nested IF against
+            // `IF a AND b`: one side holds more conditions, loops or CASEs
+            // inside it than the other), the statements of the branch that
+            // runs can be re-derived by the other side under a condition of
+            // its own, so a difference in which branch runs says nothing
+            // about the effects. A condition that only changed, with the
+            // same structure inside, keeps its witness.
+            let nested = |n: &SyntaxNode| {
+                n.descendants()
+                    .skip(1)
+                    .filter(|x| {
+                        matches!(
+                            x.kind(),
+                            SyntaxKind::IF_STMT
+                                | SyntaxKind::LOOP_STMT
+                                | SyntaxKind::CASE_STMT
+                                | SyntaxKind::TRY_CATCH
+                        )
+                    })
+                    .count()
+            };
+            if nested(na) != nested(nb) {
+                return Err("the IF holds a different number of conditions or loops inside it, so its branches are not compared".into());
+            }
+            // A branch that leaves (RETURN, BREAK, CONTINUE, GOTO, THROW), or
+            // that is skipped and falls through to what follows, is not only
+            // "what the branch does": `IF c BEGIN RAISERROR; RETURN END;
+            // INSERT` and `IF NOT c INSERT ELSE RAISERROR` differ in the
+            // text of their branches and do the same.
+            let exits = |n: &SyntaxNode| {
+                n.descendants().any(|x| {
+                    x.kind() == SyntaxKind::STATEMENT
+                        && matches!(
+                            cst::first_words(&x, 1).first().map(String::as_str),
+                            Some("RETURN" | "BREAK" | "CONTINUE" | "GOTO" | "THROW")
+                        )
+                })
+            };
+            // Only when a branch changed: an IF whose branches are the same
+            // tokens on both sides and only its condition changed does what
+            // the witness says (the branch that runs is the one the
+            // condition picks).
+            let body_tokens = |x: &Shape| -> Vec<String> {
+                x.branches
+                    .iter()
+                    .map(|b| {
+                        tokens(b)
+                            .iter()
+                            .map(|t| t.up.clone())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .collect()
+            };
+            if body_tokens(xa) != body_tokens(xb) && (exits(na) || exits(nb)) {
+                return Err("a branch of the IF leaves the routine or the loop, so its branches are not compared".into());
+            }
             let ea = ba.as_ref().map_or(Eff::No, |n| effect(ra, n));
             let eb = bb.as_ref().map_or(Eff::No, |n| effect(rb, n));
             if ea == Eff::No && eb == Eff::No {
