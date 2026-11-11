@@ -1371,8 +1371,8 @@ fn path_summaries_never_clear_a_different_pair() {
         (
             "declare-with-initializer-moved-into-a-branch",
             "@a <= 0: A has @v = 5 and writes Qty 5, B writes NULL",
-            format!("DECLARE @v int = 5; IF @a > 0 SET @a = 1; INSERT INTO dbo.Orders (Qty) VALUES (@v);"),
-            format!("DECLARE @v int; IF @a > 0 BEGIN SET @v = 5; SET @a = 1; END INSERT INTO dbo.Orders (Qty) VALUES (@v);"),
+            "DECLARE @v int = 5; IF @a > 0 SET @a = 1; INSERT INTO dbo.Orders (Qty) VALUES (@v);".into(),
+            "DECLARE @v int; IF @a > 0 BEGIN SET @v = 5; SET @a = 1; END INSERT INTO dbo.Orders (Qty) VALUES (@v);".into(),
         ),
         (
             "raising-assignment-inlined",
