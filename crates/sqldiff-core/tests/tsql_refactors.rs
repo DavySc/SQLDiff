@@ -205,7 +205,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "values-to-insert-select",
             truth: Truth::Different,
-            why: "no Item row with ItemId = 1: A inserts one row (Total NULL), B inserts none",
+            why: "@Qty = 1, @CustomerId = 1, no Item row 1: A inserts one row (Total NULL), B inserts none",
             a: r(),
             b: with_guard(
                 "IF @Qty > 0 AND @CustomerId IS NOT NULL
@@ -224,7 +224,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "wrap-insert-in-empty-try-catch",
             truth: Truth::Different,
-            why: "the INSERT violates a constraint: A reports the error to the caller, B swallows it",
+            why: "Item 1 has Price 922337203685477, @Qty = 2, @CustomerId = 1: @Qty * @Price overflows money; A returns error 8115 to the caller, B swallows it",
             a: r(),
             b: r().replace(
                 "INSERT INTO dbo.Orders (CustomerId, Qty, Total) VALUES (@CustomerId, @Qty, @Qty * @Price);",
@@ -276,7 +276,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "drop-a-write",
             truth: Truth::Different,
-            why: "any call: B no longer updates Stock",
+            why: "Stock holds (1, 5): A ends at 11, B at 10",
             a: "CREATE PROCEDURE dbo.Adj AS BEGIN UPDATE dbo.Stock SET Qty = Qty * 2; UPDATE dbo.Stock SET Qty = Qty + 1; END".into(),
             b: "CREATE PROCEDURE dbo.Adj AS BEGIN UPDATE dbo.Stock SET Qty = Qty * 2; END".into(),
             pinned: Different,
@@ -290,9 +290,17 @@ fn cases() -> Vec<Case> {
             pinned: Different,
         },
         Case {
+            name: "multiply-to-add",
+            truth: Truth::Different,
+            why: "Item 1 has Price 10, @Qty = 2, @CustomerId = 1: A stores Total 20, B stores 12",
+            a: r(),
+            b: r().replace("@Qty * @Price", "@Qty + @Price"),
+            pinned: Unknown,
+        },
+        Case {
             name: "narrow-local-type",
             truth: Truth::Different,
-            why: "Item 1 has Price 1000.00: money converts into decimal(5,2) with an overflow error in B",
+            why: "Item 1 has Price 1000.00: money converts into decimal(5,2) with an overflow error in B; or Price 1.2345 stores Total 1.23 * Qty in B",
             a: r(),
             b: r().replace("@Price money", "@Price decimal(5,2)"),
             pinned: Unknown,
@@ -332,6 +340,107 @@ fn current_verdicts_are_pinned() {
 #[test]
 fn the_same_text_is_equal_to_itself() {
     for c in cases() {
-        assert_eq!(verdict(&c.a, &c.a), Equal, "{}", c.name);
+        assert_eq!(verdict(&c.a, &c.a), Equal, "{}: A", c.name);
+        assert_eq!(verdict(&c.b, &c.b), Equal, "{}: B", c.name);
+    }
+}
+
+/// One semantic mutation of the refactored side (B) of an equal pair, with
+/// the input that tells the mutant from A.
+struct Mutant {
+    of: &'static str,
+    name: &'static str,
+    why: &'static str,
+    from: &'static str,
+    to: &'static str,
+}
+
+const MUTANTS: &[Mutant] = &[
+    Mutant {
+        of: "total-guard-clause",
+        name: "le-to-lt",
+        why: "@Qty = 0, @CustomerId = 1: A raises, B inserts",
+        from: "@Qty <= 0",
+        to: "@Qty < 0",
+    },
+    Mutant {
+        of: "total-guard-clause",
+        name: "drop-null-test",
+        why: "@Qty = NULL, @CustomerId = 1: A raises, B's guard is UNKNOWN so it inserts",
+        from: "@Qty IS NULL OR ",
+        to: "",
+    },
+    Mutant {
+        of: "total-guard-clause",
+        name: "drop-return",
+        why: "@Qty = 0, @CustomerId = 1: B raises and then inserts as well",
+        from: "RETURN;",
+        to: "",
+    },
+    Mutant {
+        of: "total-guard-clause",
+        name: "message-text",
+        why: "@Qty = 0: the caller receives 'bad' from A and 'bad!' from B",
+        from: "'bad'",
+        to: "'bad!'",
+    },
+    Mutant {
+        of: "select-into-variable-to-set",
+        name: "drop-where",
+        why:
+            "two Item rows: the subquery returns two and raises error 512; A keeps one row's Price",
+        from: " WHERE ItemId = 1)",
+        to: ")",
+    },
+    Mutant {
+        of: "swap-and-operands",
+        name: "and-to-or",
+        why: "@Qty = 0, @CustomerId = 1: A raises, B inserts",
+        from: "@CustomerId IS NOT NULL AND @Qty > 0",
+        to: "@CustomerId IS NOT NULL OR @Qty > 0",
+    },
+    Mutant {
+        of: "rename-local",
+        name: "other-item",
+        why: "Item rows (1, 10) and (2, 20): A prices with 10, B with 20",
+        from: "ItemId = 1",
+        to: "ItemId = 2",
+    },
+    Mutant {
+        of: "quoting",
+        name: "other-item",
+        why: "Item rows (1, 10) and (2, 20): A prices with 10, B with 20",
+        from: "ItemId = 1",
+        to: "ItemId = 2",
+    },
+];
+
+#[test]
+fn a_mutant_of_a_refactored_side_is_never_equal() {
+    let all = cases();
+    for m in MUTANTS {
+        let c = all
+            .iter()
+            .find(|c| c.name == m.of)
+            .unwrap_or_else(|| panic!("no case {}", m.of));
+        assert_eq!(c.truth, Truth::Equal, "{} mutates an equal pair", m.of);
+        assert!(
+            c.b.contains(m.from),
+            "{}/{}: `{}` not in B",
+            m.of,
+            m.name,
+            m.from
+        );
+        let mutant = c.b.replacen(m.from, m.to, 1);
+        for (x, y, dir) in [(&c.a, &mutant, "A to B"), (&mutant, &c.a, "B to A")] {
+            let v = verdict(x, y);
+            assert!(
+                !matches!(v, Equal | Eua),
+                "{}/{} ({dir}): reported {v:?}, witness: {}",
+                m.of,
+                m.name,
+                m.why
+            );
+        }
     }
 }
