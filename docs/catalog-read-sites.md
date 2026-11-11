@@ -104,7 +104,7 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 | `sqldiff-core/src/bind/mod.rs` | check | 2 |
 | `sqldiff-core/src/bind/query.rs` | check | 9 |
 | `sqldiff-draft/src/tsql.rs` | pass 1 | 2 |
-| `sqldiff-equiv/src/equiv/call.rs` | check | 5 |
+| `sqldiff-equiv/src/equiv/call.rs` | check | 6 |
 | `sqldiff-equiv/src/equiv/canon.rs` | check | 24 |
 | `sqldiff-equiv/src/equiv/edit.rs` | check | 2 |
 | `sqldiff-equiv/src/equiv/eval.rs` | check | 5 |

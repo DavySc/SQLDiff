@@ -874,8 +874,8 @@ fn switches(x: &Switch, t: &Side, y: &Switch, p: &Side) -> R<Verdict> {
         .catalog()
         .ok_or_else(|| format!("{} has no catalog", p.name))?;
     let pparts: Vec<Ident> = y.table.iter().map(ident).collect();
-    match pv.table(&pparts) {
-        Lookup::Found(pt) if pt.kind == catalog::TableKind::Table => {}
+    let pt = match pv.table(&pparts) {
+        Lookup::Found(pt) if pt.kind == catalog::TableKind::Table => pt,
         _ => {
             return Err(format!(
                 "{}'s catalog has no table {}",
@@ -883,7 +883,7 @@ fn switches(x: &Switch, t: &Side, y: &Switch, p: &Side) -> R<Verdict> {
                 shown(&y.table)
             ))
         }
-    }
+    };
     case_check(&y.table, p)?;
     let last = y.table.last().ok_or("a table name was expected")?;
     let trigger = |suffix: &str| {
@@ -960,7 +960,10 @@ fn switches(x: &Switch, t: &Side, y: &Switch, p: &Side) -> R<Verdict> {
     let triggers = &pv.whole().triggers;
     for (_, name) in &want {
         let there = triggers.iter().any(|t| {
-            t.name.eq_ignore_ascii_case(name) && t.table.last().is_some_and(|l| same(l, &last.text))
+            t.name == *name && {
+                let parts: Vec<Ident> = t.table.iter().map(|s| Ident::new(s.clone(), true)).collect();
+                matches!(pv.table(&parts), Lookup::Found(tt) if std::ptr::eq(tt, pt))
+            }
         });
         if !there {
             return Err(format!(

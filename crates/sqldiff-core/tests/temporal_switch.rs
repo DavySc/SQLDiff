@@ -141,6 +141,28 @@ fn a_table_without_the_versioning_triggers_is_not_compared() {
     }
 }
 
+/// The triggers must be on the very table the statement names: the same
+/// three on another schema's `Groups`, or created quoted in mixed case (the
+/// statement's unquoted names fold to lower case), are not found by
+/// PostgreSQL.
+#[test]
+fn triggers_on_another_table_or_in_another_case_are_not_compared() {
+    let other = format!(
+        "{CAT_P}CREATE TABLE Other.Groups (GroupID integer NOT NULL);\n{}",
+        TRIGGERS_P.replace("ON Sales.Groups", "ON Other.Groups")
+    );
+    let quoted = format!(
+        "{CAT_P}{}",
+        TRIGGERS_P
+            .replace("CREATE TRIGGER Groups_", "CREATE TRIGGER \"Groups_")
+            .replace(" BEFORE", "\" BEFORE")
+    );
+    for cat in [other, quoted] {
+        let r = run_with(&proc_t(OFF_T), &proc_p(OFF_P), &cat);
+        assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions, "{cat}");
+    }
+}
+
 #[test]
 fn other_triggers_or_another_period_or_history_are_not_compared() {
     // Off against enabling.
