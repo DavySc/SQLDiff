@@ -1119,3 +1119,124 @@ GO
         }
     }
 }
+
+/// A write repeated in both branches of an IF and hoisted out of them (twice
+/// in A, once in B) is the same write run once on every path. The behaviour
+/// model keys effects by their occurrence in document order and matched A's
+/// first INSERT (in the branch not taken) with B's only one, reporting that
+/// A does not run it and B keeps it durable, with a witness. Such a pair has
+/// no `error.control` or `txn.*` finding; the unpaired statements are still
+/// reported by the structural diff.
+#[test]
+fn a_write_hoisted_out_of_both_branches_has_no_behaviour_witness() {
+    let pairs = [
+        (
+            "hoist-first-statement",
+            "T is written once on every path and V or U after it, on both sides",
+            "IF @a > 0 BEGIN INSERT INTO dbo.Orders (Qty) VALUES (1); INSERT INTO dbo.Stock (ItemId, Qty) VALUES (1, 2); END ELSE BEGIN INSERT INTO dbo.Orders (Qty) VALUES (1); INSERT INTO dbo.Item (ItemId, Price) VALUES (1, 3); END",
+            "INSERT INTO dbo.Orders (Qty) VALUES (1); IF @a > 0 INSERT INTO dbo.Stock (ItemId, Qty) VALUES (1, 2); ELSE INSERT INTO dbo.Item (ItemId, Price) VALUES (1, 3);",
+        ),
+        (
+            "hoist-last-statement",
+            "the audit row is written last on every path on both sides",
+            "IF @a > 0 BEGIN INSERT INTO dbo.Stock (ItemId, Qty) VALUES (1, 2); INSERT INTO dbo.Orders (Qty) VALUES (1); END ELSE BEGIN INSERT INTO dbo.Item (ItemId, Price) VALUES (1, 3); INSERT INTO dbo.Orders (Qty) VALUES (1); END",
+            "IF @a > 0 INSERT INTO dbo.Stock (ItemId, Qty) VALUES (1, 2); ELSE INSERT INTO dbo.Item (ItemId, Price) VALUES (1, 3); INSERT INTO dbo.Orders (Qty) VALUES (1);",
+        ),
+    ];
+    let opts = Options {
+        catalog_a: vec![Artifact::new("catalog.sql", T, DDL)],
+        catalog_b: vec![Artifact::new("catalog.sql", T, DDL)],
+        ..Options::default()
+    };
+    for (name, why, a, b) in pairs {
+        let wrap = |body: &str| format!("CREATE PROCEDURE dbo.P @a int AS BEGIN {body} END");
+        for (x, y) in [(wrap(a), wrap(b)), (wrap(b), wrap(a))] {
+            let r = sqldiff_core::with_engine_stack(|| {
+                diff(
+                    &Artifact::new("a.sql", T, &x),
+                    &Artifact::new("b.sql", T, &y),
+                    &opts,
+                )
+            });
+            assert!(
+                !r.findings.iter().any(|f| matches!(
+                    f.rule.as_str(),
+                    "error.control" | "txn.durability" | "txn.atomicity"
+                )),
+                "{name}: a behaviour witness for an equal pair ({why}): {:#?}",
+                r.findings
+            );
+        }
+    }
+}
+
+/// A write whose count differs between the sides is compared by the fates of
+/// the occurrences that ran, so a real transactional or control difference
+/// survives (R1 of the #479 review) while the hoisting pairs stay clear.
+#[test]
+fn a_write_whose_count_differs_keeps_its_true_behaviour_witness() {
+    const O: &str = "INSERT INTO dbo.Orders (Qty) VALUES (1);";
+    const S: &str = "INSERT INTO dbo.Stock (ItemId, Qty) VALUES (1, 2);";
+    let witnessed = [
+        (
+            "try-hoist",
+            format!("BEGIN TRY BEGIN TRAN; IF @a > 0 BEGIN {O} {S} END ELSE {O} COMMIT; END TRY BEGIN CATCH ROLLBACK; END CATCH"),
+            format!("{O} BEGIN TRY BEGIN TRAN; IF @a > 0 {S} COMMIT; END TRY BEGIN CATCH ROLLBACK; END CATCH"),
+        ),
+        (
+            "txn-hoist",
+            format!("IF @a > 0 BEGIN BEGIN TRAN; {O} {S} COMMIT; END ELSE {O}"),
+            format!("{O} IF @a > 0 BEGIN BEGIN TRAN; {S} COMMIT; END"),
+        ),
+        (
+            "dup-commit",
+            format!("BEGIN TRAN; {O} {S} COMMIT; {O}"),
+            format!("BEGIN TRAN; {O} COMMIT; {S}"),
+        ),
+        ("dup-extra", format!("{O} {S} {O}"), format!("{S} {O}")),
+    ];
+    let clear = [(
+        "xact-hoist",
+        format!("SET XACT_ABORT ON; BEGIN TRAN; IF @a > 0 BEGIN {O} {S} END ELSE {O} COMMIT;"),
+        format!("SET XACT_ABORT ON; BEGIN TRAN; {O} IF @a > 0 {S} COMMIT;"),
+    )];
+    let opts = Options {
+        catalog_a: vec![Artifact::new("catalog.sql", T, DDL)],
+        catalog_b: vec![Artifact::new("catalog.sql", T, DDL)],
+        ..Options::default()
+    };
+    let rules = |a: &str, b: &str| -> Vec<String> {
+        let wrap = |body: &str| format!("CREATE PROCEDURE dbo.P @a int AS BEGIN {body} END");
+        let r = sqldiff_core::with_engine_stack(|| {
+            diff(
+                &Artifact::new("a.sql", T, wrap(a)),
+                &Artifact::new("b.sql", T, wrap(b)),
+                &opts,
+            )
+        });
+        r.findings
+            .iter()
+            .map(|f| f.rule.clone())
+            .filter(|r| {
+                matches!(
+                    r.as_str(),
+                    "error.control" | "txn.durability" | "txn.atomicity"
+                )
+            })
+            .collect()
+    };
+    for (name, a, b) in &witnessed {
+        for (x, y) in [(a, b), (b, a)] {
+            assert!(
+                !rules(x, y).is_empty(),
+                "{name}: the behaviour witness for a real difference was lost"
+            );
+        }
+    }
+    for (name, a, b) in &clear {
+        for (x, y) in [(a, b), (b, a)] {
+            let r = rules(x, y);
+            assert!(r.is_empty(), "{name}: a witness for an equal pair: {r:?}");
+        }
+    }
+}
