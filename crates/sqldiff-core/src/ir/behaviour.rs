@@ -508,6 +508,26 @@ impl DiffCache {
 
 const NO_POS: u32 = u32::MAX;
 
+/// Whether effect `key` cannot be matched between the sides: the same write
+/// (`Insert:T`) occurs more than once on a side and a different number of
+/// times on the other. Effects are keyed by their occurrence in document
+/// order, so a write hoisted out of both branches of an IF (twice in A, once
+/// in B) has its first occurrence in A matched with B's only one, though A's
+/// first sits in the branch the path did not take; a fate difference
+/// between them says nothing about the routines.
+fn ambiguous(sa: &SideIr, sb: &SideIr, key: &str) -> bool {
+    // Across dialects the counts differ by construction (a script's batches
+    // against one DO block) and the pairing is the conversion's own.
+    if sa.a.dialect() != sb.a.dialect() {
+        return false;
+    }
+    let Some((base, _)) = key.rsplit_once('#') else {
+        return false;
+    };
+    let (ca, cb) = (sa.bases.get(base), sb.bases.get(base));
+    ca != cb && ca.max(cb).is_some_and(|&c| c > 1)
+}
+
 /// What the diff of two sides' outcomes looks up for every key, by effect
 /// slot, and the differences of shared fate arrays already found.
 struct Align {
@@ -705,6 +725,9 @@ fn diff(
                     if ia == NO_POS || ib == NO_POS {
                         continue;
                     }
+                    if ambiguous(sa, sb, oa.effects.name(i)) {
+                        continue;
+                    }
                     consider(
                         ia as usize,
                         ib as usize,
@@ -723,6 +746,9 @@ fn diff(
                     let (Some(&(ia, _)), Some(&(ib, _))) = (sa.at.get(k), sb.at.get(k)) else {
                         continue;
                     };
+                    if ambiguous(sa, sb, k) {
+                        continue;
+                    }
                     consider(
                         ia,
                         ib,
