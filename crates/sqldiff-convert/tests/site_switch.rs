@@ -67,23 +67,28 @@ const KEYED: &[&str] = &[
 /// edits flip the flag and change nothing the file says). Guarded by
 /// [`the_layer_ambiguity_is_read_only_through_table_exact`].
 ///
-/// The two `switches` lookups (the T-SQL side's versioned table and the
-/// PostgreSQL side's converted table) are the check's repeat of the draft's
-/// own `alter_versioning` lookups: the check runs only on a statement the
-/// draft converted, and the draft converts it only when the source catalog
-/// shows the table created with the period and history table the statement
-/// names (the very conditions `switches` repeats), so a source catalog
-/// change that flips the check's answer changes the draft's text, which is
-/// in the check's key. The converted table of the target side is made by
-/// the converted CREATE TABLE of the same tree, and a base-catalog table of
-/// that name cannot shadow it (measured: TargetOverrides and
-/// TargetLookalikes change no outcome). No generated edit changes either
-/// outcome alone (T3: GAP with the `VersioningOff` dependents added). The
-/// draft and the check must find the same table under every spelling of its
-/// name; guarded by [`the_switch_lookups_find_the_table_the_draft_converted`].
+/// The `switches` lookup of the T-SQL side's versioned table
+/// (`tv.table(&parts)`) is the check's repeat of the draft's own
+/// `alter_versioning` lookup: the check runs only on a statement the draft
+/// converted, and the draft converts it only when the source catalog shows
+/// the table created with the period and history table the statement names
+/// (the very conditions `switches` repeats), so a source catalog change that
+/// flips the check's answer changes the draft's text, which is in the check's
+/// key. The check's T-SQL side is bound to the same source catalog the draft
+/// reads, and both take the first match under the same T-SQL key. No
+/// generated edit changes its outcome alone (T3: GAP with the
+/// `VersioningOff` dependents added). The draft and the check must find the
+/// same table under every spelling of its name; guarded by
+/// [`the_switch_lookups_find_the_table_the_draft_converted`].
+///
+/// The PostgreSQL side's lookup (`pv.table(&pparts)`) is NOT consumed: a
+/// versioned table whose CREATE TABLE the rules refuse is defined by nothing
+/// in the target tree, so the target base catalog decides the lookup while
+/// the draft's text stays the same (review of this change, with a repro). It
+/// is a GAP until an edit pairs such a table with a target base table that
+/// appears and goes.
 const CONSUMED: &[&str] = &[
     "crates/sqldiff-equiv/src/equiv/call.rs::switches@let Lookup::Found(table) = tv.table(&parts) else {",
-    "crates/sqldiff-equiv/src/equiv/call.rs::switches@match pv.table(&pparts) {",
     "crates/sqldiff-equiv/src/equiv/mod.rs::table_pair@sa.with_ddl(&p.ddl.0, a.dialect()),",
     "crates/sqldiff-equiv/src/equiv/mod.rs::table_pair@sb.with_ddl(&p.ddl.1, b.dialect()),",
 ];
@@ -154,7 +159,8 @@ const DOMINATED: &[&str] = &[
 
 /// Sites whose read sets change but that no generated edit kills: work for
 /// the generator.
-const GAP: &[&str] = &[];
+const GAP: &[&str] =
+    &["crates/sqldiff-equiv/src/equiv/call.rs::switches@match pv.table(&pparts) {"];
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
