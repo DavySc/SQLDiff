@@ -411,6 +411,9 @@ pub struct Canon<'a> {
     /// an unqualified PostgreSQL call may then be the conversion of a T-SQL
     /// `dbo` function (`user_fn`).
     pub other: Option<Dialect>,
+    /// Lowering the condition of an IF or WHILE (`condition`): the operands
+    /// of its AND / OR run in source order (`binary`).
+    control: bool,
     /// The select list of the query lowered last, when its `*` items were
     /// written out (`visible_star`); `None` when it was lowered as written.
     listed: Option<Vec<SelItem>>,
@@ -800,6 +803,7 @@ impl<'a> Canon<'a> {
             known_bytes: Vec::new(),
             stored_values: false,
             other: None,
+            control: false,
             listed: None,
             names: Vec::new(),
             output: None,
@@ -967,12 +971,21 @@ impl<'a> Canon<'a> {
     /// Records `ASM-UNTYPED-STORE`: a value whose type is unknown is stored
     /// into a destination of known (or unknown) type. Against another
     /// dialect the two sides may convert it differently, which is what the
-    /// assumption says. Against the same dialect it is vacuous: the stored
-    /// term is wrapped with the destination type, so the two sides compare
-    /// equal only when the source term and the destination are the same, and
-    /// the same term converted into the same destination by one dialect's
-    /// rules gives the same value (a pair that differs in either does not
-    /// compare equal, with or without the assumption). Not recorded then.
+    /// assumption says. Against the same dialect it is vacuous at both sites
+    /// it is recorded at, for different reasons:
+    /// - the source type is unknown and the destination is known: the term
+    ///   is wrapped with the destination type, so the two sides compare equal
+    ///   only when the source term and the destination type are the same, and
+    ///   one dialect's rules convert the same term into the same type the
+    ///   same way;
+    /// - the destination type is unknown (no catalog): the term is returned
+    ///   unwrapped, and the destination is the same named column or variable
+    ///   of the same database on both sides, so one dialect's conversion into
+    ///   it is the same (a variable's declared type is part of the term it is
+    ///   assigned from).
+    ///
+    /// A pair that differs in the source term or the destination does not
+    /// compare equal, with or without the assumption. Not recorded then.
     fn assume_store(&mut self, x: (&str, &str)) {
         if self.other == Some(self.d) {
             return;
@@ -3804,6 +3817,48 @@ impl<'a> Canon<'a> {
         Ok((n("win", vec![t]), ty))
     }
 
+    /// Whether evaluating the condition `e` can never raise an error, so that
+    /// the order of the operands of an AND / OR cannot change which error
+    /// happens (`binary`). Conservative: only AND, OR, NOT, `IS [NOT] NULL`
+    /// of a plain operand, and a comparison of two plain operands whose types
+    /// are both known and need no conversion (both numeric, both string with
+    /// at most one column, or one family), or against NULL. A call, cast,
+    /// arithmetic, subquery or any operand of unknown type can raise.
+    fn raise_free(&mut self, e: &Expr) -> bool {
+        let plain = |x: &Expr| {
+            matches!(
+                x,
+                Expr::Name(_) | Expr::Var(_) | Expr::Num(_) | Expr::Str(_) | Expr::Null
+            )
+        };
+        match e {
+            Expr::Bin(o, l, r) if o == "AND" || o == "OR" => {
+                self.raise_free(l) && self.raise_free(r)
+            }
+            Expr::Unary(o, x) if o.eq_ignore_ascii_case("NOT") => self.raise_free(x),
+            Expr::IsNull(x, _) => plain(x),
+            Expr::Bin(o, l, r)
+                if matches!(o.as_str(), "=" | "<>" | "<" | ">" | "<=" | ">=")
+                    && plain(l)
+                    && plain(r) =>
+            {
+                if matches!(l.as_ref(), Expr::Null) || matches!(r.as_ref(), Expr::Null) {
+                    return true;
+                }
+                let (Ok((_, Some(lt))), Ok((_, Some(rt)))) = (self.expr(l), self.expr(r)) else {
+                    return false;
+                };
+                let both_names = matches!((l.as_ref(), r.as_ref()), (Expr::Name(_), Expr::Name(_)));
+                if lt.is_string() && rt.is_string() {
+                    // Two columns of different collations raise (Msg 468).
+                    return !both_names;
+                }
+                (lt.is_numeric() && rt.is_numeric()) || (lt.fam == rt.fam && !lt.is_string())
+            }
+            _ => false,
+        }
+    }
+
     fn binary(&mut self, op: &str, l: &Expr, r: &Expr) -> R<(Term, Option<Ty>)> {
         if self.d == Dialect::Postgres && op == "+" {
             if let Some(t) = self.pg_date_add(l, r, false)? {
@@ -3819,6 +3874,18 @@ impl<'a> Canon<'a> {
             let head = op.to_lowercase();
             let mut parts = Vec::new();
             let mut todo: Vec<&Expr> = vec![r, l];
+            // Against another dialect the operands are sorted: neither
+            // dialect promises an evaluation order, and a conversion may not
+            // be held to the source's. In the condition of an IF or WHILE of
+            // one dialect the source's order is the one that runs (SQL
+            // Server and PostgreSQL short-circuit these conditions left to
+            // right in practice), so a guard moved behind what it guards
+            // (`@y <> 0 AND @x / @y > 1`) is a change: operands are sorted
+            // there only when none of them can raise. In a query's WHERE, ON
+            // or HAVING the optimizer orders the predicates, so they are
+            // sorted as before.
+            let same = self.other == Some(self.d) && self.control;
+            let mut sortable = true;
             while let Some(side) = todo.pop() {
                 if let Expr::Bin(o, sl, sr) = side {
                     if o == op {
@@ -3827,6 +3894,9 @@ impl<'a> Canon<'a> {
                         continue;
                     }
                 }
+                if same && sortable && !self.raise_free(side) {
+                    sortable = false;
+                }
                 let (t, _) = self.cond(side)?;
                 if t.is(&head) {
                     parts.extend(t.kids().iter().cloned());
@@ -3834,7 +3904,9 @@ impl<'a> Canon<'a> {
                     parts.push(t);
                 }
             }
-            parts.sort();
+            if sortable {
+                parts.sort();
+            }
             return Ok((n(&head, parts), Some(Ty::of(Fam::Bool))));
         }
         let (mut lt, mut lty) = self.expr(l)?;
@@ -5688,7 +5760,10 @@ impl<'a> Canon<'a> {
             c.rand_seen = 0;
             c.query_depth = 0;
             c.single_row = true;
-            Ok(c.cond(e)?.0)
+            let was = std::mem::replace(&mut c.control, true);
+            let t = c.cond(e);
+            c.control = was;
+            Ok(t?.0)
         })
     }
 

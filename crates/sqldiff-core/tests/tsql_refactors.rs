@@ -582,3 +582,181 @@ fn a_fresh_and_a_repeated_comparison_render_the_same_bytes() {
     };
     assert_eq!(run(), run());
 }
+
+/// Pairs with a witness that the second opinion once cleared (statements the
+/// lowering only notes, and operand orders that can raise) or that stay
+/// different: none may be Equal or EqualUnderAssumptions, in either direction.
+fn proc_body(body: &str) -> String {
+    format!("CREATE PROCEDURE dbo.P AS BEGIN {body} END")
+}
+
+const NEVER_EQUAL: &[(&str, &str, &str, &str)] = &[
+    (
+        "nocount-moved-after-update",
+        "A sends no count for the UPDATE of the one Stock row, B sends '(1 row affected)'",
+        "SET NOCOUNT ON; UPDATE dbo.Stock SET Qty = 1; DELETE FROM dbo.Orders;",
+        "UPDATE dbo.Stock SET Qty = 1; SET NOCOUNT ON; DELETE FROM dbo.Orders;",
+    ),
+    (
+        "nocount-moved-with-renamed-local",
+        "as above, beside a renamed local",
+        "DECLARE @a int = 1; SET NOCOUNT ON; UPDATE dbo.Stock SET Qty = @a; DELETE FROM dbo.Orders;",
+        "DECLARE @b int = 1; UPDATE dbo.Stock SET Qty = @b; SET NOCOUNT ON; DELETE FROM dbo.Orders;",
+    ),
+    (
+        "nocount-on-off-swapped",
+        "Stock has one row, Orders is empty: A reports 0 rows then 1, B reports 1 then 0",
+        "SET NOCOUNT ON; UPDATE dbo.Stock SET Qty = 1; SET NOCOUNT OFF; DELETE FROM dbo.Orders;",
+        "SET NOCOUNT OFF; UPDATE dbo.Stock SET Qty = 1; SET NOCOUNT ON; DELETE FROM dbo.Orders;",
+    ),
+    (
+        "nocount-off-moved-between-inserts",
+        "A sends one count, B sends two",
+        "SET NOCOUNT ON; INSERT INTO dbo.Orders (Qty) VALUES (1); SELECT 5; SET NOCOUNT OFF; INSERT INTO dbo.Orders (Qty) VALUES (2);",
+        "SET NOCOUNT OFF; INSERT INTO dbo.Orders (Qty) VALUES (1); SELECT 5; SET NOCOUNT ON; INSERT INTO dbo.Orders (Qty) VALUES (2);",
+    ),
+    (
+        "divide-after-its-guard",
+        "@y = 0: A is false at the guard and never divides, B raises error 8134",
+        "CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN IF @y <> 0 AND @x / @y > 1 SELECT 1; END",
+        "CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN IF @x / @y > 1 AND @y <> 0 SELECT 1; END",
+    ),
+    (
+        "cast-after-isnumeric",
+        "@s = 'abc': A's ISNUMERIC is 0 and the CAST never runs, B raises error 245",
+        "CREATE PROCEDURE dbo.P @s varchar(10) AS BEGIN IF ISNUMERIC(@s) = 1 AND CAST(@s AS int) > 0 SELECT 1; END",
+        "CREATE PROCEDURE dbo.P @s varchar(10) AS BEGIN IF CAST(@s AS int) > 0 AND ISNUMERIC(@s) = 1 SELECT 1; END",
+    ),
+    (
+        "divide-after-or-guard",
+        "@y = 0: A is true at the guard and never divides, B raises error 8134",
+        "CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN IF @y = 0 OR @x / @y > 1 SELECT 1; END",
+        "CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN IF @x / @y > 1 OR @y = 0 SELECT 1; END",
+    ),
+    (
+        "divide-after-guard-in-while",
+        "@y = 0: A leaves the loop, B raises error 8134",
+        "CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN WHILE @y <> 0 AND @x / @y > 1 BEGIN SET @x = @x - 1; END END",
+        "CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN WHILE @x / @y > 1 AND @y <> 0 BEGIN SET @x = @x - 1; END END",
+    ),
+];
+
+#[test]
+fn noted_statements_and_raising_operand_orders_are_never_equal() {
+    for (name, why, a, b) in NEVER_EQUAL {
+        let (a, b) = if a.starts_with("CREATE") {
+            (a.to_string(), b.to_string())
+        } else {
+            (proc_body(a), proc_body(b))
+        };
+        for (x, y, dir) in [(&a, &b, "A to B"), (&b, &a, "B to A")] {
+            let v = verdict(x, y);
+            assert!(
+                !matches!(v, Equal | Eua),
+                "{name} ({dir}): {v:?}; witness: {why}"
+            );
+        }
+    }
+}
+
+#[test]
+fn moved_session_settings_in_a_script_are_never_equal() {
+    for (name, why, a, b) in [
+        (
+            "nocount-in-script",
+            "A sends no count for the UPDATE, B sends one",
+            "SET NOCOUNT ON;\nUPDATE dbo.Stock SET Qty = 1;\nDELETE FROM dbo.Orders;",
+            "UPDATE dbo.Stock SET Qty = 1;\nSET NOCOUNT ON;\nDELETE FROM dbo.Orders;",
+        ),
+        (
+            "quoted-identifier-in-script",
+            "under QUOTED_IDENTIFIER OFF A returns the string 'a', B the column",
+            "SET QUOTED_IDENTIFIER ON;\nSELECT \"Qty\" FROM dbo.Stock;",
+            "SELECT \"Qty\" FROM dbo.Stock;\nSET QUOTED_IDENTIFIER ON;",
+        ),
+        (
+            "add-filegroup-in-script",
+            "the filegroup exists for the CREATE TABLE ... ON in A and not in B",
+            "ALTER DATABASE db ADD FILEGROUP fg1;\nCREATE TABLE dbo.X (a int) ON fg1;",
+            "CREATE TABLE dbo.X (a int) ON fg1;\nALTER DATABASE db ADD FILEGROUP fg1;",
+        ),
+    ] {
+        for (x, y, dir) in [(a, b, "A to B"), (b, a, "B to A")] {
+            let v = verdict(x, y);
+            assert!(
+                !matches!(v, Equal | Eua),
+                "{name} ({dir}): {v:?}; witness: {why}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_noted_statement_that_stays_put_does_not_block_a_rename() {
+    // SET NOCOUNT ON at the top of both, after the same tokens: the rename is cleared.
+    let a = proc_body("SET NOCOUNT ON; DECLARE @a int = 1; UPDATE dbo.Stock SET Qty = @a;");
+    let b = proc_body("SET NOCOUNT ON; DECLARE @b int = 1; UPDATE dbo.Stock SET Qty = @b;");
+    assert_eq!(verdict(&a, &b), Equal);
+}
+
+#[test]
+fn a_moved_set_nocount_is_not_excused_by_any_observer_profile() {
+    use sqldiff_core::observer::{Observer, RowCounts};
+    let a = proc_body("SET NOCOUNT ON; UPDATE dbo.Stock SET Qty = 1; DELETE FROM dbo.Orders;");
+    let b = proc_body("UPDATE dbo.Stock SET Qty = 1; SET NOCOUNT ON; DELETE FROM dbo.Orders;");
+    let run = |rc: RowCounts| {
+        let opts = Options {
+            catalog_a: vec![Artifact::new("catalog.sql", T, DDL)],
+            catalog_b: vec![Artifact::new("catalog.sql", T, DDL)],
+            observer: Observer { row_counts: rc },
+            ..Options::default()
+        };
+        sqldiff_core::with_engine_stack(|| {
+            diff(
+                &Artifact::new("a.sql", T, &a),
+                &Artifact::new("b.sql", T, &b),
+                &opts,
+            )
+        })
+    };
+    let seen = run(RowCounts::SameDialect);
+    assert!(
+        !matches!(seen.verdict(), Equal | Eua),
+        "{:?}",
+        seen.verdict()
+    );
+    // Even a profile that does not observe counts leaves a moved SET NOCOUNT
+    // to the structural diff (`stmt.moved` is not among the findings it drops).
+    let never = run(RowCounts::Never);
+    assert!(
+        !matches!(never.verdict(), Equal | Eua),
+        "{:?}",
+        never.verdict()
+    );
+}
+
+#[test]
+fn untyped_store_is_not_recorded_for_equal_terms_and_does_not_hide_a_type_change() {
+    // Without a catalog (the destination type is unknown): reordering two
+    // assignments of one statement stores the same terms, so it is equal and
+    // names no assumption.
+    let run = |a: &str, b: &str| {
+        sqldiff_core::with_engine_stack(|| {
+            diff(
+                &Artifact::new("a.sql", T, a),
+                &Artifact::new("b.sql", T, b),
+                &Options::default(),
+            )
+        })
+    };
+    let a = "CREATE PROCEDURE dbo.P @p int, @q int AS BEGIN UPDATE dbo.U SET c = @p, d = @q; END";
+    let b = "CREATE PROCEDURE dbo.P @p int, @q int AS BEGIN UPDATE dbo.U SET d = @q, c = @p; END";
+    let r = run(a, b);
+    assert_eq!(r.verdict(), Equal, "{:?}", r.findings);
+    assert!(r.assumptions.iter().all(|x| x.id != "ASM-UNTYPED-STORE"));
+    // The stored values differ in type: never equal, with or without the assumption.
+    let a = "CREATE PROCEDURE dbo.P @p int AS BEGIN UPDATE dbo.U SET c = CAST(@p AS int); END";
+    let b = "CREATE PROCEDURE dbo.P @p int AS BEGIN UPDATE dbo.U SET c = CAST(@p AS money); END";
+    let r = run(a, b);
+    assert!(!matches!(r.verdict(), Equal | Eua), "{:?}", r.verdict());
+}

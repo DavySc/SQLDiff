@@ -341,6 +341,10 @@ pub struct Unit {
     /// (`ir::behaviour::Behaviour::txn_compared`).
     pub txn_placed: Vec<SyntaxNode>,
     pub notes: Vec<String>,
+    /// The statements a note stands for: passed over, not lowered
+    /// (`note`). A comparison of one dialect with itself must not clear a
+    /// finding about their position (`second::refusal`).
+    pub noted: Vec<SyntaxNode>,
     /// Security context of a routine (scripts and views: the caller's).
     pub security: Security,
     /// The header text that sets it and its byte range; `None` for the default.
@@ -489,6 +493,7 @@ fn empty(d: Dialect) -> Unit {
         txn_stmts: Vec::new(),
         txn_placed: Vec::new(),
         notes: Vec::new(),
+        noted: Vec::new(),
         security: Security::Caller,
         security_cite: None,
         assumptions: Vec::new(),
@@ -2338,6 +2343,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
     if d == Dialect::Tsql && add_filegroup(c) {
         note(
             u,
+            c,
             "ALTER DATABASE … ADD FILEGROUP compared as storage: where data is stored is not seen in results",
         );
         return;
@@ -2489,6 +2495,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         // anything.
         StmtKind::Ddl if recheck_after_add(c, d) => note(
             u,
+            c,
             "CHECK CONSTRAINT / VALIDATE CONSTRAINT right after adding the constraint with its rows checked: nothing left to do on either side",
         ),
         // A script's own `CREATE TABLE`: compared table against table
@@ -2570,11 +2577,13 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         }
         _ if ansi_on(c, d) => note(
             u,
+            c,
             "SET ANSI_NULLS ON / SET QUOTED_IDENTIFIER ON: the behaviour T-SQL is compared under (ASM-TSQL-ANSI-NULLS, ASM-TSQL-QUOTED-IDENTIFIER) and PostgreSQL's own",
         ),
         StmtKind::SessionSetting if d == Dialect::Tsql && w(1) == "NOCOUNT" => {
             note(
                 u,
+                c,
                 "SET NOCOUNT compared as rows-affected counts by the observer profile, not as a statement",
             );
         }
@@ -3328,7 +3337,8 @@ fn raiserror(toks: &[Tok]) -> Result<Msg, String> {
     })
 }
 
-fn note(u: &mut Unit, s: &str) {
+fn note(u: &mut Unit, c: &SyntaxNode, s: &str) {
+    u.noted.push(c.clone());
     if !u.notes.iter().any(|x| x == s) {
         u.notes.push(s.to_string());
     }

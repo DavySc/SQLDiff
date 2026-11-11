@@ -24,6 +24,11 @@
 //!   (a comparison that compared nothing cannot clear anything). It names
 //!   every statement or construct it does not compare as an unknown reason,
 //!   so a clean result compared them all.
+//! - A statement the lowering only noted instead of comparing (`SET
+//!   NOCOUNT`, ANSI settings, `ADD FILEGROUP`) must stand with the same text
+//!   after the same tokens ([`noted_in_place`]): the lowering notes them
+//!   because across dialects they are not observed, but within one dialect
+//!   their position decides what the statements after them do.
 //! - Premises of the cross-dialect lowering are taken only where they are
 //!   vacuous for one dialect: `ASM-UNTYPED-STORE` is not recorded when both
 //!   sides are one dialect (`Canon::assume_store`); `ASM-TSQL-OWNERSHIP-CHAIN`
@@ -134,6 +139,48 @@ pub fn same_tokens(a: &Analyzed, b: &Analyzed) -> bool {
     x == y && declarations(a) == declarations(b)
 }
 
+/// Whether every statement the lowering passed over instead of comparing
+/// (`SET NOCOUNT`, `SET ANSI_NULLS ON`, `SET QUOTED_IDENTIFIER ON`,
+/// `ADD FILEGROUP`, `CHECK CONSTRAINT` after an add) stands as it did: the
+/// same text, after the same tokens. The lowering notes them because across
+/// dialects they are not observed; within one dialect where they sit changes
+/// what the statements after them do (a rows-affected count is sent or not, an
+/// identifier is a name or a string).
+fn noted_in_place(a: &Analyzed, b: &Analyzed, sec: &Outcome) -> bool {
+    let masked_at = |x: &Analyzed| -> Vec<(usize, String)> {
+        cst::sig_tokens(&x.root)
+            .map(|t| {
+                let at: usize = t.text_range().start().into();
+                let m = if is_variable(&t) {
+                    "@".to_string()
+                } else {
+                    t.text().to_string()
+                };
+                (at, m)
+            })
+            .collect()
+    };
+    if sec.noted[0].len() != sec.noted[1].len() {
+        return false;
+    }
+    if sec.noted[0].is_empty() {
+        return true;
+    }
+    let (ta, tb) = (masked_at(a), masked_at(b));
+    let slice = |t: &[(usize, String)], (s, e): (usize, usize)| -> (Vec<String>, Vec<String>) {
+        let lo = t.partition_point(|x| x.0 < s);
+        let hi = t.partition_point(|x| x.0 < e);
+        (
+            t[..lo].iter().map(|x| x.1.clone()).collect(),
+            t[lo..hi].iter().map(|x| x.1.clone()).collect(),
+        )
+    };
+    sec.noted[0]
+        .iter()
+        .zip(&sec.noted[1])
+        .all(|(&ra, &rb)| slice(&ta, ra) == slice(&tb, rb))
+}
+
 /// Whether any routine header of `a` names `EXECUTE` (`EXECUTE AS ...`).
 fn has_execute_as(a: &Analyzed) -> bool {
     headers(a).iter().any(|h| h.iter().any(|t| t == "EXECUTE"))
@@ -185,6 +232,12 @@ pub fn refusal(a: &Analyzed, b: &Analyzed, sec: &Outcome) -> Option<&'static str
         && (has_execute_as(a) || has_execute_as(b))
     {
         return Some("a routine names EXECUTE AS");
+    }
+    if sec.passed_over {
+        return Some("a table or DDL comparison passed over a detail");
+    }
+    if !noted_in_place(a, b, sec) {
+        return Some("a statement the lowering only noted (SET, ALTER DATABASE) is not in place");
     }
     if sec.equal == 0 {
         return Some("the statement comparison paired and proved no statement");

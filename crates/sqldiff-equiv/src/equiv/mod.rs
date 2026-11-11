@@ -70,6 +70,12 @@ pub struct Outcome {
     /// Which conditions of the routine pairs are the same fact about the
     /// input (`identity.rs`). A report: nothing reads it on the diff path.
     pub identity: Vec<identity::UnitReport>,
+    /// The byte ranges of the statements each side's lowering passed over
+    /// with a note instead of comparing (`Unit::noted`), A then B.
+    pub noted: [Vec<(usize, usize)>; 2],
+    /// Whether a table or DDL comparison passed over a detail (clustering,
+    /// fill factor, ...) with a note.
+    pub passed_over: bool,
 }
 
 impl Outcome {
@@ -741,6 +747,8 @@ fn compare_units_within(
         for note in &u.notes {
             out.normalize(note.clone());
         }
+        let at = usize::from(!std::ptr::eq(side, a));
+        out.noted[at].extend(u.noted.iter().map(cst::sig_range));
     }
     let cursors = result_cursors(ua, ub, &na, &nb);
     match &cursors {
@@ -1510,6 +1518,9 @@ fn dynamic_sql(
         for n in inner.normalizations {
             out.normalize(n);
         }
+        // Statements passed over inside the text are not at offsets of this
+        // artifact: a same-dialect second opinion refuses the pair.
+        out.passed_over |= inner.passed_over || inner.noted.iter().any(|v| !v.is_empty());
         for r in inner.refinements {
             out.refine(r);
         }
@@ -2824,7 +2835,10 @@ fn table_pair(
     for e in table::compare(&ta, &tb, &na, &nb) {
         match e {
             table::Event::Asm(x) => add(&mut asms, asm::make(x)),
-            table::Event::Note(s) => out.normalize(s),
+            table::Event::Note(s) => {
+                out.passed_over = true;
+                out.normalize(s)
+            }
             table::Event::Unknown(s) => {
                 decided = false;
                 unknown(out, s);
@@ -3530,7 +3544,10 @@ fn ddl_stmts(
         for e in ddl::compare(dx, dy, &na, &nb, &facts) {
             match e {
                 ddl::Event::Asm(x) => add(&mut asms, asm::make(x)),
-                ddl::Event::Note(s) => out.normalize(s),
+                ddl::Event::Note(s) => {
+                    out.passed_over = true;
+                    out.normalize(s)
+                }
                 ddl::Event::Unknown(s) => {
                     decided = false;
                     unknown(out, s);
@@ -5994,6 +6011,7 @@ pub fn refine_modified(
             for nrm in sub.normalizations {
                 out.normalize(nrm);
             }
+            out.passed_over |= sub.passed_over || sub.noted.iter().any(|v| !v.is_empty());
             for r in sub.refinements {
                 out.refine(r);
             }
