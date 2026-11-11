@@ -6339,6 +6339,13 @@ impl<'a> Canon<'a> {
                 _ => return Err("a RAISERROR severity that is not an int variable".into()),
             }
         }
+        // Both sides T-SQL: the severity and state reach the client.
+        if let (Some((sev, state)), Some(Dialect::Tsql), Dialect::Tsql) =
+            (&m.level, self.other, self.d)
+        {
+            let (sev, state) = (self.expr(sev)?.0, self.expr(state)?.0);
+            parts.push(n("level", vec![sev, state]));
+        }
         Ok(n(if m.error { "raise-error" } else { "message" }, parts))
     }
 

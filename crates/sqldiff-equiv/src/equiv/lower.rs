@@ -178,6 +178,11 @@ pub struct Msg {
     /// whether it is an error (above 10) or a message. Lowered as
     /// `if(@severity > 10) raise-error else message end`.
     pub severity: Option<super::ast::Expr>,
+    /// T-SQL `RAISERROR (format, severity, state, …)`: the severity and the
+    /// state as written. The client sees both (`Msg 50000, Level 16, State
+    /// 1`) and PostgreSQL has neither, so they are compared only when both
+    /// sides are T-SQL (`Canon::message`).
+    pub level: Option<(super::ast::Expr, super::ast::Expr)>,
 }
 
 #[derive(Debug, Clone)]
@@ -3153,6 +3158,7 @@ fn message(c: &SyntaxNode, d: Dialect) -> Option<Lowered> {
                 tsql: false,
                 format_var: false,
                 severity: None,
+                level: None,
             };
             Ok((Err("a RAISE compared as its message".into()), Some(msg)))
         })();
@@ -3242,7 +3248,7 @@ fn raiserror(toks: &[Tok]) -> Result<Msg, String> {
         .into_iter()
         .map(expr)
         .collect::<Result<Vec<_>, _>>()?;
-    let [fmt, sev, _state, args @ ..] = args.as_slice() else {
+    let [fmt, sev, state, args @ ..] = args.as_slice() else {
         return Err("RAISERROR with fewer than three arguments".into());
     };
     // A severity variable: SQL Server 2022 raises an error above 10 and
@@ -3334,6 +3340,7 @@ fn raiserror(toks: &[Tok]) -> Result<Msg, String> {
         tsql: true,
         format_var,
         severity,
+        level: Some((sev.clone(), state.clone())),
     })
 }
 

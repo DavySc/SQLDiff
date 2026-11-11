@@ -592,6 +592,18 @@ fn proc_body(body: &str) -> String {
 
 const NEVER_EQUAL: &[(&str, &str, &str, &str)] = &[
     (
+        "raiserror-severity-changed",
+        "the client receives Level 16 from A and Level 15 from B (ERROR_SEVERITY() in a caller's CATCH differs)",
+        "RAISERROR('bad', 16, 1);",
+        "RAISERROR('bad', 15, 1);",
+    ),
+    (
+        "raiserror-state-changed",
+        "the client receives State 1 from A and State 2 from B (ERROR_STATE() in a caller's CATCH differs)",
+        "RAISERROR('bad', 16, 1);",
+        "RAISERROR('bad', 16, 2);",
+    ),
+    (
         "nocount-moved-after-update",
         "A sends no count for the UPDATE of the one Stock row, B sends '(1 row affected)'",
         "SET NOCOUNT ON; UPDATE dbo.Stock SET Qty = 1; DELETE FROM dbo.Orders;",
