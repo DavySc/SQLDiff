@@ -5538,6 +5538,29 @@ fn observable(
             if text(&ba) == text(&bb) {
                 return Err("both versions run the same code".into());
             }
+            // The branches are compared by their effect level, not by what they
+            // do. A branch with a condition or loop of its own can re-derive
+            // the effect of the other (a nested IF against `IF a AND b`), so a
+            // difference in which branch runs says nothing about the effects.
+            let nested = |n: &Option<SyntaxNode>| {
+                n.as_ref().is_some_and(|n| {
+                    n.descendants().any(|x| {
+                        matches!(
+                            x.kind(),
+                            SyntaxKind::IF_STMT
+                                | SyntaxKind::LOOP_STMT
+                                | SyntaxKind::CASE_STMT
+                                | SyntaxKind::TRY_CATCH
+                        )
+                    })
+                })
+            };
+            if nested(&ba) || nested(&bb) {
+                return Err(
+                    "a branch holds a condition or loop of its own, whose effects are not compared"
+                        .into(),
+                );
+            }
             let ea = ba.as_ref().map_or(Eff::No, |n| effect(ra, n));
             let eb = bb.as_ref().map_or(Eff::No, |n| effect(rb, n));
             if ea == Eff::No && eb == Eff::No {

@@ -831,3 +831,51 @@ fn where_predicates_keep_sorting_in_a_query() {
     );
     assert!(matches!(v, Equal | Eua), "{v:?}");
 }
+
+/// `equiv.edit` compares which branch of a changed IF runs and how surely
+/// each branch is observable, not what the branches do. A branch with a
+/// condition of its own can re-derive the other's effect, so such a pair
+/// carries no witnessed `equiv.edit` difference (the pair stays different
+/// only through the unpaired statements, which a later proof may remove).
+#[test]
+fn an_if_reshaped_around_a_nested_condition_has_no_branch_witness() {
+    let pairs = [
+        (
+            "nested-if-to-and",
+            "the branch runs the INSERT exactly when both tests are true on both sides",
+            "IF @a > 0 BEGIN IF @b > 0 INSERT INTO dbo.Orders (Qty) VALUES (1); END",
+            "IF @a > 0 AND @b > 0 INSERT INTO dbo.Orders (Qty) VALUES (1);",
+        ),
+        (
+            "guard-clause-to-if-else",
+            "both raise for a NULL or non-positive @a and insert otherwise",
+            "IF @a IS NULL OR @a <= 0 BEGIN RAISERROR('bad', 16, 1); RETURN; END; INSERT INTO dbo.Orders (Qty) VALUES (@a);",
+            "IF @a > 0 BEGIN INSERT INTO dbo.Orders (Qty) VALUES (@a); END ELSE BEGIN RAISERROR('bad', 16, 1); RETURN; END",
+        ),
+    ];
+    for (name, why, a, b) in pairs {
+        let wrap =
+            |body: &str| format!("CREATE PROCEDURE dbo.P @a int, @b int AS BEGIN {body} END");
+        let opts = Options {
+            catalog_a: vec![Artifact::new("catalog.sql", T, DDL)],
+            catalog_b: vec![Artifact::new("catalog.sql", T, DDL)],
+            ..Options::default()
+        };
+        for (x, y) in [(wrap(a), wrap(b)), (wrap(b), wrap(a))] {
+            let r = sqldiff_core::with_engine_stack(|| {
+                diff(
+                    &Artifact::new("a.sql", T, &x),
+                    &Artifact::new("b.sql", T, &y),
+                    &opts,
+                )
+            });
+            assert!(
+                !r.findings
+                    .iter()
+                    .any(|f| f.rule == "equiv.edit" && f.verdict == Different),
+                "{name}: a witnessed equiv.edit difference ({why}): {:#?}",
+                r.findings
+            );
+        }
+    }
+}
