@@ -1132,7 +1132,10 @@ fn a_target_only_change_of_the_versioning_triggers_is_found_by_a_resume() {
             .map(|t| t.lines().next().unwrap_or("").to_string())
     };
     for (label, a, b) in cases {
-        let f = Fixture::new(&format!("target-only-{label}"), Dialect::Postgres);
+        let f = Fixture::new(
+            &format!("target-only-{}", label.replace("->", "-to-")),
+            Dialect::Postgres,
+        );
         f.write(&mk(a));
         f.run("res", false);
         let before = first_line(&f, "res");
