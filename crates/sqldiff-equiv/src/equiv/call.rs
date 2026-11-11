@@ -961,7 +961,11 @@ fn switches(x: &Switch, t: &Side, y: &Switch, p: &Side) -> R<Verdict> {
     for (_, name) in &want {
         let there = triggers.iter().any(|t| {
             t.name == *name && {
-                let parts: Vec<Ident> = t.table.iter().map(|s| Ident::new(s.clone(), true)).collect();
+                let parts: Vec<Ident> = t
+                    .table
+                    .iter()
+                    .map(|s| Ident::new(s.clone(), true))
+                    .collect();
                 matches!(pv.table(&parts), Lookup::Found(tt) if std::ptr::eq(tt, pt))
             }
         });
