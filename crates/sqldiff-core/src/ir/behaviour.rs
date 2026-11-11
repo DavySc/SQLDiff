@@ -93,6 +93,11 @@ struct SideIr<'x, 'a> {
     /// its effects with their lines, and finding a line walks the whole
     /// statement, so long scripts went cubic.
     line_nos: Vec<OnceCell<Option<usize>>>,
+    /// Set by [`SideIr::mark_lines`]: line numbers in messages are written
+    /// as [`line_mark`]s relative to `base_line`, the line where the routine
+    /// starts, instead of as plain numbers.
+    marked: bool,
+    base_line: usize,
 }
 
 impl<'x, 'a> SideIr<'x, 'a> {
@@ -131,6 +136,8 @@ impl<'x, 'a> SideIr<'x, 'a> {
         SideIr {
             a,
             line_nos: (0..cfg.nodes.len()).map(|_| OnceCell::new()).collect(),
+            marked: false,
+            base_line: 0,
             cfg,
             at,
             reads,
@@ -186,8 +193,27 @@ impl SideIr<'_, '_> {
 
     fn line(&self, n: NodeId) -> String {
         self.line_no(n)
-            .map(|l| format!("{:?} line {l}", self.a.side))
+            .map(|l| format!("{:?} line {}", self.a.side, self.line_text(l)))
             .unwrap_or_default()
+    }
+
+    /// From now on messages write their line numbers as marks relative to
+    /// the routine that starts on line `base` (see [`line_mark`]).
+    fn mark_lines(&mut self, base: usize) {
+        self.marked = true;
+        self.base_line = base;
+    }
+
+    /// The text of line `abs` of this side in a message: the number itself,
+    /// or a mark that [`PairBases::render`] turns into the number where the
+    /// routine stands in its file. This is the only way a message gets a
+    /// line number.
+    fn line_text(&self, abs: usize) -> String {
+        if self.marked {
+            line_mark(self.a.side, abs as i64 - self.base_line as i64)
+        } else {
+            abs.to_string()
+        }
     }
 
     /// Effect phrase, with an ordinal when the same write occurs more than once.
@@ -1067,11 +1093,18 @@ fn side_outcome(s: &SideIr, o: &Outcome) -> SideOutcome {
     let control = match &o.fault_route {
         None => "runs to the end".to_string(),
         Some(Routed::Handler { construct, .. }) => match next {
-            Some(l) => format!("enters the {} (line {l})", construct_phrase(construct)),
+            Some(l) => format!(
+                "enters the {} (line {})",
+                construct_phrase(construct),
+                s.line_text(l)
+            ),
             None => format!("enters the {}", construct_phrase(construct)),
         },
         Some(Routed::Next(_)) => match next {
-            Some(l) => format!("reports the error and goes on with the next statement (line {l})"),
+            Some(l) => format!(
+                "reports the error and goes on with the next statement (line {})",
+                s.line_text(l)
+            ),
             None => "reports the error and goes on; nothing else runs".to_string(),
         },
         Some(Routed::Exit) => "leaves the routine with the error".to_string(),
@@ -2331,7 +2364,7 @@ impl SideIr<'_, '_> {
             Some(s) => format!(
                 "the statement `{}` on line {}",
                 self.a.snippet(s, 40),
-                self.a.line_of(s)
+                self.line_text(self.a.line_of(s))
             ),
             None => "the statement".to_string(),
         }
@@ -2598,13 +2631,15 @@ pub fn analyze_runs(
             v.sort();
             (entry_spent, entry_work, v)
         });
+        let bases = PairBases::of(a, b, x, y);
         let fresh = || {
-            analyze_pair(
+            analyze_pair_marked(
                 a,
                 b,
                 env,
-                Some(x.clone()),
-                Some(y.clone()),
+                x.clone(),
+                y.clone(),
+                bases.marks,
                 &format!("{name}|"),
                 &prior,
                 &file_spent,
@@ -2614,7 +2649,6 @@ pub fn analyze_runs(
         let (r, stats) = match (&env.pair_cache, &caps) {
             (Some(cache), Some(caps)) => {
                 let key = pair_key(a, b, x, y, env, cache.0.build());
-                let bases = PairBases::of(a, b, x, y);
                 let taken = cache
                     .0
                     .get(&key)
@@ -2696,6 +2730,8 @@ pub fn analyze_runs(
             }
             _ => fresh(),
         };
+        // Fresh and reused results alike leave through the one renderer.
+        let r = bases.render(r);
         if let (Some(runs), Some((spent_before, work_before, prior_before))) =
             (runs.as_deref_mut(), before)
         {
@@ -2790,6 +2826,9 @@ impl StoredPair {
         unit_cap: u64,
         bases: &PairBases,
     ) -> Option<StoredPair> {
+        if !bases.marks {
+            return None;
+        }
         Some(StoredPair {
             behaviour: bases.shifted(r, false)?,
             spent: stats.spent,
@@ -2832,27 +2871,138 @@ impl StoredPair {
     }
 }
 
+/// A line number inside a message, as the pair analysis writes it: the side
+/// it belongs to and the line relative to the line where that side's routine
+/// starts. [`PairBases::render`] turns it into the file's line number; the
+/// stored result keeps the mark, so it holds the same text wherever the
+/// routine stands. The control characters cannot come from the text of a
+/// file the analysis was given (see [`marks_usable`]).
+fn line_mark(side: crate::model::Side, rel: i64) -> String {
+    format!("{MARK_OPEN}{side:?}{rel}{MARK_CLOSE}")
+}
+
+const MARK_OPEN: char = '\u{1}';
+const MARK_CLOSE: char = '\u{2}';
+
+/// Whether line marks are safe for the pair of files: a mark is told apart
+/// from the text of the files only by its control characters.
+fn marks_usable(a: &Analyzed, b: &Analyzed) -> bool {
+    [a, b]
+        .iter()
+        .all(|x| !x.artifact.text.contains([MARK_OPEN, MARK_CLOSE]))
+}
+
+/// `s` with every line mark replaced by `f(side, relative line)`. `None`
+/// when `f` refuses a mark or a control character is not part of a mark.
+fn map_marks(
+    s: &str,
+    f: &mut dyn FnMut(crate::model::Side, i64) -> Option<String>,
+) -> Option<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find([MARK_OPEN, MARK_CLOSE]) {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let body = tail.strip_prefix(MARK_OPEN)?;
+        let end = body.find(MARK_CLOSE)?;
+        let inner = &body[..end];
+        let (side, num) = (inner.get(..1)?, inner.get(1..)?);
+        let side = match side {
+            "A" => crate::model::Side::A,
+            "B" => crate::model::Side::B,
+            _ => return None,
+        };
+        out.push_str(&f(side, num.parse::<i64>().ok()?)?);
+        rest = &body[end + MARK_CLOSE.len_utf8()..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// Every string of `v`, in place, through `f`.
+fn map_strings(v: &mut serde_json::Value, f: &mut dyn FnMut(&str) -> Option<String>) -> Option<()> {
+    match v {
+        serde_json::Value::String(t) => *t = f(t)?,
+        serde_json::Value::Array(xs) => {
+            for x in xs {
+                map_strings(x, f)?;
+            }
+        }
+        serde_json::Value::Object(m) => {
+            for x in m.values_mut() {
+                map_strings(x, f)?;
+            }
+        }
+        _ => {}
+    }
+    Some(())
+}
+
 /// Where the two routines of a pair stand in their files: the byte range of
-/// each (side A, side B) and the path of its file.
+/// each (side A, side B), the path of its file and the lines it spans.
 struct PairBases {
     a: (std::ops::Range<usize>, String),
     b: (std::ops::Range<usize>, String),
+    /// First and last line of each routine.
+    lines_a: (usize, usize),
+    lines_b: (usize, usize),
+    /// [`marks_usable`] for the two files.
+    marks: bool,
 }
 
 impl PairBases {
     fn of(a: &Analyzed, b: &Analyzed, x: &SyntaxNode, y: &SyntaxNode) -> PairBases {
         let (la, lb) = (a.node_location(x), b.node_location(y));
         PairBases {
+            lines_a: (la.start_line, la.end_line),
+            lines_b: (lb.start_line, lb.end_line),
             a: (la.byte_start..la.byte_end, la.path),
             b: (lb.byte_start..lb.byte_end, lb.path),
+            marks: marks_usable(a, b),
         }
     }
 
-    /// `r` with every byte offset moved from the file's to the routine's
-    /// frame (`to_file` false) or back (`to_file` true). Offsets are in
-    /// finding locations and in the compared ranges; line and column
-    /// positions are in the key and need no move. `None` when an offset is
-    /// not inside its routine, or a location names another file.
+    fn lines(&self, s: crate::model::Side) -> (usize, usize) {
+        if s == crate::model::Side::A {
+            self.lines_a
+        } else {
+            self.lines_b
+        }
+    }
+
+    /// `r` with every line mark in its text replaced by the number of the
+    /// line in the file. Every result leaves the pair analysis through
+    /// this, a fresh one and a reused one alike, so the two cannot differ
+    /// in the lines they print.
+    fn render(&self, r: Behaviour) -> Behaviour {
+        let Ok(mut v) = serde_json::to_value(&r) else {
+            return r;
+        };
+        let rendered = map_strings(&mut v, &mut |t| {
+            if !t.contains([MARK_OPEN, MARK_CLOSE]) {
+                return Some(t.to_string());
+            }
+            map_marks(t, &mut |side, rel| {
+                let at = i64::try_from(self.lines(side).0).ok()?.checked_add(rel)?;
+                (at >= 0).then(|| at.to_string())
+            })
+        });
+        match (rendered, serde_json::from_value(v)) {
+            (Some(()), Ok(b)) => b,
+            // Not reachable for a mark the analysis wrote; a result that
+            // cannot be rendered is kept as it is rather than guessed at.
+            _ => r,
+        }
+    }
+
+    /// `r` with every byte offset and every line number moved from the
+    /// file's to the routine's frame (`to_file` false) or back (`to_file`
+    /// true). Offsets are in finding locations and in the compared ranges;
+    /// lines are in finding locations and in the structured witnesses (the
+    /// failing statement's line and the path of each outcome); line marks in
+    /// text are relative already. `None` when an offset or line is not inside
+    /// its routine, a location names another file, or text holds a mark
+    /// outside the routine.
     fn shifted(&self, r: &Behaviour, to_file: bool) -> Option<Behaviour> {
         let mut r = r.clone();
         let side = |s: crate::model::Side| {
@@ -2874,6 +3024,16 @@ impl PairBases {
                     .then(|| range.start - base.start..range.end - base.start)
             }
         };
+        // A line moved between the file's frame and the routine's: checked,
+        // and inside the routine's lines on the file side.
+        let line = |l: usize, s: crate::model::Side| -> Option<usize> {
+            let (first, last) = self.lines(s);
+            if to_file {
+                first.checked_add(l).filter(|x| *x <= last)
+            } else {
+                (first <= l && l <= last).then(|| l - first)
+            }
+        };
         for f in &mut r.findings {
             for loc in [&mut f.a, &mut f.b].into_iter().flatten() {
                 let (base, path) = side(loc.side);
@@ -2882,6 +3042,23 @@ impl PairBases {
                 }
                 let m = mv(&(loc.byte_start..loc.byte_end), base)?;
                 (loc.byte_start, loc.byte_end) = (m.start, m.end);
+                loc.start_line = line(loc.start_line, loc.side)?;
+                loc.end_line = line(loc.end_line, loc.side)?;
+            }
+        }
+        for w in &mut r.witnesses {
+            use crate::model::Side;
+            if let Some(l) = &mut w.scenario.line_a {
+                *l = line(*l, Side::A)?;
+            }
+            if let Some(l) = &mut w.scenario.line_b {
+                *l = line(*l, Side::B)?;
+            }
+            for l in &mut w.a.path {
+                *l = line(*l, Side::A)?;
+            }
+            for l in &mut w.b.path {
+                *l = line(*l, Side::B)?;
             }
         }
         for (ranges, (base, _)) in [
@@ -2892,16 +3069,37 @@ impl PairBases {
                 *range = mv(range, base)?;
             }
         }
+        if !to_file {
+            // The marks in text must lie inside their routines.
+            let mut v = serde_json::to_value(&r).ok()?;
+            map_strings(&mut v, &mut |t| {
+                if !t.contains([MARK_OPEN, MARK_CLOSE]) {
+                    return Some(String::new());
+                }
+                map_marks(t, &mut |side, rel| {
+                    let (first, last) = self.lines(side);
+                    let n = i64::try_from(last.checked_sub(first)?).ok()?;
+                    (0..=n).contains(&rel).then(String::new)
+                })
+            })?;
+        }
         Some(r)
     }
 }
 
 /// The key of a routine pair's result: everything the pair reads of the
 /// files (design `w4-4-routine-units.md`, section H and the review P1). The
-/// line and column where each routine starts and the length of its text are
-/// in the key; its byte offset is not: the stored result holds byte offsets
-/// relative to the routine and a reuse adds the routine's offset
+/// column where each routine starts and the length of its text are in the
+/// key; its byte offset and its line are not: the stored result holds byte
+/// offsets and lines relative to the routine, and line marks in its text
+/// ([`line_mark`]), and a reuse adds the routine's offset and line
 /// ([`PairBases`]), so a routine moves in its file without losing its result.
+///
+/// The invariant behind this: nothing inside a pair decides on rendered
+/// text, on an absolute line, or on a column other than the first line's
+/// (which is in the key). A pair's result is then a function of the
+/// routines' text and relative lines, and `pair_tests` checks that a pair
+/// moved by any number of lines gives the same result as a fresh one.
 fn pair_key(
     a: &Analyzed,
     b: &Analyzed,
@@ -2918,7 +3116,7 @@ fn pair_key(
         h.update((bytes.len() as u64).to_le_bytes());
         h.update(bytes);
     };
-    field("format", b"pair-1");
+    field("format", b"pair-2");
     field("build", build.as_bytes());
     for (tag, an, r, other) in [("a", a, ra, b), ("b", b, rb, a)] {
         field(
@@ -2946,8 +3144,7 @@ fn pair_key(
         field(
             &format!("{tag}.position"),
             format!(
-                "{}:{} len {}",
-                loc.start_line,
+                "col {} len {}",
                 loc.start_col,
                 loc.byte_end - loc.byte_start
             )
@@ -3020,7 +3217,38 @@ fn analyze_pair(
     file_spent: &Rc<Cell<u64>>,
     file_work: FileWork,
 ) -> (Behaviour, PairStats) {
+    analyze_pair_with(
+        a,
+        b,
+        env,
+        (ra, rb),
+        None,
+        salt,
+        prior,
+        file_spent,
+        file_work,
+    )
+}
+
+/// `marks`: the line on which each routine starts, when messages write
+/// their lines as marks relative to it.
+#[allow(clippy::too_many_arguments)]
+fn analyze_pair_with(
+    a: &Analyzed,
+    b: &Analyzed,
+    env: &Env,
+    (ra, rb): (Option<SyntaxNode>, Option<SyntaxNode>),
+    marks: Option<(usize, usize)>,
+    salt: &str,
+    prior: &Rc<HashSet<String>>,
+    file_spent: &Rc<Cell<u64>>,
+    file_work: FileWork,
+) -> (Behaviour, PairStats) {
     let mut c = Collector::new(a, b, env.clone(), ra, rb, file_spent.clone(), file_work);
+    if let Some((first_a, first_b)) = marks {
+        c.sa.mark_lines(first_a);
+        c.sb.mark_lines(first_b);
+    }
     c.salt = salt.to_string();
     c.prior = Rc::clone(prior);
     c.faults();
@@ -3068,6 +3296,39 @@ fn analyze_pair(
             .collect(),
     };
     (c.out, stats)
+}
+
+/// [`analyze_pair`] with its line numbers written as marks relative to each
+/// routine (see [`line_mark`]) when `marks` allows, to be rendered by
+/// [`PairBases::render`]. This is the form a pair cache stores.
+#[allow(clippy::too_many_arguments)]
+fn analyze_pair_marked(
+    a: &Analyzed,
+    b: &Analyzed,
+    env: &Env,
+    ra: SyntaxNode,
+    rb: SyntaxNode,
+    marks: bool,
+    salt: &str,
+    prior: &Rc<HashSet<String>>,
+    file_spent: &Rc<Cell<u64>>,
+    file_work: FileWork,
+) -> (Behaviour, PairStats) {
+    let (first_a, first_b) = (
+        a.node_location(&ra).start_line,
+        b.node_location(&rb).start_line,
+    );
+    analyze_pair_with(
+        a,
+        b,
+        env,
+        (Some(ra), Some(rb)),
+        marks.then_some((first_a, first_b)),
+        salt,
+        prior,
+        file_spent,
+        file_work,
+    )
 }
 
 /// What `analyze_pair` reports besides the behaviour.
@@ -3151,17 +3412,20 @@ pub fn analyze_one_pair(
         .total()
         .saturating_sub(start)
         .saturating_add(file_work.offset);
-    let (r, stats) = analyze_pair(
+    let bases = PairBases::of(a, b, x, y);
+    let (r, stats) = analyze_pair_marked(
         a,
         b,
         env,
-        Some(x.clone()),
-        Some(y.clone()),
+        x.clone(),
+        y.clone(),
+        bases.marks,
         &format!("{name}|"),
         &prior,
         &file_spent,
         file_work,
     );
+    let r = bases.render(r);
     Some(PairRun {
         file_spent_before: entry.file_spent,
         file_spent_after: file_spent.get(),
@@ -4546,7 +4810,194 @@ mod pair_tests {
         cache.reset_events();
         let b2 = b.replacen("END;\n$$;", "-- c\nEND;\n$$;", 1);
         let _ = analysed(&a, &b2, &env);
-        assert_eq!(cache.count(PairEvent::Built), 3, "the draft's lines shifted: pairs below and the edited one rebuild, positions are in the key");
+        assert_eq!(
+            cache.count(PairEvent::Built),
+            1,
+            "only the edited routine rebuilds: the pairs below it moved in lines and bytes, and their stored results are relative"
+        );
+    }
+
+    /// A routine pair with a transaction, TRY/CATCH against EXCEPTION, a
+    /// temp table and a call: the two sides differ, so the pair has
+    /// findings, witnesses with lines, and a caller continuation.
+    fn rich_t(name: &str, lit: u32) -> String {
+        format!(
+            "CREATE PROCEDURE dbo.{name} @x int AS\nBEGIN\nCREATE TABLE #w{name} (id int);\nBEGIN TRY\nBEGIN TRANSACTION;\nINSERT INTO dbo.t (id, c) VALUES (@x, {lit});\nINSERT INTO #w{name} VALUES (@x);\nUPDATE dbo.u SET c = 1 WHERE id = @x;\nEXEC dbo.helper @x;\nCOMMIT;\nEND TRY\nBEGIN CATCH\nROLLBACK;\nEND CATCH\nEND;\nGO\n"
+        )
+    }
+
+    fn rich_p(name: &str, lit: u32) -> String {
+        format!(
+            "CREATE PROCEDURE {name}(x int) LANGUAGE plpgsql AS $$\nBEGIN\nCREATE TEMP TABLE w{name} (id int);\nINSERT INTO t (id, c) VALUES (x, {lit});\nBEGIN\nINSERT INTO w{name} VALUES (x);\nUPDATE u SET c = 1 WHERE id = x;\nCALL helper(x);\nEXCEPTION WHEN others THEN NULL;\nEND;\nEND;\n$$;\n"
+        )
+    }
+
+    /// `n` routine pairs; `gap_a` / `gap_b` lines of comments before routine
+    /// `at`, and an extra comment line inside routine `inside` on side A.
+    fn shifted_files(
+        n: u32,
+        at: usize,
+        gap_a: usize,
+        gap_b: usize,
+        inside: Option<usize>,
+    ) -> (String, String) {
+        let gap = |k: usize| "-- pad\n".repeat(k);
+        let (mut a, mut b) = (String::new(), String::new());
+        for i in 0..n as usize {
+            if i == at {
+                a += &gap(gap_a);
+                b += &gap(gap_b);
+            }
+            let mut ra = rich_t(&format!("q{i}"), 10 + i as u32);
+            if inside == Some(i) {
+                ra = ra.replacen("BEGIN TRY\n", "BEGIN TRY\n-- extra\n", 1);
+            }
+            a += &ra;
+            b += &rich_p(&format!("q{i}"), 10 + i as u32);
+        }
+        (a, b)
+    }
+
+    /// The result of a pair moved by any number of lines (in either file, by
+    /// different amounts, across digit counts, upward and downward) is the
+    /// one a fresh analysis gives, and it is taken from the cache.
+    #[test]
+    fn a_pair_moved_in_lines_is_reused_and_equals_the_fresh_one() {
+        // (label, at, gap_a, gap_b, inside) against the base (3, 0, 0).
+        let base = shifted_files(6, 3, 5, 5, None);
+        // One line count crossing 9 -> 10, 99 -> 100 and 999 -> 1000 each.
+        let cases: [(&str, usize, usize, usize, Option<usize>); 8] = [
+            ("A only", 3, 9, 5, None),
+            ("B only", 3, 5, 11, None),
+            ("both, different", 3, 7, 40, None),
+            ("9 to 10", 3, 12, 12, None),
+            ("99 to 100", 3, 120, 120, None),
+            ("999 to 1000", 3, 1010, 1010, None),
+            ("deleted lines", 3, 0, 1, None),
+            ("a line added inside an earlier routine", 3, 5, 5, Some(1)),
+        ];
+        let cache = std::sync::Arc::new(MemCache::default());
+        let env = with_cache(&Env::default(), &cache);
+        let (_, first) = analysed(&base.0, &base.1, &env);
+        let lines: usize = first
+            .iter()
+            .map(|r| {
+                format!("{:?}", r.behaviour.witnesses)
+                    .matches("line")
+                    .count()
+            })
+            .sum();
+        assert!(lines > 10, "the fixture's witnesses carry lines: {lines}");
+        for (label, at, ga, gb, inside) in cases {
+            let (a, b) = shifted_files(6, at, ga, gb, inside);
+            cache.reset_events();
+            let (got, got_runs) = analysed(&a, &b, &env);
+            let (want, want_runs) = analysed(&a, &b, &Env::default());
+            assert_eq!(
+                shown(&got_runs, &got),
+                shown(&want_runs, &want),
+                "{label}: the moved pair differs from a fresh one"
+            );
+            // The routines before the gap keep their lines; the others move.
+            // The pairs whose own text is unchanged are all taken.
+            let built = cache.count(PairEvent::Built);
+            let expect = usize::from(inside.is_some());
+            assert_eq!(
+                built,
+                expect,
+                "{label}: built {built}, reused {}",
+                cache.count(PairEvent::Reused)
+            );
+            assert_eq!(cache.count(PairEvent::Reused), 6 - expect, "{label}");
+        }
+    }
+
+    /// A result with a line (in a field or as a mark in text) outside its
+    /// routine is not stored, as for a byte offset outside it.
+    #[test]
+    fn a_line_outside_the_routine_is_not_stored() {
+        let (a, b) = shifted_files(2, 0, 0, 0, None);
+        let (ta, tb) = (
+            crate::Artifact::new("a.sql", Dialect::Tsql, &a),
+            crate::Artifact::new("b.sql", Dialect::Postgres, &b),
+        );
+        let (x, y) = (
+            Analyzed::new(&ta, Side::A, 3),
+            Analyzed::new(&tb, Side::B, 3),
+        );
+        let m = meet(&x, &y).expect("pairs");
+        let (rx, ry) = &m.pairs[1];
+        let bases = PairBases::of(&x, &y, rx, ry);
+        let (_, runs) = analysed(&a, &b, &Env::default());
+        let r = runs[1].behaviour.clone();
+        assert!(!r.findings.is_empty() && !r.witnesses.is_empty());
+        assert!(
+            bases.shifted(&r, false).is_some(),
+            "the unchanged result is stored"
+        );
+        let past = bases.lines_a.1 + 1;
+        let mut bad = r.clone();
+        bad.findings[0].a.as_mut().unwrap().start_line = past;
+        assert!(
+            bases.shifted(&bad, false).is_none(),
+            "a finding line past the routine"
+        );
+        let mut bad = r.clone();
+        bad.findings[0].a.as_mut().unwrap().end_line = bases.lines_a.0 - 1;
+        assert!(
+            bases.shifted(&bad, false).is_none(),
+            "a finding line before the routine"
+        );
+        let mut bad = r.clone();
+        bad.witnesses[0].a.path.push(past);
+        assert!(
+            bases.shifted(&bad, false).is_none(),
+            "a path line past the routine"
+        );
+        let mut bad = r.clone();
+        bad.witnesses[0].scenario.line_b = Some(bases.lines_b.0 - 1);
+        assert!(
+            bases.shifted(&bad, false).is_none(),
+            "a scenario line before the routine"
+        );
+        let mut bad = r.clone();
+        bad.findings[0].witness += &line_mark(Side::B, 5000);
+        assert!(
+            bases.shifted(&bad, false).is_none(),
+            "a mark past the routine"
+        );
+        let mut bad = r.clone();
+        bad.findings[0].witness += &line_mark(Side::A, -1);
+        assert!(
+            bases.shifted(&bad, false).is_none(),
+            "a mark before the routine"
+        );
+        let mut bad = r.clone();
+        bad.findings[0].witness += "\u{1}broken";
+        assert!(
+            bases.shifted(&bad, false).is_none(),
+            "a control character that is no mark"
+        );
+        // And back: a relative line past the routine's end does not move.
+        let rel = bases.shifted(&r, false).unwrap();
+        let mut bad = rel.clone();
+        bad.witnesses[0].a.path.push(usize::MAX);
+        assert!(bases.shifted(&bad, true).is_none(), "overflow moving back");
+        // Marks and numbers: a file with the control character gets no marks.
+        let dirty = a.replacen("BEGIN TRY", "-- \u{1}\nBEGIN TRY", 1);
+        let td = crate::Artifact::new("a.sql", Dialect::Tsql, &dirty);
+        let xd = Analyzed::new(&td, Side::A, 3);
+        assert!(!marks_usable(&xd, &y));
+        let cache = std::sync::Arc::new(MemCache::default());
+        let env = with_cache(&Env::default(), &cache);
+        let (got, got_runs) = analysed(&dirty, &b, &env);
+        let (want, want_runs) = analysed(&dirty, &b, &Env::default());
+        assert_eq!(shown(&got_runs, &got), shown(&want_runs, &want));
+        assert_eq!(
+            cache.map.lock().unwrap().len(),
+            0,
+            "nothing is stored for such a file"
+        );
     }
 
     #[test]
@@ -4573,5 +5024,144 @@ mod pair_tests {
         assert_eq!(shown(&cached_runs, &cached), shown(&fresh_runs, &fresh));
         assert_eq!(cache.count(PairEvent::Built), 2, "p0 and p1");
         assert_eq!(cache.count(PairEvent::Reused), 1, "p2 keeps its collision");
+    }
+}
+
+/// A pair's result is stored relative to its routine (design `w4-4-stage2.md`,
+/// review A3): a line number may reach a message or a structured field only
+/// where this file moves it with the routine. This test lists every function
+/// that reads a line; a new one fails it, so the author has to decide how the
+/// number moves (a [`line_mark`] in text, [`PairBases::shifted`] in a field)
+/// and add the function here, instead of a benchmark finding out.
+#[cfg(test)]
+mod line_guard_tests {
+    /// (function, what it reads, how the number reaches the output)
+    const ALLOWED: &[(&str, &str, &str)] = &[
+        ("line", "line_no(", "text through SideIr::line_text"),
+        ("line_no", "line_no(", "the cell that caches the line"),
+        ("line_no", "line_of(", "the cell that caches the line"),
+        ("stmt_phrase", "line_of(", "text through SideIr::line_text"),
+        (
+            "scenario_info",
+            "line_no(",
+            "Witness line_a/line_b, moved by PairBases::shifted",
+        ),
+        (
+            "side_outcome",
+            "line_no(",
+            "text through line_text; path moved by PairBases::shifted",
+        ),
+        (
+            "emit",
+            "node_location(",
+            "Finding locations, moved by PairBases::shifted",
+        ),
+        (
+            "budget_findings",
+            "node_location(",
+            "Finding locations, moved by PairBases::shifted",
+        ),
+        ("of", "node_location(", "PairBases: the routine's own lines"),
+        ("of", ".start_line", "PairBases: the routine's own lines"),
+        ("of", ".end_line", "PairBases: the routine's own lines"),
+        ("shifted", ".start_line", "PairBases::shifted itself"),
+        ("shifted", ".end_line", "PairBases::shifted itself"),
+        (
+            "pair_key",
+            "node_location(",
+            "the key holds the column and length, not the line",
+        ),
+        (
+            "analyze_pair_marked",
+            "node_location(",
+            "the line where the routine starts",
+        ),
+        (
+            "analyze_pair_marked",
+            ".start_line",
+            "the line where the routine starts",
+        ),
+        (
+            "what_if",
+            "node_location(",
+            "what_if renders absolute lines and stores nothing",
+        ),
+        (
+            "what_if",
+            ".start_line",
+            "what_if renders absolute lines and stores nothing",
+        ),
+        (
+            "what_if",
+            ".end_line",
+            "what_if renders absolute lines and stores nothing",
+        ),
+        (
+            "what_if",
+            "line_no(",
+            "what_if renders absolute lines and stores nothing",
+        ),
+        (
+            "pair_states",
+            "node_location(",
+            "line counts, not line numbers",
+        ),
+        (
+            "pair_states",
+            ".start_line",
+            "line counts, not line numbers",
+        ),
+        ("pair_states", ".end_line", "line counts, not line numbers"),
+    ];
+
+    #[test]
+    fn a_line_number_reaches_the_output_only_where_it_moves_with_the_routine() {
+        let src = include_str!("behaviour.rs");
+        let code = src.split("\n#[cfg(test)]\nmod cap_tests").next().unwrap();
+        let mut func = String::new();
+        let mut bad = Vec::new();
+        for (n, l) in code.lines().enumerate() {
+            let t = l.trim_start();
+            if let Some(rest) = t
+                .strip_prefix("pub fn ")
+                .or_else(|| t.strip_prefix("pub(crate) fn "))
+                .or_else(|| t.strip_prefix("fn "))
+            {
+                func = rest
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+            }
+            let text = l.split("//").next().unwrap_or("");
+            for pat in [
+                "line_no(",
+                "line_of(",
+                ".start_line",
+                ".end_line",
+                "node_location(",
+            ] {
+                if text.contains(pat) && !ALLOWED.iter().any(|(f, p, _)| *f == func && *p == pat) {
+                    bad.push(format!("line {}: `{pat}` in fn {func}", n + 1));
+                }
+            }
+            // A message that formats a raw line must say so here too.
+            if text.contains("line {")
+                && !matches!(
+                    func.as_str(),
+                    "what_if" | "stmt_phrase" | "line" | "side_outcome"
+                )
+            {
+                bad.push(format!(
+                    "line {}: a message with `line {{` in fn {func}",
+                    n + 1
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "a line number must reach the output through line_text or PairBases::shifted, and the function be listed in ALLOWED:\n{}",
+            bad.join("\n")
+        );
     }
 }
