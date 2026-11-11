@@ -132,8 +132,8 @@ struct Tree {
     nodes: Vec<Node>,
     /// The `sym` ids of the OUTPUT parameters.
     outs: Vec<String>,
-    /// The `sym` ids of the locals.
-    locals: Vec<String>,
+    /// The `sym` ids of the locals, with the declared type each starts with.
+    locals: Vec<(String, Term)>,
     /// The masked text of every assignment, sorted.
     assigns: Vec<String>,
     /// The literals of every condition, sorted.
@@ -297,7 +297,7 @@ fn int_range(ty: &str) -> Option<(i128, i128)> {
 /// of known length. Anything else (arithmetic, CAST, a call, a subquery, a
 /// narrowing or unknown type) is refused: the assignment would be a hidden
 /// way for the routine to fail.
-fn total_assignment(u: &Unit, target: &str, e: &Expr) -> bool {
+fn total_assignment(u: &Unit, target: &str, e: &Expr, national: bool) -> bool {
     let Some(dst) = declared(u, target) else {
         return false;
     };
@@ -310,14 +310,28 @@ fn total_assignment(u: &Unit, target: &str, e: &Expr) -> bool {
             _ => false,
         },
         Expr::Str(s) => {
-            matches!(dst_name.as_str(), "varchar" | "nvarchar" | "char" | "nchar")
-                && match dst.args.as_slice() {
-                    [len] if len.eq_ignore_ascii_case("max") => {
-                        dst_name.starts_with('v') || dst_name.starts_with("nv")
-                    }
-                    [len] => len.parse::<usize>().is_ok_and(|l| s.chars().count() <= l),
-                    _ => false,
-                }
+            let wide = matches!(dst_name.as_str(), "nvarchar" | "nchar");
+            if !wide && !matches!(dst_name.as_str(), "varchar" | "char") {
+                return false;
+            }
+            // What a non-ASCII character becomes in a varchar (or in an
+            // N-less literal) depends on the database's code page, and a
+            // varchar length counts bytes of the collation's encoding: only
+            // ASCII is read for those. A national literal into a wide type
+            // is counted in UTF-16 code units, which is what the length of
+            // nvarchar counts.
+            if !s.is_ascii() && (!wide || !national) {
+                return false;
+            }
+            if national && !wide && !s.is_ascii() {
+                return false;
+            }
+            let units = s.encode_utf16().count();
+            match dst.args.as_slice() {
+                [len] if len.eq_ignore_ascii_case("max") => true,
+                [len] => len.parse::<usize>().is_ok_and(|l| units <= l),
+                _ => false,
+            }
         }
         _ => false,
     }
@@ -358,48 +372,89 @@ fn exits(nodes: &[Node]) -> bool {
 
 /// Lowers a condition to its skeleton. Every comparison must be total
 /// (`Canon::raise_free` on the whole condition) and between plain operands.
-fn cond_of(c: &mut Canon, e: &Expr) -> Result<Cond, String> {
-    fn operand(c: &mut Canon, x: &Expr) -> Result<Term, String> {
-        match x {
-            Expr::Var(v) if !v.starts_with("@@") => {}
-            Expr::Num(_) | Expr::Str(_) | Expr::Null => {}
-            _ => return Err("path:raising-guard".into()),
-        }
-        c.expr(x)
-            .map(|(t, _)| t)
-            .map_err(|_| "path:raising-guard".to_string())
-    }
-    fn go(c: &mut Canon, e: &Expr) -> Result<Cond, String> {
-        match e {
-            Expr::Bin(o, l, r) if o.eq_ignore_ascii_case("AND") => {
-                Ok(Cond::And(Box::new(go(c, l)?), Box::new(go(c, r)?)))
-            }
-            Expr::Bin(o, l, r) if o.eq_ignore_ascii_case("OR") => {
-                Ok(Cond::Or(Box::new(go(c, l)?), Box::new(go(c, r)?)))
-            }
-            Expr::Unary(o, x) if o.eq_ignore_ascii_case("NOT") => {
-                Ok(Cond::Not(Box::new(go(c, x)?)))
-            }
-            Expr::IsNull(x, neg) => Ok(Cond::IsNull(operand(c, x)?, *neg)),
-            Expr::Bin(o, l, r) => {
-                let op = match o.as_str() {
-                    "=" => "=",
-                    "<>" | "!=" => "<>",
-                    "<" => "<",
-                    ">" => ">",
-                    "<=" => "<=",
-                    ">=" => ">=",
-                    _ => return Err("path:raising-guard".into()),
-                };
-                Ok(Cond::Cmp(op, operand(c, l)?, operand(c, r)?))
-            }
-            _ => Err("path:raising-guard".into()),
-        }
-    }
+fn cond_of(c: &mut Canon, e: &Expr, nat: &[bool]) -> Result<Cond, String> {
     if !c.raise_free(e) {
         return Err("path:raising-guard".into());
     }
-    go(c, e)
+    let mut it = Flags {
+        nat: nat.iter().copied(),
+        used: 0,
+    };
+    let cond = cond_go(c, e, &mut it)?;
+    // A condition the lowering made up (the severity test of a RAISERROR)
+    // has no literal of its own: the tokens are the statement's.
+    if it.used != 0 && it.used != nat.len() {
+        return Err("path:raising-guard".into());
+    }
+    Ok(cond)
+}
+
+/// The string literals of a condition in source order, each with whether it
+/// was written `N'..'`: the term of a literal does not keep the prefix, so
+/// the operand carries it.
+struct Flags<I: Iterator<Item = bool>> {
+    nat: I,
+    used: usize,
+}
+
+fn operand<I: Iterator<Item = bool>>(
+    c: &mut Canon,
+    x: &Expr,
+    f: &mut Flags<I>,
+) -> Result<Term, String> {
+    match x {
+        Expr::Var(v) if !v.starts_with("@@") => {}
+        Expr::Num(_) | Expr::Str(_) | Expr::Null => {}
+        _ => return Err("path:raising-guard".into()),
+    }
+    let t = c
+        .expr(x)
+        .map(|(t, _)| t)
+        .map_err(|_| "path:raising-guard".to_string())?;
+    if matches!(x, Expr::Str(_)) {
+        f.used += 1;
+        let Some(national) = f.nat.next() else {
+            return Err("path:raising-guard".into());
+        };
+        return Ok(flag(national, t));
+    }
+    Ok(t)
+}
+
+fn cond_go<I: Iterator<Item = bool>>(
+    c: &mut Canon,
+    e: &Expr,
+    f: &mut Flags<I>,
+) -> Result<Cond, String> {
+    match e {
+        Expr::Bin(o, l, r) if o.eq_ignore_ascii_case("AND") => Ok(Cond::And(
+            Box::new(cond_go(c, l, f)?),
+            Box::new(cond_go(c, r, f)?),
+        )),
+        Expr::Bin(o, l, r) if o.eq_ignore_ascii_case("OR") => Ok(Cond::Or(
+            Box::new(cond_go(c, l, f)?),
+            Box::new(cond_go(c, r, f)?),
+        )),
+        Expr::Unary(o, x) if o.eq_ignore_ascii_case("NOT") => {
+            Ok(Cond::Not(Box::new(cond_go(c, x, f)?)))
+        }
+        Expr::IsNull(x, neg) => Ok(Cond::IsNull(operand(c, x, f)?, *neg)),
+        Expr::Bin(o, l, r) => {
+            let op = match o.as_str() {
+                "=" => "=",
+                "<>" | "!=" => "<>",
+                "<" => "<",
+                ">" => ">",
+                "<=" => "<=",
+                ">=" => ">=",
+                _ => return Err("path:raising-guard".into()),
+            };
+            let l = operand(c, l, f)?;
+            let r = operand(c, r, f)?;
+            Ok(Cond::Cmp(op, l, r))
+        }
+        _ => Err("path:raising-guard".into()),
+    }
 }
 
 /// The tree of one routine's unit, or the reason it is not read.
@@ -436,9 +491,10 @@ fn tree(u: &Unit, schema: &Schema) -> Result<Tree, String> {
             match &m.kind {
                 CtlKind::If(Ok(e)) => {
                     c.reset();
-                    let cond = cond_of(&mut c, e)?;
+                    let toks = tokens(&m.node);
+                    let cond = cond_of(&mut c, e, &str_flags(&toks))?;
                     assumed.extend(c.asm.drain(..).map(|x| x.id.to_string()));
-                    for t in tokens(&m.node) {
+                    for t in toks {
                         if matches!(t.kind, K::Num | K::Str) {
                             literals.push(t.text.clone());
                         }
@@ -481,7 +537,9 @@ fn tree(u: &Unit, schema: &Schema) -> Result<Tree, String> {
                     let Expr::Var(v) = target else {
                         return Err("path:unmodelled-write".into());
                     };
-                    if !total_assignment(u, v, e) {
+                    let toks = tokens(&s.node);
+                    let flags = str_flags(toks.get(s.tok_from..).unwrap_or_default());
+                    if flags.len() > 1 || !total_assignment(u, v, e, flags == [true]) {
                         return Err("path:raising-assignment".into());
                     }
                     let t = c
@@ -496,7 +554,12 @@ fn tree(u: &Unit, schema: &Schema) -> Result<Tree, String> {
                         .and_then(|k| k.kid(0))
                         .and_then(Term::atom)
                         .unwrap_or("");
-                    Node::Assign(id.to_string(), t.kids()[1].clone())
+                    let mut val = t.kids()[1].clone();
+                    if matches!(e, Expr::Str(_)) {
+                        val = flag(flags == [true], val);
+                    }
+                    let tag = declared(u, v).map_or_else(|| a("none"), type_tag);
+                    Node::Assign(id.to_string(), n("typed", vec![tag, val]))
                 }
                 Stmt::Return(None) => Node::Return(None),
                 Stmt::Return(Some(e)) => {
@@ -567,7 +630,15 @@ fn tree(u: &Unit, schema: &Schema) -> Result<Tree, String> {
             .filter(|(_, p)| p.out)
             .map(|(k, _)| sym("p", k))
             .collect(),
-        locals: (0..u.locals.len()).map(|k| sym("l", k)).collect(),
+        locals: u
+            .locals
+            .iter()
+            .enumerate()
+            .map(|(k, l)| {
+                let tag = l.decl.as_ref().map_or_else(|| a("none"), type_tag);
+                (sym("l", k), n("typed", vec![tag, a("null")]))
+            })
+            .collect(),
         assigns,
         literals,
     })
@@ -597,8 +668,50 @@ fn subst(t: &Term, st: &Store) -> Term {
     })
 }
 
+/// The term under the wrappers the store puts around a value: the declared
+/// type of the variable it went through (`typed`), and whether a string
+/// literal was national (`nat`) or not (`narrow`).
+fn core(t: &Term) -> &Term {
+    let mut t = t;
+    while matches!(t.head(), "typed" | "nat" | "narrow") {
+        match t.kids().last() {
+            Some(k) => t = k,
+            None => break,
+        }
+    }
+    t
+}
+
+/// The declared type as the store tags a value with: name and arguments,
+/// lower case.
+fn type_tag(t: &Type) -> Term {
+    a(format!(
+        "{}({})",
+        t.name.to_lowercase(),
+        t.args
+            .iter()
+            .map(|x| x.to_lowercase())
+            .collect::<Vec<_>>()
+            .join(",")
+    ))
+}
+
+/// A string value marked national (`N'..'`) or not.
+fn flag(national: bool, t: Term) -> Term {
+    n(if national { "nat" } else { "narrow" }, vec![t])
+}
+
+/// The tokens of a statement or condition that are string literals, each
+/// with whether it is national.
+fn str_flags(toks: &[super::ast::Tok]) -> Vec<bool> {
+    toks.iter()
+        .filter(|t| t.kind == K::Str)
+        .map(|t| t.text.starts_with(['N', 'n']))
+        .collect()
+}
+
 fn is_literal(t: &Term) -> bool {
-    matches!(t.head(), "num" | "str")
+    matches!(core(t).head(), "num" | "str")
 }
 
 /// The truth of a condition under the store and a partial valuation, or the
@@ -681,7 +794,7 @@ fn eval(c: &Cond, st: &Store, v: &Valuation, ansi: bool) -> Result<Tri, AtomKey>
 
 /// Whether the term is NULL: known for a literal, otherwise an atom.
 fn nullness(t: &Term, v: &Valuation) -> Result<bool, AtomKey> {
-    if t.atom() == Some("null") {
+    if core(t).atom() == Some("null") {
         return Ok(true);
     }
     if is_literal(t) {
@@ -736,8 +849,8 @@ fn run(
 
 fn trace(t: &Tree, v: &Valuation, ansi: bool, visits: &mut u64) -> Result<Outcome, AtomKey> {
     let mut st = Store::new();
-    for l in &t.locals {
-        st.insert(l.clone(), a("null"));
+    for (l, init) in &t.locals {
+        st.insert(l.clone(), init.clone());
     }
     let mut events = Vec::new();
     let mut exit = None;
@@ -1071,6 +1184,34 @@ mod tests {
             let r = prove_sql(&a, &b);
             let why = r.expect_err(extra);
             assert!(why.starts_with(reason), "{extra}: {why}");
+        }
+    }
+
+    /// A literal assigned to a variable is read only where its value does
+    /// not depend on the code page, the prefix or the declared length.
+    #[test]
+    fn string_assignments_are_read_only_when_their_value_is_certain() {
+        let ins = "INSERT INTO dbo.Orders (Note) VALUES (@x);";
+        let flat =
+            |decl: &str, lit: &str| format!("{decl} SET @x = {lit}; IF @a > 0 AND @b > 0 {ins}");
+        let nested = |decl: &str, lit: &str| {
+            format!("{decl} SET @x = {lit}; IF @a > 0 BEGIN IF @b > 0 {ins} END")
+        };
+        // ASCII into a long enough variable: proved.
+        let ok = |d: &str, l: &str| prove_sql(&nested(d, l), &flat(d, l));
+        assert_eq!(ok("DECLARE @x varchar(5);", "'abc'"), Ok(()));
+        assert_eq!(ok("DECLARE @x nvarchar(3);", "N'abc'"), Ok(()));
+        assert_eq!(ok("DECLARE @x nvarchar(2);", "N'😀'"), Ok(()));
+        // Code page or length dependent: refused.
+        for (d, l) in [
+            ("DECLARE @x varchar(5);", "'ж'"),
+            ("DECLARE @x varchar(5);", "N'ж'"),
+            ("DECLARE @x nvarchar(5);", "'ж'"),
+            ("DECLARE @x nvarchar(1);", "N'😀'"),
+            ("DECLARE @x varchar(2);", "'abc'"),
+        ] {
+            let why = ok(d, l).expect_err(l);
+            assert_eq!(why, "path:raising-assignment", "{d} {l}");
         }
     }
 

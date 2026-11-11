@@ -27,7 +27,7 @@ const T: Dialect = Dialect::Tsql;
 
 const DDL: &str = "
 CREATE TABLE dbo.Item (ItemId int NOT NULL PRIMARY KEY, Price money NOT NULL);
-CREATE TABLE dbo.Orders (CustomerId int NULL, Qty int NULL, Total money NULL, Note varchar(100) NULL);
+CREATE TABLE dbo.Orders (CustomerId int NULL, Qty int NULL, Total money NULL, Note varchar(100) NULL, NNote nvarchar(100) NULL);
 CREATE TABLE dbo.Stock (ItemId int NOT NULL PRIMARY KEY, Qty int NOT NULL);
 ";
 
@@ -1391,6 +1391,36 @@ fn path_summaries_never_clear_a_different_pair() {
             "A returns the deleted rows, B does not",
             "DELETE FROM dbo.Stock OUTPUT deleted.ItemId;".into(),
             "DELETE FROM dbo.Stock;".into(),
+        ),
+        (
+            "typed-through-tinyint-against-int",
+            "the result column is tinyint in A and int in B (Y5)",
+            "DECLARE @t tinyint; DECLARE @i int; SET @t = 5; SET @i = 5; IF @a > 0 BEGIN IF @b > 0 SELECT @t AS v; END".into(),
+            "DECLARE @t tinyint; DECLARE @i int; SET @t = 5; SET @i = 5; IF @a > 0 AND @b > 0 SELECT @i AS v;".into(),
+        ),
+        (
+            "surrogate-pair-truncated-by-nvarchar-1",
+            "the emoji is two UTF-16 units: @x (nvarchar(1)) keeps a lone surrogate (Y6)",
+            "DECLARE @x nvarchar(1); DECLARE @y nvarchar(2); SET @x = N'😀'; SET @y = N'😀'; IF @a > 0 BEGIN IF @b > 0 INSERT INTO dbo.Orders (NNote) VALUES (@x); END".into(),
+            "DECLARE @x nvarchar(1); DECLARE @y nvarchar(2); SET @x = N'😀'; SET @y = N'😀'; IF @a > 0 AND @b > 0 INSERT INTO dbo.Orders (NNote) VALUES (@y);".into(),
+        ),
+        (
+            "national-literal-swapped-between-variables",
+            "under a non-UTF-8 code page B stores '?' (Y3)",
+            "DECLARE @x nvarchar(10); DECLARE @y nvarchar(10); SET @x = N'ж'; SET @y = 'ж'; IF @a > 0 BEGIN IF @b > 0 INSERT INTO dbo.Orders (NNote) VALUES (@x); END".into(),
+            "DECLARE @x nvarchar(10); DECLARE @y nvarchar(10); SET @x = 'ж'; SET @y = N'ж'; IF @a > 0 AND @b > 0 INSERT INTO dbo.Orders (NNote) VALUES (@x);".into(),
+        ),
+        (
+            "national-literal-into-varchar-tested-later",
+            "@x holds '?' under a non-UTF-8 code page, so the test differs (Y4)",
+            "DECLARE @x varchar(5); DECLARE @y nvarchar(5); SET @x = N'ж'; SET @y = N'ж'; IF @a > 0 BEGIN IF @x = N'ж' INSERT INTO dbo.Orders (Qty) VALUES (1); END".into(),
+            "DECLARE @x varchar(5); DECLARE @y nvarchar(5); SET @x = N'ж'; SET @y = N'ж'; IF @a > 0 AND @y = N'ж' INSERT INTO dbo.Orders (Qty) VALUES (1);".into(),
+        ),
+        (
+            "non-ascii-varchar-length-counts-bytes",
+            "under a UTF-8 collation 'жж' is 4 bytes: varchar(2) truncates, varchar(4) does not (X7)",
+            "DECLARE @x varchar(2); SET @x = 'жж'; IF @a > 0 BEGIN IF @b > 0 INSERT INTO dbo.Orders (Note) VALUES (@x); END".into(),
+            "DECLARE @x varchar(4); SET @x = 'жж'; IF @a > 0 AND @b > 0 INSERT INTO dbo.Orders (Note) VALUES (@x);".into(),
         ),
         (
             "sysdatetime-shared-against-inlined",
