@@ -147,6 +147,7 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 | file | stage | count |
 |---|---|---|
 | `sqldiff-convert/src/plan.rs` | driver | 1 |
+| `sqldiff-draft/src/tsql/trigger.rs` | pass 1 | 1 |
 | `sqldiff-equiv/src/equiv/mod.rs` | check | 3 |
 
 ### schema fields
