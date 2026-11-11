@@ -84,6 +84,7 @@ const KILLED: &[&str] = &[
     "crates/sqldiff-core/src/bind/query.rs::unknown_column_in@view.origin()",
     "crates/sqldiff-core/src/bind/query.rs::unresolved_bare@view.origin()",
     "crates/sqldiff-core/src/engine.rs::diff_inner@schema_a.list_stars_with(&mut schema_b);",
+    "crates/sqldiff-draft/src/tsql/bits.rs::catalog_types@.map(|c| c.column_types().into_owned())",
     "crates/sqldiff-equiv/src/equiv/call.rs::case_check@.case_check(&key(n, s.d)?, true)",
     "crates/sqldiff-equiv/src/equiv/canon.rs::all_columns@None => self.schema.table_exact(",
     "crates/sqldiff-equiv/src/equiv/canon.rs::col_ty@.table(Self::base_table(table))",

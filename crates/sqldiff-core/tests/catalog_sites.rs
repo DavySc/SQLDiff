@@ -592,7 +592,7 @@ const SOURCE_METHODS: &[(&str, &str)] = &[
     ("column_types", "pass 1 `ColumnTypes`"),
     (
         "column_types_wide",
-        "pass 1 `WholeCatalog` (the narrow form waits for a T3 proof)",
+        "pass 1 `WholeCatalog` (unused; the narrow form is proven by T3)",
     ),
     ("tables", "pass 1 `WholeCatalog`"),
     ("routines", "pass 1 `WholeCatalog`"),
