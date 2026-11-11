@@ -7,8 +7,10 @@
 //! the comparison of different-dialect pairs) can prove equal. This module
 //! decides when that proof may remove the structural findings, and only then.
 //!
-//! The rule is all or nothing for the artifact pair, and it removes nothing it
-//! did not compare:
+//! The rule is all or nothing for the routines it lowers, and it removes nothing
+//! it did not compare. Only the routines that hold a removable finding are
+//! lowered ([`unread_routines`]: the others are blanked on both sides); every
+//! removable finding then lies in a routine that was read:
 //!
 //! - B must be A with variables renamed and tokens reordered and nothing
 //!   else ([`same_tokens`]): the lowering does not compare what a conversion
@@ -230,6 +232,64 @@ fn noted_in_place(a: &Analyzed, b: &Analyzed, sec: &Outcome) -> bool {
         .iter()
         .zip(&sec.noted[1])
         .all(|(&ra, &rb)| slice(&ta, ra) == slice(&tb, rb))
+}
+
+/// The byte ranges of the routines the lowering need not read: when every
+/// removable finding lies inside a routine, on side A inside routine i of A
+/// or on side B inside routine i of B (routines paired by position, which
+/// `same_headers` guarantees to be the same routines), the routines without
+/// one are blanked on both sides and only the others are lowered. A routine
+/// no removable finding names has nothing the proof could clear, and its
+/// unrelated unknown reasons no longer keep another routine's rename from
+/// being cleared. `None` when nothing can be left out: a finding outside
+/// every routine (a script's own statement), a different number of routines,
+/// or every routine holds one.
+pub fn unread_routines(
+    a: &Analyzed,
+    b: &Analyzed,
+    findings: &[Finding],
+) -> Option<(Vec<(usize, usize)>, Vec<(usize, usize)>)> {
+    let ranges = |x: &Analyzed| -> Vec<(usize, usize)> {
+        x.root
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::ROUTINE)
+            .map(|n| {
+                let r = n.text_range();
+                (usize::from(r.start()), usize::from(r.end()))
+            })
+            .collect()
+    };
+    let (ra, rb) = (ranges(a), ranges(b));
+    if ra.is_empty() || ra.len() != rb.len() {
+        return None;
+    }
+    let at = |rs: &[(usize, usize)], l: &crate::model::Location| {
+        rs.iter()
+            .position(|&(s, e)| l.byte_start >= s && l.byte_start < e)
+    };
+    let mut live = vec![false; ra.len()];
+    for f in findings.iter().filter(|f| removable(f)) {
+        let ia = f.a.as_ref().map(|l| at(&ra, l));
+        let ib = f.b.as_ref().map(|l| at(&rb, l));
+        match (ia, ib) {
+            // A side the finding names must sit in a routine, and the
+            // routines must be the same pair.
+            (Some(None), _) | (_, Some(None)) | (None, None) => return None,
+            (Some(Some(i)), Some(Some(j))) if i != j => return None,
+            (Some(Some(i)), _) | (_, Some(Some(i))) => live[i] = true,
+        }
+    }
+    if live.iter().all(|&l| l) {
+        return None;
+    }
+    let pick = |rs: &[(usize, usize)]| -> Vec<(usize, usize)> {
+        rs.iter()
+            .zip(&live)
+            .filter(|(_, &l)| !l)
+            .map(|(&r, _)| r)
+            .collect()
+    };
+    Some((pick(&ra), pick(&rb)))
 }
 
 /// Whether any routine header of `a` names `EXECUTE` (`EXECUTE AS ...`).

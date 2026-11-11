@@ -949,3 +949,60 @@ fn a_guard_reordered_inside_a_scalar_nested_in_a_predicate_is_never_equal() {
         }
     }
 }
+
+/// The second opinion lowers only the routines that hold a removable finding
+/// (`second::unread_routines`): an unchanged routine the lowering cannot
+/// read (here a cursor) no longer keeps another routine's rename from being
+/// cleared, and a routine with a witnessed difference still keeps its own.
+#[test]
+fn only_the_routines_with_findings_are_lowered() {
+    let unread = "CREATE PROCEDURE dbo.Scan AS BEGIN
+    DECLARE c CURSOR FOR SELECT ItemId FROM dbo.Stock;
+    OPEN c; CLOSE c; DEALLOCATE c;
+END
+GO
+";
+    let proc_a = |v: &str| {
+        format!(
+            "CREATE PROCEDURE dbo.Place @q int AS BEGIN DECLARE @{v} int = @q; INSERT INTO dbo.Orders (Qty) VALUES (@{v}); END\nGO\n"
+        )
+    };
+    let lone_a = verdict(&proc_a("a"), &proc_a("b"));
+    assert_eq!(lone_a, Equal, "the rename alone is cleared");
+    for (name, a, b) in [
+        (
+            "unread routine after",
+            format!("{}{unread}", proc_a("a")),
+            format!("{}{unread}", proc_a("b")),
+        ),
+        (
+            "unread routine before",
+            format!("{unread}{}", proc_a("a")),
+            format!("{unread}{}", proc_a("b")),
+        ),
+    ] {
+        let v = verdict(&a, &b);
+        assert_eq!(
+            v, Equal,
+            "{name}: an unchanged routine the lowering cannot read must not block the rename"
+        );
+        let v = verdict(&b, &a);
+        assert_eq!(v, Equal, "{name} (B to A)");
+    }
+    // A witnessed difference elsewhere in the file stays.
+    let different_b = format!(
+        "{}{}",
+        proc_a("b"),
+        "CREATE PROCEDURE dbo.Other AS BEGIN INSERT INTO dbo.Orders (Qty) VALUES (2); END\nGO\n"
+    );
+    let different_a = format!(
+        "{}{}",
+        proc_a("a"),
+        "CREATE PROCEDURE dbo.Other AS BEGIN INSERT INTO dbo.Orders (Qty) VALUES (1); END\nGO\n"
+    );
+    let v = verdict(&different_a, &different_b);
+    assert!(
+        !matches!(v, Equal | Eua),
+        "a changed value in another routine: {v:?}"
+    );
+}
