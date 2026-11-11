@@ -161,6 +161,38 @@ pub struct Model {
     pub no_history: bool,
     /// The target base catalog has a plain table `dbo.t2` (no triggers).
     pub lone_t2: bool,
+    /// The target base catalog's `t2` also has `t2_versioning_truncate`.
+    pub lone_truncate: bool,
+    /// That trigger is on another table of the target base catalog.
+    pub moved_truncate: bool,
+    /// Raw text appended to the PostgreSQL base catalog.
+    pub pg_extra: String,
+}
+
+/// Which base tree the generator starts from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Tree {
+    /// No system-versioned table.
+    Plain,
+    /// A system-versioned table in the tree from the start.
+    Hidden,
+    /// `Hidden`, but the table has no `HISTORY_TABLE` (its CREATE TABLE is
+    /// refused) and the target base catalog has a `t2` with both triggers.
+    Refused,
+}
+
+impl Tree {
+    pub const ALL: [Tree; 3] = [Tree::Plain, Tree::Hidden, Tree::Refused];
+}
+
+impl From<bool> for Tree {
+    fn from(hidden: bool) -> Tree {
+        if hidden {
+            Tree::Hidden
+        } else {
+            Tree::Plain
+        }
+    }
 }
 
 /// The three tables the fixed dependents use.
@@ -188,11 +220,20 @@ impl Model {
     /// [`Model::generate`], and with `hidden` a system-versioned table in
     /// the tree from the start (so a star over a view or table is already
     /// refused where it hides columns).
-    pub fn generate_with(seed: u64, hidden: bool) -> Model {
+    pub fn generate_with(seed: u64, tree: impl Into<Tree>) -> Model {
         let mut m = Model::generate(seed);
-        if hidden {
+        let tree = tree.into();
+        if tree != Tree::Plain {
             m.tables[2].versioned = true;
             m.tables[2].index = Some(2);
+        }
+        if tree == Tree::Refused {
+            // The versioned table has no HISTORY_TABLE, so the rules refuse
+            // its CREATE TABLE and the target tree has no `t2`; the target
+            // base catalog has a `t2` with both versioning triggers.
+            m.no_history = true;
+            m.lone_t2 = true;
+            m.lone_truncate = true;
         }
         m
     }
@@ -355,6 +396,9 @@ impl Model {
             hand: false,
             no_history: false,
             lone_t2: false,
+            lone_truncate: false,
+            moved_truncate: false,
+            pg_extra: String::new(),
         }
     }
 
@@ -498,10 +542,15 @@ impl Model {
                 ));
             }
         }
+        if d == Dialect::Postgres && !self.pg_extra.is_empty() {
+            s.push('\n');
+            s.push_str(&self.pg_extra);
+        }
         if self.lone_t2 && d != Dialect::Tsql {
             // A plain table of the name the converted versioned table has,
-            // with one of its triggers (`t2_versioning`) but not the other
-            // (`t2_versioning_truncate`).
+            // with its trigger `t2_versioning`, and `t2_versioning_truncate`
+            // on it (`lone_truncate`) or on another table (`moved_truncate`)
+            // or nowhere.
             s.push('\n');
             s.push_str(&create_table(
                 &Table {
@@ -517,6 +566,27 @@ impl Model {
                 s.push_str(
                 "CREATE FUNCTION t2_versioning() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;\nCREATE TRIGGER t2_versioning BEFORE UPDATE ON t2 FOR EACH ROW EXECUTE FUNCTION t2_versioning();\n",
                 );
+                let fun = "CREATE FUNCTION t2_versioning_truncate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;\n";
+                let trg = |on: &str| {
+                    format!("CREATE TRIGGER t2_versioning_truncate BEFORE UPDATE ON {on} FOR EACH ROW EXECUTE FUNCTION t2_versioning_truncate();\n")
+                };
+                if self.moved_truncate {
+                    s.push_str(&create_table(
+                        &Table {
+                            schema: "dbo".into(),
+                            name: "Other2".into(),
+                            cols: vec![key()],
+                            index: None,
+                            versioned: false,
+                        },
+                        d,
+                    ));
+                    s.push_str(fun);
+                    s.push_str(&trg("other2"));
+                } else if self.lone_truncate {
+                    s.push_str(fun);
+                    s.push_str(&trg("t2"));
+                }
             }
         }
         if !self.tables.is_empty() {
@@ -992,6 +1062,8 @@ pub enum Edit {
     /// The same, and the target base catalog has a plain `t2` with one of
     /// the two versioning triggers.
     HistoryDroppedLoneTarget,
+    /// The same, with `t2_versioning_truncate` on another table.
+    HistoryDroppedMovedTrigger,
     /// A column of the base catalog (both dialects) changes type.
     BaseRetype,
     /// The fixed table `Sink` (named by one dependent only) has a non-integer `C1`.
@@ -1076,6 +1148,7 @@ pub const ALL_EDITS: &[Edit] = &[
     Edit::VersioningOn,
     Edit::HistoryDropped,
     Edit::HistoryDroppedLoneTarget,
+    Edit::HistoryDroppedMovedTrigger,
     Edit::BaseRetype,
     Edit::RetypeSink,
     Edit::AddStatusRoutine,
@@ -1268,11 +1341,15 @@ impl Edit {
                 m.tables[ti].versioned = true;
                 format!("system versioning on for {tname}")
             }
-            Edit::HistoryDropped | Edit::HistoryDroppedLoneTarget => {
+            Edit::HistoryDropped
+            | Edit::HistoryDroppedLoneTarget
+            | Edit::HistoryDroppedMovedTrigger => {
                 m.tables[2].versioned = true;
                 m.tables[2].index = Some(2);
                 m.no_history = true;
-                m.lone_t2 = matches!(self, Edit::HistoryDroppedLoneTarget);
+                m.lone_t2 = !matches!(self, Edit::HistoryDropped);
+                m.lone_truncate = false;
+                m.moved_truncate = matches!(self, Edit::HistoryDroppedMovedTrigger);
                 "T2 is system-versioned without a HISTORY_TABLE".into()
             }
             Edit::BaseRetype => {
