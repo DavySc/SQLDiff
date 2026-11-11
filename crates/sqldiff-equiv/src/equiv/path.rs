@@ -991,7 +991,7 @@ mod tests {
             (format!("IF @a > 0 {O}"), format!("IF @a > 0 {S}")),
             (format!("IF @a > 0 {O}"), format!("IF @a > 1 {O}")),
             (format!("{O} {S}"), format!("{S} {O}")),
-            (format!("IF @a > 0 {O}"), format!("{O}")),
+            (format!("IF @a > 0 {O}"), O.to_string()),
             (
                 format!("IF @a > 0 BEGIN {O} RETURN; END {S}"),
                 format!("IF @a > 0 {O} {S}"),
@@ -1008,7 +1008,7 @@ mod tests {
             ),
             ("SET @o = @a;".to_string(), "SET @o = @b;".to_string()),
             (format!("{O} RETURN 1;"), format!("{O} RETURN 2;")),
-            (format!("{O}"), format!("{O} RETURN 0;")),
+            (O.to_string(), format!("{O} RETURN 0;")),
         ];
         for (a, b) in pairs {
             assert!(prove_sql(&a, &b).is_err(), "{a} / {b}");
@@ -1018,7 +1018,7 @@ mod tests {
 
     #[test]
     fn a_dropped_output_assignment_is_not_proved() {
-        let r = prove_sql(&format!("SET @o = 1; {O}"), &format!("{O}"));
+        let r = prove_sql(&format!("SET @o = 1; {O}"), O);
         assert!(r.is_err());
         let r = prove_sql(&format!("SET @o = @a; {O}"), &format!("SET @o = @a; {O}"));
         assert_eq!(r, Ok(()));
