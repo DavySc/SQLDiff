@@ -384,6 +384,14 @@ impl Model {
         }
         if !self.no_procs {
             out.extend(dependents());
+            // A file whose conversion depends on the catalog only through the
+            // types its columns have: whether the catalog holds a `bit` column
+            // anywhere decides how `CAST(.. AS bit) = 1` is written (no table is
+            // named, so no table is read). The base model has no `bit` column.
+            out.push((
+                "routines/BitGate.sql".into(),
+                "CREATE PROCEDURE dbo.BitGate @x int AS\nBEGIN\n  IF CAST(@x AS bit) = 1 SELECT 1;\nEND\nGO\n".into(),
+            ));
         }
         // A file that stays as it is whatever the edits do, and whose
         // statements call things the tree does not define: whether the
@@ -953,6 +961,9 @@ pub enum Edit {
     /// The target output of the table T0 is written by hand (it has a
     /// column the source table does not).
     HandWritten,
+    /// The first `bit` column of the catalog appears, in a table nothing
+    /// names: only `ColumnTypes` (pass 1) changes for most drafts.
+    AddBitColumn,
 }
 
 pub const ALL_EDITS: &[Edit] = &[
@@ -1000,6 +1011,7 @@ pub const ALL_EDITS: &[Edit] = &[
     Edit::TargetBaseTriggerEvent,
     Edit::VersioningToggle,
     Edit::HandWritten,
+    Edit::AddBitColumn,
 ];
 
 impl Edit {
@@ -1235,6 +1247,11 @@ impl Edit {
             Edit::TargetBaseTriggerEvent => {
                 m.tr1_target_update = true;
                 "the target base trigger tr1 fires on UPDATE".into()
+            }
+            Edit::AddBitColumn => {
+                let t = m.tables.iter().position(|t| t.name == "X0").unwrap_or(0);
+                m.tables[t].cols.push(col("Flag", "bit", true));
+                "add bit column Flag to X0".into()
             }
             Edit::HandWritten => {
                 m.hand = true;

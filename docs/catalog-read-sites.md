@@ -247,7 +247,7 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 | `triggers_named_wide` | pass 1 `WholeCatalog` (the narrow form waits for a T3 proof) |
 | `triggers_named` | pass 1 `TriggersNamed` |
 | `column_types` | pass 1 `ColumnTypes` |
-| `column_types_wide` | pass 1 `WholeCatalog` (the narrow form waits for a T3 proof) |
+| `column_types_wide` | pass 1 `WholeCatalog` (unused; the narrow form is proven by T3) |
 | `tables` | pass 1 `WholeCatalog` |
 | `routines` | pass 1 `WholeCatalog` |
 | `ask` | replay: a pass-1 query again, through the draft's own method |

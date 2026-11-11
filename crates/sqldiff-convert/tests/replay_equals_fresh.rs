@@ -69,6 +69,7 @@ fn recheck_at_most(e: &Edit) -> usize {
         | Edit::NoCatalog
         | Edit::VersioningToggle
         | Edit::HandWritten => usize::MAX / 2,
+        Edit::AddBitColumn => usize::MAX / 2,
         Edit::BaseTriggerEvent | Edit::TargetBaseTriggerEvent => 5,
         Edit::BaseRetype => 6,
         Edit::BaseTable => 5,
@@ -100,6 +101,18 @@ fn drafts_at_most(e: &Edit) -> usize {
         | Edit::TargetBaseTriggerEvent
         | Edit::HandWritten => 0,
         Edit::NoOpComment => 1,
+        // The distinct column types of the catalog (`ColumnTypes`, the one
+        // narrow pass-1 read) do not change when a column of a type the
+        // catalog has already comes, goes (in these trees) or changes its
+        // nullability, default, position or index: the drafts that read
+        // nothing else wide are taken from their entries. As measured: 67
+        // on PostgreSQL, 34 on Db2 for i, of about 93 files.
+        Edit::AddColumn
+        | Edit::AddMixedCaseColumn
+        | Edit::ReorderColumns
+        | Edit::FlipNullability
+        | Edit::ChangeDefault
+        | Edit::ToggleIndex => 68,
         _ => usize::MAX / 2,
     }
 }
@@ -204,6 +217,11 @@ const EXEMPT: &[(Dialect, &str, &str)] = &[
         "no rule reads a column default of another file's table (the default is read only in a table's own file, by the table diff); the recorded `Table` digest still holds it",
     ),
     (Dialect::Db2i, "ChangeDefault", "same"),
+    (
+        Dialect::Db2i,
+        "AddBitColumn",
+        "T-SQL procedure bodies are not converted to Db2 for i (the draft is the source text), so the bit rewrites that follow the catalog's types do not run; `site_switch.rs` kills the `ColumnTypes` read of pass 1 on the PostgreSQL tree",
+    ),
     (
         Dialect::Db2i,
         "ToggleIndex",
