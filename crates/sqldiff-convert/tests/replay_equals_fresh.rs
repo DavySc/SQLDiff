@@ -68,6 +68,9 @@ fn recheck_at_most(e: &Edit) -> usize {
         | Edit::RetypeSide
         | Edit::NoCatalog
         | Edit::VersioningToggle
+        | Edit::HistoryDropped
+        | Edit::HistoryDroppedLoneTarget
+        | Edit::HistoryDroppedMovedTrigger
         | Edit::HandWritten => usize::MAX / 2,
         Edit::AddBitColumn | Edit::RetypeSink | Edit::AddStatusRoutine => usize::MAX / 2,
         Edit::BaseTriggerEvent | Edit::TargetBaseTriggerEvent => 5,

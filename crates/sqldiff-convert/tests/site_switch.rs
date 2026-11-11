@@ -41,7 +41,7 @@ use std::path::PathBuf;
 
 use sqldiff_catalog::record::site_switch;
 use sqldiff_core::Dialect;
-use support::edits::{Edit, Model, Rng, ALL_EDITS};
+use support::edits::{Edit, Model, Rng, Tree, ALL_EDITS};
 use support::harness::{per_file, try_one, try_one_in, try_two_in, Fixture};
 
 const SEED: u64 = 7;
@@ -81,12 +81,29 @@ const KEYED: &[&str] = &[
 /// same table under every spelling of its name; guarded by
 /// [`the_switch_lookups_find_the_table_the_draft_converted`].
 ///
-/// The PostgreSQL side's lookup (`pv.table(&pparts)`) is NOT consumed: a
-/// versioned table whose CREATE TABLE the rules refuse is defined by nothing
-/// in the target tree, so the target base catalog decides the lookup while
-/// the draft's text stays the same (review of this change, with a repro). It
-/// is a GAP until an edit pairs such a table with a target base table that
-/// appears and goes.
+/// The PostgreSQL side's reads in `switches` are not consumed: a versioned
+/// table whose CREATE TABLE the rules refuse is defined by nothing in the
+/// target tree, so the target base catalog decides them while the draft's
+/// text stays the same (review of #471, with a repro).
+///
+/// - The trigger list (`pv.whole().triggers`) is KILLED: from the `Refused`
+///   tree (the versioned table has no `HISTORY_TABLE`, the target base catalog
+///   has `t2` with both versioning triggers) `HistoryDroppedLoneTarget` takes
+///   one trigger away while the source tree stays as it is; a resume that
+///   skipped the record differs from a fresh run
+///   (`a_target_only_change_of_the_versioning_triggers_is_found_by_a_resume`
+///   keeps six such transitions, without a skip, as a test).
+/// - The two table lookups (`pv.table(&pparts)` and the trigger's table) are
+///   DOMINATED by other recorded target reads, not by the source text
+///   changing. Where the table is found, `whole()` runs and records the whole
+///   catalog, whose answer changes with any table or trigger change. Where it
+///   is not found (the target has no `t2`), `whole()` is not reached; the
+///   check's own bound statement `ALTER TABLE T2 ...` records
+///   `SchemaTables("t2")` (the target tables of that name) and the
+///   `Table(T2)` read of the spelling, and the first changes when a `t2`
+///   appears, so the stored result is not taken (traced on the `Refused`
+///   tree after `HistoryDropped`, where the entry of
+///   `dependents/VersioningOff2.sql` holds exactly these target reads).
 const CONSUMED: &[&str] = &[
     "crates/sqldiff-equiv/src/equiv/call.rs::switches@let Lookup::Found(table) = tv.table(&parts) else {",
     "crates/sqldiff-equiv/src/equiv/mod.rs::table_pair@sa.with_ddl(&p.ddl.0, a.dialect()),",
@@ -112,6 +129,7 @@ const KILLED: &[&str] = &[
     "crates/sqldiff-draft/src/tsql/bits.rs::catalog_types@.map(|c| c.column_types().into_owned())",
     "crates/sqldiff-draft/src/tsql/trigger.rs::drop_trigger@let defs = cat.triggers_named(schema, tname);",
     "crates/sqldiff-equiv/src/equiv/call.rs::case_check@.case_check(&key(n, s.d)?, true)",
+    "crates/sqldiff-equiv/src/equiv/call.rs::switches@let triggers = &pv.whole().triggers;",
     "crates/sqldiff-equiv/src/equiv/canon.rs::all_columns@None => self.schema.table_exact(",
     "crates/sqldiff-equiv/src/equiv/canon.rs::col_ty@.table(Self::base_table(table))",
     "crates/sqldiff-equiv/src/equiv/canon.rs::fold_check@(Some(x), None) => schema.case_check(x, false)?,",
@@ -151,6 +169,8 @@ const REDUNDANT: &[&str] = &[
 const DOMINATED: &[&str] = &[
     "crates/sqldiff-core/src/bind/query.rs::lookup_table_silent@_ => match self.input.view.table(parts) {",
     "crates/sqldiff-equiv/src/equiv/canon.rs::visible_star@b.derived.is_none() && self.schema.is_star_view(&lc(Self::base_table(&b.table)))",
+    "crates/sqldiff-equiv/src/equiv/call.rs::switches@let pt = match pv.table(&pparts) {",
+    "crates/sqldiff-equiv/src/equiv/call.rs::switches@matches!(pv.table(&parts), Lookup::Found(tt) if std::ptr::eq(tt, pt))",
     "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(n), true)?;#2",
     "crates/sqldiff-equiv/src/equiv/ddl.rs::case_check@schema.case_check(&stored(n), x.kind == \"TABLE\")?;",
     "crates/sqldiff-equiv/src/equiv/trigger.rs::pairs_for@.with_images(&tr.table, &names)",
@@ -159,8 +179,11 @@ const DOMINATED: &[&str] = &[
 
 /// Sites whose read sets change but that no generated edit kills: work for
 /// the generator.
-const GAP: &[&str] =
-    &["crates/sqldiff-equiv/src/equiv/call.rs::switches@match pv.table(&pparts) {"];
+const GAP: &[&str] = &[];
+
+/// The site switch is global: a test that lists the sites of a run, and one
+/// that resumes a run (which replays reads from other places), take turns.
+static SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -224,7 +247,7 @@ fn keys_of(sites: &BTreeSet<site_switch::Site>) -> BTreeMap<site_switch::Site, S
     out
 }
 
-fn model_with(edit: Option<&Edit>, hidden: bool) -> Model {
+fn model_with(edit: Option<&Edit>, hidden: Tree) -> Model {
     let mut m = Model::generate_with(SEED, hidden);
     if let Some(e) = edit {
         let mut r = Rng::new(SEED ^ 0xA5A5);
@@ -238,7 +261,7 @@ fn model_with(edit: Option<&Edit>, hidden: bool) -> Model {
 /// file's read set).
 fn run_tree(
     to: Dialect,
-    hidden: bool,
+    hidden: Tree,
     edit: Option<&Edit>,
 ) -> (BTreeSet<String>, Vec<site_switch::Site>) {
     let (ids, seen, _) = run_tree_with_reads(to, hidden, edit);
@@ -267,7 +290,7 @@ type Reference = (
 /// [`run_tree`], and the questions of each entry (for a diagnosis).
 fn run_tree_with_reads(
     to: Dialect,
-    hidden: bool,
+    hidden: Tree,
     edit: Option<&Edit>,
 ) -> (
     BTreeSet<String>,
@@ -281,7 +304,7 @@ fn run_tree_with_reads(
 /// [`run_tree_with_reads`], and the answers too.
 fn run_tree_answers(
     to: Dialect,
-    hidden: bool,
+    hidden: Tree,
     edit: Option<&Edit>,
 ) -> (
     BTreeSet<String>,
@@ -289,7 +312,7 @@ fn run_tree_answers(
     BTreeMap<String, Vec<String>>,
     Answers,
 ) {
-    let f = Fixture::new(&format!("t3-{to:?}-{hidden}-{edit:?}"), to);
+    let f = Fixture::new(&format!("t3-{to:?}-{hidden:?}-{edit:?}"), to);
     f.write(&model_with(edit, hidden));
     f.run("res", false);
     let seen = site_switch::seen();
@@ -437,7 +460,7 @@ fn run_tree_answers(
 fn base_sites() -> BTreeSet<site_switch::Site> {
     let mut all = BTreeSet::new();
     for &d in DIALECTS {
-        for hidden in [false, true] {
+        for hidden in Tree::ALL {
             site_switch::discover();
             run_tree(d, hidden, None);
             all.extend(site_switch::seen());
@@ -489,6 +512,33 @@ fn the_switch_lookups_find_the_table_the_draft_converted() {
     }
 }
 
+/// A versioned table whose CREATE TABLE is refused (no `HISTORY_TABLE`) leaves
+/// the target tree without it: the switch is not compared, whether the target
+/// base catalog has no such table or a plain one with only one of the two
+/// versioning triggers.
+#[test]
+fn a_switch_of_a_table_the_target_does_not_have_is_not_compared() {
+    for (edit, why) in [
+        (Edit::HistoryDropped, "has no table"),
+        (
+            Edit::HistoryDroppedLoneTarget,
+            "has no trigger t2_versioning_truncate",
+        ),
+    ] {
+        let f = Fixture::new(&format!("switch-refused-{edit:?}"), Dialect::Postgres);
+        let mut m = Model::generate_with(SEED, true);
+        edit.apply(&mut m, &mut Rng::new(SEED ^ 0xA5A5));
+        f.write(&m);
+        f.run("a", true);
+        let files = per_file(&f.dir.join("a"));
+        let text = files.get("dependents/VersioningOff2.sql").unwrap();
+        let (report, _) = text.split_once('\n').unwrap();
+        let j: serde_json::Value = serde_json::from_str(report).unwrap();
+        assert_eq!(j["status"], "unproven", "{edit:?}: {report}");
+        assert!(report.contains(why), "{edit:?}: {report}");
+    }
+}
+
 #[test]
 fn the_layer_ambiguity_is_read_only_through_table_exact() {
     let text = std::fs::read_to_string(root().join("crates/sqldiff-equiv/src/equiv/schema.rs"))
@@ -536,10 +586,10 @@ const CHAIN_FIRST: &[Edit] = &[
 /// a resume different from the fresh run.
 fn chain_kill(
     site: &site_switch::Site,
-    trees: &[(Dialect, bool, Option<&Edit>)],
+    trees: &[(Dialect, Tree, Option<&Edit>)],
     reference: &[Reference],
 ) -> Option<String> {
-    for (d, h) in DIALECTS.iter().flat_map(|&d| [(d, false), (d, true)]) {
+    for (d, h) in DIALECTS.iter().flat_map(|&d| Tree::ALL.map(|t| (d, t))) {
         if !trees
             .iter()
             .zip(reference)
@@ -553,7 +603,7 @@ fn chain_kill(
                 let r = try_two_in(d, SEED, first, second, h);
                 site_switch::off();
                 if r.is_err() {
-                    return Some(format!("{d:?} hidden={h} {first:?} then {second:?}"));
+                    return Some(format!("{d:?} hidden={h:?} {first:?} then {second:?}"));
                 }
             }
         }
@@ -563,6 +613,7 @@ fn chain_kill(
 
 #[test]
 fn every_site_the_base_tree_reads_from_is_classified_and_the_classified_sites_exist() {
+    let _one = SWITCH.lock().unwrap_or_else(|e| e.into_inner());
     let known: BTreeSet<&str> = KILLED
         .iter()
         .chain(REDUNDANT)
@@ -627,10 +678,10 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
     let only = std::env::var("SQLDIFF_T3_ONLY").ok();
     // The trees: the base and every edit, in both dialects, with and without
     // a system-versioned table in the tree from the start.
-    let trees: Vec<(Dialect, bool, Option<&Edit>)> = DIALECTS
+    let trees: Vec<(Dialect, Tree, Option<&Edit>)> = DIALECTS
         .iter()
         .flat_map(|&d| {
-            [false, true].into_iter().flat_map(move |h| {
+            Tree::ALL.into_iter().flat_map(move |h| {
                 std::iter::once((d, h, None)).chain(ALL_EDITS.iter().map(move |e| (d, h, Some(e))))
             })
         })
@@ -648,7 +699,7 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
     }
     let keys = keys_of(&all);
     assert!(all.len() >= 20, "only {} sites seen", all.len());
-    let mut skipped_base: BTreeMap<(Dialect, bool), BTreeMap<String, BTreeSet<String>>> =
+    let mut skipped_base: BTreeMap<(Dialect, Tree), BTreeMap<String, BTreeSet<String>>> =
         BTreeMap::new();
     let (mut killed, mut redundant, mut gap, mut dom) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -702,7 +753,9 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
                         .flat_map(|(_, q)| q.iter())
                         .collect();
                     let only_gone: Vec<_> = gone.difference(&new).take(4).collect();
-                    println!("  {name}: {d:?} hidden={h} {e:?}: reads that vanish: {only_gone:?}");
+                    println!(
+                        "  {name}: {d:?} hidden={h:?} {e:?}: reads that vanish: {only_gone:?}"
+                    );
                 }
                 break;
             }
@@ -713,8 +766,8 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
             continue;
         }
         let mut by = None;
-        let mut agains: BTreeMap<(Dialect, bool, String), Vec<String>> = BTreeMap::new();
-        'search: for (d, hidden) in DIALECTS.iter().flat_map(|&d| [(d, false), (d, true)]) {
+        let mut agains: BTreeMap<(Dialect, Tree, String), Vec<String>> = BTreeMap::new();
+        'search: for (d, hidden) in DIALECTS.iter().flat_map(|&d| Tree::ALL.map(|t| (d, t))) {
             if !trees
                 .iter()
                 .zip(&reference)
@@ -728,12 +781,12 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
                 site_switch::off();
                 if only.is_some() && std::env::var("SQLDIFF_T3_VERBOSE").is_ok() {
                     println!(
-                        "    {d:?} hidden={hidden} {e:?}: reused {:?}, changed {:?}, again {:?}",
+                        "    {d:?} hidden={hidden:?} {e:?}: reused {:?}, changed {:?}, again {:?}",
                         o.reused, o.dependents_changed, o.again
                     );
                 }
                 if o.verdict.is_err() {
-                    by = Some(format!("{d:?} hidden={hidden} {e:?}"));
+                    by = Some(format!("{d:?} hidden={hidden:?} {e:?}"));
                     break 'search;
                 }
                 agains.insert((d, hidden, format!("{e:?}")), o.again);
@@ -806,7 +859,7 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
                         .collect();
                     if !gone.is_empty() {
                         println!(
-                            "    {d:?} hidden={h} {e:?}: result changes for {:?}, vanished {gone:?}, changed {:?}",
+                            "    {d:?} hidden={h:?} {e:?}: result changes for {:?}, vanished {gone:?}, changed {:?}",
                             new.get(PATH),
                             gone.iter()
                                 .filter(|v| old.get(**v) != new.get(**v))
@@ -828,7 +881,7 @@ fn every_site_that_reads_a_catalog_is_classified_by_the_edits() {
                 let paths = new.get(PATH).cloned().unwrap_or_default();
                 if paths.is_empty() || !paths.iter().all(|p| again.contains(p)) {
                     println!(
-                        "  {name}: {d:?} hidden={h} {e:?}: a read of {paths:?} changes, the result changes, and the resumed run does not check the file again"
+                        "  {name}: {d:?} hidden={h:?} {e:?}: a read of {paths:?} changes, the result changes, and the resumed run does not check the file again"
                     );
                     dominated = false;
                     break 'dom;
@@ -964,7 +1017,10 @@ fn reads() {
     });
     for (label, ed) in [("before", None), ("after", Some(e))] {
         let f = Fixture::new("reads", Dialect::Postgres);
-        f.write(&model_with(ed, std::env::var("SQLDIFF_T3_HIDDEN").is_ok()));
+        f.write(&model_with(
+            ed,
+            std::env::var("SQLDIFF_T3_HIDDEN").is_ok().into(),
+        ));
         if let Some(s) = &skip {
             site_switch::skip(s.clone());
         }
@@ -1015,5 +1071,87 @@ fn reads() {
                 }
             }
         }
+    }
+}
+
+/// The target base catalog alone changes (the source tree is fixed: the
+/// versioned table has no `HISTORY_TABLE`, so the target tree has no `t2`):
+/// a resume equals a fresh run, and the switch's result changes, whether the
+/// catalog's `t2` and its two versioning triggers appear, go, lose one or have
+/// one on another table. The reads the check makes of the target catalog
+/// (the table, the list of triggers, the trigger's table) are all recorded.
+#[test]
+fn a_target_only_change_of_the_versioning_triggers_is_found_by_a_resume() {
+    // A resume asks the recorded reads again: not while another test lists
+    // the sites a run reads from.
+    let _one = SWITCH.lock().unwrap_or_else(|e| e.into_inner());
+    let fun = |n: &str| {
+        format!("CREATE FUNCTION {n}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;\n")
+    };
+    let trg = |n: &str, t: &str| {
+        format!("CREATE TRIGGER {n} BEFORE UPDATE ON {t} FOR EACH ROW EXECUTE FUNCTION {n}();\n")
+    };
+    let tbl = "CREATE TABLE t2 (k integer NOT NULL PRIMARY KEY);\n";
+    let both = format!(
+        "{tbl}{}{}{}{}",
+        fun("t2_versioning"),
+        trg("t2_versioning", "t2"),
+        fun("t2_versioning_truncate"),
+        trg("t2_versioning_truncate", "t2")
+    );
+    let one = format!(
+        "{tbl}{}{}",
+        fun("t2_versioning"),
+        trg("t2_versioning", "t2")
+    );
+    let moved = format!(
+        "{tbl}CREATE TABLE other2 (k integer NOT NULL PRIMARY KEY);\n{}{}{}{}",
+        fun("t2_versioning"),
+        trg("t2_versioning", "t2"),
+        fun("t2_versioning_truncate"),
+        trg("t2_versioning_truncate", "other2")
+    );
+    let none = String::new();
+    let cases = [
+        ("none->both", &none, &both),
+        ("both->none", &both, &none),
+        ("both->one", &both, &one),
+        ("one->both", &one, &both),
+        ("both->moved", &both, &moved),
+        ("moved->both", &moved, &both),
+    ];
+    let mk = |extra: &str| {
+        let mut m = Model::generate_with(SEED, Tree::Hidden);
+        m.no_history = true;
+        m.pg_extra = extra.to_string();
+        m
+    };
+    let first_line = |f: &Fixture, dir: &str| {
+        per_file(&f.dir.join(dir))
+            .get("dependents/VersioningOff2.sql")
+            .map(|t| t.lines().next().unwrap_or("").to_string())
+    };
+    for (label, a, b) in cases {
+        let f = Fixture::new(
+            &format!("target-only-{}", label.replace("->", "-to-")),
+            Dialect::Postgres,
+        );
+        f.write(&mk(a));
+        f.run("res", false);
+        let before = first_line(&f, "res");
+        f.write(&mk(b));
+        f.run("res", false);
+        f.run("fre", true);
+        let after = first_line(&f, "fre");
+        assert_ne!(
+            before, after,
+            "{label}: the switch's result does not change"
+        );
+        support::harness::try_compare(
+            &support::harness::tree_of(&f.dir.join("res")),
+            &support::harness::tree_of(&f.dir.join("fre")),
+            label,
+        )
+        .unwrap_or_else(|e| panic!("{label}: the resume differs from a fresh run: {e}"));
     }
 }
