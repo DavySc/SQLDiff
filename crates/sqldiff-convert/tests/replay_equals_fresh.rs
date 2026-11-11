@@ -50,7 +50,7 @@ fn recheck_at_most(e: &Edit) -> usize {
         Edit::ViewBody => 8,
         Edit::ChangeParameterType | Edit::AddSchemaTable => 7,
         Edit::BaseDrop => 8,
-        Edit::DropTrigger | Edit::RetargetTrigger => 6,
+        Edit::DropTrigger | Edit::RetargetTrigger => 4,
         Edit::VersioningOn
         | Edit::DropAllTables
         | Edit::NoProcedures
