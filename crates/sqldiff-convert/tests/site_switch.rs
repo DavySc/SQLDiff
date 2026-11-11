@@ -88,6 +88,7 @@ const KILLED: &[&str] = &[
     "crates/sqldiff-draft/src/tsql.rs::entry_table@let t = cat.table(&parts)?;",
     "crates/sqldiff-draft/src/tsql.rs::routine_in@cat.procedure_named(schema.as_deref(), &proc)",
     "crates/sqldiff-draft/src/tsql/bits.rs::catalog_types@.map(|c| c.column_types().into_owned())",
+    "crates/sqldiff-draft/src/tsql/trigger.rs::drop_trigger@let defs = cat.triggers_named(schema, tname);",
     "crates/sqldiff-equiv/src/equiv/call.rs::case_check@.case_check(&key(n, s.d)?, true)",
     "crates/sqldiff-equiv/src/equiv/canon.rs::all_columns@None => self.schema.table_exact(",
     "crates/sqldiff-equiv/src/equiv/canon.rs::col_ty@.table(Self::base_table(table))",

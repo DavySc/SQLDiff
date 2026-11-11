@@ -85,7 +85,7 @@ fn recheck_at_most(e: &Edit) -> usize {
 /// Pass-1 reads are recorded narrow for the table lookups (`Table(parts)`),
 /// the callee lookup (`ProcedureNamed`) and the type set (`ColumnTypes`);
 /// the sites with no killing generated edit yet (`table_wide`,
-/// `triggers_named_wide`, `tables`) still record `WholeCatalog` and rebuild
+/// `column_owners`, the `temporal.rs` lookups, `tables`) still record `WholeCatalog` and rebuild
 /// on any edit, but this generator's trees do not reach them. Lowering a
 /// bound is how a better recording shows.
 fn drafts_at_most(e: &Edit) -> usize {
