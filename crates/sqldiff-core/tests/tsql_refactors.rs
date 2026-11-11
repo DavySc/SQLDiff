@@ -616,6 +616,30 @@ const NEVER_EQUAL: &[(&str, &str, &str, &str)] = &[
         "SET NOCOUNT OFF; INSERT INTO dbo.Orders (Qty) VALUES (1); SELECT 5; SET NOCOUNT ON; INSERT INTO dbo.Orders (Qty) VALUES (2);",
     ),
     (
+        "nested-ifs-swapped-with-a-raising-condition",
+        "@b = 0: A divides before its guard and raises error 8134, B tests @b <> 0 first and skips",
+        "CREATE PROCEDURE dbo.P @a int, @b int AS BEGIN IF @a / @b > 0 BEGIN IF @b <> 0 INSERT INTO dbo.Orders (Qty) VALUES (1); END END",
+        "CREATE PROCEDURE dbo.P @a int, @b int AS BEGIN IF @b <> 0 BEGIN IF @a / @b > 0 INSERT INTO dbo.Orders (Qty) VALUES (1); END END",
+    ),
+    (
+        "nested-ifs-swapped-with-inner-else",
+        "@a = 0, @b = 1: A takes the outer ELSE-less IF false and does nothing, B reaches its inner ELSE and inserts 2",
+        "CREATE PROCEDURE dbo.P @a int, @b int AS BEGIN IF @a > 0 BEGIN IF @b > 0 INSERT INTO dbo.Orders (Qty) VALUES (1); ELSE INSERT INTO dbo.Orders (Qty) VALUES (2); END END",
+        "CREATE PROCEDURE dbo.P @a int, @b int AS BEGIN IF @b > 0 BEGIN IF @a > 0 INSERT INTO dbo.Orders (Qty) VALUES (1); ELSE INSERT INTO dbo.Orders (Qty) VALUES (2); END END",
+    ),
+    (
+        "not-with-null-in-front-of-a-nested-if",
+        "@a NULL, @b = 1: NOT UNKNOWN is UNKNOWN so A skips; B's `@a IS NULL` is true and inserts",
+        "CREATE PROCEDURE dbo.P @a int, @b int AS BEGIN IF NOT (@a > 0) BEGIN IF @b > 0 INSERT INTO dbo.Orders (Qty) VALUES (1); END END",
+        "CREATE PROCEDURE dbo.P @a int, @b int AS BEGIN IF @a <= 0 OR @a IS NULL BEGIN IF @b > 0 INSERT INTO dbo.Orders (Qty) VALUES (1); END END",
+    ),
+    (
+        "condition-changed-above-a-raising-inner-else",
+        "@a = 0, @b = 1: A skips the outer branch, B enters it and inserts 1",
+        "CREATE PROCEDURE dbo.P @a int, @b int AS BEGIN IF @a > 0 BEGIN IF @b > 0 INSERT INTO dbo.Orders (Qty) VALUES (1); ELSE RAISERROR('x', 16, 1); END END",
+        "CREATE PROCEDURE dbo.P @a int, @b int AS BEGIN IF @a >= 0 BEGIN IF @b > 0 INSERT INTO dbo.Orders (Qty) VALUES (1); ELSE RAISERROR('x', 16, 1); END END",
+    ),
+    (
         "divide-after-its-guard",
         "@y = 0: A is false at the guard and never divides, B raises error 8134",
         "CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN IF @y <> 0 AND @x / @y > 1 SELECT 1; END",
@@ -847,10 +871,22 @@ fn an_if_reshaped_around_a_nested_condition_has_no_branch_witness() {
             "IF @a > 0 AND @b > 0 INSERT INTO dbo.Orders (Qty) VALUES (1);",
         ),
         (
-            "guard-clause-to-if-else",
-            "both raise for a NULL or non-positive @a and insert otherwise",
+            "guard-clause-without-else",
+            "both raise for a NULL or non-positive @a and do nothing else; both insert otherwise",
+            "IF @a IS NULL OR @a <= 0 BEGIN RAISERROR('bad', 16, 1); RETURN; END INSERT INTO dbo.Orders (Qty) VALUES (@a);",
+            "IF @a > 0 INSERT INTO dbo.Orders (Qty) VALUES (@a); ELSE RAISERROR('bad', 16, 1);",
+        ),
+        (
+            "guard-clause-with-blocks",
+            "as above (this pair already had no equiv.edit finding before the change)",
             "IF @a IS NULL OR @a <= 0 BEGIN RAISERROR('bad', 16, 1); RETURN; END; INSERT INTO dbo.Orders (Qty) VALUES (@a);",
             "IF @a > 0 BEGIN INSERT INTO dbo.Orders (Qty) VALUES (@a); END ELSE BEGIN RAISERROR('bad', 16, 1); RETURN; END",
+        ),
+        (
+            "early-return-to-if-else",
+            "@a > 0: both insert 1 and the second insert is skipped by RETURN or by the ELSE; otherwise both insert 2",
+            "IF @a > 0 BEGIN INSERT INTO dbo.Orders (Qty) VALUES (1); RETURN; END INSERT INTO dbo.Orders (Qty) VALUES (2);",
+            "IF @a > 0 INSERT INTO dbo.Orders (Qty) VALUES (1); ELSE INSERT INTO dbo.Orders (Qty) VALUES (2);",
         ),
     ];
     for (name, why, a, b) in pairs {
