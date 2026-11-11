@@ -100,6 +100,11 @@ pub enum Query {
     /// need to know whether any column could be a `bit`; it changes only when
     /// a type shape appears or disappears, not on every column edit.
     ColumnTypes,
+    /// Pass 1 only (`Side::Draft`): the one procedure of this normalised
+    /// schema (`None` for `dbo` and for no schema) and lower-case name, or
+    /// none when no procedure or more than one matches. What a call's
+    /// callee lookup (`SourceReads::procedure_named`) asks.
+    ProcedureNamed(Option<String>, String),
     /// Pass 1 only (`Side::Draft`): every claim of the tree's table
     /// variables on a temporary table name (`Claims`), as one digest. Asked
     /// of the tree's claims, not of a catalog, so it is replayed by the
@@ -636,6 +641,35 @@ impl<'a> SourceReads<'a> {
         types
     }
 
+    /// The procedure called `name` in `schema` (`dbo` and no schema are the
+    /// same), when exactly one matches, as a case-insensitive name and schema
+    /// comparison would find it. Records [`Query::ProcedureNamed`] with the
+    /// routine (every field) as the answer, so only an edit of that routine,
+    /// or one that makes a second one match, changes it.
+    #[track_caller]
+    pub fn procedure_named(&self, schema: Option<&str>, name: &str) -> Option<&'a Routine> {
+        let norm = |s: Option<&str>| {
+            s.filter(|s| !s.eq_ignore_ascii_case("dbo"))
+                .map(str::to_ascii_lowercase)
+        };
+        let want = norm(schema);
+        let mut hits = self.cat.routines.iter().filter(|r| {
+            r.kind == RoutineKind::Procedure
+                && r.name.eq_ignore_ascii_case(name)
+                && norm(r.schema.as_deref()) == want
+        });
+        let hit = hits.next();
+        let a = match hit {
+            Some(h) if hits.next().is_none() => Some(h),
+            _ => None,
+        };
+        self.rec(
+            || Query::ProcedureNamed(want, name.to_ascii_lowercase()),
+            &a,
+        );
+        a
+    }
+
     /// [`column_types`](Self::column_types), recording `WholeCatalog` instead
     /// of `ColumnTypes`: the sound fallback until a per-site test proves the
     /// narrow query.
@@ -683,6 +717,9 @@ impl<'a> SourceReads<'a> {
             }
             Query::ColumnTypes => {
                 self.column_types();
+            }
+            Query::ProcedureNamed(schema, name) => {
+                self.procedure_named(schema.as_deref(), name);
             }
             Query::WholeCatalog => {
                 self.tables();

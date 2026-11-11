@@ -689,6 +689,21 @@ fn dependents() -> Vec<(String, String)> {
         "StarHidden".into(),
         "INSERT INTO dbo.Sink SELECT * FROM dbo.T1 AS a JOIN dbo.Lone AS b ON a.Id = b.Id".into(),
     );
+    // A fraction assigned to a column of a table that only this statement's
+    // typing looks up (`entry_table`): T-SQL truncates it, so the converted
+    // text wraps it in `trunc()` while the column is an integer.
+    // `RetypeSink` makes `Sink.C1` a decimal, and `AddTable` makes `Fresh`.
+    add(
+        "UpdateFractionSink".into(),
+        "UPDATE dbo.Sink SET C1 = 1.5 WHERE Id = @x".into(),
+    );
+    add(
+        "UpdateFractionFresh".into(),
+        "UPDATE dbo.Fresh SET C0 = 1.5 WHERE Id = @x".into(),
+    );
+    // A call of a procedure that returns a status gets a `return_code`
+    // argument (`AddStatusRoutine` defines it).
+    add("CallStatus".into(), "EXEC dbo.Status @x".into());
     add(
         "InsertNoListSink".into(),
         "INSERT INTO dbo.Sink VALUES (1, N'a', 1, NULL)".into(),
@@ -872,8 +887,14 @@ fn routine(r: &Routine) -> String {
             r.name, r.param, r.reads
         );
     }
+    // `Status` is the one procedure that returns a value (a status).
+    let ret = if r.name == "Status" {
+        "  RETURN 1;\n"
+    } else {
+        ""
+    };
     format!(
-        "CREATE PROCEDURE dbo.{} @x {}\nAS\nBEGIN\n  SET NOCOUNT ON;\n  INSERT INTO dbo.Sink (Id) VALUES (@x);\nEND\nGO\n",
+        "CREATE PROCEDURE dbo.{} @x {}\nAS\nBEGIN\n  SET NOCOUNT ON;\n  INSERT INTO dbo.Sink (Id) VALUES (@x);\n{ret}END\nGO\n",
         r.name, r.param
     )
 }
@@ -913,6 +934,10 @@ pub enum Edit {
     VersioningOn,
     /// A column of the base catalog (both dialects) changes type.
     BaseRetype,
+    /// The fixed table `Sink` (named by one dependent only) has a non-integer `C1`.
+    RetypeSink,
+    /// A procedure that returns a status appears (its callers get `return_code`).
+    AddStatusRoutine,
     /// The base catalog gains a table a dependent reads.
     BaseTable,
     /// The base catalog loses its table.
@@ -989,6 +1014,8 @@ pub const ALL_EDITS: &[Edit] = &[
     Edit::DropTrigger,
     Edit::VersioningOn,
     Edit::BaseRetype,
+    Edit::RetypeSink,
+    Edit::AddStatusRoutine,
     Edit::BaseTable,
     Edit::BaseDrop,
     Edit::SplitBase,
@@ -1176,6 +1203,24 @@ impl Edit {
             Edit::BaseRetype => {
                 m.base[0].cols[1].ty = "int".into();
                 "base catalog: ext.Ref.Note becomes int".into()
+            }
+            Edit::AddStatusRoutine => {
+                m.routines.push(Routine {
+                    name: "Status".into(),
+                    reads: "T2".into(),
+                    param: "int".into(),
+                    function: false,
+                });
+                "add routine Status (returns a status)".into()
+            }
+            Edit::RetypeSink => {
+                let sink = m
+                    .tables
+                    .iter_mut()
+                    .find(|t| t.name == "Sink")
+                    .expect("the fixed table Sink");
+                sink.cols[2].ty = "decimal(10,2)".into();
+                "Sink.C1 becomes decimal(10,2)".into()
             }
             Edit::BaseTable => {
                 m.base.push(Table {
