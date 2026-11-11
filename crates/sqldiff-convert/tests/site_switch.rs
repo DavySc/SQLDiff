@@ -66,7 +66,24 @@ const KEYED: &[&str] = &[
 /// without that consumer, so no edit can show it (measured: the lookalike
 /// edits flip the flag and change nothing the file says). Guarded by
 /// [`the_layer_ambiguity_is_read_only_through_table_exact`].
+///
+/// The two `switches` lookups (the T-SQL side's versioned table and the
+/// PostgreSQL side's converted table) are the check's repeat of the draft's
+/// own `alter_versioning` lookups: the check runs only on a statement the
+/// draft converted, and the draft converts it only when the source catalog
+/// shows the table created with the period and history table the statement
+/// names (the very conditions `switches` repeats), so a source catalog
+/// change that flips the check's answer changes the draft's text, which is
+/// in the check's key. The converted table of the target side is made by
+/// the converted CREATE TABLE of the same tree, and a base-catalog table of
+/// that name cannot shadow it (measured: TargetOverrides and
+/// TargetLookalikes change no outcome). No generated edit changes either
+/// outcome alone (T3: GAP with the `VersioningOff` dependents added). The
+/// draft and the check must find the same table under every spelling of its
+/// name; guarded by [`the_switch_lookups_find_the_table_the_draft_converted`].
 const CONSUMED: &[&str] = &[
+    "crates/sqldiff-equiv/src/equiv/call.rs::switches@let Lookup::Found(table) = tv.table(&parts) else {",
+    "crates/sqldiff-equiv/src/equiv/call.rs::switches@match pv.table(&pparts) {",
     "crates/sqldiff-equiv/src/equiv/mod.rs::table_pair@sa.with_ddl(&p.ddl.0, a.dialect()),",
     "crates/sqldiff-equiv/src/equiv/mod.rs::table_pair@sb.with_ddl(&p.ddl.1, b.dialect()),",
 ];
@@ -432,6 +449,38 @@ fn per_key(qs: &BTreeMap<String, Vec<String>>) -> BTreeMap<String, BTreeSet<Stri
         out.entry(key).or_default().extend(reads.iter().cloned());
     }
     out
+}
+
+/// The draft looks the versioned table up with plain identifiers and the
+/// check with the spelling's quoting: under the plain, the lower-case and the
+/// bracketed spelling of its name, the draft converts the `ALTER TABLE …
+/// SYSTEM_VERSIONING = OFF` and the check finds both tables, so the
+/// statement is compared and equal under ASM-TEMPORAL-SWITCH (a lookup that
+/// resolved another table would fail the check or refuse the draft).
+#[test]
+fn the_switch_lookups_find_the_table_the_draft_converted() {
+    let f = Fixture::new("switch-spellings", Dialect::Postgres);
+    f.write(&Model::generate_with(SEED, true));
+    f.run("a", true);
+    let files = per_file(&f.dir.join("a"));
+    for name in [
+        "VersioningOff2",
+        "VersioningOffLower",
+        "VersioningOffQuoted",
+    ] {
+        let text = files
+            .get(&format!("dependents/{name}.sql"))
+            .unwrap_or_else(|| panic!("no dependents/{name}.sql"));
+        let (report, sql) = text.split_once('\n').unwrap();
+        let j: serde_json::Value = serde_json::from_str(report).unwrap();
+        assert_eq!(j["status"], "assumptions", "{name}: {report}");
+        assert!(report.contains("ASM-TEMPORAL-SWITCH"), "{name}: {report}");
+        assert!(
+            sql.to_ascii_lowercase()
+                .contains("disable trigger t2_versioning"),
+            "{name} does not switch T2's triggers:\n{sql}"
+        );
+    }
 }
 
 #[test]

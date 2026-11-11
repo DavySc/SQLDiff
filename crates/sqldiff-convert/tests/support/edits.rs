@@ -611,6 +611,13 @@ fn dependents() -> Vec<(String, String)> {
             format!("Positional{k}"),
             format!("INSERT INTO dbo.T{k} VALUES (@x, N'a', 1, '2020-01-01')"),
         );
+        // Switching versioning off reads the table's period and history
+        // table from the source catalog, and the converted table from the
+        // target one (`VersioningOn` / `VersioningToggle`).
+        add(
+            format!("VersioningOff{k}"),
+            format!("ALTER TABLE dbo.T{k} SET (SYSTEM_VERSIONING = OFF)"),
+        );
         add(
             format!("Defaults{k}"),
             format!("INSERT INTO dbo.T{k} (Id) VALUES (@x)"),
@@ -665,6 +672,17 @@ fn dependents() -> Vec<(String, String)> {
             format!("UPDATE t SET C0 = s.C0 FROM dbo.T{k} AS t JOIN dbo.T{n} AS s ON s.C1 = t.C1"),
         );
     }
+    // The same switch, naming the table with other quoting and case: the
+    // draft looks it up with plain identifiers, the equivalence check with
+    // the spelling's quoting.
+    add(
+        "VersioningOffQuoted".into(),
+        "ALTER TABLE [dbo].[t2] SET (SYSTEM_VERSIONING = OFF)".into(),
+    );
+    add(
+        "VersioningOffLower".into(),
+        "ALTER TABLE dbo.t2 SET (SYSTEM_VERSIONING = OFF)".into(),
+    );
     add("DropTr0".into(), "DROP TRIGGER dbo.Tr0".into());
     add("DropTg1".into(), "DROP TRIGGER dbo.Tg1".into());
     add("DropBaseTr1".into(), "DROP TRIGGER dbo.Tr1".into());

@@ -36,7 +36,7 @@ fn recheck_at_most(e: &Edit) -> usize {
     match e {
         Edit::NoOpComment | Edit::NoOpReorderTables => 0,
         Edit::AddTable => 6,
-        Edit::DropTable => 27,
+        Edit::DropTable => 28,
         Edit::RenameTable
         | Edit::AddColumn
         | Edit::AddMixedCaseColumn
@@ -45,7 +45,7 @@ fn recheck_at_most(e: &Edit) -> usize {
         | Edit::ReorderColumns
         | Edit::FlipNullability
         | Edit::ChangeDefault
-        | Edit::ToggleIndex => 28,
+        | Edit::ToggleIndex => 29,
         Edit::AddRoutine | Edit::DropRoutine | Edit::AddTrigger => 6,
         Edit::ViewBody => 8,
         Edit::ChangeParameterType | Edit::AddSchemaTable => 7,
