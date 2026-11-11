@@ -590,6 +590,7 @@ const SOURCE_METHODS: &[(&str, &str)] = &[
     ),
     ("triggers_named", "pass 1 `TriggersNamed`"),
     ("column_types", "pass 1 `ColumnTypes`"),
+    ("procedure_named", "pass 1 `ProcedureNamed`"),
     (
         "column_types_wide",
         "pass 1 `WholeCatalog` (unused; the narrow form is proven by T3)",

@@ -4242,7 +4242,7 @@ impl<'a> Cx<'a> {
             [.., t] => vec![Ident::plain(t.clone())],
             [] => return None,
         };
-        cat.table_wide(&parts)
+        cat.table(&parts)
     }
 
     /// How many of the DELETE's FROM tables have column `name`, by the
@@ -6128,17 +6128,7 @@ impl<'a> Cx<'a> {
             [.., s, p] => (Some(s.clone()), p.clone()),
             [] => return None,
         };
-        let norm = |s: Option<&str>| {
-            s.filter(|s| !s.eq_ignore_ascii_case("dbo"))
-                .map(str::to_ascii_lowercase)
-        };
-        let mut hits = cat.routines().iter().filter(|r| {
-            r.kind == sqldiff_equiv::catalog::RoutineKind::Procedure
-                && r.name.eq_ignore_ascii_case(&proc)
-                && norm(r.schema.as_deref()) == norm(schema.as_deref())
-        });
-        let hit = hits.next()?;
-        hits.next().is_none().then_some(hit)
+        cat.procedure_named(schema.as_deref(), &proc)
     }
 
     /// `sp_addextendedproperty` with literal arguments → `COMMENT ON`. Only
@@ -13118,7 +13108,7 @@ impl Cx<'_> {
             [.., t] => vec![Ident::plain(t.clone())],
             [] => return None,
         };
-        let t = cat.table_wide(&parts)?;
+        let t = cat.table(&parts)?;
         t.columns_known.then_some(t)
     }
 
