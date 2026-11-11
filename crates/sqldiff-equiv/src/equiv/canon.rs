@@ -411,9 +411,11 @@ pub struct Canon<'a> {
     /// an unqualified PostgreSQL call may then be the conversion of a T-SQL
     /// `dbo` function (`user_fn`).
     pub other: Option<Dialect>,
-    /// Lowering the condition of an IF or WHILE (`condition`): the operands
-    /// of its AND / OR run in source order (`binary`).
-    control: bool,
+    /// Lowering a WHERE, ON or HAVING predicate (`pred`): the optimizer
+    /// orders its terms, so the operands of its AND / OR are sorted
+    /// (`binary`). Everywhere else (IF, WHILE, CASE, SET, RETURN, VALUES,
+    /// a select list) they run in source order.
+    in_pred: bool,
     /// The select list of the query lowered last, when its `*` items were
     /// written out (`visible_star`); `None` when it was lowered as written.
     listed: Option<Vec<SelItem>>,
@@ -803,7 +805,7 @@ impl<'a> Canon<'a> {
             known_bytes: Vec::new(),
             stored_values: false,
             other: None,
-            control: false,
+            in_pred: false,
             listed: None,
             names: Vec::new(),
             output: None,
@@ -1592,6 +1594,14 @@ impl<'a> Canon<'a> {
     fn cond(&mut self, e: &Expr) -> R<(Term, Option<Ty>)> {
         let (t, ty) = self.expr(e)?;
         Ok((self.bare_bool(t, ty), ty))
+    }
+
+    /// A WHERE, ON or HAVING predicate (see `in_pred`).
+    fn pred(&mut self, e: &Expr) -> R<(Term, Option<Ty>)> {
+        let was = std::mem::replace(&mut self.in_pred, true);
+        let r = self.cond(e);
+        self.in_pred = was;
+        r
     }
 
     fn bare_bool(&self, t: Term, ty: Option<Ty>) -> Term {
@@ -3876,15 +3886,16 @@ impl<'a> Canon<'a> {
             let mut todo: Vec<&Expr> = vec![r, l];
             // Against another dialect the operands are sorted: neither
             // dialect promises an evaluation order, and a conversion may not
-            // be held to the source's. In the condition of an IF or WHILE of
-            // one dialect the source's order is the one that runs (SQL
-            // Server and PostgreSQL short-circuit these conditions left to
-            // right in practice), so a guard moved behind what it guards
-            // (`@y <> 0 AND @x / @y > 1`) is a change: operands are sorted
-            // there only when none of them can raise. In a query's WHERE, ON
+            // be held to the source's. Within one dialect, outside a WHERE,
+            // ON or HAVING predicate (an IF or WHILE condition, a CASE or
+            // IIF, a SET, RETURN or VALUES expression, a select list) the
+            // source's order is the one that runs (SQL Server short-circuits
+            // these left to right in practice), so a guard moved behind what
+            // it guards (`@y <> 0 AND @x / @y > 1`) is a change: operands are
+            // sorted there only when none of them can raise. In a WHERE, ON
             // or HAVING the optimizer orders the predicates, so they are
             // sorted as before.
-            let same = self.other == Some(self.d) && self.control;
+            let same = self.other == Some(self.d) && !self.in_pred;
             let mut sortable = true;
             while let Some(side) = todo.pop() {
                 if let Expr::Bin(o, sl, sr) = side {
@@ -4904,7 +4915,7 @@ impl<'a> Canon<'a> {
                 let l = self.table_ref(left)?;
                 let r = self.table_ref(right)?;
                 let on = match on {
-                    Some(e) => self.cond(e)?.0,
+                    Some(e) => self.pred(e)?.0,
                     None => a("-"),
                 };
                 Ok(n("join", vec![a(kind.to_lowercase()), l, r, on]))
@@ -5416,7 +5427,7 @@ impl<'a> Canon<'a> {
             items.clear();
         }
         let where_ = match &s.where_ {
-            Some(w) => self.cond(w)?.0,
+            Some(w) => self.pred(w)?.0,
             None => a("-"),
         };
         let mut group = Vec::new();
@@ -5449,7 +5460,7 @@ impl<'a> Canon<'a> {
             a("distinct")
         };
         let having = match &s.having {
-            Some(h) => self.cond(h)?.0,
+            Some(h) => self.pred(h)?.0,
             None => a("-"),
         };
         let order = self.order_terms(&s.order_by, None)?;
@@ -5760,10 +5771,7 @@ impl<'a> Canon<'a> {
             c.rand_seen = 0;
             c.query_depth = 0;
             c.single_row = true;
-            let was = std::mem::replace(&mut c.control, true);
-            let t = c.cond(e);
-            c.control = was;
-            Ok(t?.0)
+            Ok(c.cond(e)?.0)
         })
     }
 
@@ -6087,7 +6095,7 @@ impl<'a> Canon<'a> {
                 let r = (|| {
                     let kv = self.update_sets(&table, sets)?;
                     let w = match where_ {
-                        Some(w) => self.cond(w)?.0,
+                        Some(w) => self.pred(w)?.0,
                         None => a("-"),
                     };
                     Ok(n("update", vec![a(table.clone()), n("set", kv), w]))
@@ -7003,7 +7011,7 @@ impl<'a> Canon<'a> {
         whens: &[super::ast::When],
     ) -> R<Term> {
         // ON: conjunction of target.col = source value.
-        let on_t = self.cond(on)?.0;
+        let on_t = self.pred(on)?.0;
         let conj: Vec<Term> = if on_t.is("and") {
             on_t.kids().to_vec()
         } else {
@@ -7217,7 +7225,7 @@ impl<'a> Canon<'a> {
                 .into_iter()
                 .reduce(|l, r| Expr::Bin("AND".into(), Box::new(l), Box::new(r)))
             {
-                Some(w) => self.cond(&w)?.0,
+                Some(w) => self.pred(&w)?.0,
                 None => a("-"),
             };
             let kv = self.update_sets(&table, sets)?;
@@ -7496,7 +7504,7 @@ impl<'a> Canon<'a> {
                 let table = b.table.clone();
                 self.scopes.last_mut().unwrap().push(b);
                 let w = match where_ {
-                    Some(w) => self.cond(w)?.0,
+                    Some(w) => self.pred(w)?.0,
                     None => a("-"),
                 };
                 return Ok(n("delete", vec![a(table), w]));
