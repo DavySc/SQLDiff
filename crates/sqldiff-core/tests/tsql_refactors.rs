@@ -760,3 +760,74 @@ fn untyped_store_is_not_recorded_for_equal_terms_and_does_not_hide_a_type_change
     let r = run(a, b);
     assert!(!matches!(r.verdict(), Equal | Eua), "{:?}", r.verdict());
 }
+
+const SCALAR_GUARDS: &[(&str, &str, &str, &str)] = &[
+    (
+        "set-case-guard",
+        "@y = 0: A's CASE tests the guard first and never divides, B raises error 8134",
+        "DECLARE @r int; SET @r = CASE WHEN @y <> 0 AND @x / @y > 1 THEN 1 ELSE 0 END; SELECT @r;",
+        "DECLARE @r int; SET @r = CASE WHEN @x / @y > 1 AND @y <> 0 THEN 1 ELSE 0 END; SELECT @r;",
+    ),
+    (
+        "select-case-guard",
+        "@y = 0: B raises error 8134",
+        "SELECT CASE WHEN @y <> 0 AND @x / @y > 1 THEN 1 ELSE 0 END;",
+        "SELECT CASE WHEN @x / @y > 1 AND @y <> 0 THEN 1 ELSE 0 END;",
+    ),
+    (
+        "iif-guard",
+        "@y = 0: B raises error 8134",
+        "DECLARE @r int; SET @r = IIF(@y <> 0 AND @x / @y > 1, 1, 0); SELECT @r;",
+        "DECLARE @r int; SET @r = IIF(@x / @y > 1 AND @y <> 0, 1, 0); SELECT @r;",
+    ),
+    (
+        "insert-values-case-guard",
+        "@y = 0: B raises error 8134",
+        "INSERT INTO dbo.Orders (Qty) VALUES (CASE WHEN @y <> 0 AND @x / @y > 1 THEN 1 ELSE 0 END);",
+        "INSERT INTO dbo.Orders (Qty) VALUES (CASE WHEN @x / @y > 1 AND @y <> 0 THEN 1 ELSE 0 END);",
+    ),
+    (
+        "return-case-guard",
+        "@y = 0: B raises error 8134",
+        "RETURN CASE WHEN @y <> 0 AND @x / @y > 1 THEN 1 ELSE 0 END;",
+        "RETURN CASE WHEN @x / @y > 1 AND @y <> 0 THEN 1 ELSE 0 END;",
+    ),
+];
+
+#[test]
+fn a_guard_reordered_in_a_scalar_expression_is_never_equal() {
+    for (name, why, a, b) in SCALAR_GUARDS {
+        let wrap =
+            |body: &str| format!("CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN {body} END");
+        let (a, b) = (wrap(a), wrap(b));
+        for (x, y, dir) in [(&a, &b, "A to B"), (&b, &a, "B to A")] {
+            let v = verdict(x, y);
+            assert!(
+                !matches!(v, Equal | Eua),
+                "{name} ({dir}): {v:?}; witness: {why}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raise_free_operands_of_a_scalar_expression_may_still_swap() {
+    let wrap = |c: &str| {
+        format!("CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN SELECT CASE WHEN {c} THEN 1 ELSE 0 END; END")
+    };
+    let v = verdict(&wrap("@y <> 0 AND @x > 1"), &wrap("@x > 1 AND @y <> 0"));
+    assert!(matches!(v, Equal | Eua), "{v:?}");
+}
+
+#[test]
+fn where_predicates_keep_sorting_in_a_query() {
+    // The optimizer orders WHERE terms (checked on SQL Server 2022: both forms run).
+    let q = |w: &str| {
+        format!("CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN SELECT Qty FROM dbo.Stock WHERE {w}; END")
+    };
+    let v = verdict(
+        &q("ItemId <> 0 AND Qty / ItemId > 1"),
+        &q("Qty / ItemId > 1 AND ItemId <> 0"),
+    );
+    assert!(matches!(v, Equal | Eua), "{v:?}");
+}
