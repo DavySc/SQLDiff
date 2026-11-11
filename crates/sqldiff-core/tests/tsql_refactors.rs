@@ -15,8 +15,10 @@
 //!
 //! Known gaps visible in the pins: `total-guard-clause` and
 //! `select-into-variable-to-set` are equal in truth and reported `Different`
-//! (statements with no counterpart); `rename-local` and
-//! `swap-and-operands` are equal in truth and reported `Unknown`.
+//! (statements with no counterpart; path summaries, step 2). `rename-local`
+//! and `swap-and-operands` were `Unknown` before step 1 (the second opinion
+//! of the statement lowering, `equiv::second`) and are now `Equal` and
+//! `EqualUnderAssumptions`.
 
 use sqldiff_core::{diff, Artifact, Dialect, Options, Verdict};
 use Verdict::{Different, Equal, EqualUnderAssumptions as Eua, Unknown};
@@ -121,7 +123,7 @@ fn cases() -> Vec<Case> {
             why: "@Price is local; every use is renamed, no caller can see it",
             a: r(),
             b: r().replace("@Price", "@UnitPrice"),
-            pinned: Unknown,
+            pinned: Equal,
         },
         Case {
             name: "swap-and-operands",
@@ -132,7 +134,7 @@ fn cases() -> Vec<Case> {
                 "@Qty > 0 AND @CustomerId IS NOT NULL",
                 "@CustomerId IS NOT NULL AND @Qty > 0",
             ),
-            pinned: Unknown,
+            pinned: Eua,
         },
         Case {
             name: "total-guard-clause",
@@ -298,6 +300,30 @@ fn cases() -> Vec<Case> {
             pinned: Unknown,
         },
         Case {
+            name: "declared-type-precision",
+            truth: Truth::Different,
+            why: "datetime2(7) keeps SYSDATETIME()'s seventh fraction digit, datetime2(6) rounds it away: SELECT @at returns different values",
+            a: "CREATE PROCEDURE dbo.Stamp AS BEGIN DECLARE @at datetime2(7) = SYSDATETIME(); SELECT @at; END".into(),
+            b: "CREATE PROCEDURE dbo.Stamp AS BEGIN DECLARE @at datetime2(6) = SYSDATETIME(); SELECT @at; END".into(),
+            pinned: Unknown,
+        },
+        Case {
+            name: "swap-declared-types",
+            truth: Truth::Different,
+            why: "SELECT @a, @b returns an int then a money in A and a money then an int in B (set a = 1)",
+            a: "CREATE PROCEDURE dbo.Types AS BEGIN DECLARE @a int = 1, @b money = 2; SELECT @a, @b; END".into(),
+            b: "CREATE PROCEDURE dbo.Types AS BEGIN DECLARE @a money = 1, @b int = 2; SELECT @a, @b; END".into(),
+            pinned: Unknown,
+        },
+        Case {
+            name: "swap-subtract-operands",
+            truth: Truth::Different,
+            why: "Qty = 5, Price = 2: A stores 3, B stores -3",
+            a: "CREATE PROCEDURE dbo.Sub @Qty int, @Price int AS BEGIN INSERT INTO dbo.Orders (Qty) VALUES (@Qty - @Price); END".into(),
+            b: "CREATE PROCEDURE dbo.Sub @Qty int, @Price int AS BEGIN INSERT INTO dbo.Orders (Qty) VALUES (@Price - @Qty); END".into(),
+            pinned: Different,
+        },
+        Case {
             name: "narrow-local-type",
             truth: Truth::Different,
             why: "Item 1 has Price 1000.00: money converts into decimal(5,2) with an overflow error in B; or Price 1.2345 stores Total 1.23 * Qty in B",
@@ -443,4 +469,294 @@ fn a_mutant_of_a_refactored_side_is_never_equal() {
             );
         }
     }
+}
+
+/// Step 1 clears structural findings only for a pair whose routine headers
+/// are token-identical (strict same-dialect signature): the same body change
+/// that is cleared above must not be, once the signature moves too. Every
+/// pair here is a caller-visible change and may never come out equal.
+const SIGNATURE_WITNESSES: &[(&str, &str, &str)] = &[
+    (
+        "rename-parameter",
+        "@CustomerId int, @Qty int",
+        "@CustId int, @Qty int",
+    ),
+    (
+        "add-default",
+        "@CustomerId int, @Qty int",
+        "@CustomerId int, @Qty int = 1",
+    ),
+    (
+        "widen-type",
+        "@CustomerId int, @Qty int",
+        "@CustomerId bigint, @Qty int",
+    ),
+    (
+        "add-output",
+        "@CustomerId int, @Qty int",
+        "@CustomerId int, @Qty int OUTPUT",
+    ),
+    (
+        "reorder",
+        "@CustomerId int, @Qty int",
+        "@Qty int, @CustomerId int",
+    ),
+];
+
+#[test]
+fn a_signature_change_next_to_a_cleared_rename_is_never_equal() {
+    let renamed = |params: &str| {
+        place_order(params, "@UnitPrice money", GUARD).replace("@Price", "@UnitPrice")
+    };
+    for (name, from, to) in SIGNATURE_WITNESSES {
+        let a = place_order(from, DECL, GUARD);
+        let b = renamed(to);
+        for (x, y, dir) in [(&a, &b, "A to B"), (&b, &a, "B to A")] {
+            let v = verdict(x, y);
+            assert!(!matches!(v, Equal | Eua), "{name} ({dir}): {v:?}");
+        }
+    }
+}
+
+#[test]
+fn a_rename_beside_a_header_naming_execute_as_is_not_cleared() {
+    // Both headers are identical, so the signature holds; the ownership-chain
+    // premise is only vacuous for two callers' contexts, so a routine that
+    // names EXECUTE keeps the structural findings.
+    for opt in ["WITH EXECUTE AS CALLER", "WITH EXECUTE AS OWNER"] {
+        let with = |p: String| p.replacen("\nAS\n", &format!("\n{opt}\nAS\n"), 1);
+        let a = with(reference());
+        let b = with(reference().replace("@Price", "@UnitPrice"));
+        assert_ne!(a, reference());
+        let v = verdict(&a, &b);
+        assert!(!matches!(v, Equal), "{opt}: {v:?}");
+        assert_eq!(v, Unknown, "{opt}");
+    }
+}
+
+#[test]
+fn the_cleared_rename_names_no_assumption_it_does_not_need() {
+    let opts = Options {
+        catalog_a: vec![Artifact::new("catalog.sql", T, DDL)],
+        catalog_b: vec![Artifact::new("catalog.sql", T, DDL)],
+        ..Options::default()
+    };
+    let r = sqldiff_core::with_engine_stack(|| {
+        diff(
+            &Artifact::new("a.sql", T, reference()),
+            &Artifact::new("b.sql", T, reference().replace("@Price", "@UnitPrice")),
+            &opts,
+        )
+    });
+    let ids: Vec<&str> = r.assumptions.iter().map(|x| x.id.as_str()).collect();
+    assert!(r.findings.is_empty(), "{:?}", r.findings);
+    assert!(
+        !ids.contains(&"ASM-UNTYPED-STORE") && !ids.contains(&"ASM-TSQL-OWNERSHIP-CHAIN"),
+        "{ids:?}"
+    );
+}
+
+#[test]
+fn a_fresh_and_a_repeated_comparison_render_the_same_bytes() {
+    let opts = Options {
+        catalog_a: vec![Artifact::new("catalog.sql", T, DDL)],
+        catalog_b: vec![Artifact::new("catalog.sql", T, DDL)],
+        ..Options::default()
+    };
+    let run = || {
+        sqldiff_core::with_engine_stack(|| {
+            let r = diff(
+                &Artifact::new("a.sql", T, reference()),
+                &Artifact::new(
+                    "b.sql",
+                    T,
+                    reference().replace(
+                        "@Qty > 0 AND @CustomerId IS NOT NULL",
+                        "@CustomerId IS NOT NULL AND @Qty > 0",
+                    ),
+                ),
+                &opts,
+            );
+            serde_json::to_string(&r).unwrap()
+        })
+    };
+    assert_eq!(run(), run());
+}
+
+/// Pairs with a witness that the second opinion once cleared (statements the
+/// lowering only notes, and operand orders that can raise) or that stay
+/// different: none may be Equal or EqualUnderAssumptions, in either direction.
+fn proc_body(body: &str) -> String {
+    format!("CREATE PROCEDURE dbo.P AS BEGIN {body} END")
+}
+
+const NEVER_EQUAL: &[(&str, &str, &str, &str)] = &[
+    (
+        "nocount-moved-after-update",
+        "A sends no count for the UPDATE of the one Stock row, B sends '(1 row affected)'",
+        "SET NOCOUNT ON; UPDATE dbo.Stock SET Qty = 1; DELETE FROM dbo.Orders;",
+        "UPDATE dbo.Stock SET Qty = 1; SET NOCOUNT ON; DELETE FROM dbo.Orders;",
+    ),
+    (
+        "nocount-moved-with-renamed-local",
+        "as above, beside a renamed local",
+        "DECLARE @a int = 1; SET NOCOUNT ON; UPDATE dbo.Stock SET Qty = @a; DELETE FROM dbo.Orders;",
+        "DECLARE @b int = 1; UPDATE dbo.Stock SET Qty = @b; SET NOCOUNT ON; DELETE FROM dbo.Orders;",
+    ),
+    (
+        "nocount-on-off-swapped",
+        "Stock has one row, Orders is empty: A reports 0 rows then 1, B reports 1 then 0",
+        "SET NOCOUNT ON; UPDATE dbo.Stock SET Qty = 1; SET NOCOUNT OFF; DELETE FROM dbo.Orders;",
+        "SET NOCOUNT OFF; UPDATE dbo.Stock SET Qty = 1; SET NOCOUNT ON; DELETE FROM dbo.Orders;",
+    ),
+    (
+        "nocount-off-moved-between-inserts",
+        "A sends one count, B sends two",
+        "SET NOCOUNT ON; INSERT INTO dbo.Orders (Qty) VALUES (1); SELECT 5; SET NOCOUNT OFF; INSERT INTO dbo.Orders (Qty) VALUES (2);",
+        "SET NOCOUNT OFF; INSERT INTO dbo.Orders (Qty) VALUES (1); SELECT 5; SET NOCOUNT ON; INSERT INTO dbo.Orders (Qty) VALUES (2);",
+    ),
+    (
+        "divide-after-its-guard",
+        "@y = 0: A is false at the guard and never divides, B raises error 8134",
+        "CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN IF @y <> 0 AND @x / @y > 1 SELECT 1; END",
+        "CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN IF @x / @y > 1 AND @y <> 0 SELECT 1; END",
+    ),
+    (
+        "cast-after-isnumeric",
+        "@s = 'abc': A's ISNUMERIC is 0 and the CAST never runs, B raises error 245",
+        "CREATE PROCEDURE dbo.P @s varchar(10) AS BEGIN IF ISNUMERIC(@s) = 1 AND CAST(@s AS int) > 0 SELECT 1; END",
+        "CREATE PROCEDURE dbo.P @s varchar(10) AS BEGIN IF CAST(@s AS int) > 0 AND ISNUMERIC(@s) = 1 SELECT 1; END",
+    ),
+    (
+        "divide-after-or-guard",
+        "@y = 0: A is true at the guard and never divides, B raises error 8134",
+        "CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN IF @y = 0 OR @x / @y > 1 SELECT 1; END",
+        "CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN IF @x / @y > 1 OR @y = 0 SELECT 1; END",
+    ),
+    (
+        "divide-after-guard-in-while",
+        "@y = 0: A leaves the loop, B raises error 8134",
+        "CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN WHILE @y <> 0 AND @x / @y > 1 BEGIN SET @x = @x - 1; END END",
+        "CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN WHILE @x / @y > 1 AND @y <> 0 BEGIN SET @x = @x - 1; END END",
+    ),
+];
+
+#[test]
+fn noted_statements_and_raising_operand_orders_are_never_equal() {
+    for (name, why, a, b) in NEVER_EQUAL {
+        let (a, b) = if a.starts_with("CREATE") {
+            (a.to_string(), b.to_string())
+        } else {
+            (proc_body(a), proc_body(b))
+        };
+        for (x, y, dir) in [(&a, &b, "A to B"), (&b, &a, "B to A")] {
+            let v = verdict(x, y);
+            assert!(
+                !matches!(v, Equal | Eua),
+                "{name} ({dir}): {v:?}; witness: {why}"
+            );
+        }
+    }
+}
+
+#[test]
+fn moved_session_settings_in_a_script_are_never_equal() {
+    for (name, why, a, b) in [
+        (
+            "nocount-in-script",
+            "A sends no count for the UPDATE, B sends one",
+            "SET NOCOUNT ON;\nUPDATE dbo.Stock SET Qty = 1;\nDELETE FROM dbo.Orders;",
+            "UPDATE dbo.Stock SET Qty = 1;\nSET NOCOUNT ON;\nDELETE FROM dbo.Orders;",
+        ),
+        (
+            "quoted-identifier-in-script",
+            "under QUOTED_IDENTIFIER OFF A returns the string 'a', B the column",
+            "SET QUOTED_IDENTIFIER ON;\nSELECT \"Qty\" FROM dbo.Stock;",
+            "SELECT \"Qty\" FROM dbo.Stock;\nSET QUOTED_IDENTIFIER ON;",
+        ),
+        (
+            "add-filegroup-in-script",
+            "the filegroup exists for the CREATE TABLE ... ON in A and not in B",
+            "ALTER DATABASE db ADD FILEGROUP fg1;\nCREATE TABLE dbo.X (a int) ON fg1;",
+            "CREATE TABLE dbo.X (a int) ON fg1;\nALTER DATABASE db ADD FILEGROUP fg1;",
+        ),
+    ] {
+        for (x, y, dir) in [(a, b, "A to B"), (b, a, "B to A")] {
+            let v = verdict(x, y);
+            assert!(
+                !matches!(v, Equal | Eua),
+                "{name} ({dir}): {v:?}; witness: {why}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_noted_statement_that_stays_put_does_not_block_a_rename() {
+    // SET NOCOUNT ON at the top of both, after the same tokens: the rename is cleared.
+    let a = proc_body("SET NOCOUNT ON; DECLARE @a int = 1; UPDATE dbo.Stock SET Qty = @a;");
+    let b = proc_body("SET NOCOUNT ON; DECLARE @b int = 1; UPDATE dbo.Stock SET Qty = @b;");
+    assert_eq!(verdict(&a, &b), Equal);
+}
+
+#[test]
+fn a_moved_set_nocount_is_not_excused_by_any_observer_profile() {
+    use sqldiff_core::observer::{Observer, RowCounts};
+    let a = proc_body("SET NOCOUNT ON; UPDATE dbo.Stock SET Qty = 1; DELETE FROM dbo.Orders;");
+    let b = proc_body("UPDATE dbo.Stock SET Qty = 1; SET NOCOUNT ON; DELETE FROM dbo.Orders;");
+    let run = |rc: RowCounts| {
+        let opts = Options {
+            catalog_a: vec![Artifact::new("catalog.sql", T, DDL)],
+            catalog_b: vec![Artifact::new("catalog.sql", T, DDL)],
+            observer: Observer { row_counts: rc },
+            ..Options::default()
+        };
+        sqldiff_core::with_engine_stack(|| {
+            diff(
+                &Artifact::new("a.sql", T, &a),
+                &Artifact::new("b.sql", T, &b),
+                &opts,
+            )
+        })
+    };
+    let seen = run(RowCounts::SameDialect);
+    assert!(
+        !matches!(seen.verdict(), Equal | Eua),
+        "{:?}",
+        seen.verdict()
+    );
+    // Even a profile that does not observe counts leaves a moved SET NOCOUNT
+    // to the structural diff (`stmt.moved` is not among the findings it drops).
+    let never = run(RowCounts::Never);
+    assert!(
+        !matches!(never.verdict(), Equal | Eua),
+        "{:?}",
+        never.verdict()
+    );
+}
+
+#[test]
+fn untyped_store_is_not_recorded_for_equal_terms_and_does_not_hide_a_type_change() {
+    // Without a catalog (the destination type is unknown): reordering two
+    // assignments of one statement stores the same terms, so it is equal and
+    // names no assumption.
+    let run = |a: &str, b: &str| {
+        sqldiff_core::with_engine_stack(|| {
+            diff(
+                &Artifact::new("a.sql", T, a),
+                &Artifact::new("b.sql", T, b),
+                &Options::default(),
+            )
+        })
+    };
+    let a = "CREATE PROCEDURE dbo.P @p int, @q int AS BEGIN UPDATE dbo.U SET c = @p, d = @q; END";
+    let b = "CREATE PROCEDURE dbo.P @p int, @q int AS BEGIN UPDATE dbo.U SET d = @q, c = @p; END";
+    let r = run(a, b);
+    assert_eq!(r.verdict(), Equal, "{:?}", r.findings);
+    assert!(r.assumptions.iter().all(|x| x.id != "ASM-UNTYPED-STORE"));
+    // The stored values differ in type: never equal, with or without the assumption.
+    let a = "CREATE PROCEDURE dbo.P @p int AS BEGIN UPDATE dbo.U SET c = CAST(@p AS int); END";
+    let b = "CREATE PROCEDURE dbo.P @p int AS BEGIN UPDATE dbo.U SET c = CAST(@p AS money); END";
+    let r = run(a, b);
+    assert!(!matches!(r.verdict(), Equal | Eua), "{:?}", r.verdict());
 }

@@ -486,6 +486,29 @@ fn diff_inner(
             &mut eq,
             &allowance,
         );
+        // Second opinion (T-SQL against T-SQL step 1, `equiv::second`): the
+        // statement lowering may clear the structural findings of a pair it
+        // proves equal as a whole. It runs last, so it sees what the edit
+        // search and the refinement left.
+        if td.findings.iter().any(equiv::second::removable)
+            && equiv::second::eligible(&aa, &ab).is_none()
+        {
+            let sec =
+                equiv::compare_within(&aa, &ab, &schema_a, &schema_b, &opts.anchors, &allowance);
+            if equiv::second::refusal(&aa, &ab, &sec).is_none() {
+                let before = td.findings.len();
+                let mut cleared = equiv::second::clear(&mut td.findings);
+                if td.findings.len() < before {
+                    td.structural += before - td.findings.len();
+                    for x in sec.normalizations {
+                        if !eq.normalizations.contains(&x) {
+                            eq.normalizations.push(x);
+                        }
+                    }
+                    eq.receipts.append(&mut cleared);
+                }
+            }
+        }
         findings.extend(td.findings);
         receipts.append(&mut td.receipts);
         receipts.append(&mut eq.receipts);
