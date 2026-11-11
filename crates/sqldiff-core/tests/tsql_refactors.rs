@@ -640,6 +640,72 @@ const NEVER_EQUAL: &[(&str, &str, &str, &str)] = &[
         "CREATE PROCEDURE dbo.P @a int, @b int AS BEGIN IF @a >= 0 BEGIN IF @b > 0 INSERT INTO dbo.Orders (Qty) VALUES (1); ELSE RAISERROR('x', 16, 1); END END",
     ),
     (
+        "print-moved-after-write",
+        "Stock has one row: A prints, then sends the count of the UPDATE; B sends the count first",
+        "PRINT 'x'; UPDATE dbo.Stock SET Qty = 1;",
+        "UPDATE dbo.Stock SET Qty = 1; PRINT 'x';",
+    ),
+    (
+        "print-moved-with-renamed-local",
+        "as above, beside a renamed local",
+        "DECLARE @a int = 1; PRINT 'x'; UPDATE dbo.Stock SET Qty = @a;",
+        "DECLARE @b int = 1; UPDATE dbo.Stock SET Qty = @b; PRINT 'x';",
+    ),
+    (
+        "national-literals-swapped-in-select-list",
+        "A returns column 1 as nvarchar and column 2 as varchar, B the reverse (the result types differ)",
+        "SELECT N'x', 'x';",
+        "SELECT 'x', N'x';",
+    ),
+    (
+        "national-prefix-dropped",
+        "the literal is nvarchar in A and varchar in B: N'\u{436}' keeps its character, '\u{436}' stores '?' under a Latin1 collation",
+        "SELECT N'\u{436}';",
+        "SELECT '\u{436}';",
+    ),
+    (
+        "national-prefixes-swapped-between-statements",
+        "A's first result is the nvarchar value, B's first result the varchar value (a non-Latin character shows as ?)",
+        "SELECT N'\u{436}'; SELECT '\u{436}';",
+        "SELECT '\u{436}'; SELECT N'\u{436}';",
+    ),
+    (
+        "national-prefixes-swapped-between-statements-ascii",
+        "the first result column is nvarchar in A and varchar in B",
+        "SELECT N'x'; SELECT 'x';",
+        "SELECT 'x'; SELECT N'x';",
+    ),
+    (
+        "national-prefixes-swapped-with-renamed-local",
+        "as above, beside a renamed local",
+        "DECLARE @a int = 1; SELECT N'\u{436}', @a; SELECT '\u{436}', @a;",
+        "DECLARE @b int = 1; SELECT '\u{436}', @b; SELECT N'\u{436}', @b;",
+    ),
+    (
+        "declare-with-subquery-moved-after-delete",
+        "Stock has one row: A reads count 1 at the DECLARE, B reads 0 after the DELETE",
+        "DECLARE @a int = (SELECT COUNT(*) FROM dbo.Stock); DELETE FROM dbo.Stock; INSERT INTO dbo.Orders (Qty) VALUES (@a);",
+        "DELETE FROM dbo.Stock; DECLARE @a int = (SELECT COUNT(*) FROM dbo.Stock); INSERT INTO dbo.Orders (Qty) VALUES (@a);",
+    ),
+    (
+        "declare-with-clock-moved-after-waitfor",
+        "B's value is one second later than A's",
+        "DECLARE @t datetime2 = SYSDATETIME(); WAITFOR DELAY '00:00:01'; INSERT INTO dbo.Orders (Note) VALUES (CONVERT(varchar(30), @t, 121));",
+        "WAITFOR DELAY '00:00:01'; DECLARE @t datetime2 = SYSDATETIME(); INSERT INTO dbo.Orders (Note) VALUES (CONVERT(varchar(30), @t, 121));",
+    ),
+    (
+        "declare-with-initializer-moved-into-loop",
+        "A counts to 3 and inserts 3; B resets the variable on every pass and inserts 1",
+        "DECLARE @s int = 0; DECLARE @i int = 0; WHILE @i < 3 BEGIN SET @s = @s + 1; SET @i = @i + 1; END; INSERT INTO dbo.Orders (Qty) VALUES (@s);",
+        "DECLARE @i int = 0; WHILE @i < 3 BEGIN DECLARE @s int = 0; SET @s = @s + 1; SET @i = @i + 1; END; INSERT INTO dbo.Orders (Qty) VALUES (@s);",
+    ),
+    (
+        "cursor-declared-after-the-variable-it-reads-changes",
+        "the cursor reads @v when it is declared: A filters on 1, B on 5",
+        "DECLARE @v int = 1; DECLARE c CURSOR FOR SELECT ItemId FROM dbo.Stock WHERE Qty > @v; SET @v = 5; OPEN c; CLOSE c; DEALLOCATE c;",
+        "DECLARE @v int = 1; SET @v = 5; DECLARE c CURSOR FOR SELECT ItemId FROM dbo.Stock WHERE Qty > @v; OPEN c; CLOSE c; DEALLOCATE c;",
+    ),
+    (
         "divide-after-its-guard",
         "@y = 0: A is false at the guard and never divides, B raises error 8134",
         "CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN IF @y <> 0 AND @x / @y > 1 SELECT 1; END",
@@ -911,6 +977,58 @@ fn an_if_reshaped_around_a_nested_condition_has_no_branch_witness() {
                     .any(|f| f.rule == "equiv.edit" && f.verdict == Different),
                 "{name}: a witnessed equiv.edit difference ({why}): {:#?}",
                 r.findings
+            );
+        }
+    }
+}
+
+/// A CASE, IIF or nested select list inside a WHERE, ON or HAVING predicate
+/// is not ordered by the optimizer (it evaluates a CASE's WHEN terms in
+/// order): the guard behind its division is a guard.
+#[test]
+fn a_guard_reordered_inside_a_scalar_nested_in_a_predicate_is_never_equal() {
+    let q = |body: &str| format!("CREATE PROCEDURE dbo.P @x int, @y int AS BEGIN {body} END");
+    let g = "@y <> 0 AND @x / @y > 1";
+    let h = "@x / @y > 1 AND @y <> 0";
+    let rows: Vec<(&str, String, String)> = vec![
+        (
+            "where-case",
+            "SELECT Qty FROM dbo.Stock WHERE CASE WHEN ItemId <> 0 AND Qty / ItemId > 1 THEN 1 ELSE 0 END = 1;".into(),
+            "SELECT Qty FROM dbo.Stock WHERE CASE WHEN Qty / ItemId > 1 AND ItemId <> 0 THEN 1 ELSE 0 END = 1;".into(),
+        ),
+        (
+            "where-iif",
+            "SELECT Qty FROM dbo.Stock WHERE IIF(ItemId <> 0 AND Qty / ItemId > 1, 1, 0) = 1;".into(),
+            "SELECT Qty FROM dbo.Stock WHERE IIF(Qty / ItemId > 1 AND ItemId <> 0, 1, 0) = 1;".into(),
+        ),
+        (
+            "where-eq-case",
+            format!("SELECT Qty FROM dbo.Stock WHERE Qty = CASE WHEN {g} THEN 1 ELSE 0 END;"),
+            format!("SELECT Qty FROM dbo.Stock WHERE Qty = CASE WHEN {h} THEN 1 ELSE 0 END;"),
+        ),
+        (
+            "where-scalar-subquery",
+            format!("SELECT Qty FROM dbo.Stock WHERE Qty = (SELECT CASE WHEN {g} THEN 1 ELSE 0 END);"),
+            format!("SELECT Qty FROM dbo.Stock WHERE Qty = (SELECT CASE WHEN {h} THEN 1 ELSE 0 END);"),
+        ),
+        (
+            "having-max-case",
+            "SELECT ItemId FROM dbo.Stock GROUP BY ItemId HAVING MAX(CASE WHEN Qty <> 0 AND ItemId / Qty > 1 THEN 1 ELSE 0 END) = 1;".into(),
+            "SELECT ItemId FROM dbo.Stock GROUP BY ItemId HAVING MAX(CASE WHEN ItemId / Qty > 1 AND Qty <> 0 THEN 1 ELSE 0 END) = 1;".into(),
+        ),
+        (
+            "on-case",
+            "SELECT s.Qty FROM dbo.Stock s JOIN dbo.Item i ON CASE WHEN s.Qty <> 0 AND i.ItemId / s.Qty > 1 THEN 1 ELSE 0 END = 1;".into(),
+            "SELECT s.Qty FROM dbo.Stock s JOIN dbo.Item i ON CASE WHEN i.ItemId / s.Qty > 1 AND s.Qty <> 0 THEN 1 ELSE 0 END = 1;".into(),
+        ),
+    ];
+    for (name, a, b) in rows {
+        let (a, b) = (q(&a), q(&b));
+        for (x, y, dir) in [(&a, &b, "A to B"), (&b, &a, "B to A")] {
+            let v = verdict(x, y);
+            assert!(
+                !matches!(v, Equal | Eua),
+                "{name} ({dir}): {v:?}; a row with a zero divisor: A is guarded, B raises error 8134"
             );
         }
     }

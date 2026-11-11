@@ -136,7 +136,58 @@ pub fn same_tokens(a: &Analyzed, b: &Analyzed) -> bool {
     let (mut x, mut y) = (masked(a), masked(b));
     x.sort_unstable();
     y.sort_unstable();
-    x == y && declarations(a) == declarations(b)
+    x == y && declarations(a) == declarations(b) && national_units(a) == national_units(b)
+}
+
+/// For each string literal of `n`, in order, whether it is a national one
+/// (`N'..'`). The statement lowering reads both spellings as one string, as
+/// it must across dialects; in T-SQL `'x'` is `varchar` and `N'x'` is
+/// `nvarchar`, so a non-Latin character becomes `?` in the first, a result
+/// column or `SELECT ... INTO` column has the other type, and a pair that
+/// puts one where the other stood changes the meaning.
+pub fn string_prefixes(n: &sqldiff_syntax::SyntaxNode) -> Vec<bool> {
+    n.descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() == SyntaxKind::STRING)
+        .map(|t| t.text().starts_with(['N', 'n']))
+        .collect()
+}
+
+/// The string-literal prefixes of each statement of `a` (its own tokens,
+/// not those of a statement nested in it), one entry per statement that has
+/// any, in document order. Not sorted: a literal moved within a statement or
+/// between statements changes the sequence, and so does a statement moved
+/// past another whose literals have other prefixes (refused, never cleared).
+/// Statements whose literals all have the same prefix may still swap.
+fn national_units(a: &Analyzed) -> Vec<Vec<bool>> {
+    fn own(n: &sqldiff_syntax::SyntaxNode, out: &mut Vec<bool>) {
+        for e in n.children_with_tokens() {
+            match e {
+                rowan::NodeOrToken::Token(t) => {
+                    if t.kind() == SyntaxKind::STRING {
+                        out.push(t.text().starts_with(['N', 'n']));
+                    }
+                }
+                rowan::NodeOrToken::Node(c) => {
+                    if !(c.kind().is_unit() || c.kind().is_container()) {
+                        own(&c, out);
+                    }
+                }
+            }
+        }
+    }
+    let v: Vec<Vec<bool>> = a
+        .root
+        .descendants()
+        .filter(|n| n.kind().is_unit())
+        .map(|n| {
+            let mut f = Vec::new();
+            own(&n, &mut f);
+            f
+        })
+        .filter(|f| !f.is_empty())
+        .collect();
+    v
 }
 
 /// Whether every statement the lowering passed over instead of comparing
