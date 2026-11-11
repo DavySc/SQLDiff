@@ -584,10 +584,6 @@ const SOURCE_METHODS: &[(&str, &str)] = &[
         "table_wide",
         "pass 1 `WholeCatalog` (the narrow form waits for a T3 proof)",
     ),
-    (
-        "triggers_named_wide",
-        "pass 1 `WholeCatalog` (the narrow form waits for a T3 proof)",
-    ),
     ("triggers_named", "pass 1 `TriggersNamed`"),
     ("column_types", "pass 1 `ColumnTypes`"),
     ("procedure_named", "pass 1 `ProcedureNamed`"),

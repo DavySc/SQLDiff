@@ -245,7 +245,6 @@ Counts of each kind of door in the non-test sources, comments left out. A change
 | `recording` | builder with a live sink (the tree run's pass 1, `sqldiff-draft/src/lib.rs`) |
 | `table` | pass 1 `Table(parts)` |
 | `table_wide` | pass 1 `WholeCatalog` (the narrow form waits for a T3 proof) |
-| `triggers_named_wide` | pass 1 `WholeCatalog` (the narrow form waits for a T3 proof) |
 | `triggers_named` | pass 1 `TriggersNamed` |
 | `column_types` | pass 1 `ColumnTypes` |
 | `procedure_named` | pass 1 `ProcedureNamed` |
