@@ -117,6 +117,7 @@ pub(crate) fn convert(
         catalog,
         claims,
         loops: Vec::new(),
+        goto_open: Vec::new(),
         labels: 0,
         cursors: Vec::new(),
         cursor_plans: BTreeMap::new(),
@@ -184,7 +185,7 @@ pub(crate) fn convert(
         match el {
             SyntaxElement::Node(n) if n.kind() == BATCH => cx.batch(&mut out, &n),
             SyntaxElement::Node(n) if n.kind().is_unit() => {
-                cx.list_unit(&mut out, &els, i, 0, &mut joined)
+                cx.list_unit(&mut out, &els, i, 0, &mut joined, false)
             }
             SyntaxElement::Token(t) if matches!(t.kind(), LINE_COMMENT | BLOCK_COMMENT) => {
                 out.lines(0, t.text())
@@ -226,6 +227,17 @@ enum Mode {
     Func,
     /// A T-SQL script with variables or control flow, run as a `DO` block.
     Do,
+}
+
+/// A forward jump of one statement list, written as a labelled block.
+struct GotoRegion {
+    /// Index in the list of the first unit holding a `GOTO` to the label.
+    start: usize,
+    /// Index of the label.
+    label: usize,
+    /// The label, lower-cased.
+    name: String,
+    node: SyntaxNode,
 }
 
 #[derive(Debug, Clone)]
@@ -415,6 +427,9 @@ struct Cx<'a> {
     claims: crate::table_vars::ClaimReads<'a>,
     /// Db2: labels of the enclosing WHILE loops (LEAVE/ITERATE need one).
     loops: Vec<String>,
+    /// PostgreSQL: lower-cased T-SQL labels whose `<<goto_l>> BEGIN` block is
+    /// open, so a `GOTO l` inside is an `EXIT goto_l`.
+    goto_open: Vec<String>,
     /// Db2: loop labels handed out in this routine or script.
     labels: usize,
     /// Db2: result-set cursors of the routine, declared after the variables.
@@ -1474,23 +1489,156 @@ impl<'a> Cx<'a> {
     }
 
     /// Writes the units and comments directly inside `n`, skipping its own keywords.
+    ///
+    /// A forward `GOTO` (see `goto_regions`) is written as a labelled block
+    /// from the first unit holding a jump to the label, left with `EXIT`.
     fn body_elements(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize) {
         let els: Vec<SyntaxElement> = n.children_with_tokens().collect();
+        let regions = self.goto_regions(&els);
         let mut joined = 0;
+        let mut open: Vec<&GotoRegion> = Vec::new();
         for (i, el) in els.iter().cloned().enumerate() {
+            if let Some(r) = regions.iter().find(|r| r.label == i) {
+                // The label: closes its block; the header unit covers it.
+                if open.last().is_some_and(|o| o.label == r.label) {
+                    open.pop();
+                    self.goto_open.pop();
+                    out.lines(indent + INDENT * open.len(), "END;");
+                }
+                continue;
+            }
+            let mut starting: Vec<&GotoRegion> = regions.iter().filter(|r| r.start == i).collect();
+            starting.sort_by_key(|r| std::cmp::Reverse(r.label));
+            for r in starting {
+                let src = Self::range(&r.node);
+                self.step("tsql.ctl.goto-block", src);
+                let text = format!("<<goto_{}>>\nBEGIN", r.name);
+                self.emit(out, src, indent + INDENT * open.len(), &text);
+                open.push(r);
+                self.goto_open.push(r.name.clone());
+            }
+            let ind = indent + INDENT * open.len();
             match el {
                 SyntaxElement::Node(c) if c.kind().is_unit() => {
-                    self.list_unit(out, &els, i, indent, &mut joined)
+                    self.list_unit(out, &els, i, ind, &mut joined, !regions.is_empty())
                 }
                 SyntaxElement::Node(c) if c.kind().is_container() => {
-                    self.body_elements(out, &c, indent)
+                    self.body_elements(out, &c, ind)
                 }
                 SyntaxElement::Token(t) if matches!(t.kind(), LINE_COMMENT | BLOCK_COMMENT) => {
-                    out.lines(indent, t.text())
+                    out.lines(ind, t.text())
                 }
                 _ => {}
             }
         }
+        // A region never outlives its list: every label closes its block.
+        debug_assert!(open.is_empty());
+    }
+
+    /// The forward jumps of one statement list that PL/pgSQL can express: a
+    /// label of the list that occurs once in the routine, is a plain name,
+    /// and is the target of at least one `GOTO`, all of them inside units of
+    /// the list before the label. The region is the units from the first
+    /// of them to the label. Regions that cross (neither nested nor
+    /// disjoint) are dropped. Not for Db2 for i (it has GOTO), triggers or
+    /// plain scripts.
+    fn goto_regions(&self, els: &[SyntaxElement]) -> Vec<GotoRegion> {
+        if self.db2() || self.mode == Mode::Top || self.trigger.is_some() {
+            return Vec::new();
+        }
+        let labels: Vec<(usize, SyntaxNode)> = els
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                e.as_node()
+                    .filter(|n| n.kind() == LABEL)
+                    .map(|n| (i, n.clone()))
+            })
+            .collect();
+        if labels.is_empty() {
+            return Vec::new();
+        }
+        let Some(any) = els.iter().find_map(|e| e.as_node()) else {
+            return Vec::new();
+        };
+        let root = any
+            .ancestors()
+            .find(|a| a.kind() == ROUTINE)
+            .or_else(|| any.ancestors().last())
+            .unwrap_or_else(|| any.clone());
+        let label_of = |n: &SyntaxNode| {
+            n.text()
+                .to_string()
+                .trim()
+                .trim_end_matches(':')
+                .trim()
+                .to_string()
+        };
+        let all_labels: Vec<String> = root
+            .descendants()
+            .filter(|d| d.kind() == LABEL)
+            .map(|d| label_of(&d).to_lowercase())
+            .collect();
+        let gotos: Vec<(SyntaxNode, String)> = root
+            .descendants()
+            .filter(|d| d.kind() == STATEMENT)
+            .filter_map(|d| {
+                let ts = tokens(&d);
+                let s = sig(&ts);
+                let first = s.first().map(|&i| ts[i].up());
+                (first.as_deref() == Some("GOTO") && s.len() >= 2)
+                    .then(|| (d.clone(), tsql_unquote(&ts[s[1]].s).to_lowercase()))
+            })
+            .collect();
+        let mut out = Vec::new();
+        for (li, ln) in labels {
+            let name = label_of(&ln).to_lowercase();
+            let plain = !name.is_empty()
+                && name.len() <= 50
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !plain || all_labels.iter().filter(|x| **x == name).count() != 1 {
+                continue;
+            }
+            let mine: Vec<&SyntaxNode> = gotos
+                .iter()
+                .filter(|(_, l)| *l == name)
+                .map(|(d, _)| d)
+                .collect();
+            if mine.is_empty() {
+                continue;
+            }
+            let at = |g: &SyntaxNode| {
+                els.iter().position(|e| {
+                    e.as_node()
+                        .is_some_and(|u| u.text_range().contains_range(g.text_range()))
+                })
+            };
+            let starts: Vec<Option<usize>> = mine.iter().map(|g| at(g)).collect();
+            if starts.iter().any(|s| s.is_none_or(|s| s >= li)) {
+                continue;
+            }
+            let start = starts.into_iter().flatten().min().unwrap_or(li);
+            out.push(GotoRegion {
+                start,
+                label: li,
+                name,
+                node: ln,
+            });
+        }
+        // Crossing regions are dropped.
+        let crossing: Vec<bool> = out
+            .iter()
+            .map(|a| {
+                out.iter()
+                    .any(|b| a.start < b.start && b.start < a.label && a.label < b.label)
+                    || out
+                        .iter()
+                        .any(|b| b.start < a.start && a.start < b.label && b.label < a.label)
+            })
+            .collect();
+        let mut keep = crossing.into_iter();
+        out.retain(|_| !keep.next().unwrap_or(false));
+        out
     }
 
     /// Converts the unit `els[i]` of a list. `joined` is where the last pair
@@ -1502,6 +1650,7 @@ impl<'a> Cx<'a> {
         i: usize,
         indent: usize,
         joined: &mut usize,
+        regions: bool,
     ) {
         let Some(n) = els[i].as_node() else { return };
         if Self::range(n).0 < *joined {
@@ -1510,7 +1659,9 @@ impl<'a> Cx<'a> {
         if self.trigger_guard(out, n, indent) {
             return;
         }
-        if let Some(next) = adjacent_unit(els, i) {
+        // A pair converted together must not straddle the edge of a GOTO block.
+        let pair = if regions { None } else { adjacent_unit(els, i) };
+        if let Some(next) = pair {
             if self.idiom_pair(out, n, &next, indent) {
                 *joined = Self::range(&next).1;
                 return;
@@ -2494,7 +2645,12 @@ impl<'a> Cx<'a> {
             "ALTER" if w(1) == "DATABASE" => self.alter_database(&ts)?,
             "GOTO" => {
                 let label = s.get(1).map(|&i| tsql_unquote(&ts[i].s)).unwrap_or_default();
-                return no(goto(n, &label));
+                let key = label.to_lowercase();
+                if s.len() != 2 || !self.goto_open.contains(&key) {
+                    return no(goto(n, &label));
+                }
+                self.step_ts("tsql.ctl.goto-exit", &ts);
+                format!("EXIT goto_{key}")
             }
             ":" if w(1) == "R" && !self.db2() => {
                 // The file named after `:r`, as written (quotes removed).
@@ -12690,10 +12846,11 @@ struct ScopeEntry {
 
 /// The FROM, JOIN, UPDATE, MERGE and USING items of a statement, at any
 /// depth. `None` when the statement has CTEs, whose names would hide tables.
-/// Why GOTO is not converted. PL/pgSQL has no GOTO; a jump forward to a
+/// Why a GOTO is not converted. PL/pgSQL has no GOTO; a jump forward to a
 /// label later in an enclosing statement list (Ola Hallengren's `GOTO
-/// Logging`) is a labelled block left with EXIT, which the engine does not
-/// compare yet.
+/// Logging`) is a labelled block left with EXIT (`goto_regions`), unless the
+/// label is also reached another way (a jump from another list or from
+/// after it, a label used twice, regions that cross).
 fn goto(n: &SyntaxNode, label: &str) -> String {
     let at = n.text_range().start();
     let forward = n.ancestors().skip(1).any(|a| {
@@ -12708,7 +12865,7 @@ fn goto(n: &SyntaxNode, label: &str) -> String {
         })
     });
     if forward {
-        format!("GOTO {label}: PL/pgSQL has no GOTO. This jump forward is a labelled block from here to the label, left with EXIT (<<{0}>> BEGIN … EXIT {0}; … END; then the statements after {label}:); not converted yet, since the engine does not compare such blocks", label.to_lowercase())
+        format!("GOTO {label}: PL/pgSQL has no GOTO. A jump forward to a label of an enclosing list is a labelled block left with EXIT, but not here: {label} is also the target of a jump that is not in a statement list before it, of a name used twice, or of blocks that cross; not converted")
     } else {
         format!("GOTO {label}: PL/pgSQL has no GOTO, and this jump does not go forward to a label in an enclosing statement list; rewrite it as a loop or IF; not converted")
     }

@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 199 | 35 (18%) | 6 (3%) | 158 (79%) |
+| `converter` | 201 | 35 (17%) | 6 (3%) | 160 (80%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 228 | 38 (17%) | 8 (4%) | 182 (80%) |
+| **All** | 230 | 38 (17%) | 8 (3%) | 184 (80%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -83,6 +83,8 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.charindex` | `converter` | engine |  | `sqldiff-draft/src/tsql.rs` |
 | `tsql.convert-style` | `converter` | engine |  | `sqldiff-draft/src/tsql.rs` |
 | `tsql.cte.recursive` | `converter` | engine |  | `sqldiff-draft/src/tsql.rs` |
+| `tsql.ctl.goto-block` | `converter` | engine | a forward GOTO's region (first unit holding a jump to the label .. the label) as a labelled `<<goto_l>> BEGIN … END` block; the engine follows the jump on the T-SQL side and the exit on the PostgreSQL side | `sqldiff-draft/src/tsql.rs` |
+| `tsql.ctl.goto-exit` | `converter` | engine | GOTO l inside such a block as `EXIT goto_l` | `sqldiff-draft/src/tsql.rs` |
 | `tsql.ctl.if` | `converter` | lemma: `Sqldiff.Mirror/C2a operators/IF and WHILE` | a condition of the slice; `IF [NOT] EXISTS (...)` as the whole condition is C3b rule 3; other conditions are C1 | `sqldiff-draft/src/tsql.rs` |
 | `tsql.ctl.try-catch` | `converter` | lemma: `Sqldiff.Mirror/C4 errors and transactions/TRY-CATCH against EXCEPTION WHEN OTHERS` | the `exception-block` form in a procedure, under ASM-TRY-SUBTRANSACTION and ASM-CATCH-CORE-ERRORS; the Db2 for i handler forms engine | `sqldiff-draft/src/tsql.rs` |
 | `tsql.ctl.while` | `converter` | lemma: `Sqldiff.Mirror/C2a operators/IF and WHILE` | a condition of the slice; other conditions are C1 | `sqldiff-draft/src/tsql.rs` |
