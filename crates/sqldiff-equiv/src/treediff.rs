@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use sqldiff_syntax::{ast, SyntaxKind, SyntaxNode};
+use sqldiff_syntax::{ast, Dialect, SyntaxKind, SyntaxNode, SyntaxToken};
 
 use crate::artifact::{snippet_of, Analyzed};
 use crate::classify::{stmt_kind, StmtKind};
@@ -21,6 +21,14 @@ struct Unit {
     strict: String,
     header: Vec<NormTok>,
     header_hash: String,
+    /// The header was compared without a `public.` qualifier on the routine's
+    /// own name (`pg_canonical_header`): a pair that matches only because the
+    /// other side has none relies on ASM-DEFAULT-SCHEMA.
+    default_schema_dropped: bool,
+    /// `pg_canonical_header` dropped a token: the header's own text differs
+    /// from what was compared, so the pair needs a judged receipt of its own
+    /// (the shell receipt checks the text itself).
+    header_canonicalised: bool,
     children: Vec<Unit>,
     effectful: bool,
     /// Where the unit runs is observable even though running it is not an
@@ -53,9 +61,106 @@ fn declaration_runs(node: &SyntaxNode) -> bool {
     false
 }
 
+/// A PostgreSQL routine's header tokens with the two spellings of what the
+/// server defaults dropped, so two headers that differ only by them hash
+/// alike. Every other header token (LANGUAGE, SECURITY, SET, RETURNS,
+/// volatility, defaults, the argument names and types) is kept.
+///
+/// - `public.` before the routine's own name: only the schema `public`
+///   (unquoted in any case, or quoted exactly `"public"`) directly before
+///   the name and the `(` of the argument list. The second element says it
+///   was dropped; the engine then reports ASM-DEFAULT-SCHEMA, because an
+///   unqualified name is created in the first schema of the search_path.
+/// - `IN` as an argument's mode: the unquoted keyword `IN` that starts an
+///   element of the first argument list (after `(` or a `,` at depth 1) and
+///   is not followed by `OUT` (`IN OUT` is `INOUT`; dropping `IN` would read
+///   it as `OUT`). An omitted mode is `IN`, for functions and procedures.
+///   A quoted `"IN"`, a mode after the argument's name and any other `IN` stay.
+fn pg_canonical_header(tokens: Vec<SyntaxToken>) -> (Vec<SyntaxToken>, bool, bool) {
+    let word = |t: &SyntaxToken, w: &str| {
+        t.kind() == SyntaxKind::IDENT && t.text().eq_ignore_ascii_case(w)
+    };
+    let Some(k) = tokens
+        .iter()
+        .position(|t| word(t, "PROCEDURE") || word(t, "FUNCTION"))
+    else {
+        return (tokens, false, false);
+    };
+    let mut drop = vec![false; tokens.len()];
+    let mut dropped_schema = false;
+    let is_name = |t: Option<&SyntaxToken>| {
+        t.is_some_and(|t| matches!(t.kind(), SyntaxKind::IDENT | SyntaxKind::QUOTED_IDENT))
+    };
+    let kind_at = |i: usize| tokens.get(i).map(|t| t.kind());
+    let open = if is_name(tokens.get(k + 1))
+        && kind_at(k + 2) == Some(SyntaxKind::DOT)
+        && is_name(tokens.get(k + 3))
+        && kind_at(k + 4) == Some(SyntaxKind::L_PAREN)
+    {
+        let schema = &tokens[k + 1];
+        let public = match schema.kind() {
+            SyntaxKind::IDENT => schema.text().eq_ignore_ascii_case("public"),
+            _ => ast::unquote(schema.text()) == "public",
+        };
+        if public {
+            drop[k + 1] = true;
+            drop[k + 2] = true;
+            dropped_schema = true;
+        }
+        k + 4
+    } else if is_name(tokens.get(k + 1)) && kind_at(k + 2) == Some(SyntaxKind::L_PAREN) {
+        k + 2
+    } else {
+        return (tokens, false, false);
+    };
+    // The first argument list: `IN` at the start of an element.
+    let mut depth = 0usize;
+    let mut element_start = false;
+    for i in open..tokens.len() {
+        match tokens[i].kind() {
+            SyntaxKind::L_PAREN => {
+                depth += 1;
+                element_start = depth == 1;
+                continue;
+            }
+            SyntaxKind::R_PAREN => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            SyntaxKind::COMMA if depth == 1 => {
+                element_start = true;
+                continue;
+            }
+            _ => {}
+        }
+        if element_start && depth == 1 && word(&tokens[i], "IN") {
+            let next_out = tokens.get(i + 1).is_some_and(|t| word(t, "OUT"));
+            if !next_out {
+                drop[i] = true;
+            }
+        }
+        element_start = false;
+    }
+    let changed = drop.iter().any(|d| *d);
+    let kept = tokens
+        .into_iter()
+        .zip(drop)
+        .filter_map(|(t, d)| (!d).then_some(t))
+        .collect();
+    (kept, dropped_schema, changed)
+}
+
 fn build_unit(node: SyntaxNode, a: &Analyzed) -> Unit {
     let d = a.dialect();
-    let header = norm_of(ast::header_tokens(&node).into_iter(), d);
+    let (header_tokens, default_schema_dropped, header_canonicalised) =
+        if d == Dialect::Postgres && node.kind() == SyntaxKind::ROUTINE {
+            pg_canonical_header(ast::header_tokens(&node))
+        } else {
+            (ast::header_tokens(&node), false, false)
+        };
+    let header = norm_of(header_tokens.into_iter(), d);
     let children: Vec<Unit> = ast::structural_children(&node)
         .into_iter()
         .map(|c| build_unit(c, a))
@@ -87,6 +192,8 @@ fn build_unit(node: SyntaxNode, a: &Analyzed) -> Unit {
         full: loose_hash(&toks),
         strict: strict_hash(&toks),
         header_hash: loose_hash(&header),
+        default_schema_dropped,
+        header_canonicalised,
         node,
         kind,
         toks,
@@ -103,6 +210,9 @@ pub struct TreeDiff {
     pub structural: usize,
     /// T-SQL identifiers matched only case-insensitively.
     pub used_case_insensitive_idents: bool,
+    /// A PostgreSQL routine pair was accepted although only one side
+    /// qualified the routine's name with `public.` (ASM-DEFAULT-SCHEMA).
+    pub used_default_schema: bool,
     /// What the diff vouches for (`coverage::unreceipted`).
     pub receipts: Vec<Receipt>,
 }
@@ -194,6 +304,7 @@ pub fn diff_within(
             cosmetic: 0,
             structural: 0,
             used_case_insensitive_idents: false,
+            used_default_schema: false,
             receipts: Vec::new(),
         },
         removed: Vec::new(),
@@ -513,6 +624,16 @@ impl Ctx<'_, '_> {
         if x.header_hash != y.header_hash {
             self.push_change(x, y, &x.header, &y.header, "header.modified");
         } else {
+            if x.default_schema_dropped != y.default_schema_dropped {
+                self.out.used_default_schema = true;
+            }
+            if x.header_canonicalised || y.header_canonicalised {
+                self.out.receipts.push(Receipt::Judged {
+                    rule: "a PostgreSQL routine header differing only by `public.` and `IN` (treediff)",
+                    a: Some(Part::Own(x.node.clone())),
+                    b: Some(Part::Own(y.node.clone())),
+                });
+            }
             self.out
                 .receipts
                 .push(Receipt::Shell(x.node.clone(), y.node.clone()));
