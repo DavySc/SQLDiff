@@ -3493,6 +3493,9 @@ impl<'a> Cx<'a> {
             .unwrap_or(None);
         let base = target.and_then(|j| name_last(&ts, j));
         if base.as_ref().is_some_and(|b| names.contains(b)) {
+            if what == "UPDATE" {
+                return self.update_through_cte(&ts, &names, verb);
+            }
             return no(format!(
                 "WITH … {what} through a CTE: T-SQL changes the CTE's base table; rewrite the statement against that table"
             ));
@@ -3535,6 +3538,214 @@ impl<'a> Cx<'a> {
         self.stmt_ctes.clear();
         let (prefix, body) = (prefix?, body?);
         Ok(format!("{} {}", prefix.trim(), body.trim_start()))
+    }
+
+    /// `WITH c AS (SELECT … FROM t [WHERE w]) UPDATE c SET col = rn, …`
+    /// (rule `tsql.dml.update-cte`): T-SQL changes the rows of the base
+    /// table `t` that the CTE returns, to values the CTE computes (Ola
+    /// Hallengren's `ROW_NUMBER()` renumbering). PostgreSQL cannot update a
+    /// CTE, so the CTE's query becomes a derived table that also returns each
+    /// row's `ctid`, and the base table is updated from it by that row
+    /// identity: `UPDATE t AS x SET col = c.rn FROM (SELECT ctid AS rid, …
+    /// FROM t WHERE w) AS c WHERE x.ctid = c.rid`. Every base row meets its
+    /// own row of the query, never another. Only the plain shape is taken: one
+    /// CTE without a column list; its query one
+    /// SELECT from one session-private table (a converted table variable or a
+    /// `#temp` table: a catalog table may be partitioned or inherited, where
+    /// `ctid` repeats, or changed by another session while the UPDATE waits,
+    /// when READ COMMITTED skips the row whose `ctid` moved) with an optional WHERE, no DISTINCT, TOP,
+    /// grouping, set operation, join or ORDER BY; every item a plain column
+    /// or `expression AS alias`; the UPDATE with no FROM, WHERE, TOP or
+    /// OUTPUT, and every SET item `column = alias`, a plain column set from a
+    /// computed one. Anything else stays refused.
+    fn update_through_cte(&mut self, ts: &[T], names: &[String], verb: usize) -> R<String> {
+        let why = |w: &str| {
+            No(format!(
+                "WITH … UPDATE through a CTE: T-SQL changes the CTE's base table; {w}; rewrite the statement against that table"
+            ))
+        };
+        let [cte] = names else {
+            return Err(why("only a list of one CTE is converted"));
+        };
+        // `WITH c (a, b) AS (…)` renames the CTE's columns by position, which
+        // this rule does not map: only `WITH c AS (…)` is converted.
+        if sig(ts).get(2).map_or(true, |&i| !ts[i].is("AS")) {
+            return Err(why("the CTE has a column list"));
+        }
+        let bodies = cte_bodies(ts).ok_or_else(|| why("the WITH list is unreadable"))?;
+        let body = &ts[bodies[0].1.clone()];
+        let bs = sig(body);
+        if bs
+            .first()
+            .map(|&i| &body[i])
+            .map_or(true, |t| !t.is("SELECT"))
+        {
+            return Err(why("the CTE's query is not a plain SELECT"));
+        }
+        if bs
+            .get(1)
+            .map(|&i| &body[i])
+            .is_some_and(|t| t.is("DISTINCT") || t.is("TOP") || t.is("ALL"))
+        {
+            return Err(why("the CTE's query has DISTINCT, ALL or TOP"));
+        }
+        for w in [
+            "GROUP",
+            "HAVING",
+            "UNION",
+            "INTERSECT",
+            "EXCEPT",
+            "ORDER",
+            "OFFSET",
+            "FOR",
+            "OPTION",
+            "JOIN",
+            "CROSS",
+            "APPLY",
+            "INTO",
+            "WINDOW",
+        ] {
+            if find_word(body, 0, w).is_some() {
+                return Err(why(&format!("the CTE's query has {w}")));
+            }
+        }
+        let from = find_word(body, 0, "FROM").ok_or_else(|| why("the CTE's query has no FROM"))?;
+        let wh = find_word(body, from + 1, "WHERE");
+        let item = &body[from + 1..wh.unwrap_or(body.len())];
+        let steps = join_steps(item).map_err(|w| why(&w))?;
+        let [step] = &steps[..] else {
+            return Err(why("the CTE's query reads more than one table"));
+        };
+        let leaf = &step.leaf;
+        if !leaf.table || hinted(leaf.toks) || find_word(leaf.toks, 0, "WITH").is_some() {
+            return Err(why("the CTE's source is not a plain table without hints"));
+        }
+        // Only a source private to the session is updated by `ctid`: a
+        // converted table variable or a `#temp` table. A catalog table may be
+        // partitioned or inherited on PostgreSQL (the same `ctid` in two
+        // partitions) and may be changed by another session while the UPDATE
+        // waits (READ COMMITTED then skips the row whose `ctid` moved).
+        match leaf.name.first() {
+            Some(n) if n.starts_with('@') => {
+                let v = &n[1..];
+                if !self.tables.contains_key(v) {
+                    return Err(why(&format!(
+                        "the table variable `@{v}` was not converted to a table"
+                    )));
+                }
+            }
+            Some(n) if n.starts_with('#') && leaf.name.len() == 1 => {}
+            _ => {
+                return Err(why(
+                    "the CTE's source is not a table variable or a temporary table: a catalog table may be partitioned or inherited, where `ctid` is not a row identity, and another session may change it while the UPDATE waits",
+                ));
+            }
+        }
+        // The source's name without its alias.
+        let lt = trimmed(leaf.toks);
+        let ls = sig(lt);
+        let mut last = *ls.last().ok_or_else(|| why("the CTE's source is empty"))?;
+        if leaf.alias.is_some() {
+            let k = ls.len() - 1;
+            last = if k >= 2 && lt[ls[k - 1]].is("AS") {
+                ls[k - 2]
+            } else if k >= 1 {
+                ls[k - 1]
+            } else {
+                return Err(why("the CTE's source is not understood"));
+            };
+        }
+        let tgt = self.expr(&lt[..=last]).trim().to_string();
+        // How the CTE's query names its table for `ctid`: its alias, else the
+        // table's own name.
+        let qual = match leaf.alias {
+            Some(_) => self.expr(&lt[*ls.last().unwrap()..]).trim().to_string(),
+            None => tgt.clone(),
+        };
+        // The CTE's columns: plain ones map to base columns, computed ones
+        // (`expression AS alias`) are values.
+        let (mut plain, mut computed): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+        for it in split_commas(&body[bs[0] + 1..from]) {
+            let is = sig(it);
+            let as_at = is.iter().rposition(|&j| it[j].is("AS"));
+            match as_at {
+                Some(k) if k > 0 && k + 2 == is.len() => {
+                    let a = name_parts(&it[is[k + 1]..=is[k + 1]])
+                        .filter(|p| p.len() == 1)
+                        .ok_or_else(|| why("a CTE column alias is not a plain name"))?;
+                    if name_parts(trimmed(&it[..is[k]])).is_some() {
+                        return Err(why("a CTE column renames a base column"));
+                    }
+                    computed.push(a[0].clone());
+                }
+                None => match name_parts(trimmed(it)) {
+                    Some(p) if matches!(p.len(), 1 | 2) => plain.push(p[p.len() - 1].clone()),
+                    _ => return Err(why("a CTE column has no name")),
+                },
+                _ => return Err(why("a CTE column is not a column or `expression AS alias`")),
+            }
+        }
+        let mut all: Vec<&String> = plain.iter().chain(computed.iter()).collect();
+        all.sort();
+        if all.windows(2).any(|w| w[0] == w[1]) {
+            return Err(why("two CTE columns share a name (SQL Server rejects it)"));
+        }
+        // The UPDATE: `UPDATE c SET col = alias, …` and nothing else.
+        let upd = &ts[verb..];
+        let us = sig(upd);
+        let set = find_word(upd, 0, "SET").ok_or_else(|| why("the UPDATE has no SET"))?;
+        for w in ["FROM", "WHERE", "OUTPUT", "OPTION"] {
+            if find_word(upd, set, w).is_some() {
+                return Err(why(&format!("the UPDATE has {w}")));
+            }
+        }
+        if us.get(1).is_some_and(|&j| upd[j].is("TOP"))
+            || name_parts(trimmed(&upd[us[0] + 1..set])).as_deref() != Some(&[cte.clone()][..])
+        {
+            return Err(why("the UPDATE's target is not the CTE alone"));
+        }
+        let mut sets: Vec<String> = Vec::new();
+        for it in split_commas(&upd[set + 1..]) {
+            let is = sig(it);
+            let eq = is
+                .iter()
+                .position(|&j| it[j].k == OP && it[j].s == "=")
+                .ok_or_else(|| why("a SET item is not `column = value`"))?;
+            let lhs = name_parts(trimmed(&it[..is[eq]]));
+            let rhs = name_parts(trimmed(&it[is[eq] + 1..]));
+            let (Some(l), Some(r)) = (lhs, rhs) else {
+                return Err(why("a SET item is not a column set from a column"));
+            };
+            let col = l.last().cloned().unwrap_or_default();
+            let val = r.last().cloned().unwrap_or_default();
+            let qual_ok = |p: &Vec<String>| p.len() == 1 || (p.len() == 2 && p[0] == *cte);
+            if !qual_ok(&l) || !qual_ok(&r) || !plain.contains(&col) || !computed.contains(&val) {
+                return Err(why(
+                    "a SET item is not a plain CTE column set from a computed one",
+                ));
+            }
+            let last_tok = |ts: &[T]| -> Vec<T> {
+                let t = trimmed(ts);
+                let k = *sig(t).last().unwrap();
+                t[k..=k].to_vec()
+            };
+            let lc = self.expr(&last_tok(&it[..is[eq]])).trim().to_string();
+            let rc = self.expr(&last_tok(&it[is[eq] + 1..])).trim().to_string();
+            sets.push(format!("{lc} = sqldiff_c.{rc}"));
+        }
+        let inner = self.expr(body).trim().to_string();
+        let Some(rest) = inner
+            .get(..6)
+            .filter(|h| h.eq_ignore_ascii_case("SELECT"))
+            .map(|_| &inner[6..])
+        else {
+            return Err(why("the CTE's query was not converted as a SELECT"));
+        };
+        self.step_ts("tsql.dml.update-cte", ts);
+        Ok(format!(
+            "UPDATE {tgt} AS sqldiff_t SET {} FROM (SELECT {qual}.ctid AS sqldiff_rid,{rest}) AS sqldiff_c WHERE sqldiff_t.ctid = sqldiff_c.sqldiff_rid",
+            sets.join(", ")
+        ))
     }
 
     /// `ts[..end]` of a statement that starts with WITH. A recursive CTE

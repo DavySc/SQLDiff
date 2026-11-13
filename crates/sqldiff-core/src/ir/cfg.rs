@@ -1605,9 +1605,16 @@ impl Lowerer {
         }
         // Temporary objects written and read.
         let mut temp_writes: Vec<String> = Vec::new();
+        // `WITH c AS (SELECT … FROM @t) UPDATE c …` writes @t, which the text
+        // names only inside the CTE's query: that mention is a read and the
+        // write is one more use of the table.
+        let mut hidden_write: Option<String> = None;
         if kind.is_write() {
-            if let Some(parts) = classify::write_target(n) {
+            if let Some((parts, via_cte)) = classify::write_target_via(n) {
                 if let Some(t) = self.temp_of(&parts) {
+                    if via_cte {
+                        hidden_write = Some(t.clone());
+                    }
                     temp_writes.push(t);
                 }
             }
@@ -1666,6 +1673,9 @@ impl Lowerer {
                     .entry(self.name_key(parts.last().unwrap_or(&t.text().to_string())))
                     .or_insert(0) += 1;
             }
+        }
+        if let Some(t) = hidden_write {
+            *mentions.entry(t).or_insert(0) += 1;
         }
         let declares = matches!(kind, StmtKind::Declare | StmtKind::Ddl);
         let temp_reads: Vec<String> = if declares {

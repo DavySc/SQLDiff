@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 201 | 35 (17%) | 6 (3%) | 160 (80%) |
+| `converter` | 202 | 35 (17%) | 6 (3%) | 161 (80%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 230 | 38 (17%) | 8 (3%) | 184 (80%) |
+| **All** | 231 | 38 (16%) | 8 (3%) | 185 (80%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -106,6 +106,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.dml.delete-join` | `converter` | engine |  | `sqldiff-draft/src/tsql.rs` |
 | `tsql.dml.insert-into` | `converter` | lemma: `Sqldiff.Mirror/C3a data statements/INSERT` | `INSERT t (cols) VALUES (...)` on a plain table (the step is the added INTO); INSERT ... SELECT, OUTPUT and other forms engine | `sqldiff-draft/src/tsql.rs` |
 | `tsql.dml.output-into` | `converter` | engine |  | `sqldiff-draft/src/tsql.rs` |
+| `tsql.dml.update-cte` | `converter` | engine | WITH c AS (SELECT … FROM t) UPDATE c SET col = computed: updated by row identity (ctid) from the CTE's query as a derived table | `sqldiff-draft/src/tsql.rs` |
 | `tsql.dml.update-from` | `converter` | engine | UPDATE ... FROM with a join; a plain `UPDATE t SET` leaves no step and is C3a | `sqldiff-draft/src/tsql.rs` |
 | `tsql.end-of-time-literal` | `converter` | engine |  | `sqldiff-draft/src/tsql.rs` |
 | `tsql.exec.named-argument` | `converter` | engine |  | `sqldiff-draft/src/tsql.rs` |
