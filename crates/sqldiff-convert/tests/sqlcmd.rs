@@ -212,3 +212,29 @@ fn a_goto_in_a_trigger_or_with_an_odd_label_is_not_converted() {
     let c = pg(twice);
     assert!(!c.output.contains("<<goto_"), "{}", c.output);
 }
+
+#[test]
+fn a_routine_with_too_many_labels_converts_none_of_its_jumps() {
+    // Regions nest and the output grows with the nesting: past 64 labels the
+    // jumps are named and not converted (the engine reads none either).
+    let routine = |n: usize| {
+        let mut b = String::new();
+        for i in 0..n {
+            b.push_str(&format!("  IF @x = {i} GOTO l{i};\n"));
+        }
+        b.push_str("  UPDATE dbo.u SET a = 1;\n");
+        for i in (0..n).rev() {
+            b.push_str(&format!("  l{i}:\n"));
+        }
+        format!("CREATE PROCEDURE dbo.p @x int\nAS\nBEGIN\n{b}END\n")
+    };
+    let c = pg(&routine(3));
+    assert!(c.output.contains("<<goto_l0>>"), "{}", c.output);
+    let c = pg(&routine(65));
+    assert!(!c.output.contains("<<goto_"), "{}", c.output);
+    assert!(
+        reasons(&c).contains("more than 64 labels"),
+        "{}",
+        reasons(&c)
+    );
+}
