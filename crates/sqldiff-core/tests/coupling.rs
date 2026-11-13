@@ -45,6 +45,11 @@ fn not_coupled(a: &str, b: &str) -> (CClass, CClass) {
     (x, y)
 }
 
+/// The reason text of an `other` class.
+fn why(c: &CClass) -> String {
+    c.why().unwrap_or("").to_string()
+}
+
 const T: &str = "UPDATE t SET c = 1";
 
 #[test]
@@ -58,7 +63,7 @@ fn a_parameter_only_condition_is_coupled() {
 
 #[test]
 fn a_variable_assigned_differently_is_not_coupled() {
-    not_coupled(
+    let (x, y) = not_coupled(
         &tsql(
             "@x int",
             &format!("DECLARE @n int = 0;\nSET @n = @x + 1;\nIF @n > 5 {T};"),
@@ -68,6 +73,10 @@ fn a_variable_assigned_differently_is_not_coupled() {
             "n integer := 0;",
             &format!("n := p_x + 2;\nIF n > 5 THEN {T}; END IF;"),
         ),
+    );
+    assert_eq!(
+        (x, y),
+        (CClass::StatementNotEqual, CClass::StatementNotEqual)
     );
 }
 
@@ -91,10 +100,10 @@ fn a_value_derived_from_a_select_from_a_table_is_not_coupled() {
 
 #[test]
 fn an_assignment_in_one_if_arm_is_not_coupled() {
-    not_coupled(
+    let (x, y) = not_coupled(
         &tsql(
             "@x int",
-            &format!("DECLARE @n int = 0;\nIF @x > 1 SET @n = 5;\nIF @n > 3 {T};"),
+            &format!("DECLARE @n int = 0;\nIF @x > 1 SET @n = @x + 1;\nIF @n > 3 {T};"),
         ),
         &pg(
             "p_x integer",
@@ -102,11 +111,13 @@ fn an_assignment_in_one_if_arm_is_not_coupled() {
             &format!("IF p_x > 1 THEN NULL; END IF;\nIF n > 3 THEN {T}; END IF;"),
         ),
     );
+    assert!(why(&x).contains("no partner"), "{x:?}");
+    assert!(why(&y).contains("no partner"), "{y:?}");
 }
 
 #[test]
 fn a_counter_step_of_one_against_two_is_not_coupled() {
-    not_coupled(
+    let (x, y) = not_coupled(
         &tsql(
             "@x int",
             "DECLARE @i int = 0;\nWHILE @i < 10 BEGIN\nSET @i = @i + 1;\nEND",
@@ -117,11 +128,13 @@ fn a_counter_step_of_one_against_two_is_not_coupled() {
             "WHILE i < 10 LOOP\ni := i + 2;\nEND LOOP;",
         ),
     );
+    assert_eq!(y, CClass::StatementNotEqual, "{y:?}");
+    assert!(why(&x).contains("written in a loop"), "{x:?}");
 }
 
 #[test]
 fn a_select_assignment_from_a_table_is_not_coupled() {
-    not_coupled(
+    let (x, y) = not_coupled(
         &tsql(
             "@x int",
             &format!("DECLARE @v int;\nSELECT @v = c FROM t;\nIF @v > 1 {T};"),
@@ -132,11 +145,12 @@ fn a_select_assignment_from_a_table_is_not_coupled() {
             &format!("SELECT c INTO v FROM t;\nIF v > 1 THEN {T}; END IF;"),
         ),
     );
+    assert_eq!((x, y), (CClass::ReadsTable, CClass::ReadsTable));
 }
 
 #[test]
 fn an_output_argument_is_not_coupled() {
-    let (x, _) = not_coupled(
+    let (x, y) = not_coupled(
         &tsql(
             "@x int",
             &format!("DECLARE @v int = 0;\nEXEC q @v OUTPUT;\nIF @v > 1 {T};"),
@@ -148,6 +162,7 @@ fn an_output_argument_is_not_coupled() {
         ),
     );
     assert_ne!(x, CClass::Coupled);
+    assert_eq!((x, y), (CClass::AfterOutputCall, CClass::AfterOutputCall));
 }
 
 #[test]
@@ -180,17 +195,24 @@ fn random_and_clock_values_are_not_coupled() {
             &format!("IF u IS NULL THEN {T}; END IF;"),
         ),
     );
-    assert_ne!(x, CClass::Coupled);
-    not_coupled(
+    assert_eq!(x, CClass::Volatile);
+    let (x, y) = not_coupled(
         &tsql(
             "@x int",
-            &format!("DECLARE @d datetime2 = SYSDATETIME();\nIF @d IS NULL {T};"),
+            &format!("DECLARE @d datetime2(6) = SYSDATETIME();\nIF @d IS NULL {T};"),
         ),
         &pg(
             "p_x integer",
             "d timestamp := clock_timestamp();",
             &format!("IF d IS NULL THEN {T}; END IF;"),
         ),
+    );
+    // SYSDATETIME and clock_timestamp are different time sources, so the
+    // statement level refuses the pair before volatility is reached: the
+    // volatile reason cannot be isolated for the clock.
+    assert_eq!(
+        (x, y),
+        (CClass::StatementNotEqual, CClass::StatementNotEqual)
     );
 }
 
@@ -209,13 +231,18 @@ fn different_parameter_defaults_are_not_coupled() {
 
 #[test]
 fn a_varchar_parameter_against_nvarchar_is_not_coupled() {
-    not_coupled(
-        &tsql("@x nvarchar(10)", &format!("IF @x = 'a' {T};")),
+    let (_x, _y) = not_coupled(
+        &tsql("@x nvarchar(10)", &format!("IF @x IS NULL {T};")),
         &pg(
             "p_x varchar(10)",
             "",
-            &format!("IF p_x = 'a' THEN {T}; END IF;"),
+            &format!("IF p_x IS NULL THEN {T}; END IF;"),
         ),
+    );
+    assert_eq!(
+        (_x, _y),
+        (CClass::ParamType, CClass::ParamType),
+        "only the type rule may block it"
     );
     // A length the PostgreSQL parameter ignores.
     let (x, _) = not_coupled(
@@ -231,7 +258,7 @@ fn a_varchar_parameter_against_nvarchar_is_not_coupled() {
 
 #[test]
 fn a_declare_in_an_untaken_arm_against_a_block_default_is_not_coupled() {
-    not_coupled(
+    let (x, y) = not_coupled(
         &tsql(
             "@x int",
             &format!("IF @x > 100 BEGIN DECLARE @n int = 5; END\nIF @n = 5 {T};"),
@@ -242,11 +269,13 @@ fn a_declare_in_an_untaken_arm_against_a_block_default_is_not_coupled() {
             &format!("IF p_x > 100 THEN NULL; END IF;\nIF n = 5 THEN {T}; END IF;"),
         ),
     );
+    assert!(why(&x).contains("no partner"), "{x:?}");
+    assert!(why(&y).contains("no partner"), "{y:?}");
 }
 
 #[test]
 fn a_shadowed_variable_is_not_coupled() {
-    not_coupled(
+    let (x, y) = not_coupled(
         &tsql("@x int", &format!("DECLARE @n int = 1;\nIF @n = 1 {T};")),
         &pg(
             "p_x integer",
@@ -254,21 +283,34 @@ fn a_shadowed_variable_is_not_coupled() {
             &format!("DECLARE n integer := 2;\nBEGIN\nIF n = 1 THEN {T}; END IF;\nEND;"),
         ),
     );
+    assert!(why(&x).contains("declared twice"), "{x:?}");
+    assert!(why(&y).contains("declared twice"), "{y:?}");
 }
 
 #[test]
 fn a_multi_target_select_is_not_coupled() {
-    not_coupled(
+    // Values are parameters, so the locals pair and only the multi-target
+    // rule can keep @a1 out of kappa.
+    let (x, y) = not_coupled(
         &tsql(
             "@x int",
-            &format!("DECLARE @a int;\nDECLARE @b int;\nSELECT @a = 1, @b = 2;\nIF @a = 1 {T};"),
+            &format!(
+                "DECLARE @a1 int;\nDECLARE @b int;\nSELECT @a1 = @x, @b = @x + 1;\nIF @a1 = 1 {T};"
+            ),
         ),
         &pg(
             "p_x integer",
-            "a integer; b integer;",
-            &format!("a := 1;\nb := 2;\nIF a = 1 THEN {T}; END IF;"),
+            "a1 integer; b integer;",
+            &format!("a1 := p_x;\nb := p_x + 1;\nIF a1 = 1 THEN {T}; END IF;"),
         ),
     );
+    for c in [x, y] {
+        assert_eq!(
+            why(&c),
+            sqldiff_core::equiv::coupling::MULTI_TARGET,
+            "{c:?}"
+        );
+    }
 }
 
 #[test]
@@ -357,4 +399,64 @@ fn the_diff_path_does_not_run_the_analysis() {
     report(&a, &b);
     let (after, _) = diff(a, b);
     assert_eq!(before, after);
+}
+
+#[test]
+fn cx2_a_declare_in_an_untaken_arm_against_a_block_default_is_not_coupled() {
+    let (x, y) = not_coupled(
+        &tsql(
+            "@a int",
+            "IF @a = 1 BEGIN DECLARE @x int = 5; END;\nIF @x IS NULL DELETE FROM big;",
+        ),
+        &pg(
+            "a integer",
+            "x integer := 5;",
+            "IF a = 1 THEN NULL; END IF;\nIF x IS NULL THEN DELETE FROM big; END IF;",
+        ),
+    );
+    // The T-SQL initializer is an assignment at its own point (inside the
+    // arm); the PostgreSQL default is one at block entry. Unpaired.
+    assert!(why(&x).contains("no partner"), "{x:?}");
+    assert!(why(&y).contains("no partner"), "{y:?}");
+}
+
+#[test]
+fn cx2_a_goto_over_the_declare_against_a_block_default_is_not_coupled() {
+    let (x, y) = not_coupled(
+        &tsql(
+            "@a int",
+            "IF @a = 1 GOTO l;\nDECLARE @x int = 5;\nl:\nIF @x IS NULL DELETE FROM big;",
+        ),
+        &pg(
+            "a integer",
+            "x integer := 5;",
+            "<<goto_l>>\nBEGIN\nIF a = 1 THEN EXIT goto_l; END IF;\nEND;\nIF x IS NULL THEN DELETE FROM big; END IF;",
+        ),
+    );
+    assert!(
+        why(&x).contains("no partner") || why(&x).contains("jump leaves"),
+        "{x:?}"
+    );
+    assert!(
+        why(&y).contains("no partner") || why(&y).contains("jump leaves"),
+        "{y:?}"
+    );
+}
+
+#[test]
+fn a_declare_with_a_value_at_the_same_aligned_point_is_coupled() {
+    // T-SQL `DECLARE @v = e` is an assignment at its own point and the
+    // PostgreSQL default one at block entry: aligned at the top they couple.
+    let (x, y) = last(
+        &tsql(
+            "@a int",
+            "DECLARE @v int = 5;\nIF @v IS NULL DELETE FROM big;",
+        ),
+        &pg(
+            "a integer",
+            "v integer := 5;",
+            "IF v IS NULL THEN DELETE FROM big; END IF;",
+        ),
+    );
+    assert_eq!((x, y), (CClass::Coupled, CClass::Coupled));
 }

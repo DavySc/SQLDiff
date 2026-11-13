@@ -153,6 +153,8 @@ enum Why {
     Table,
     ServerFn,
     NotEqual,
+    /// `SELECT @a = .., @b = ..` with more than one target.
+    MultiTarget,
     Other(String),
 }
 
@@ -167,7 +169,11 @@ struct K {
 impl K {
     fn drop_var(&mut self, v: Var, why: Why) {
         self.set.remove(&v);
-        self.why.insert(v, why);
+        // The multi-target rule is the reason that names the statement shape;
+        // a later drop of the same variable does not hide it.
+        if self.why.get(&v) != Some(&Why::MultiTarget) {
+            self.why.insert(v, why);
+        }
     }
 
     fn meet(&self, o: &K) -> K {
@@ -306,6 +312,10 @@ fn volatile_kind(t: &Term) -> Option<Why> {
     out
 }
 
+/// The reason text of a multi-target assignment.
+pub const MULTI_TARGET: &str =
+    "a SELECT with more than one assignment target is not on the allow-list (multi-target rule)";
+
 fn why_class(w: &Why) -> CClass {
     match w {
         Why::Param(_) => CClass::ParamType,
@@ -315,6 +325,7 @@ fn why_class(w: &Why) -> CClass {
         Why::Table => CClass::ReadsTable,
         Why::ServerFn => CClass::ServerFn,
         Why::NotEqual => CClass::StatementNotEqual,
+        Why::MultiTarget => CClass::Other(MULTI_TARGET.into()),
         Why::Other(s) => CClass::Other(s.clone()),
     }
 }
@@ -362,6 +373,12 @@ impl Ctx<'_, '_> {
     fn kill_why(&self, b: bool, e: usize) -> Why {
         let s = self.side(b);
         match &s.ev[e] {
+            Ev::Stmt(st)
+                if matches!(&st.ast, Ok(Stmt::Select(q))
+                    if q.from.is_empty() && q.items.iter().filter(|i| i.assign.is_some()).count() > 1) =>
+            {
+                Why::MultiTarget
+            }
             Ev::Ctl(_) => Why::Output,
             Ev::Stmt(st) => match &st.ast {
                 Ok(Stmt::Select(q)) if !q.from.is_empty() => Why::Table,
@@ -377,7 +394,10 @@ impl Ctx<'_, '_> {
                 let (Write::Plain(v) | Write::Implicit(v) | Write::Kill(v)) = w;
                 if let Some(av) = self.a_index(b, v) {
                     if self.cand.contains(&av) {
-                        let y = why.clone().unwrap_or_else(|| self.kill_why(b, e));
+                        let y = match self.kill_why(b, e) {
+                            Why::MultiTarget => Why::MultiTarget,
+                            k => why.clone().unwrap_or(k),
+                        };
                         k.drop_var(av, y);
                     }
                 }
@@ -492,8 +512,21 @@ impl Ctx<'_, '_> {
             self.tap(&k.clone(), q);
             return;
         }
-        let w = self.written(b, std::slice::from_ref(n));
-        let kk = self.region(k, &w, "written by a statement or region with no partner");
+        let mut kk = k.clone();
+        match n {
+            Node::Stmts(v) => self.apply_writes(
+                b,
+                v,
+                &mut kk,
+                Some(Why::Other(
+                    "written by a statement with no partner on the other side".into(),
+                )),
+            ),
+            Node::Blk(_) => {
+                let w = self.written(b, std::slice::from_ref(n));
+                kk = self.region(k, &w, "written by a region with no partner");
+            }
+        }
         self.tap(&kk, q);
         *k = kk;
     }
@@ -839,7 +872,7 @@ impl Ctx<'_, '_> {
                 let end = self.seq(ba, bb, head.clone(), true);
                 k.meet(&end).meet(&head)
             } else {
-                restricted.meet(&head)
+                head.meet(&restricted)
             };
             self.loops -= 1;
             if next.set == head.set {
