@@ -1,6 +1,7 @@
 //! Procedure calls and object comments compared across dialects: T-SQL
 //! `EXEC` against PostgreSQL `CALL`, and T-SQL `sp_addextendedproperty`
-//! against PostgreSQL `COMMENT ON`.
+//! against PostgreSQL `COMMENT ON`. Against Db2 for i only an `EXEC` without
+//! arguments, as `CALL schema.name()`, is compared.
 //!
 //! Each statement is read completely or not at all: dynamic SQL, return
 //! codes, `WITH` options, expressions T-SQL does not accept as arguments and
@@ -192,7 +193,15 @@ fn object_key(parts: &[Name], d: Dialect) -> R<(Option<String>, String)> {
     let default = match d {
         Dialect::Tsql => "dbo",
         Dialect::Postgres => "public",
-        Dialect::Db2i => return Err("Db2 for i is not compared".into()),
+        // A Db2 for i name without a schema resolves through the current
+        // schema or the library list, which no catalog here records.
+        Dialect::Db2i => {
+            return match parts {
+                [s, o] => Ok((Some(super::ddl::fold(s, d)?), super::ddl::fold(o, d)?)),
+                [_] => Err("a Db2 for i name without a schema is not compared".into()),
+                _ => Err("a name with more than two parts".into()),
+            }
+        }
     };
     match parts {
         [o] => Ok((None, key(o, d)?)),
@@ -247,8 +256,33 @@ pub fn parse(ts: &[Tok], d: Dialect) -> R<Stmt> {
             Some("COMMENT") => pg_comment(ts).map(Stmt::Comment),
             _ => Err("not a CALL or COMMENT ON".into()),
         },
-        Dialect::Db2i => Err("Db2 for i calls and comments are not compared yet".into()),
+        Dialect::Db2i => match ts.first().map(|t| t.up.as_str()) {
+            Some("CALL") => db2_call(ts).map(Stmt::Call),
+            _ => Err("Db2 for i comments are not compared yet".into()),
+        },
     }
+}
+
+/// Db2 for i `CALL schema.name()`: only a qualified name and an empty
+/// argument list are read. An argument takes the parameter's type, and the
+/// Db2 for i parameter types are not verified facts, so a call with
+/// arguments is not compared.
+fn db2_call(ts: &[Tok]) -> R<Call> {
+    let (name, i) = dotted(ts, 1)?;
+    if ts.get(i).map(|t| t.kind) != Some(K::LParen) || ts.last().map(|t| t.kind) != Some(K::RParen)
+    {
+        return Err("CALL without an argument list".into());
+    }
+    if ts.len() != i + 2 {
+        return Err(
+            "Db2 for i call arguments are not compared (the parameter types are not verified)"
+                .into(),
+        );
+    }
+    Ok(Call {
+        name,
+        args: Vec::new(),
+    })
 }
 
 fn tsql(ts: &[Tok]) -> R<Stmt> {
@@ -1589,7 +1623,39 @@ fn comparable(x: &Term, y: &Term) -> bool {
     x.head() == y.head() && (!x.is("tval") || x.kid(0) == y.kid(0))
 }
 
+/// A T-SQL `EXEC p` without arguments against a Db2 for i `CALL p()`.
+/// Nothing is passed, so no parameter type or value is involved: both
+/// procedures must exist once, in a qualified name, and take no parameters.
+fn calls_without_arguments(x: &Call, t: &Side, y: &Call, p: &Side) -> R<Verdict> {
+    if !x.args.is_empty() || !y.args.is_empty() {
+        return Err("a call with arguments to Db2 for i is not compared".into());
+    }
+    let (rt, rp) = (callee(x, t)?, callee(y, p)?);
+    if !rt.params.is_empty() || !rp.params.is_empty() {
+        return Err(format!(
+            "{} takes {} parameter(s) on {} and {} on {}",
+            rt.display(),
+            rt.params.len(),
+            t.name,
+            rp.params.len(),
+            p.name
+        ));
+    }
+    // Both sides must name the same procedure (schema and name, up to
+    // letter case).
+    if object_key(&x.name, t.d)? != object_key(&y.name, p.d)? {
+        return Err("the two calls name different procedures".into());
+    }
+    Ok(Verdict::Equal(vec![
+        asm::make(asms::CALLEE),
+        asm::make(asm::IDENT_FOLD),
+    ]))
+}
+
 fn calls(x: &Call, t: &Side, y: &Call, p: &Side) -> R<Verdict> {
+    if p.d == Dialect::Db2i {
+        return calls_without_arguments(x, t, y, p);
+    }
     let mut asms = vec![asm::make(asms::CALLEE), asm::make(asm::IDENT_FOLD)];
     let (rt, rp) = (callee(x, t)?, callee(y, p)?);
     case_check(&y.name, p)?;

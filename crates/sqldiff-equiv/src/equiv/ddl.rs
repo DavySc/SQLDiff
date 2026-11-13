@@ -280,7 +280,7 @@ fn drop_kind(w: &str) -> Option<&'static str> {
 
 /// The name a part resolves to (see `table::key`); a quoted Db2 for i name
 /// that is not all capitals matches no unquoted name.
-fn fold(n: &Name, d: Dialect) -> R<String> {
+pub(super) fn fold(n: &Name, d: Dialect) -> R<String> {
     if d == Dialect::Db2i && n.quoted && n.text != n.text.to_uppercase() {
         return Err(format!(
             "the quoted name \"{}\" keeps its lower-case letters in Db2 for i",
