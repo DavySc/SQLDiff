@@ -1004,13 +1004,13 @@ fn calls(
         format!("`{s}`")
     };
     let t_is_a = match (a.dialect(), b.dialect()) {
-        (Dialect::Tsql, Dialect::Postgres) => true,
-        (Dialect::Postgres, Dialect::Tsql) => false,
+        (Dialect::Tsql, Dialect::Postgres | Dialect::Db2i) => true,
+        (Dialect::Postgres | Dialect::Db2i, Dialect::Tsql) => false,
         _ => {
             for (side, u, name) in [(a, ua, &na), (b, ub, &nb)] {
                 for (node, _) in &u.calls {
                     out.unknown_reasons.push(format!(
-                        "{name} line {}: the call {} is not compared: only T-SQL against PostgreSQL is",
+                        "{name} line {}: the call {} is not compared: only T-SQL against PostgreSQL or Db2 for i is",
                         side.line_of(node),
                         shown(node)
                     ));

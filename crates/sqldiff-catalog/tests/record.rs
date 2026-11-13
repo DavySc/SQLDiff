@@ -238,6 +238,7 @@ fn routine() -> Routine {
         }],
         returns: None,
         returns_status: false,
+        dynamic_result_sets: None,
     }
 }
 
@@ -250,6 +251,7 @@ fn every_field_of_a_routine_and_its_parameters_is_digested() {
         params: _,
         returns: _,
         returns_status: _,
+        dynamic_result_sets: _,
     } = routine();
     all_change(
         &routine(),
@@ -260,6 +262,10 @@ fn every_field_of_a_routine_and_its_parameters_is_digested() {
             ("params", Box::new(|r| r.params.clear())),
             ("returns", Box::new(|r| r.returns = Some(dt("int")))),
             ("returns_status", Box::new(|r| r.returns_status = true)),
+            (
+                "dynamic_result_sets",
+                Box::new(|r| r.dynamic_result_sets = Some(true)),
+            ),
         ],
     );
     let param = || routine().params.remove(0);

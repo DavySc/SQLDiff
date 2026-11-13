@@ -291,6 +291,13 @@ pub struct Routine {
     /// Only read from T-SQL DDL.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub returns_status: bool,
+    /// A Db2 for i procedure: whether it declares `[DYNAMIC] RESULT SETS n`
+    /// with n other than 0 (the cursors it leaves open go to its caller, or
+    /// its client, which a comparison of the calls cannot see). `None` when
+    /// not read: only Db2 for i DDL sets it, a catalog sent by an adapter
+    /// does not, and a reader must treat `None` as "may return result sets".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_result_sets: Option<bool>,
 }
 
 impl Routine {

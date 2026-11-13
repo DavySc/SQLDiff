@@ -156,8 +156,11 @@ order by what they call or comment on; one without a counterpart is not
 compared. A call must sit in the same place among the data statements on both
 sides. A comment reads and writes no data, so its place does not matter, as
 long as only comments follow it on each side (nothing after it can create,
-change or drop the object again). Db2 for i calls and comments are not
-compared yet; the open questions are probes `V30-*` in
+change or drop the object again). Db2 for i: only a T-SQL `EXEC p` without
+arguments against `CALL schema.p()` is compared (the procedure found once on
+each side, no parameters, a schema on the Db2 name; `ASM-CALLEE-CONVERTED`).
+A call with arguments needs the Db2 for i parameter types, and Db2 for i
+comments are not compared yet; the open questions are probes `V30-*` in
 [probes/db2i](../probes/db2i/README.md).
 
 **Calls.** The called procedure is looked up in both sides' catalogs (in a
