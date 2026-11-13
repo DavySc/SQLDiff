@@ -1644,11 +1644,20 @@ fn calls_without_arguments(x: &Call, t: &Side, y: &Call, p: &Side) -> R<Verdict>
     // A Db2 for i procedure's open cursors go to its caller, a T-SQL
     // procedure's result sets to the client: `CALL` of a callee that declares
     // DYNAMIC RESULT SETS may route rows elsewhere (WITH RETURN TO CALLER).
-    if rp.dynamic_result_sets {
-        return Err(format!(
-            "{} declares DYNAMIC RESULT SETS: its result sets may go to the caller of the CALL, not to the client as T-SQL's go",
-            rp.display()
-        ));
+    match rp.dynamic_result_sets {
+        Some(false) => {}
+        Some(true) => {
+            return Err(format!(
+                "{} declares DYNAMIC RESULT SETS: its result sets may go to the caller of the CALL, not to the client as T-SQL's go",
+                rp.display()
+            ))
+        }
+        None => {
+            return Err(format!(
+                "{}'s catalog entry does not say whether it declares DYNAMIC RESULT SETS (its result sets may go to the caller of the CALL)",
+                rp.display()
+            ))
+        }
     }
     // Both sides must name the same procedure (schema and name, up to
     // letter case).

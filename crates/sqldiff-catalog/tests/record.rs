@@ -238,7 +238,7 @@ fn routine() -> Routine {
         }],
         returns: None,
         returns_status: false,
-        dynamic_result_sets: false,
+        dynamic_result_sets: None,
     }
 }
 
@@ -264,7 +264,7 @@ fn every_field_of_a_routine_and_its_parameters_is_digested() {
             ("returns_status", Box::new(|r| r.returns_status = true)),
             (
                 "dynamic_result_sets",
-                Box::new(|r| r.dynamic_result_sets = true),
+                Box::new(|r| r.dynamic_result_sets = Some(true)),
             ),
         ],
     );

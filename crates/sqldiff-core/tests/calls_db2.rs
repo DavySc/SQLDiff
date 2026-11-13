@@ -163,6 +163,22 @@ END;
 }
 
 #[test]
+fn result_sets_without_dynamic_is_read_too() {
+    for decl in ["RESULT SETS 1", "RESULT SET 1", "DYNAMIC RESULT SETS 2"] {
+        let cat = format!(
+            "CREATE SCHEMA SALES;\nCREATE PROCEDURE SALES.REP () {decl} LANGUAGE SQL\nBEGIN\n  DECLARE C CURSOR WITH RETURN TO CALLER FOR SELECT 1 FROM SYSIBM.SYSDUMMY1;\n  OPEN C;\nEND;\n"
+        );
+        let r = run_rep("EXEC Sales.Rep;", "CALL Sales.Rep();", &cat);
+        assert!(
+            r.unknown_reasons.iter().any(|x| x.contains("RESULT SETS")),
+            "{decl}: {:?}",
+            r.unknown_reasons
+        );
+        assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions, "{decl}");
+    }
+}
+
+#[test]
 fn a_callee_with_zero_result_sets_is_compared() {
     let cat = "CREATE SCHEMA SALES;
 CREATE PROCEDURE SALES.REP () LANGUAGE SQL DYNAMIC RESULT SETS 0
@@ -170,16 +186,47 @@ BEGIN
 END;
 ";
     let r = run_rep("EXEC Sales.Rep;", "CALL Sales.Rep();", cat);
-    assert!(
-        !r.unknown_reasons.iter().any(|x| x.contains("call")),
-        "{:?}",
-        r.unknown_reasons
-    );
+    assert!(r.unknown_reasons.is_empty(), "{:?}", r.unknown_reasons);
+    assert_eq!(r.verdict(), Verdict::EqualUnderAssumptions);
 }
 
 #[test]
 fn an_argument_on_one_side_only_is_never_equal() {
     let r = run("EXEC Sales.Noop 3;", "CALL Sales.Noop();", CAT_D);
     assert_ne!(r.verdict(), Verdict::Equal);
+    assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
+}
+
+#[test]
+fn a_callee_whose_result_sets_the_catalog_did_not_read_is_not_compared() {
+    use sqldiff_core::catalog::{ddl, Catalog};
+    use sqldiff_core::Facts;
+    use std::sync::Arc;
+
+    // A catalog an adapter sent (no DDL read) does not say whether the
+    // procedure declares result sets: the call must not count as compared.
+    let mut cat = Catalog::default();
+    let root = sqldiff_syntax::parse(CAT_D, D).syntax();
+    ddl::load_tree(&mut cat, &root, D);
+    for r in &mut cat.routines {
+        r.dynamic_result_sets = None;
+    }
+    let o = Options {
+        catalog_a: vec![Artifact::new("cat.sql", T, CAT_T)],
+        facts_b: vec![Facts::new(Arc::new(cat))],
+        ..Options::default()
+    };
+    let r = diff(
+        &Artifact::new("a.sql", T, "EXEC Sales.Noop;"),
+        &Artifact::new("b.sql", D, "CALL Sales.Noop();"),
+        &o,
+    );
+    assert!(
+        r.unknown_reasons
+            .iter()
+            .any(|x| x.contains("does not say whether it declares DYNAMIC RESULT SETS")),
+        "{:?}",
+        r.unknown_reasons
+    );
     assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
 }
