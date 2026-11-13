@@ -202,6 +202,7 @@ pub fn diff_within(
         hashes_b: all_hashes(&ub),
         skipped_a: HashSet::new(),
         skipped_b: HashSet::new(),
+        named_jumps: names_labels(a) || names_labels(b),
         work,
         allowance,
     };
@@ -225,10 +226,28 @@ struct Ctx<'x, 'a> {
     /// whose twin is among them may only have moved there.
     skipped_a: HashSet<String>,
     skipped_b: HashSet<String>,
+    /// Either side has a jump that may name a label (`GOTO l`, `EXIT l`,
+    /// `CONTINUE l`, `LEAVE l`, `ITERATE l`): then a label added, removed or
+    /// renamed can change which block or loop a jump leaves, and is not noise.
+    named_jumps: bool,
     /// The exact-alignment bound ([`crate::normalize::lcs_pairs_bounded`]).
     work: usize,
     /// What the alignments and gap pairings of this diff may still spend.
     allowance: &'x sqldiff_model::work::Allowance,
+}
+
+/// Whether the artifact holds a statement that may jump to a label.
+fn names_labels(a: &Analyzed) -> bool {
+    a.root.descendants().any(|n| {
+        n.kind() == SyntaxKind::STATEMENT && {
+            let w = ast::first_words(&n, 2);
+            w.len() == 2
+                && matches!(
+                    w[0].as_str(),
+                    "GOTO" | "EXIT" | "CONTINUE" | "LEAVE" | "ITERATE"
+                )
+        }
+    })
 }
 
 fn all_hashes(units: &[Unit]) -> HashSet<String> {
@@ -543,7 +562,12 @@ impl Ctx<'_, '_> {
         if touches_txn {
             class = ChangeClass::Transactional;
         }
-        if class == ChangeClass::Structural {
+        // A renamed label is structure only, unless a jump may name a label:
+        // then which block or loop it leaves can change (a rename that makes
+        // an inner label shadow an outer one), so it is not judged here.
+        let label_matters = self.named_jumps
+            && (x.node.kind() == SyntaxKind::LABEL || y.node.kind() == SyntaxKind::LABEL);
+        if class == ChangeClass::Structural && !label_matters {
             self.out.structural += 1;
             let part = |u: &Unit| {
                 if rule == "header.modified" {
@@ -710,7 +734,11 @@ impl Ctx<'_, '_> {
     }
 
     fn push_unpaired(&mut self, u: &Unit, removed: bool) {
-        if u.node.kind() == SyntaxKind::LABEL {
+        // A label no jump can name changes nothing; with jumps that may name
+        // one, the labelled statement a jump leaves can change (a renamed
+        // label that shadows another), so it is left to the generic path:
+        // an unpaired statement, not proven.
+        if u.node.kind() == SyntaxKind::LABEL && !self.named_jumps {
             self.out.structural += 1;
             let p = Some(Part::Whole(u.node.clone()));
             self.out.receipts.push(Receipt::Judged {
