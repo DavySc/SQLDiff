@@ -1896,3 +1896,6 @@ fn resolve_oracle(prof: &Profile, frames: &[Frame], kind: ErrorKind, resume: Nod
 
 #[cfg(test)]
 mod route_tests;
+
+#[cfg(test)]
+mod goto_tests;

@@ -56,17 +56,6 @@ fn a_jump_out_of_nested_blocks_is_followed() {
 }
 
 #[test]
-fn a_jump_out_of_a_catch_block_is_followed() {
-    let src = "BEGIN TRY\nINSERT dbo.t (c) VALUES (1);\nEND TRY\nBEGIN CATCH\nINSERT dbo.err (c) VALUES (1);\nGOTO Done\nEND CATCH\nUPDATE dbo.t SET c = @x;\nDone:\nINSERT dbo.log (c) VALUES (@x);";
-    let no_jump = src.replace("GOTO Done\n", "");
-    let r = run(src, &no_jump);
-    assert_ne!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
-    // The jump is followed: nothing says it is not modelled.
-    let text = format!("{:#?}", r.findings);
-    assert!(!text.contains("GOTO is not modelled"), "{text}");
-}
-
-#[test]
 fn a_backward_goto_is_not_modelled() {
     let src = "DECLARE @n int = 0;\nagain:\nSET @n = @n + 1;\nINSERT dbo.t (c) VALUES (@n);\nIF @n < 3 GOTO again;";
     let other = src.replace("< 3", "< 4");
