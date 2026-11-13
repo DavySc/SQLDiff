@@ -475,9 +475,9 @@ struct Ctx {
     /// (`Lowerer::push_frame`) and shared by every statement lowered here.
     routes: Rc<FrameRoutes>,
     scope: Option<ScopeId>,
-    /// Innermost loop: (head, exit).
+    /// Innermost loop: its head and exit, and the context it was entered in.
     loop_: Option<Target>,
-    /// Labels of enclosing loops and blocks: label -> (head, exit).
+    /// Labels of enclosing loops and blocks: label -> target (head, exit, depth).
     labels: Vec<(String, Target)>,
     /// Db2 `DECLARE c CONDITION FOR SQLSTATE '...'`.
     conditions: HashMap<String, Vec<ErrorKind>>,
@@ -1352,8 +1352,8 @@ impl Lowerer {
     /// exit) starts at: the exception blocks and TRY blocks entered since
     /// the target was set up are left first, as at their normal ends, so no
     /// scope stays on the stack (a later COMMIT would be refused as inside an
-    /// exception block). A jump out of a handler body (Db2 or PostgreSQL
-    /// EXCEPTION section) keeps the direct edge.
+    /// exception block). A jump out of a Db2 handler body keeps the direct
+    /// edge (PostgreSQL EXCEPTION handlers run in the outer context).
     fn leave_scopes(&mut self, t: &Target, to: NodeId, ctx: &Ctx) -> NodeId {
         if t.handler_depth != ctx.handler_depth || t.frames > ctx.frames.len() {
             return to;
@@ -1953,4 +1953,6 @@ mod route_tests;
 
 #[cfg(test)]
 mod exit_tests;
+
+#[cfg(test)]
 mod goto_tests;
