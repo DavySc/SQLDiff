@@ -9,7 +9,7 @@
 //! it needs (a note), or refuses, in which case the unit is kept as a comment
 //! and marked not converted. Behavioural checks are left to the engine.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sqldiff_syntax::{Dialect, SyntaxElement, SyntaxKind, SyntaxNode};
 use SyntaxKind::*;
@@ -175,6 +175,7 @@ pub(crate) fn convert(
         table_items: Vec::new(),
         left_out_indexes: Vec::new(),
         alias_types: BTreeMap::new(),
+        unresolved_types: std::cell::RefCell::new(BTreeSet::new()),
         update_ctes: Vec::new(),
         stmt_ctes: Vec::new(),
         stmt_insert: false,
@@ -583,6 +584,12 @@ struct Cx<'a> {
     /// Alias types this file creates (`CREATE TYPE n FROM base`), by schema
     /// and name (lower case, `dbo` for none).
     alias_types: BTreeMap<(String, String), AliasType>,
+    /// Column types read from the catalog that name a user type this file
+    /// does not create (an alias type defined in another file, a CLR or
+    /// table type): what a rewrite reads off the column's base type is
+    /// unknown for them. Filled by `dt_cat`, taken by `guard_bits`, which
+    /// refuses the statement.
+    unresolved_types: std::cell::RefCell<BTreeSet<String>>,
     /// The CTEs of the `WITH … UPDATE … FROM` being converted (lower case),
     /// with the GROUP BY key their query returns (`group_key`), if any.
     update_ctes: Vec<(String, Option<Vec<String>>)>,
@@ -6767,6 +6774,15 @@ impl<'a> Cx<'a> {
     /// The class of a catalog column type (`base` as the catalog spells it),
     /// reading an alias type created in this file as its base type.
     fn dt_cat(&self, base: &str, args: &[u32]) -> Dt {
+        if let Some(n) = self.unresolved_user_type(base, args) {
+            self.unresolved_types.borrow_mut().insert(n);
+            return Dt::Other;
+        }
+        self.dt_cat_known(base, args)
+    }
+
+    /// `dt_cat` without noting an unresolved user type.
+    fn dt_cat_known(&self, base: &str, args: &[u32]) -> Dt {
         if args.is_empty() {
             let parts: Vec<String> = base.split('.').map(tsql_unquote).collect();
             let key = match parts.as_slice() {
@@ -6781,6 +6797,48 @@ impl<'a> Cx<'a> {
             }
         }
         Dt::of(base, args)
+    }
+
+    /// The name of a catalog column type (no arguments) that is neither a
+    /// built-in type nor an alias type this file creates: its definition, if
+    /// any, is in another file, and a conversion of this file must not
+    /// guess its base type (a bit alias compared with 1 needs `= TRUE`).
+    fn unresolved_user_type(&self, base: &str, args: &[u32]) -> Option<String> {
+        // No type at all (a computed column) is not a user type. Db2 for i
+        // keeps no alias types (`create_alias_type` refuses them) and its
+        // rewrites do not read a column's base type this way.
+        if self.db2() || !args.is_empty() || base.trim().is_empty() {
+            return None;
+        }
+        let parts: Vec<String> = base.split('.').map(|p| tsql_unquote(p.trim())).collect();
+        let (schema, name) = match parts.as_slice() {
+            [n] => ("dbo".to_string(), n.clone()),
+            [s, n] => (s.to_ascii_lowercase(), n.clone()),
+            _ => return Some(parts.join(".")),
+        };
+        let up = name.to_ascii_uppercase();
+        let builtin = KNOWN_TYPES.contains(&up.as_str())
+            || [
+                "ROWVERSION",
+                "TIMESTAMP",
+                "SQL_VARIANT",
+                "HIERARCHYID",
+                "GEOGRAPHY",
+                "GEOMETRY",
+            ]
+            .contains(&up.as_str());
+        if (builtin && (schema == "dbo" || schema == "sys"))
+            || self
+                .alias_types
+                .contains_key(&(schema.clone(), name.to_ascii_lowercase()))
+        {
+            return None;
+        }
+        Some(if schema == "dbo" {
+            name
+        } else {
+            format!("{schema}.{name}")
+        })
     }
 
     fn create_schema(&mut self, ts: &[T]) -> R<String> {
