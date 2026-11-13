@@ -157,8 +157,8 @@ impl<'a> Parser<'a> {
 
     fn sig_index(&self, n: usize) -> Option<usize> {
         let mut seen = 0;
-        for i in self.pos..self.tokens.len() {
-            if !self.tokens[i].kind.is_trivia() {
+        for (i, t) in self.tokens.iter().enumerate().skip(self.pos) {
+            if !t.kind.is_trivia() {
                 if seen == n {
                     return Some(i);
                 }
