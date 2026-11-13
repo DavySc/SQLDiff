@@ -1635,6 +1635,27 @@ enum Same {
     Unknown(String),
 }
 
+/// Whether a column default reads PostgreSQL's `statement_timestamp()`. A
+/// default is filled when a row is inserted, and inside a routine that clock
+/// is the start of the CALL, not of the INSERT (SQL Server's SYSDATETIME()
+/// default reads the INSERT's): which of the two a default means depends on
+/// the statements that fill it, so it is never shown equal.
+/// An equal verdict for defaults one of which reads `statement_timestamp()`
+/// becomes "not proven"; a difference or an unknown stays as it is.
+fn clock_default_not_proven(v: Same, clock: bool) -> Same {
+    match v {
+        Same::Yes(_) if clock => Same::Unknown(STATEMENT_CLOCK_DEFAULT.to_string()),
+        v => v,
+    }
+}
+
+fn reads_statement_clock(toks: &[ast::Tok]) -> bool {
+    toks.iter()
+        .any(|t| t.kind == ast::K::Word && t.up == "STATEMENT_TIMESTAMP")
+}
+
+const STATEMENT_CLOCK_DEFAULT: &str = "a default that reads statement_timestamp() is the start of the CALL when a routine inserts the row, not the time of the INSERT";
+
 /// Compares statement `x` (side A) with `y` (side B) term by term.
 #[allow(clippy::too_many_arguments)]
 fn same_stmt(
@@ -2871,7 +2892,11 @@ fn table_pair(
                     v.extend(e.iter().cloned());
                     v
                 };
-                match same(&select(&ea), &select(&eb), sa, sb, false) {
+                let verdict = clock_default_not_proven(
+                    same(&select(&ea), &select(&eb), sa, sb, false),
+                    reads_statement_clock(&ea) || reads_statement_clock(&eb),
+                );
+                match verdict {
                     Same::Yes(xs) => xs.into_iter().for_each(|x| add(&mut asms, x)),
                     Same::No(class, rule, w) => {
                         found = true;
@@ -3575,7 +3600,11 @@ fn ddl_stmts(
                         v.extend(e.iter().cloned());
                         v
                     };
-                    match same_stmt(&select(&ea), &select(&eb), ua, ub, sa, sb, &na, &nb) {
+                    let verdict = clock_default_not_proven(
+                        same_stmt(&select(&ea), &select(&eb), ua, ub, sa, sb, &na, &nb),
+                        reads_statement_clock(&ea) || reads_statement_clock(&eb),
+                    );
+                    match verdict {
                         Same::Yes(xs) => xs.into_iter().for_each(|x| add(&mut asms, x)),
                         Same::No(class, rule, w) => {
                             found = true;
