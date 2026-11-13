@@ -241,6 +241,9 @@ fn structure(ev: &[Ev<'_>]) -> Option<Vec<Blk>> {
             CtlKind::If(_) | CtlKind::RowsIf(..) => Some(Open::If),
             CtlKind::While(_) | CtlKind::FetchWhile(_) => Some(Open::While),
             CtlKind::Try => Some(Open::Try),
+            // A block or a jump out of one is not followed here: an `End`
+            // would close the wrong construct.
+            CtlKind::Block | CtlKind::Exit(_) => return None,
             _ => None,
         };
         if let Some(kind) = open {

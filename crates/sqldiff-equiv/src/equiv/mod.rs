@@ -18,6 +18,7 @@ pub mod edit;
 pub mod eval;
 pub mod geography;
 mod geography_area;
+pub mod goto;
 pub mod identity;
 mod known_bytes;
 pub mod like;
@@ -231,7 +232,8 @@ fn known_wkb_args(unit: &Unit, s: &lower::LStmt) -> Vec<(String, String)> {
 
 /// The item of an IF or loop marker (`lower::CtlKind`): `ctl-if(cond)`,
 /// `ctl-while(cond)`, `ctl-try`, `ctl-catch`, `ctl-else`, `ctl-end`,
-/// `ctl-break`, `ctl-continue`, `ctl-rethrow`, `ctl-call(callee)`.
+/// `ctl-break`, `ctl-continue`, `ctl-rethrow`, `ctl-block`, `ctl-exit(n)`,
+/// `ctl-call(callee)`.
 fn ctl_item(c: &mut Canon, unit: &Unit, m: &lower::Ctl) -> Item {
     use lower::CtlKind as C;
     let (head, res): (&str, Result<Vec<Term>, String>) = match &m.kind {
@@ -267,6 +269,8 @@ fn ctl_item(c: &mut Canon, unit: &Unit, m: &lower::Ctl) -> Item {
         C::End => ("ctl-end", Ok(vec![])),
         C::Break => ("ctl-break", Ok(vec![])),
         C::Continue => ("ctl-continue", Ok(vec![])),
+        C::Block => ("ctl-block", Ok(vec![])),
+        C::Exit(k) => ("ctl-exit", Ok(vec![a(k.to_string())])),
         C::Call => (
             "ctl-call",
             call::parse(&ast::tokens(&m.node), unit.dialect)
@@ -3879,7 +3883,7 @@ fn error_continues(
     let mut stack: Vec<usize> = Vec::new();
     for (k, (_, e)) in seq.iter().enumerate() {
         match head(*e) {
-            "ctl-if" | "ctl-while" | "ctl-try" => stack.push(k),
+            "ctl-if" | "ctl-while" | "ctl-try" | "ctl-block" => stack.push(k),
             "ctl-else" | "ctl-catch" => {}
             "ctl-end" => {
                 if let Some(o) = stack.pop() {
@@ -3913,7 +3917,7 @@ fn error_continues(
         while k < seq.len() {
             let e = seq[k].1;
             match head(e) {
-                "ctl-if" | "ctl-while" | "ctl-try" => depth += 1,
+                "ctl-if" | "ctl-while" | "ctl-try" | "ctl-block" => depth += 1,
                 // The branch around `p` ends: skip the ELSE branches.
                 "ctl-else" | "ctl-catch" if depth == 0 => {
                     k = close[k];
@@ -3931,7 +3935,7 @@ fn error_continues(
                         unsure = true;
                     }
                 }
-                "ctl-break" | "ctl-continue" => unsure = true,
+                "ctl-break" | "ctl-continue" | "ctl-exit" => unsure = true,
                 "return" => {
                     if is_effect(e) {
                         if depth == 0 && !unsure {
@@ -3967,7 +3971,7 @@ fn error_continues(
             match items[k].term.head() {
                 // These cannot fail; a call marker's call is in `seq`.
                 "ctl-else" | "ctl-catch" | "ctl-end" | "ctl-break" | "ctl-continue"
-                | "ctl-call" => continue,
+                | "ctl-block" | "ctl-exit" | "ctl-call" => continue,
                 _ => {}
             }
             if items[k].nodes.len() == 1 && script::cannot_fail(t, &items[k].nodes[0]) {
@@ -5398,7 +5402,7 @@ fn flow_seq(items: &[Item], gaps: &[Gap], k: &mut usize, g: &mut usize) -> Vec<E
         };
         match it.term.head() {
             "ctl-else" | "ctl-catch" | "ctl-end" => return out,
-            "ctl-if" | "ctl-while" | "ctl-try" => {
+            "ctl-if" | "ctl-while" | "ctl-try" | "ctl-block" => {
                 let open = *k;
                 *k += 1;
                 let mut parts = vec![(None, flow_seq(items, gaps, k, g))];
@@ -5739,6 +5743,8 @@ fn compare_pair(
             "ctl-else" => "the start of an ELSE branch",
             "ctl-end" => "the end of an IF or loop",
             "ctl-break" => "a loop exit",
+            "ctl-block" => "the start of a block a GOTO leaves",
+            "ctl-exit" => "a jump out of a block",
             "ctl-continue" => "a CONTINUE",
             "ctl-call" => "a call",
             _ => "a statement",

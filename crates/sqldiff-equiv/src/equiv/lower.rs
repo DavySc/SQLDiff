@@ -250,6 +250,14 @@ pub enum CtlKind {
     /// T-SQL `THROW;` in a CATCH block, PL/pgSQL `RAISE;` in a handler: the
     /// caught error is raised again.
     Rethrow,
+    /// A labelled block that jumps leave: a T-SQL region from the first
+    /// forward `GOTO` to its label (`goto.rs`), a PL/pgSQL `<<l>> BEGIN … END`
+    /// without declarations or handlers. Its end is an `End`.
+    Block,
+    /// A jump out of the `n`-th enclosing block, innermost first: T-SQL
+    /// `GOTO l`, PL/pgSQL `EXIT l`. Counted, not named, so a renamed label is
+    /// the same jump.
+    Exit(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -437,6 +445,15 @@ pub struct Unit {
     depth: usize,
     /// The labels of the loops around it, innermost last (upper case).
     loops: Vec<Option<String>>,
+    /// The blocks a jump can leave, innermost last: the label (lower case)
+    /// and how many TRY parts were open where it began.
+    blocks: Vec<(String, usize)>,
+    /// How many TRY parts the statement being lowered sits in: a jump out of
+    /// one is not read.
+    tries: usize,
+    /// The labels and jumps of the routine, found when the first list with a
+    /// label is lowered.
+    goto_index: Option<std::rc::Rc<super::goto::Index>>,
 }
 
 /// The event a trigger body is lowered for.
@@ -528,6 +545,9 @@ fn empty(d: Dialect) -> Unit {
         flow: Vec::new(),
         depth: 0,
         loops: Vec::new(),
+        blocks: Vec::new(),
+        tries: 0,
+        goto_index: None,
     }
 }
 
@@ -1385,9 +1405,61 @@ pub(crate) fn param(toks: &[Tok], d: Dialect) -> Option<Param> {
 }
 
 fn walk(node: &SyntaxNode, u: &mut Unit) {
-    for c in cst::structural_children(node) {
-        unit(&c, u);
+    let kids = cst::structural_children(node);
+    let regions = goto_regions(node, &kids, u);
+    if regions.is_empty() {
+        for c in kids {
+            unit(&c, u);
+        }
+        return;
     }
+    // T-SQL forward jumps are blocks (`goto::Index::regions`): a `Block`
+    // marker before the first unit holding a jump, an `End` where the label
+    // stands, which is not a statement of its own.
+    let mut open: Vec<usize> = Vec::new();
+    for (i, c) in kids.iter().enumerate() {
+        if regions.iter().any(|r| r.label == i) {
+            open.pop();
+            u.blocks.pop();
+            u.flow.pop();
+            u.depth -= 1;
+            mark(u, CtlKind::End, c);
+            continue;
+        }
+        let mut starting: Vec<&super::goto::Region> =
+            regions.iter().filter(|r| r.start == i).collect();
+        starting.sort_by_key(|r| std::cmp::Reverse(r.label));
+        for r in starting {
+            mark(u, CtlKind::Block, c);
+            u.blocks.push((r.name.clone(), u.tries));
+            u.flow.push("a block a GOTO leaves");
+            u.depth += 1;
+            open.push(r.label);
+        }
+        unit(c, u);
+    }
+}
+
+/// The T-SQL forward-jump regions of the list `kids` of `node`.
+fn goto_regions(node: &SyntaxNode, kids: &[SyntaxNode], u: &mut Unit) -> Vec<super::goto::Region> {
+    if u.dialect != Dialect::Tsql
+        || u.trigger.is_some()
+        || !kids.iter().any(|k| k.kind() == SyntaxKind::LABEL)
+    {
+        return Vec::new();
+    }
+    if u.goto_index.is_none() {
+        let root = node
+            .ancestors()
+            .find(|a| a.kind() == SyntaxKind::ROUTINE)
+            .or_else(|| node.ancestors().last())
+            .unwrap_or_else(|| node.clone());
+        u.goto_index = Some(std::rc::Rc::new(super::goto::Index::of(&root)));
+    }
+    u.goto_index
+        .as_ref()
+        .map(|ix| ix.regions(kids))
+        .unwrap_or_default()
 }
 
 fn unit(c: &SyntaxNode, u: &mut Unit) {
@@ -1412,10 +1484,8 @@ fn unit(c: &SyntaxNode, u: &mut Unit) {
         }
     }
     match c.kind() {
-        SyntaxKind::SOURCE_FILE
-        | SyntaxKind::BATCH
-        | SyntaxKind::ROUTINE_BODY
-        | SyntaxKind::TRY_BLOCK => walk(c, u),
+        SyntaxKind::SOURCE_FILE | SyntaxKind::BATCH | SyntaxKind::ROUTINE_BODY => walk(c, u),
+        SyntaxKind::TRY_BLOCK => walk_try(c, u),
         SyntaxKind::BLOCK if assign_loop(c, u) => {}
         SyntaxKind::BLOCK if u.catch_branches && warning_wrapper(c) => {
             // The statement stands where it stands in the T-SQL routine,
@@ -1429,6 +1499,18 @@ fn unit(c: &SyntaxNode, u: &mut Unit) {
             }
         }
         SyntaxKind::BLOCK if u.catch_branches && others_handler(c).is_some() => try_block(c, u),
+        SyntaxKind::BLOCK if goto_block(c, u).is_some() => {
+            let name = goto_block(c, u).unwrap_or_default();
+            mark(u, CtlKind::Block, c);
+            u.blocks.push((name, u.tries));
+            u.flow.push("a block a GOTO leaves");
+            u.depth += 1;
+            walk(c, u);
+            u.depth -= 1;
+            u.flow.pop();
+            u.blocks.pop();
+            mark(u, CtlKind::End, c);
+        }
         SyntaxKind::BLOCK => {
             let w = cst::first_words(c, 2);
             if w.get(1).is_some_and(|x| x == "ATOMIC") {
@@ -1462,7 +1544,7 @@ fn unit(c: &SyntaxNode, u: &mut Unit) {
         SyntaxKind::TRY_CATCH => {
             for part in c.children() {
                 match part.kind() {
-                    SyntaxKind::TRY_BLOCK => walk(&part, u),
+                    SyntaxKind::TRY_BLOCK => walk_try(&part, u),
                     SyntaxKind::CATCH_BLOCK => {
                         if is_rollback_rethrow(&part, d) {
                             u.txn_control = true;
@@ -1538,7 +1620,7 @@ fn try_catch(c: &SyntaxNode, u: &mut Unit) {
         return;
     }
     if is_rollback_rethrow(k, d) {
-        walk(t, u);
+        walk_try(t, u);
         u.txn_control = true;
         if u.depth == 0 {
             u.stops_on_error = true;
@@ -1551,7 +1633,7 @@ fn try_catch(c: &SyntaxNode, u: &mut Unit) {
     // IFs and loops is compared in it as it was before CATCH bodies were
     // read; the markers keep its statements paired with the TRY part's.
     mark_at(u, CtlKind::Try, t, c);
-    walk(t, u);
+    walk_try(t, u);
     catch_body(c, k, k, &cst::structural_children(t), u);
 }
 
@@ -1630,7 +1712,14 @@ fn others_handler(block: &SyntaxNode) -> Option<SyntaxNode> {
 /// statements, then the handler (`exception_section`).
 fn try_block(c: &SyntaxNode, u: &mut Unit) {
     mark(u, CtlKind::Try, c);
+    walk_try(c, u);
+}
+
+/// `walk` of a TRY part: a jump out of it is not read (`goto_exit`).
+fn walk_try(c: &SyntaxNode, u: &mut Unit) {
+    u.tries += 1;
     walk(c, u);
+    u.tries -= 1;
 }
 
 /// A PL/pgSQL block's `EXCEPTION` section: one `WHEN OTHERS THEN` handler is
@@ -2221,6 +2310,71 @@ fn loop_stmt(c: &SyntaxNode, u: &mut Unit) {
     mark_at(u, CtlKind::End, c, cond);
 }
 
+/// The label of a PL/pgSQL block that is only a scope a jump leaves:
+/// `<<l>> BEGIN … END`, no declarations, no handlers, not ATOMIC (what the
+/// converter writes for a forward GOTO). Lower-cased.
+fn goto_block(c: &SyntaxNode, u: &Unit) -> Option<String> {
+    if u.dialect != Dialect::Postgres || u.trigger.is_some() {
+        return None;
+    }
+    let label = c.children().find(|k| k.kind() == SyntaxKind::LABEL)?;
+    let name: String = tokens(&label)
+        .iter()
+        .filter(|t| t.kind == K::Word)
+        .map(|t| t.text.clone())
+        .collect::<String>();
+    let plain = !name.is_empty()
+        && name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+    let plain_block = !c.children().any(|k| {
+        matches!(
+            k.kind(),
+            SyntaxKind::EXCEPTION_SECTION | SyntaxKind::DECLARE_SECTION | SyntaxKind::HANDLER
+        )
+    }) && !cst::first_words(c, 3).iter().any(|w| w == "ATOMIC");
+    (plain && plain_block).then(|| name.to_lowercase())
+}
+
+/// T-SQL `GOTO l` / PL/pgSQL `EXIT l` out of one of the blocks `u.blocks`
+/// holds: `Exit(n)`, the `n`-th block outwards. Returns whether the statement
+/// was one. A jump to a label that is no open block, one that leaves a TRY
+/// part, or a PL/pgSQL `EXIT l WHEN c` stays uncovered, with the reason.
+fn goto_exit(c: &SyntaxNode, u: &mut Unit) -> bool {
+    let toks: Vec<Tok> = tokens(c)
+        .iter()
+        .filter(|t| t.kind != K::Semi)
+        .cloned()
+        .collect();
+    let (word, target) = match (u.dialect, toks.as_slice()) {
+        (Dialect::Tsql, [g, l]) if g.up == "GOTO" && l.kind == K::Word => ("GOTO", l.text.to_lowercase()),
+        (Dialect::Tsql, [g, ..]) if g.up == "GOTO" => {
+            u.uncovered.push((c.clone(), "`GOTO`".into()));
+            return true;
+        }
+        // `EXIT label` names a block; `EXIT` and `EXIT WHEN` leave a loop.
+        (Dialect::Postgres, [e, l])
+            if e.up == "EXIT"
+                && l.kind == K::Word
+                && l.up != "WHEN"
+                && u.blocks.iter().any(|(b, _)| *b == l.text.to_lowercase()) =>
+        {
+            ("EXIT", l.text.to_lowercase())
+        }
+        _ => return false,
+    };
+    let Some(at) = u.blocks.iter().rposition(|(b, _)| *b == target) else {
+        u.uncovered
+            .push((c.clone(), format!("`{word} {target}` that leaves no block it reads")));
+        return true;
+    };
+    if u.blocks[at].1 != u.tries {
+        u.uncovered
+            .push((c.clone(), format!("`{word} {target}` out of a TRY part")));
+        return true;
+    }
+    mark(u, CtlKind::Exit(u.blocks.len() - 1 - at), c);
+    true
+}
+
 /// BREAK / CONTINUE of the innermost loop: T-SQL `BREAK`, `CONTINUE`;
 /// PostgreSQL `EXIT`, `CONTINUE` without a label, optionally `WHEN c`
 /// (`if(c) break end`); Db2 for i `LEAVE l`, `ITERATE l` where `l` labels the
@@ -2310,7 +2464,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         mark(u, CtlKind::Rethrow, c);
         return;
     }
-    if jump(c, u) || result_open(c, u) || cursor_stmt(c, u) {
+    if goto_exit(c, u) || jump(c, u) || result_open(c, u) || cursor_stmt(c, u) {
         return;
     }
     let dynamic = match d {
