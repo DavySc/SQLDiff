@@ -557,6 +557,12 @@ fn diff_inner(
                 }
             }
         }
+        if td.used_default_schema {
+            let asm = equiv::canon::asm::make(equiv::canon::asm::DEFAULT_SCHEMA);
+            if !assumptions.iter().any(|x| x.id == asm.id) {
+                assumptions.push(asm);
+            }
+        }
         // Lints that are new in B.
         let old: HashSet<String> = lint::all_hits(&aa)
             .into_iter()
