@@ -1255,6 +1255,7 @@ pub fn routine_header(node: &SyntaxNode, dialect: Dialect) -> Option<RoutineHead
             returns_status: dialect == Dialect::Tsql
                 && kind == RoutineKind::Procedure
                 && returns_a_value(node),
+            dynamic_result_sets: false,
         },
         param_spans: Vec::new(),
         trigger: None,
@@ -1299,6 +1300,15 @@ pub fn routine_header(node: &SyntaxNode, dialect: Dialect) -> Option<RoutineHead
     } else {
         &[]
     };
+    if dialect == Dialect::Db2i && kind == RoutineKind::Procedure {
+        // `DYNAMIC RESULT SETS n`, with any n but a literal 0.
+        h.routine.dynamic_result_sets = t.windows(4).any(|w| {
+            w[0].is_kw("DYNAMIC")
+                && w[1].is_kw("RESULT")
+                && w[2].is_kw("SETS")
+                && w[3].upper() != "0"
+        });
+    }
     for el in split_commas(params) {
         if let Some((p, span)) = param(el, dialect, kind) {
             h.routine.params.push(p);

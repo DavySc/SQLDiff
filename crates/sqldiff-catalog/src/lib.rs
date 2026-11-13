@@ -291,6 +291,11 @@ pub struct Routine {
     /// Only read from T-SQL DDL.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub returns_status: bool,
+    /// A Db2 for i procedure that declares `DYNAMIC RESULT SETS n` with n > 0:
+    /// the cursors it leaves open go to its caller (or its client), which a
+    /// comparison of the calls cannot see. Only read from Db2 for i DDL.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dynamic_result_sets: bool,
 }
 
 impl Routine {

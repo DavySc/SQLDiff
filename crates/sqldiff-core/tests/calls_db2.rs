@@ -121,3 +121,65 @@ fn a_quoted_lower_case_db2_name_is_not_the_folded_one() {
         "lower-case",
     );
 }
+
+const CAT_T_REP: &str = "CREATE SCHEMA Sales;
+GO
+CREATE PROCEDURE Sales.Rep AS BEGIN SELECT 1 AS One; END;
+";
+
+fn run_rep(a: &str, b: &str, cat_d: &str) -> Report {
+    let o = Options {
+        catalog_a: vec![Artifact::new("cat.sql", T, CAT_T_REP)],
+        catalog_b: vec![Artifact::new("cat.db2.sql", D, cat_d)],
+        ..Options::default()
+    };
+    diff(
+        &Artifact::new("a.sql", T, a),
+        &Artifact::new("b.sql", D, b),
+        &o,
+    )
+}
+
+#[test]
+fn a_callee_that_returns_result_sets_to_its_caller_is_not_compared() {
+    // T-SQL sends the rows to the client; this Db2 for i callee leaves its
+    // cursor open for the caller of the CALL.
+    let cat = "CREATE SCHEMA SALES;
+CREATE PROCEDURE SALES.REP () LANGUAGE SQL DYNAMIC RESULT SETS 1
+BEGIN
+  DECLARE C CURSOR WITH RETURN TO CALLER FOR SELECT 1 FROM SYSIBM.SYSDUMMY1;
+  OPEN C;
+END;
+";
+    let r = run_rep("EXEC Sales.Rep;", "CALL Sales.Rep();", cat);
+    assert!(
+        r.unknown_reasons
+            .iter()
+            .any(|x| x.contains("DYNAMIC RESULT SETS")),
+        "{:?}",
+        r.unknown_reasons
+    );
+    assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
+}
+
+#[test]
+fn a_callee_with_zero_result_sets_is_compared() {
+    let cat = "CREATE SCHEMA SALES;
+CREATE PROCEDURE SALES.REP () LANGUAGE SQL DYNAMIC RESULT SETS 0
+BEGIN
+END;
+";
+    let r = run_rep("EXEC Sales.Rep;", "CALL Sales.Rep();", cat);
+    assert!(
+        !r.unknown_reasons.iter().any(|x| x.contains("call")),
+        "{:?}",
+        r.unknown_reasons
+    );
+}
+
+#[test]
+fn an_argument_on_one_side_only_is_never_equal() {
+    let r = run("EXEC Sales.Noop 3;", "CALL Sales.Noop();", CAT_D);
+    assert_ne!(r.verdict(), Verdict::Equal);
+    assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
+}
