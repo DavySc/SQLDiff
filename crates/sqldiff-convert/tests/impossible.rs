@@ -85,6 +85,18 @@ fn statements_with_no_counterpart_are_marked() {
 }
 
 #[test]
+fn openrowset_bulk_is_not_marked_as_bulk_insert() {
+    let c = pg("INSERT INTO dbo.t SELECT * FROM OPENROWSET(BULK 'f.csv', SINGLE_CLOB) AS r;\n");
+    assert!(
+        c.units
+            .iter()
+            .all(|u| u.impossible() != Some(impossible::BULK_INSERT)),
+        "{:?}",
+        c.units.iter().map(|u| &u.notes).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn a_missing_rule_is_not_impossible() {
     let c = pg("TRUNCATE TABLE dbo.t WITH (PARTITIONS (1));\nALTER INDEX i ON dbo.t REBUILD;\n");
     assert_eq!(c.counts.impossible, 0);
