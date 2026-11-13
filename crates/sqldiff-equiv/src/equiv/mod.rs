@@ -76,9 +76,10 @@ pub struct Outcome {
     /// Relational variable coupling (`coupling.rs`), computed only for the
     /// `coupling` report. A report: nothing reads it on the diff path.
     pub coupling: Vec<coupling::UnitCoupling>,
-    /// Input, not result: whether to compute `coupling` ([`compare_report`]).
+    /// Input, not result: the step budget of `coupling`, or `None` to not
+    /// compute it ([`compare_report`]).
     /// Off, the analysis does not run and counts no work.
-    coupling_on: bool,
+    coupling_cap: Option<u64>,
     /// The byte ranges of the statements each side's lowering passed over
     /// with a note instead of comparing (`Unit::noted`), A then B.
     pub noted: [Vec<(usize, usize)>; 2],
@@ -375,7 +376,7 @@ pub fn compare_within(
     anchors: &[Anchor],
     allowance: &Allowance,
 ) -> Outcome {
-    compare_flagged(a, b, sa, sb, anchors, allowance, false)
+    compare_flagged(a, b, sa, sb, anchors, allowance, None)
 }
 
 /// [`compare`] that also computes `Outcome::coupling` (report only).
@@ -386,7 +387,26 @@ pub fn compare_report(
     sb: &Schema,
     anchors: &[Anchor],
 ) -> Outcome {
-    compare_flagged(a, b, sa, sb, anchors, &Allowance::new(None), true)
+    compare_flagged(
+        a,
+        b,
+        sa,
+        sb,
+        anchors,
+        &Allowance::new(None),
+        Some(coupling::MAX_STEPS),
+    )
+}
+
+/// [`compare_report`] with another step budget (a test of the over-cap path).
+pub fn compare_report_capped(
+    a: &Analyzed,
+    b: &Analyzed,
+    sa: &Schema,
+    sb: &Schema,
+    cap: u64,
+) -> Outcome {
+    compare_flagged(a, b, sa, sb, &[], &Allowance::new(None), Some(cap))
 }
 
 fn compare_flagged(
@@ -396,10 +416,10 @@ fn compare_flagged(
     sb: &Schema,
     anchors: &[Anchor],
     allowance: &Allowance,
-    coupling_on: bool,
+    coupling_cap: Option<u64>,
 ) -> Outcome {
     let mut out = Outcome {
-        coupling_on,
+        coupling_cap,
         ..Outcome::default()
     };
     if let Some(pairs) = trigger::pairs(a, b, sa, sb, &mut out) {
@@ -883,9 +903,9 @@ fn compare_units_within(
     let pairs = pair_items(a, b, &ia, &ib, &gaps, anchors, wit.as_ref(), allowance, out);
     out.identity
         .push(identity::analyze(a, b, ua, ub, &ia, &ib, &pairs));
-    if out.coupling_on {
+    if let Some(cap) = out.coupling_cap {
         out.coupling
-            .push(coupling::analyze(a, b, ua, ub, &ia, &ib, &pairs));
+            .push(coupling::analyze(a, b, ua, ub, &ia, &ib, &pairs, cap));
     }
     calls(a, b, ua, ub, sa, sb, anchors, ((&ia, &ib), &pairs), out);
     for p in places {

@@ -76,7 +76,10 @@ fn a_variable_assigned_differently_is_not_coupled() {
     );
     assert_eq!(
         (x, y),
-        (CClass::StatementNotEqual, CClass::StatementNotEqual)
+        (
+            CClass::FeedingAssignmentNotEqual,
+            CClass::FeedingAssignmentNotEqual
+        )
     );
 }
 
@@ -128,7 +131,7 @@ fn a_counter_step_of_one_against_two_is_not_coupled() {
             "WHILE i < 10 LOOP\ni := i + 2;\nEND LOOP;",
         ),
     );
-    assert_eq!(y, CClass::StatementNotEqual, "{y:?}");
+    assert_eq!(y, CClass::FeedingAssignmentNotEqual, "{y:?}");
     assert!(why(&x).contains("written in a loop"), "{x:?}");
 }
 
@@ -212,7 +215,10 @@ fn random_and_clock_values_are_not_coupled() {
     // volatile reason cannot be isolated for the clock.
     assert_eq!(
         (x, y),
-        (CClass::StatementNotEqual, CClass::StatementNotEqual)
+        (
+            CClass::FeedingAssignmentNotEqual,
+            CClass::FeedingAssignmentNotEqual
+        )
     );
 }
 
@@ -459,4 +465,109 @@ fn a_declare_with_a_value_at_the_same_aligned_point_is_coupled() {
         ),
     );
     assert_eq!((x, y), (CClass::Coupled, CClass::Coupled));
+}
+
+/// A deep nest of loops finishes at once: the rows are recorded in the
+/// converged round, so a nest that converges in one round costs one walk per
+/// level (the review's repro was exponential in the depth).
+#[test]
+fn a_deep_loop_nest_finishes_and_is_deterministic() {
+    for depth in [30usize, 64] {
+        let a = tsql(
+            "@a int",
+            &format!("{}PRINT 1;", "WHILE 1 = 1 ".repeat(depth)),
+        );
+        let b = pg(
+            "a integer",
+            "",
+            &format!(
+                "{}RAISE NOTICE 'x';{}",
+                "WHILE 1 = 1 LOOP ".repeat(depth),
+                " END LOOP;".repeat(depth)
+            ),
+        );
+        let start = std::time::Instant::now();
+        let r = report(&a, &b);
+        assert!(
+            start.elapsed().as_secs() < 20,
+            "depth {depth} took too long"
+        );
+        assert_eq!(format!("{r:?}"), format!("{:?}", report(&a, &b)));
+        let u = &r[0];
+        assert!(
+            u.refused.is_none() || u.refused.as_deref().unwrap().starts_with("over-cap"),
+            "{:?}",
+            u.refused
+        );
+        // Linear in the depth, far below the budget.
+        assert!(u.ff_b.steps < 100 * depth as u64, "{:?}", u.ff_b);
+    }
+}
+
+/// Past the step budget the pair is reported over-cap, deterministically,
+/// with no row and no pair counted as coupled.
+#[test]
+fn a_pair_that_runs_out_of_budget_is_reported_over_cap() {
+    let a = tsql(
+        "@a int",
+        &format!(
+            "{}PRINT 1;{}",
+            "WHILE @a > 0 BEGIN\n".repeat(8),
+            "\nEND".repeat(8)
+        ),
+    );
+    let b = pg(
+        "a integer",
+        "",
+        &format!(
+            "{}RAISE NOTICE 'x';{}",
+            "WHILE a > 0 LOOP ".repeat(8),
+            " END LOOP;".repeat(8)
+        ),
+    );
+    let run = |cap: u64| {
+        let (a, b) = (a.clone(), b.clone());
+        sqldiff_core::with_engine_stack(move || {
+            let aa = Artifact::new("a.sql", Dialect::Tsql, a);
+            let bb = Artifact::new("b.sql", Dialect::Postgres, b);
+            sqldiff_core::coupling_capped(&aa, &bb, &Options::default(), cap)
+        })
+    };
+    let ok = run(1 << 20);
+    assert!(
+        ok[0].refused.is_none() && !ok[0].rows.is_empty(),
+        "{:?}",
+        ok[0]
+    );
+    let steps = ok[0].ff_a.steps + ok[0].ff_b.steps + ok[0].all_a.steps + ok[0].all_b.steps;
+    let r1 = run(steps / 2);
+    let r2 = run(steps / 2);
+    assert_eq!(format!("{r1:?}"), format!("{r2:?}"));
+    let u = &r1[0];
+    assert!(
+        u.refused.as_deref().unwrap().starts_with("over-cap"),
+        "{u:?}"
+    );
+    assert!(u.rows.is_empty());
+    assert_eq!(u.ff_b.exit + u.all_b.exit, 0);
+    // The budget is exactly the steps: one more is enough.
+    assert!(run(steps)[0].refused.is_none());
+}
+
+/// A condition the pairing left out is a row of class `unpaired`, so the
+/// counts say how many conditions were not classed.
+#[test]
+fn an_unpaired_condition_is_a_row() {
+    let r = report(
+        &tsql("@a int", &format!("IF @a > 1 {T};\nIF @a > 2 {T};")),
+        &pg("a integer", "", &format!("IF a > 1 THEN {T}; END IF;")),
+    );
+    let rows = &r[0].rows;
+    // The pairing may leave out either side's conditions; none is silent.
+    assert_eq!(rows.iter().filter(|x| x.a_line > 0).count(), 2, "{rows:?}");
+    assert_eq!(rows.iter().filter(|x| x.b_line > 0).count(), 1, "{rows:?}");
+    assert!(
+        rows.iter().any(|x| x.ff_b.label() == "unpaired"),
+        "{rows:?}"
+    );
 }

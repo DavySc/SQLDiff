@@ -40,6 +40,13 @@
 //!
 //! The condition classes are those of section 9 of the design.
 //!
+//! # Assumptions are not carried
+//!
+//! kappa does not carry the assumptions `pair_equal` returns for a proven
+//! pair (section 3.2, rule 1 of the design says they are carried). That is
+//! fine for a meter; the stage-1 consumer must carry them, and a coupling it
+//! uses is only as good as the assumptions it rests on.
+//!
 //! # Not modelled (conservative)
 //!
 //! `RETURN e` is not a coupled variable (the return status is not a
@@ -50,7 +57,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use sqldiff_model::work::{self, Site};
-use sqldiff_syntax::{ast as cst, Dialect};
+use sqldiff_syntax::ast as cst;
 
 use super::ast::Stmt;
 use super::canon::Item;
@@ -58,6 +65,12 @@ use super::identity::{build, kind_of, structure, syms, Analysis, Blk, Ev, Kind, 
 use super::lower::{Ctl, CtlKind, Unit};
 use super::term::Term;
 use crate::artifact::Analyzed;
+
+/// The step budget of the analysis of one routine pair (all four runs
+/// together). Past it the pair is reported as over-cap, with no row and no
+/// pair counted as coupled. Counted steps, never time, so the outcome is the
+/// same on every run.
+pub const MAX_STEPS: u64 = 1 << 20;
 
 /// The class of a paired condition.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -74,7 +87,13 @@ pub enum CClass {
     AfterOutputCall,
     AfterDynamicSql,
     Volatile,
-    StatementNotEqual,
+    /// The condition pair itself is not proven equal at the statement level.
+    ConditionNotEqual,
+    /// A variable the condition reads was dropped by an assignment pair the
+    /// statement level did not prove equal.
+    FeedingAssignmentNotEqual,
+    /// The condition has no partner (an unpaired item), so no row pairs it.
+    Unpaired,
     Other(String),
 }
 
@@ -89,7 +108,9 @@ impl CClass {
             CClass::AfterOutputCall => "after-output-call",
             CClass::AfterDynamicSql => "after-dynamic-sql",
             CClass::Volatile => "volatile",
-            CClass::StatementNotEqual => "statement-not-equal",
+            CClass::ConditionNotEqual => "condition-not-equal",
+            CClass::FeedingAssignmentNotEqual => "feeding-assignment-not-equal",
+            CClass::Unpaired => "unpaired",
             CClass::Other(_) => "other",
         }
     }
@@ -243,10 +264,6 @@ fn has_jump(side: &Side<'_>, blks: &[Blk]) -> bool {
     })
 }
 
-fn has_events(blks: &[Blk]) -> bool {
-    !blks.is_empty()
-}
-
 /// `fn` names that read the server or session rather than the inputs.
 const SERVER_FNS: &[&str] = &[
     "serverproperty",
@@ -324,7 +341,7 @@ fn why_class(w: &Why) -> CClass {
         Why::Volatile => CClass::Volatile,
         Why::Table => CClass::ReadsTable,
         Why::ServerFn => CClass::ServerFn,
-        Why::NotEqual => CClass::StatementNotEqual,
+        Why::NotEqual => CClass::FeedingAssignmentNotEqual,
         Why::MultiTarget => CClass::Other(MULTI_TARGET.into()),
         Why::Other(s) => CClass::Other(s.clone()),
     }
@@ -340,6 +357,12 @@ struct Ctx<'x, 'a> {
     rows: BTreeMap<(usize, usize), CClass>,
     rounds: usize,
     steps: u64,
+    /// Steps the earlier runs of the routine pair used.
+    before: u64,
+    cap: u64,
+    /// The routine pair's step budget ran out: the walk unwinds and the
+    /// result is discarded.
+    over: bool,
     taps: Vec<Option<K>>,
     loops: usize,
     rev: BTreeMap<usize, usize>,
@@ -350,6 +373,9 @@ impl Ctx<'_, '_> {
     fn step(&mut self) {
         self.steps += 1;
         work::spend(Site::Coupling, 1);
+        if self.before + self.steps > self.cap {
+            self.over = true;
+        }
     }
 
     /// The side A index of a variable of side `b?`.
@@ -539,6 +565,9 @@ impl Ctx<'_, '_> {
         let (mut i, mut j) = (0, 0);
         while i < na.len() || j < nb.len() {
             self.step();
+            if self.over {
+                break;
+            }
             let pa = ka
                 .get(i)
                 .copied()
@@ -615,6 +644,12 @@ impl Ctx<'_, '_> {
         k: K,
         lock: bool,
     ) -> K {
+        // The handler-entry tap is taken once, before the group. A group is
+        // an item that absorbed later statements (`Canon::lift`); today that
+        // is an INSERT followed by `SET @v = SCOPE_IDENTITY()`, where the
+        // INSERT fails before the write, so kappa before the group is the
+        // state at every routing point. If `lift` grows to absorb a failing
+        // statement after a write, tap after each event instead.
         let q = self.qualifies(false, ga) || self.qualifies(true, gb);
         self.tap(&k, q);
         if !lock {
@@ -637,6 +672,15 @@ impl Ctx<'_, '_> {
             }
             // A declaration without a value: both NULL, but only at a point
             // that runs once (a T-SQL DECLARE does not reset in a loop).
+            //
+            // Defence in depth, not reached today (checked by instrumenting the
+            // branch and running the #507 review's loop test): `lower` pushes
+            // no statement for a `DECLARE` without a value (it returns before
+            // the push), so no `Stmt::Declare { default: None }` event exists;
+            // and a PL/pgSQL declaration inside an IF or loop is refused by
+            // the statement level (`inside_flow`, "a declaration"), so no
+            // aligned pair of such declarations inside a loop can be built.
+            // A local without a value therefore couples only once assigned.
             if Self::is_decl_without_value(&self.an.a, *ea)
                 && Self::is_decl_without_value(&self.an.b, *eb)
             {
@@ -703,7 +747,7 @@ impl Ctx<'_, '_> {
             return CClass::Other("not an IF / WHILE test (row or cursor test)".into());
         }
         if self.an.pair_equal(ia, ib).is_err() {
-            return CClass::StatementNotEqual;
+            return CClass::ConditionNotEqual;
         }
         let (x, y) = (&self.an.a.items[ia], &self.an.b.items[ib]);
         let (tx, ty) = (
@@ -809,16 +853,13 @@ impl Ctx<'_, '_> {
             }
             (Blk::Block { body: ba, .. }, Blk::Block { body: bb, .. }) => {
                 let mut w = BTreeSet::new();
-                for (side_b, bl) in [(false, ba), (true, bb)] {
-                    let ns = nodes(
-                        std::slice::from_ref(if side_b { b } else { a }),
-                        self.side(side_b),
-                    );
-                    let _ = bl;
+                for (side_b, blk) in [(false, a), (true, b)] {
+                    let ns = nodes(std::slice::from_ref(blk), self.side(side_b));
                     w.extend(self.written(side_b, &ns));
                 }
-                let inner = self.seq(ba, bb, k.clone(), lock);
-                let _ = inner;
+                // The inner walk records the rows of the block's conditions;
+                // its result is not used (the block's exit is `region`).
+                self.seq(ba, bb, k.clone(), lock);
                 if lock {
                     self.region(&k, &w, "written in a block a jump leaves")
                 } else {
@@ -843,7 +884,6 @@ impl Ctx<'_, '_> {
             w.extend(self.written(side_b, &ns));
         }
         let jumps = has_jump(&self.an.a, ba) || has_jump(&self.an.b, bb);
-        let _ = has_events(ba);
         let restricted = if lock {
             self.region(&k, &w, "written in a loop")
         } else {
@@ -860,38 +900,39 @@ impl Ctx<'_, '_> {
             self.loops -= 1;
             return restricted;
         }
-        // Configuration (b): the greatest fixpoint from the entry state.
-        let rec = std::mem::replace(&mut self.rec, false);
+        // Configuration (b): the greatest fixpoint from the entry state. The
+        // rows are recorded in every round and overwritten by the next, so
+        // the last round (the one whose input is the converged head) is the
+        // one that stays: there is no second walk of the body. A round walks
+        // the body once, so a nest of loops that converge in one round costs
+        // one walk per level; the step budget bounds the rest.
         let mut head = k.clone();
         loop {
+            if self.over {
+                return head;
+            }
             self.rounds += 1;
             self.step();
             let class = self.cond_class(&head, ia, ib);
+            self.record(ia, ib, &class);
+            self.tap(&head, self.all);
             self.loops += 1;
             let next = if class == CClass::Coupled {
                 let end = self.seq(ba, bb, head.clone(), true);
                 k.meet(&end).meet(&head)
             } else {
+                // An uncoupled test: the loop runs asynchronously; the body
+                // is walked only to classify the conditions inside it.
+                self.seq(ba, bb, head.clone(), false);
                 head.meet(&restricted)
             };
             self.loops -= 1;
-            if next.set == head.set {
-                head = next;
+            let done = next.set == head.set;
+            head = next;
+            if done {
                 break;
             }
-            head = next;
         }
-        self.rec = rec;
-        let class = self.cond_class(&head, ia, ib);
-        self.record(ia, ib, &class);
-        self.tap(&head, self.all);
-        self.loops += 1;
-        if class == CClass::Coupled {
-            self.seq(ba, bb, head.clone(), true);
-        } else {
-            self.seq(ba, bb, head.clone(), false);
-        }
-        self.loops -= 1;
         head
     }
 }
@@ -999,6 +1040,7 @@ fn entry(an: &Analysis<'_>, ua: &Unit, ub: &Unit) -> (K, BTreeSet<Var>) {
     (k, cand)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     an: &mut Analysis<'_>,
     blocks: (&[Blk], &[Blk]),
@@ -1007,7 +1049,9 @@ fn run(
     fix: bool,
     all: bool,
     pairs: &[(usize, usize)],
-) -> (BTreeMap<(usize, usize), CClass>, RunSummary) {
+    before: u64,
+    cap: u64,
+) -> (BTreeMap<(usize, usize), CClass>, RunSummary, bool) {
     let rev = pairs.iter().map(|&(i, j)| (j, i)).collect();
     let mut cx = Ctx {
         an,
@@ -1017,6 +1061,9 @@ fn run(
         rows: BTreeMap::new(),
         rounds: 0,
         steps: 0,
+        before,
+        cap,
+        over: false,
         taps: Vec::new(),
         loops: 0,
         rev,
@@ -1028,11 +1075,12 @@ fn run(
         rounds: cx.rounds,
         steps: cx.steps,
     };
-    (cx.rows, summary)
+    (cx.rows, summary, cx.over)
 }
 
 /// The coupling report of one routine pair. `pairs` are the item pairs
 /// `pair_items` chose.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn analyze(
     a: &Analyzed,
     b: &Analyzed,
@@ -1041,6 +1089,7 @@ pub(super) fn analyze(
     ia: &[Item],
     ib: &[Item],
     pairs: &[(usize, usize)],
+    cap: u64,
 ) -> UnitCoupling {
     let mut rep = UnitCoupling::default();
     if ua.dialect == ub.dialect {
@@ -1061,15 +1110,29 @@ pub(super) fn analyze(
     let (k0, cand) = entry(&an, ua, ub);
     rep.candidates = cand.len();
     let blocks = (blocks_a.as_slice(), blocks_b.as_slice());
-    let (r_ff_a, s_ff_a) = run(&mut an, blocks, &k0, &cand, false, false, pairs);
-    let (r_ff_b, s_ff_b) = run(&mut an, blocks, &k0, &cand, true, false, pairs);
-    let (r_all_a, s_all_a) = run(&mut an, blocks, &k0, &cand, false, true, pairs);
-    let (r_all_b, s_all_b) = run(&mut an, blocks, &k0, &cand, true, true, pairs);
+    let mut used = 0;
+    let mut runs = Vec::new();
+    for (fix, all) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (rows, summary, over) = run(&mut an, blocks, &k0, &cand, fix, all, pairs, used, cap);
+        used += summary.steps;
+        if over {
+            // Deterministic: the budget counts steps. Nothing is coupled.
+            rep.refused = Some(format!(
+                "over-cap: more than {cap} transfer steps for the routine pair"
+            ));
+            rep.ff_a.steps = used;
+            return rep;
+        }
+        runs.push((rows, summary));
+    }
+    let [(r_ff_a, s_ff_a), (r_ff_b, s_ff_b), (r_all_a, s_all_a), (r_all_b, s_all_b)]: [_; 4] =
+        runs.try_into().expect("four runs");
     rep.ff_a = s_ff_a;
     rep.ff_b = s_ff_b;
     rep.all_a = s_all_a;
     rep.all_b = s_all_b;
     let (first_a, first_b) = (first_events(&an.a.item_of), first_events(&an.b.item_of));
+    let (mut seen_a, mut seen_b) = (BTreeSet::new(), BTreeSet::new());
     for &(i, j) in pairs {
         let (x, y) = (&ia[i], &ib[j]);
         let kind = match x.term.head() {
@@ -1099,6 +1162,8 @@ pub(super) fn analyze(
             }
         };
         let (ff_b, all_b) = (get(&r_ff_b), get(&r_all_b));
+        seen_a.insert(i);
+        seen_b.insert(j);
         rep.rows.push(CouplingRow {
             kind,
             a_line: a.line_of(&ma.node),
@@ -1111,8 +1176,45 @@ pub(super) fn analyze(
             all_b,
         });
     }
+    // Conditions with no partner are rows too (class `unpaired`), so the
+    // counts say how many conditions the pairing left out. A condition only
+    // on side B has `a_start` at the end of the order and `a_line` 0.
+    for (items, side, seen, first, is_b) in [
+        (ia, &an.a, &seen_a, &first_a, false),
+        (ib, &an.b, &seen_b, &first_b, true),
+    ] {
+        for (k, it) in items.iter().enumerate() {
+            let kind = match it.term.head() {
+                "ctl-if" => "if",
+                "ctl-while" => "while",
+                _ => continue,
+            };
+            let Some(Ev::Ctl(m)) = first.get(&k).map(|e| &side.ev[*e]) else {
+                continue;
+            };
+            if seen.contains(&k) {
+                continue;
+            }
+            let (line, start) = if is_b {
+                (b.line_of(&m.node), cst::sig_range(&m.node).0)
+            } else {
+                (a.line_of(&m.node), cst::sig_range(&m.node).0)
+            };
+            let c = CClass::Unpaired;
+            rep.rows.push(CouplingRow {
+                kind,
+                a_line: if is_b { 0 } else { line },
+                b_line: if is_b { line } else { 0 },
+                a_start: if is_b { usize::MAX } else { start },
+                b_start: if is_b { start } else { 0 },
+                ff_a: c.clone(),
+                ff_b: c.clone(),
+                all_a: c.clone(),
+                all_b: c,
+            });
+        }
+    }
     rep.rows.sort_by_key(|r| (r.a_start, r.b_start));
-    let _ = Dialect::Tsql;
     rep
 }
 

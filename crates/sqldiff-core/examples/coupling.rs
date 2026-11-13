@@ -69,7 +69,7 @@ fn main() {
                 "{}",
                 serde_json::json!({
                     "file": rel_s, "unit": u, "candidates": r.candidates,
-                    "paired": r.rows.len(), "refused": r.refused,
+                    "paired": r.rows.iter().filter(|c| c.ff_b.label() != "unpaired").count(), "unpaired": r.rows.iter().filter(|c| c.ff_b.label() == "unpaired").count(), "refused": r.refused,
                     "classes_a": counts(&r.rows, |c| c.ff_a.label()),
                     "classes_b": counts(&r.rows, |c| c.ff_b.label()),
                     "classes_all_a": counts(&r.rows, |c| c.all_a.label()),
