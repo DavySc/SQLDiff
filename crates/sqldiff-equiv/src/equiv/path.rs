@@ -213,6 +213,7 @@ fn refuse(u: &Unit) -> Option<String> {
             CtlKind::RowsIf(..) => return no("path:reads-failure-state"),
             CtlKind::Try | CtlKind::Catch | CtlKind::Rethrow => return no("path:error-handler"),
             CtlKind::Call => return no("path:call"),
+            CtlKind::Block | CtlKind::Exit(_) => return no("path:goto"),
             CtlKind::While(_) | CtlKind::FetchWhile(_) | CtlKind::Break | CtlKind::Continue => {
                 return no("path:loop-or-jump")
             }
