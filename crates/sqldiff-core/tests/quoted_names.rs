@@ -432,4 +432,24 @@ fn quoted_upper_case_keyword_is_not_the_unquoted_word() {
         pg("select \"TEXT\" from t;", "select \"TEXT\" from t;").verdict(),
         Verdict::Equal
     );
+    // Db2 for i folds unquoted names to upper case: `"DATE"` is `date`.
+    let db2 = |a: &str, b: &str| {
+        diff(
+            &Artifact::new("a.sql", Dialect::Db2i, a),
+            &Artifact::new("b.sql", Dialect::Db2i, b),
+            &Options::default(),
+        )
+    };
+    for (a, b) in [
+        (
+            "create table t (\"DATE\" int);",
+            "create table t (date int);",
+        ),
+        (
+            "create table t (\"TEXT\" int);",
+            "create table t (text int);",
+        ),
+    ] {
+        assert_eq!(db2(a, b).verdict(), Verdict::Equal, "{a} / {b}");
+    }
 }
