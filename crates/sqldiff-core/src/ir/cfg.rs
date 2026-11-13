@@ -1001,8 +1001,10 @@ impl Lowerer {
     fn label_of(n: &SyntaxNode) -> Option<String> {
         let prev = n.prev_sibling().filter(|p| p.kind() == SyntaxKind::LABEL);
         let inner = n.children().find(|c| c.kind() == SyntaxKind::LABEL);
+        // The name is the identifier: PostgreSQL writes `<<name>>`, whose
+        // first token is `<<`.
         prev.or(inner)
-            .and_then(|l| ast::sig_tokens(&l).next())
+            .and_then(|l| ast::sig_tokens(&l).find(|t| t.kind() == SyntaxKind::IDENT))
             .map(|t| upper(&t))
     }
 
