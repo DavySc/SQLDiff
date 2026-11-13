@@ -730,3 +730,52 @@ fn engine_accepts_truncation_in_insert_select_and_update_from() {
         assert!(c.output.contains("trunc("), "{body}\n{}", c.output);
     }
 }
+
+/// Issue #421: an alias type defined in another file is not known to the
+/// rewrites. A statement that reads a column of such a type is refused (kept
+/// as a comment), never left as `= 1` against a PostgreSQL boolean. The same
+/// statements with the type in the file convert; a plain `bit` column of
+/// another file converts.
+#[test]
+fn an_alias_type_from_another_file_is_not_guessed() {
+    let types = "CREATE TYPE \"flag_t\" FROM bit\nGO\n";
+    let table = "CREATE TABLE \"item\" (\"id\" int NOT NULL, \"active\" \"flag_t\" NOT NULL)\nGO\n";
+    let view = "CREATE VIEW \"item_v\" AS\nSELECT i.id FROM \"item\" i WHERE i.active = 1\nGO\n";
+    let cat = source_catalog(&[types, table, view]);
+    let run = |src: &str, cat: &_| {
+        let d = rewrite_in(src, Dialect::Tsql, Dialect::Postgres, Some(cat));
+        sqldiff_convert::check(src, d, &Options::default())
+    };
+    let c = run(view, &cat);
+    let u = unit(&c, view, "CREATE VIEW");
+    assert_eq!(
+        u.status,
+        Status::NotConverted,
+        "{:?}\n{}",
+        u.notes,
+        c.output
+    );
+    assert!(!c.output.contains("= 1;"), "{}", c.output);
+    assert!(
+        u.notes
+            .iter()
+            .any(|n| n.text.to_ascii_lowercase().contains("flag_t")),
+        "{:?}",
+        u.notes
+    );
+    // The type and its use in one file: converted.
+    let one = format!("{types}{table}{view}");
+    let c = pg(&one);
+    assert!(c.output.contains("i.active = TRUE"), "{}", c.output);
+    // A plain bit column in another file converts.
+    let table = "CREATE TABLE \"item\" (\"id\" int NOT NULL, \"active\" bit NOT NULL)\nGO\n";
+    let cat = source_catalog(&[table, view]);
+    let c = run(view, &cat);
+    assert!(c.output.contains("i.active = TRUE"), "{}", c.output);
+    // A statement that does not read the column is not affected.
+    let other = "CREATE VIEW \"item_w\" AS\nSELECT i.id FROM \"item\" i WHERE i.id = 1\nGO\n";
+    let table = "CREATE TABLE \"item\" (\"id\" int NOT NULL, \"active\" \"flag_t\" NOT NULL)\nGO\n";
+    let cat = source_catalog(&[types, table, other]);
+    let c = run(other, &cat);
+    assert!(c.output.contains("i.id = 1"), "{}", c.output);
+}

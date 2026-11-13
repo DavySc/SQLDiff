@@ -816,12 +816,18 @@ impl Cx<'_> {
             || self.own_tables.iter().any(|t| {
                 t.columns
                     .iter()
-                    .any(|c| self.dt_cat(&c.data_type.base, &c.data_type.args) == Dt::Bit)
+                    .any(|c| self.dt_cat_known(&c.data_type.base, &c.data_type.args) == Dt::Bit)
             })
             || self
                 .catalog_types()
                 .iter()
-                .any(|(b, a)| self.dt_cat(b, a) == Dt::Bit)
+                .any(|(b, a)| self.dt_cat_known(b, a) == Dt::Bit)
+            // A user type defined elsewhere may be a bit alias: the rules
+            // stay on so a use of it is refused, not left as written.
+            || self
+                .catalog_types()
+                .iter()
+                .any(|(b, a)| self.unresolved_user_type(b, a).is_some())
     }
 
     /// The distinct column types of the catalog, sorted. `dt_cat` of a type
@@ -1296,11 +1302,17 @@ impl Cx<'_> {
     /// without catalogs does not; so the rules refuse it themselves.
     pub(super) fn guard_bits<X>(&mut self, f: impl FnOnce(&mut Self) -> R<X>) -> R<X> {
         let open = self.take_bit_unhandled();
+        let outer_types = std::mem::take(&mut *self.unresolved_types.borrow_mut());
         let r = f(self);
         let refusal = self.bit_refusal();
         self.bit_unhandled = open;
+        let types = std::mem::replace(&mut *self.unresolved_types.borrow_mut(), outer_types);
         match (r, refusal) {
             (Ok(_), Some(reason)) => no(reason),
+            (Ok(_), None) if !types.is_empty() => no(format!(
+                "the column type {} is not defined in this file (an alias type from another file?) and the rewrites need its base type; define it in the same file, or rewrite the use by hand",
+                types.into_iter().collect::<Vec<_>>().join(", ")
+            )),
             (r, _) => r,
         }
     }
