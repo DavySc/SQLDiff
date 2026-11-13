@@ -73,9 +73,12 @@ pub enum Site {
     /// atoms (`equiv::path`): each run under a partial valuation visits the
     /// nodes it passes.
     PathNodes,
+    /// Transfer steps of the relational coupling report (`equiv::coupling`):
+    /// one per aligned element visited, per fixpoint round and variant.
+    Coupling,
 }
 
-const SITES: usize = 11;
+const SITES: usize = 12;
 
 const NAMES: [&str; SITES] = [
     "explorer_steps",
@@ -89,6 +92,7 @@ const NAMES: [&str; SITES] = [
     "items_built",
     "pair_compares",
     "path_nodes",
+    "coupling",
 ];
 
 /// The counts of one scope.
@@ -301,6 +305,7 @@ const SITE_LIST: [Site; SITES] = [
     Site::ItemsBuilt,
     Site::PairCompares,
     Site::PathNodes,
+    Site::Coupling,
 ];
 
 /// Runs `f` without counting: work that only re-creates a state whose cost
