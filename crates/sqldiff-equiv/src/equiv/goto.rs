@@ -22,9 +22,11 @@ use sqldiff_syntax::{SyntaxKind, SyntaxNode};
 
 use super::ast::tokens_shared as tokens;
 
-/// The most regions one statement list may have (they nest, and every level
-/// is recursion); more than this are left unread, so "not proven".
-const MAX_REGIONS: usize = 500;
+/// The most labels a routine (or file) may have for any region to be read:
+/// regions nest like blocks, even across statement lists, and every level is
+/// recursion in the lowering and the alignment. More labels than this and no
+/// region is read, so "not proven" instead of a deep recursion.
+const MAX_REGIONS: usize = 64;
 
 /// One label of a statement list and the units its jumps start from.
 #[derive(Debug, Clone)]
@@ -101,6 +103,9 @@ impl Index {
     /// The regions of the statement list `units`.
     pub fn regions(&self, units: &[SyntaxNode]) -> Vec<Region> {
         let mut out = Vec::new();
+        if self.labels.len() > MAX_REGIONS {
+            return out;
+        }
         for (li, ln) in units.iter().enumerate() {
             if ln.kind() != SyntaxKind::LABEL {
                 continue;
@@ -135,11 +140,6 @@ impl Index {
                 name,
             });
         }
-        // Regions nest like blocks, and the lowering and the alignment
-        // recurse over them: a list with more than MAX_REGIONS reads none.
-        if out.len() > MAX_REGIONS {
-            return Vec::new();
-        }
         let crossing: Vec<bool> = out
             .iter()
             .map(|a| {
@@ -152,5 +152,43 @@ impl Index {
         let mut keep = crossing.into_iter();
         out.retain(|_| !keep.next().unwrap_or(false));
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqldiff_syntax::Dialect;
+
+    /// `n` nested regions in one script: `IF .. GOTO l<i>` lines, a
+    /// statement, then the labels in reverse.
+    fn script(n: usize) -> String {
+        let mut t = String::new();
+        for i in 0..n {
+            t.push_str(&format!("IF @x = {i} GOTO l{i};\n"));
+        }
+        t.push_str("SET @y = 1;\n");
+        for i in (0..n).rev() {
+            t.push_str(&format!("l{i}:\n"));
+        }
+        t.push_str("SET @y = 2;");
+        t
+    }
+
+    fn regions(n: usize) -> usize {
+        let root = sqldiff_syntax::parse(&script(n), Dialect::Tsql).syntax();
+        let units: Vec<SyntaxNode> = root
+            .descendants()
+            .filter(|d| matches!(d.kind(), SyntaxKind::STATEMENT | SyntaxKind::LABEL))
+            .collect();
+        Index::of(&root).regions(&units).len()
+    }
+
+    #[test]
+    fn regions_are_read_within_the_bound_and_none_past_it() {
+        assert_eq!(regions(3), 3);
+        assert_eq!(regions(MAX_REGIONS), MAX_REGIONS);
+        // Past the bound nothing is read, so nesting stays bounded.
+        assert_eq!(regions(MAX_REGIONS + 1), 0);
     }
 }

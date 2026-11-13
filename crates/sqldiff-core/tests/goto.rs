@@ -197,45 +197,43 @@ fn an_exit_names_the_block_it_leaves_not_the_innermost_one() {
 
 #[test]
 fn a_jump_out_of_a_try_part_is_not_equal() {
-    // A jump out of a TRY part is never read as a block exit. (The check in
-    // `goto_exit` is defence in depth: other layers refuse these pairs too,
-    // so this test pins the verdict, not that one guard.)
-    let t = "BEGIN TRY\nIF @x = 1 GOTO l;\nUPDATE dbo.t SET c = 1;\nEND TRY\nBEGIN CATCH\nUPDATE dbo.t SET d = 1;\nEND CATCH\nl:\nUPDATE dbo.t SET c = 2;";
-    let p = "<<goto_l>>\nBEGIN\nBEGIN\nIF p_x = 1 THEN EXIT goto_l; END IF;\nUPDATE t SET c = 1;\nEXCEPTION WHEN OTHERS THEN\nUPDATE t SET d = 1;\nEND;\nEND;\nUPDATE t SET c = 2;";
+    // A single final write, so nothing else (atomicity findings) makes these
+    // pairs unproven: only the TRY check in `goto_exit` does.
+    let t = "BEGIN TRY\nIF @x = 1 GOTO l;\nSET @y = @y * 10 + 1;\nEND TRY\nBEGIN CATCH\nSET @y = @y * 10 + 9;\nEND CATCH\nSET @y = @y * 10 + 2;\nl:\nSET @y = @y * 10 + 3;\nUPDATE dbo.t SET c = @y;";
+    let p = "<<goto_l>>\nBEGIN\nBEGIN\nIF p_x = 1 THEN EXIT goto_l; END IF;\nv_y := v_y * 10 + 1;\nEXCEPTION WHEN OTHERS THEN\nv_y := v_y * 10 + 9;\nEND;\nv_y := v_y * 10 + 2;\nEND;\nv_y := v_y * 10 + 3;\nUPDATE t SET c = v_y;";
     assert!(!is_equal(cross(t, p)));
-    // A jump from the EXCEPTION handler is no better.
-    let t = "BEGIN TRY\nUPDATE dbo.t SET c = 1;\nEND TRY\nBEGIN CATCH\nIF @x = 1 GOTO l;\nUPDATE dbo.t SET d = 1;\nEND CATCH\nl:\nUPDATE dbo.t SET c = 2;";
-    let p = "<<goto_l>>\nBEGIN\nBEGIN\nUPDATE t SET c = 1;\nEXCEPTION WHEN OTHERS THEN\nIF p_x = 1 THEN EXIT goto_l; END IF;\nUPDATE t SET d = 1;\nEND;\nEND;\nUPDATE t SET c = 2;";
+    // A GOTO in the CATCH part against an EXIT from the handler.
+    let t = "BEGIN TRY\nSET @y = @y * 10 + 1;\nEND TRY\nBEGIN CATCH\nGOTO l;\nEND CATCH\nSET @y = @y * 10 + 2;\nl:\nSET @y = @y * 10 + 3;\nUPDATE dbo.t SET c = @y;";
+    let p = "<<goto_l>>\nBEGIN\nBEGIN\nv_y := v_y * 10 + 1;\nEXCEPTION WHEN OTHERS THEN\nEXIT goto_l;\nEND;\nv_y := v_y * 10 + 2;\nEND;\nv_y := v_y * 10 + 3;\nUPDATE t SET c = v_y;";
     assert!(!is_equal(cross(t, p)));
 }
 
-#[test]
-fn a_long_flat_list_of_jumps_is_bounded() {
-    // 600 labels each jumped to from the line before, in reverse order, nest
-    // 600 deep: past the bound no region is read, so nothing is claimed and
-    // nothing overflows the stack.
-    let n = 600;
-    let mut t = String::new();
+/// `n` jumps to `n` labels written in reverse, so `n` regions nest; and the
+/// exact PostgreSQL mirror, `n` nested blocks.
+fn nested(n: usize) -> (String, String) {
+    let (mut t, mut p) = (String::new(), String::new());
     for i in 0..n {
         t.push_str(&format!("IF @x = {i} GOTO l{i};\n"));
+        p.push_str(&format!(
+            "<<goto_l{i}>>\nBEGIN\nIF p_x = {i} THEN EXIT goto_l{i}; END IF;\n"
+        ));
     }
-    t.push_str("UPDATE dbo.t SET c = 1;\n");
+    t.push_str("SET @y = 1;\n");
+    p.push_str("v_y := 1;\n");
     for i in (0..n).rev() {
         t.push_str(&format!("l{i}:\n"));
+        p.push_str("END;\n");
     }
-    t.push_str("UPDATE dbo.t SET d = 1;");
-    let r = diff(&tsql_file(&t), &tsql_file(&t), &Options::default());
-    assert_eq!(r.verdict(), Verdict::Unknown, "{:#?}", r.findings);
-    // Within the bound the same shape is read (and the file compares equal).
-    let mut small = String::new();
-    for i in 0..3 {
-        small.push_str(&format!("IF @x = {i} GOTO l{i};\n"));
-    }
-    small.push_str("UPDATE dbo.t SET c = 1;\n");
-    for i in (0..3).rev() {
-        small.push_str(&format!("l{i}:\n"));
-    }
-    small.push_str("UPDATE dbo.t SET d = 1;");
-    let r = diff(&tsql_file(&small), &tsql_file(&small), &Options::default());
-    assert!(is_equal(r.verdict()), "{:#?}", r.findings);
+    t.push_str("UPDATE dbo.t SET d = @y;");
+    p.push_str("UPDATE t SET d = v_y;");
+    (t, p)
+}
+
+#[test]
+fn nested_regions_in_bounds_compare_equal() {
+    let (t, p) = nested(3);
+    assert!(
+        is_equal(cross(&t, &p)),
+        "the mirror compares equal in bounds"
+    );
 }
