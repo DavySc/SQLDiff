@@ -324,3 +324,36 @@ fn insert_without_a_column_list_into_a_table_variable() {
         ),
     );
 }
+
+/// T-SQL DATEADD truncates a non-integer number toward zero (SQL Server 2022,
+/// decimal and float, both signs: eval/builtins/2026-11-02-dateadd); the
+/// converter writes `trunc(x)::integer`. Rounding it, or dropping the
+/// truncation, is not the same call.
+#[test]
+fn dateadd_truncates_a_fractional_number() {
+    equal(
+        "  SET @d = DATEADD(minute, @n * 1.5, @d);",
+        "  v_d := (v_d + make_interval(mins => trunc(v_n * 1.5)::integer));",
+    );
+    equal(
+        "  SET @d = DATEADD(second, -2.7, @d);",
+        "  v_d := (v_d + make_interval(secs => trunc(-2.7)::integer));",
+    );
+    equal(
+        "  SET @d = DATEADD(hour, CEILING(@n * 0.4), @d);",
+        "  v_d := (v_d + make_interval(hours => trunc(CEILING(v_n * 0.4))::integer));",
+    );
+    // PostgreSQL's integer cast rounds; make_interval keeps a fraction.
+    not_equal(
+        "  SET @d = DATEADD(minute, @n * 1.5, @d);",
+        "  v_d := (v_d + make_interval(mins => (v_n * 1.5)::integer));",
+    );
+    not_equal(
+        "  SET @d = DATEADD(minute, @n * 1.5, @d);",
+        "  v_d := (v_d + make_interval(mins => round(v_n * 1.5)::integer));",
+    );
+    not_equal(
+        "  SET @d = DATEADD(second, @n * 1.5, @d);",
+        "  v_d := (v_d + make_interval(secs => v_n * 1.5));",
+    );
+}
