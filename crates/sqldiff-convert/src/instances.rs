@@ -23,10 +23,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 
 use serde::Serialize;
-use sqldiff_core::{Artifact, ChangeClass, Dialect, Options, Verdict};
+use sqldiff_core::{Artifact, ChangeClass, Dialect, Facts, Options, Verdict};
 use sqldiff_source::compose;
 use sqldiff_source::weave::{Instance, Manifest, Weaver, Woven};
 use sqldiff_syntax::SyntaxKind;
@@ -334,17 +333,19 @@ pub fn check(a: &Args, hooks: &Hooks) -> Result<Checked, String> {
 
     // Catalogs: every woven instance on its side, plus any given.
     let mut opts = a.options.clone();
-    opts.facts_a.push(Arc::new(catalog(
+    opts.facts_a.push(Facts::from(catalog(
         woven.iter().map(|(s, _)| s.text.as_str()),
         a.from,
         &source_root,
         None,
+        1,
     )));
-    opts.facts_b.push(Arc::new(catalog(
+    opts.facts_b.push(Facts::from(catalog(
         woven.iter().map(|(_, t)| t.text.as_str()),
         a.to,
         &target_root,
         None,
+        1,
     )));
 
     // The name values each instance gives the target, for the name checks
@@ -699,18 +700,21 @@ fn hash(text: &str) -> String {
     d.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The running executable's hash: another build may check differently.
-fn build_hash() -> Result<String, String> {
-    use sha2::{Digest, Sha256};
-    static HASH: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
-    HASH.get_or_init(|| {
-        let exe = std::env::current_exe().map_err(|e| format!("the sqldiff executable: {e}"))?;
-        let mut f = std::fs::File::open(&exe).map_err(|e| format!("{}: {e}", exe.display()))?;
-        let mut h = Sha256::new();
-        std::io::copy(&mut f, &mut h).map_err(|e| format!("{}: {e}", exe.display()))?;
-        Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
-    })
-    .clone()
+/// What decides a result: a hash of the engine's sources and build
+/// settings (`ENGINE_FINGERPRINT`, from `build.rs`), the same for every
+/// binary that links the engine. Another engine may check differently.
+pub(crate) fn build_hash() -> Result<String, String> {
+    Ok(crate::ENGINE_FINGERPRINT.to_string())
+}
+
+/// What decides a stored *result*: the fingerprint of the check stage
+/// (`CHECK_FINGERPRINT`), which leaves out the draft-only crates. The
+/// result's key holds the draft by text, and the part of the draft the key
+/// does not hold (the mix) is stored with the result and rebuilt on reuse
+/// (`check::Mix`), so an edit to draft code alone cannot make a stale
+/// result count.
+pub(crate) fn check_build_hash() -> String {
+    crate::CHECK_FINGERPRINT.to_string()
 }
 
 /// Everything an instance's checks read besides the instance itself.
@@ -1670,6 +1674,7 @@ mod tests {
             Dialect::Postgres,
             Path::new("conv"),
             None,
+            1,
         )
     }
 
@@ -1692,19 +1697,34 @@ mod tests {
             proof,
             observer,
             anchors,
+            historyless,
+            skip_witnesses,
+            work_budgets,
+            work_caps,
+            alignment_bound,
+            statement_work_cap,
+            // A performance handle: no result depends on it.
+            pair_cache: _,
         } = Options::default();
         let base = Options {
             excerpt_lines,
             catalog_a,
             catalog_b,
             facts_a,
-            facts_b: vec![Arc::new(facts(DDL))],
+            facts_b: vec![Facts::from(facts(DDL))],
             helpers,
             flips,
             declared,
             proof,
             observer,
             anchors,
+            historyless,
+            skip_witnesses,
+            work_budgets,
+            work_caps,
+            alignment_bound,
+            statement_work_cap,
+            pair_cache: None,
         };
         let artifact = || Artifact::new("schema.sql", Dialect::Tsql, "CREATE TABLE t (id int);");
         let changes: Vec<Change<Options>> = vec![
@@ -1713,11 +1733,16 @@ mod tests {
             ("catalog_b", Box::new(move |o| o.catalog_b.push(artifact()))),
             (
                 "facts_a",
-                Box::new(|o| o.facts_a.push(Arc::new(facts("CREATE TABLE u (id int);")))),
+                Box::new(|o| {
+                    o.facts_a
+                        .push(Facts::from(facts("CREATE TABLE u (id int);")))
+                }),
             ),
             (
                 "facts_b",
-                Box::new(|o| o.facts_b = vec![Arc::new(facts(&DDL.replace("(12, 2)", "(12, 3)")))]),
+                Box::new(|o| {
+                    o.facts_b = vec![Facts::from(facts(&DDL.replace("(12, 2)", "(12, 3)")))]
+                }),
             ),
             (
                 "helpers",
@@ -1754,6 +1779,15 @@ mod tests {
                     })
                 }),
             ),
+            ("historyless", Box::new(|o| o.historyless = true)),
+            ("skip_witnesses", Box::new(|o| o.skip_witnesses = true)),
+            ("work_budgets", Box::new(|o| o.work_budgets = Some((1, 1)))),
+            ("work_caps", Box::new(|o| o.work_caps = Some((1, 1)))),
+            ("alignment_bound", Box::new(|o| o.alignment_bound = Some(1))),
+            (
+                "statement_work_cap",
+                Box::new(|o| o.statement_work_cap = Some(1)),
+            ),
             (
                 "proof mode",
                 Box::new(|o| o.proof.mode = sqldiff_core::proof::Mode::Require),
@@ -1761,11 +1795,12 @@ mod tests {
             (
                 "proof checker",
                 Box::new(|o| {
-                    o.proof.checker = Some(Arc::new(sqldiff_core::proof::FnChecker(|_| {
-                        sqldiff_core::proof::Answer::Unconfirmed {
-                            reason: "test".into(),
-                        }
-                    })))
+                    o.proof.checker =
+                        Some(std::sync::Arc::new(sqldiff_core::proof::FnChecker(|_| {
+                            sqldiff_core::proof::Answer::Unconfirmed {
+                                reason: "test".into(),
+                            }
+                        })))
                 }),
             ),
         ];

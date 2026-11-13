@@ -13,7 +13,7 @@ use sqldiff_syntax::{Dialect, SyntaxKind};
 use super::{Binder, CallArg, CallStyle, DeclKind, Issue, RefKind, Resolution, Target};
 use crate::catalog::builtins::{self, Availability};
 use crate::catalog::ddl::{self, OutputCol};
-use crate::catalog::{CatalogView, DataType, Ident, Lookup, RoutineKind, Table, TableKind};
+use crate::catalog::{DataType, Ident, Lookup, RoutineKind, Table, TableKind};
 use crate::model::{ChangeClass, Severity};
 use crate::tokens::{self, close_paren, split_commas, Tok};
 
@@ -73,6 +73,8 @@ struct Shape {
     clause: Vec<bool>,
     /// Kind of the innermost paren around each token.
     inner: Vec<Option<Paren>>,
+    /// Length of `chain(g)` for each group, made once.
+    depth: Vec<usize>,
 }
 
 const SET_OPS: &[&str] = &["UNION", "EXCEPT", "INTERSECT", "MINUS"];
@@ -203,11 +205,19 @@ fn shape(t: &[Tok]) -> Shape {
         clause.push(at_query);
         inner.push(stack.last().map(|s| s.0));
     }
+    // A parent is always made before its children.
+    let mut depth = vec![1usize; parent.len()];
+    for g in 0..parent.len() {
+        if let Some(p) = parent[g] {
+            depth[g] = depth[p] + 1;
+        }
+    }
     Shape {
         group,
         parent,
         clause,
         inner,
+        depth,
     }
 }
 
@@ -272,6 +282,12 @@ struct Analysis {
 }
 
 impl Analysis {
+    /// Sets `consumed` for the tokens in `range` (as a loop over the
+    /// indices would: an index past the end panics).
+    fn mark(&mut self, range: impl Iterator<Item = usize>, value: bool) {
+        range.for_each(|m| self.consumed[m] = value);
+    }
+
     fn resume_at(&mut self, k: usize) {
         self.resume = Some(self.resume.map_or(k, |r| r.min(k)));
     }
@@ -338,9 +354,7 @@ impl<'a> Binder<'a> {
                             })
                             .collect::<Vec<_>>(),
                     );
-                    for m in j..=c.min(t.len() - 1) {
-                        an.consumed[m] = true;
-                    }
+                    an.mark(j..=c.min(t.len() - 1), true);
                     j = c + 1;
                 }
                 if !t.get(j).is_some_and(|x| x.is_kw("AS")) {
@@ -475,9 +489,7 @@ impl<'a> Binder<'a> {
                     // SELECT ... INTO #t FROM: creates a table.
                     let (parts, after) = tokens::qualified(t, i + 1);
                     if !parts.is_empty() {
-                        for m in i + 1..after {
-                            an.consumed[m] = true;
-                        }
+                        an.mark(i + 1..after, true);
                         an.select_into = Some(parts);
                         i = after;
                     } else {
@@ -634,14 +646,10 @@ impl<'a> Binder<'a> {
                 let (p, after) = tokens::qualified(t, i);
                 parts = p;
                 span = (x.start, t[after - 1].end);
-                for m in i..after {
-                    an.consumed[m] = true;
-                }
+                an.mark(i..after, true);
                 if t.get(after).is_some_and(|y| y.is(SyntaxKind::L_PAREN)) && !insert_target {
                     // Table function: the call is bound by the generic pass.
-                    for m in i..after {
-                        an.consumed[m] = false;
-                    }
+                    an.mark(i..after, false);
                     if self.d == Dialect::Db2i
                         && !(after == i + 1 && x.is_any_kw(&["UNNEST", "XMLTABLE", "JSON_TABLE"]))
                     {
@@ -678,9 +686,7 @@ impl<'a> Binder<'a> {
                 && t.get(k + 1).is_some_and(|y| y.is(SyntaxKind::L_PAREN))
             {
                 let c = close_paren(t, k + 1);
-                for m in k..=c.min(t.len() - 1) {
-                    an.consumed[m] = true;
-                }
+                an.mark(k..=c.min(t.len() - 1), true);
                 k = c + 1;
             }
             // Alias.
@@ -714,9 +720,7 @@ impl<'a> Binder<'a> {
                         .filter_map(|e| e.first().filter(|y| y.is_name()).map(Tok::ident))
                         .collect(),
                 );
-                for m in k..=c.min(t.len() - 1) {
-                    an.consumed[m] = true;
-                }
+                an.mark(k..=c.min(t.len() - 1), true);
                 k = c + 1;
             }
             // T-SQL table hints: WITH (NOLOCK)
@@ -724,9 +728,7 @@ impl<'a> Binder<'a> {
                 && t.get(k + 1).is_some_and(|y| y.is(SyntaxKind::L_PAREN))
             {
                 let c = close_paren(t, k + 1);
-                for m in k..=c.min(t.len() - 1) {
-                    an.consumed[m] = true;
-                }
+                an.mark(k..=c.min(t.len() - 1), true);
                 k = c + 1;
             }
             let _ = start;
@@ -739,9 +741,7 @@ impl<'a> Binder<'a> {
                     .is_some_and(|y| y.is_any_kw(&["SELECT", "WITH", "VALUES"]))
             {
                 let c = close_paren(t, k);
-                for m in k..=c.min(t.len() - 1) {
-                    an.consumed[m] = true;
-                }
+                an.mark(k..=c.min(t.len() - 1), true);
                 col_list = Some((k + 1, c));
                 k = c + 1;
             }
@@ -1034,7 +1034,7 @@ impl<'a> Binder<'a> {
                 return tb;
             }
         }
-        let local = CatalogView::new(d, &[&self.local]);
+        let local = &self.local;
         if let Lookup::Found(tb) = local.table(parts) {
             let tb = tb.clone();
             self.add_ref(
@@ -1071,6 +1071,7 @@ impl<'a> Binder<'a> {
                 identity: false,
                 has_default: false,
                 generated: false,
+                hidden: false,
                 collation: None,
             });
             self.add_ref(
@@ -1176,7 +1177,7 @@ impl<'a> Binder<'a> {
         if d == Dialect::Tsql {
             if let Some(tr) = self.trigger.clone() {
                 let view = self.input.view;
-                let local = CatalogView::new(d, &[&self.local]);
+                let local = &self.local;
                 let tb = match local.table(&tr.table) {
                     Lookup::Found(x) => Some(x.clone()),
                     _ => match view.table(&tr.table) {
@@ -1275,9 +1276,7 @@ impl<'a> Binder<'a> {
                         self.target_column(n, ti, stmt, an);
                     }
                 }
-                for m in i..=c.min(t.len() - 1) {
-                    an.consumed[m] = true;
-                }
+                an.mark(i..=c.min(t.len() - 1), true);
                 i = c + 1;
                 continue;
             }
@@ -1336,9 +1335,7 @@ impl<'a> Binder<'a> {
                             if t.get(after)
                                 .is_some_and(|y| y.is_op("=") || y.is_op("+=") || y.is_op("-="))
                             {
-                                for m in k..after {
-                                    an.consumed[m] = true;
-                                }
+                                an.mark(k..after, true);
                                 let last = t[after - 1].clone();
                                 let _ = parts;
                                 self.target_column(&last, ti, stmt, an);
@@ -1472,7 +1469,7 @@ impl<'a> Binder<'a> {
                             "FOR",
                             "WINDOW",
                         ]))
-                        || (sh.group[k] != g && sh.chain(sh.group[k]).len() < sh.chain(g).len())
+                        || (sh.group[k] != g && sh.depth[sh.group[k]] < sh.depth[g])
                         || t[k].is(SyntaxKind::SEMICOLON)
                 })
                 .unwrap_or(t.len());
@@ -1720,9 +1717,7 @@ impl<'a> Binder<'a> {
                     .is_some_and(|y| y.is(SyntaxKind::NUMBER) || y.is_kw("MAX"))
             {
                 let c = close_paren(t, k);
-                for m in k..=c.min(t.len() - 1) {
-                    an.consumed[m] = true;
-                }
+                an.mark(k..=c.min(t.len() - 1), true);
                 k = c + 1;
             } else if x.is(SyntaxKind::L_BRACKET) || x.is(SyntaxKind::R_BRACKET) {
                 k += 1;
@@ -1811,9 +1806,7 @@ impl<'a> Binder<'a> {
                     if first > 0 {
                         let ty = DataType::parse(&tokens::texts(&inner[..first]));
                         self.check_type(&ty, (inner[0].start, inner[first - 1].end), stmt);
-                        for m in open + 1..open + 1 + first {
-                            an.consumed[m] = true;
-                        }
+                        an.mark(open + 1..open + 1 + first, true);
                     }
                 }
                 "DATEADD" | "DATEDIFF" | "DATEDIFF_BIG" | "DATEPART" | "DATENAME" | "DATETRUNC"
@@ -1880,7 +1873,7 @@ impl<'a> Binder<'a> {
         } else {
             RefKind::Routine
         };
-        let local = CatalogView::new(d, &[&self.local]);
+        let local = &self.local;
         let view = self.input.view;
         let found = match local.routines(parts) {
             Lookup::Found(r) => Some(r.into_iter().cloned().collect::<Vec<_>>()),
@@ -2055,6 +2048,21 @@ impl<'a> Binder<'a> {
             self.add_ref(kind, display, span, stmt, Resolution::Assumed(id));
             return;
         }
+        // The PostGIS functions the geography conversion writes
+        // (`tsql/geography.rs`): extension functions, present where postgis is.
+        if d == Dialect::Postgres
+            && style == CallStyle::Function
+            && parts.len() == 1
+            && ["st_geomfromwkb", "st_setsrid", "st_makepoint"]
+                .contains(&word.to_lowercase().as_str())
+        {
+            let id = self.assume(
+                "ASM-POSTGIS-GEOGRAPHY".to_string(),
+                format!("Function `{display}` is PostGIS's: the postgis extension is installed and on the search path"),
+            );
+            self.add_ref(kind, display, span, stmt, Resolution::Assumed(id));
+            return;
+        }
         if view.routines_authoritative(rkind) {
             let what = if style == CallStyle::Function {
                 "function"
@@ -2098,7 +2106,7 @@ impl<'a> Binder<'a> {
             return None;
         }
         let d = self.d;
-        let later = CatalogView::new(d, &[&self.later]);
+        let later = &self.later;
         let Lookup::Found(rs) = later.routines(parts) else {
             return None;
         };
@@ -2376,7 +2384,7 @@ impl<'a> Binder<'a> {
     }
 
     fn lookup_table_silent(&self, parts: &[Ident]) -> Option<Table> {
-        let local = CatalogView::new(self.d, &[&self.local]);
+        let local = &self.local;
         match local.table(parts) {
             Lookup::Found(x) => Some(x.clone()),
             _ => match self.input.view.table(parts) {
@@ -2603,7 +2611,7 @@ impl<'a> Binder<'a> {
         };
         match (var, matches.first()) {
             (Some(i), Some((s, c))) => {
-                if d == Dialect::Postgres && !self.pg_conflict_directive {
+                if d == Dialect::Postgres && !self.pg_conflict_directive_at(span.0) {
                     let dn = self.out.decls[i].name.clone();
                     let msg = format!(
                         "`{}` is both PL/pgSQL variable `{dn}` (line {}) and column {}.{}; with the default plpgsql.variable_conflict = error the statement fails with \"column reference is ambiguous\".",
@@ -3003,13 +3011,14 @@ impl<'a> Binder<'a> {
                         identity: false,
                         has_default: false,
                         generated: false,
+                        hidden: false,
                         collation: None,
                     });
                 }
             }
             _ => tb.columns_known = false,
         }
-        self.local.put_table(self.d, tb);
+        self.local.put_table(tb);
     }
 }
 

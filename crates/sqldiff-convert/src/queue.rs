@@ -620,10 +620,12 @@ pub fn write(
     q: &Queue,
     out: &std::path::Path,
 ) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
-    let text = serde_json::to_string_pretty(q).map_err(|e| e.to_string())? + "\n";
+    // Both paths are checked before either file is created.
     crate::tree::dest_under(out, QUEUE_JSON)?;
     crate::tree::dest_under(out, QUEUE_MD)?;
-    let json = crate::tree::write_under(out, QUEUE_JSON, text.as_bytes())?;
+    // Streamed to the file, not built as one string: the queue of a large
+    // tree is over a hundred megabytes. Same bytes as `to_string_pretty + "\n"`.
+    let (json, _) = crate::tree::write_json_under(out, QUEUE_JSON, q)?;
     let md = crate::tree::write_under(out, QUEUE_MD, markdown(q).as_bytes())?;
     Ok((json, md))
 }

@@ -29,6 +29,9 @@ fn masked(dir: &Path) -> Vec<(String, String)> {
     while let Some(d) = stack.pop() {
         for e in std::fs::read_dir(&d).unwrap().flatten() {
             let p = e.path();
+            if p.file_name().is_some_and(|n| n == ".sqldiff") {
+                continue;
+            }
             if p.is_dir() {
                 stack.push(p);
                 continue;
@@ -164,6 +167,7 @@ fn a_batch_writes_what_its_runs_write_one_by_one() {
                     catalogs: Vec::new(),
                     catalogs_b: Vec::new(),
                     instances: None,
+                    increment: Default::default(),
                 },
                 true,
                 |_| {},

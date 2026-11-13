@@ -86,6 +86,11 @@ fn handshake_list_and_conversion_review() {
             "convert_tree",
             "conversion_queue",
             "write_unit",
+            "run_status",
+            "cancel_run",
+            "engine",
+            "reload_config",
+            "compare_runs",
             "converted_file"
         ]
     );

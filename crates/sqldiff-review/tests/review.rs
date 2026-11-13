@@ -442,7 +442,7 @@ fn cache_misses_when_catalog_contents_change() {
     let cfg = config(&dir, PACK);
     let (a, b) = movestock();
     let facts = |ddl: &str| {
-        std::sync::Arc::new(sqldiff_core::catalog::ddl::load(
+        sqldiff_core::Facts::from(sqldiff_core::catalog::ddl::load(
             ddl,
             Dialect::Tsql,
             "base catalogs orders.sql",
@@ -578,6 +578,34 @@ fn redaction_never_touches_keys_enums_or_hashes() {
             serde_json::from_str(&render::sarif(std::slice::from_ref(&out))).unwrap();
         red.verify_value(&sarif).unwrap();
         assert!(!json.contains(&format!("\"{pa}\"")), "{json}");
+    }
+}
+
+// A term that matches inside a word leaves its placeholder glued to the rest of the word
+// (`obj` in `objects`). The placeholder's hex must still not count as a leak of a hex-only
+// term. This salt made `obj` become `TERM_0406CC47` while "06cc" is also banned.
+#[test]
+fn placeholder_glued_to_a_word_is_not_a_leak_of_a_hex_term() {
+    let dir = scratch("glued");
+    let cfg = config(&dir, WORDS_PACK);
+    let (mut a, mut b) = movestock();
+    a.path = "object.sql".into();
+    b.path = "different.sql".into();
+    let r = sqldiff_core::diff(&a, &b, &Options::default());
+    let mut red = Redactor::new(&cfg, b"salt-00009466-padpadpad");
+    let out = red.redact_report(&r);
+    red.verify_report(&out).unwrap();
+    let mut red = Redactor::new(&cfg, b"0123456789abcdef");
+    let s = red.redact_str("ownership chain (routine and objects with one owner)");
+    assert!(!s.contains("objects"), "{s}");
+    red.verify(&s).unwrap();
+    // Glued on the left, on the right, or both.
+    let mut red = Redactor::new(&cfg, b"salt-00009466-padpadpad");
+    for text in ["objects", "subobjects", "subobj", "myobj", "the obj here"] {
+        let s = red.redact_str(text);
+        assert!(!s.contains("obj"), "{s}");
+        red.verify(&s)
+            .unwrap_or_else(|e| panic!("{text} -> {s}: {e:?}"));
     }
 }
 

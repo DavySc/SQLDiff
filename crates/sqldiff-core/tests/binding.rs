@@ -319,7 +319,11 @@ fn every_reference_resolves_or_is_assumed() {
             let bound = bind::bind(
                 &analyzed,
                 &BindInput {
-                    view: &view,
+                    view: sqldiff_core::catalog::record::RecordingView::new(
+                        &view,
+                        sqldiff_core::catalog::record::Side::Source,
+                        &sqldiff_core::catalog::record::NO_SINK,
+                    ),
                     helpers: &[],
                 },
             );
@@ -619,7 +623,11 @@ fn incomplete_input_never_panics() {
                 bind::bind(
                     &analyzed,
                     &BindInput {
-                        view: &view,
+                        view: sqldiff_core::catalog::record::RecordingView::new(
+                            &view,
+                            sqldiff_core::catalog::record::Side::Source,
+                            &sqldiff_core::catalog::record::NO_SINK,
+                        ),
                         helpers: &[],
                     },
                 );
@@ -819,4 +827,39 @@ CREATE TRIGGER tu AFTER UPDATE ON orders REFERENCING NEW TABLE AS inserted OLD T
     );
     let outside = "CREATE PROCEDURE p AS SELECT order_id FROM inserted;";
     assert!(!check(Dialect::Tsql, outside).is_empty());
+}
+
+/// `#variable_conflict use_column` belongs to the function that holds it
+/// (PostgreSQL scopes it per function): another function of the same file,
+/// without the directive, still reports a name that is both a variable and a
+/// column, and the one with the directive does not.
+#[test]
+fn pg_variable_conflict_directive_is_per_function() {
+    let catalog = "create table t (id integer, name text);";
+    let func = |name: &str, option: &str| {
+        format!(
+            "create function {name}(id integer) returns void language plpgsql as $$\n{option}begin\n    perform 1 from t where id = 1;\nend\n$$;\n"
+        )
+    };
+    let ambiguous = |src: &str| {
+        check_rules(Dialect::Postgres, src, Some(catalog))
+            .findings
+            .iter()
+            .filter(|f| f.rule == "bind.ambiguous-name")
+            .count()
+    };
+    assert_eq!(ambiguous(&func("f", "")), 1);
+    assert_eq!(ambiguous(&func("f", "#variable_conflict use_column\n")), 0);
+    let both = format!(
+        "{}{}",
+        func("f", "#variable_conflict use_column\n"),
+        func("g", "")
+    );
+    assert_eq!(ambiguous(&both), 1, "only g lacks the directive");
+    let both = format!(
+        "{}{}",
+        func("g", ""),
+        func("f", "#variable_conflict use_column\n")
+    );
+    assert_eq!(ambiguous(&both), 1, "the order does not matter");
 }

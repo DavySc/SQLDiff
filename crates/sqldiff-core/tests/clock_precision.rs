@@ -122,13 +122,16 @@ fn clock_cast_to_six_digits() {
         "  SET @d = SYSDATETIME();",
         "  v_d := statement_timestamp()::timestamp;",
     );
-    let r = equal(&a, &b);
-    assert!(ids(&r).contains(&"ASM-CLOCK-FRACTION-6"), "{:?}", ids(&r));
+    // Inside a routine PostgreSQL's statement_timestamp() is the time of the
+    // CALL, not of the statement, so main no longer shows an assignment from
+    // SYSDATETIME() equal to it: the clock cast alone (ASM-CLOCK-FRACTION-6)
+    // does not make the pair equal there.
+    not_equal(&a, &b);
     let (a, b) = proc(
         "  SET @d = CAST(SYSDATETIME() AS datetime2(6));",
         "  v_d := CAST(statement_timestamp() AS timestamp(6));",
     );
-    equal(&a, &b);
+    not_equal(&a, &b);
     // The transaction clock, the real clock and datetime's GETDATE are other values.
     for p in [
         "  v_d := now()::timestamp;",

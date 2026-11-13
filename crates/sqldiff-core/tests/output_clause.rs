@@ -195,7 +195,11 @@ fn returning_old_and_new_bind_to_the_target() {
     let bound = bind::bind(
         &analyzed,
         &BindInput {
-            view: &view,
+            view: sqldiff_core::catalog::record::RecordingView::new(
+                &view,
+                sqldiff_core::catalog::record::Side::Source,
+                &sqldiff_core::catalog::record::NO_SINK,
+            ),
             helpers: &[],
         },
     );
@@ -223,7 +227,11 @@ fn old_and_new_outside_returning_do_not_bind() {
     let bound = bind::bind(
         &analyzed,
         &BindInput {
-            view: &view,
+            view: sqldiff_core::catalog::record::RecordingView::new(
+                &view,
+                sqldiff_core::catalog::record::Side::Source,
+                &sqldiff_core::catalog::record::NO_SINK,
+            ),
             helpers: &[],
         },
     );

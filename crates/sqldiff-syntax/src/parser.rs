@@ -41,6 +41,8 @@ pub fn parse(text: &str, dialect: Dialect) -> Parse {
         diags: lexed.diagnostics,
         mode: Mode::Sql,
         stops: Vec::new(),
+        nest: 0,
+        too_deep: false,
     };
     p.parse_file();
     Parse {
@@ -125,7 +127,21 @@ struct Parser<'a> {
     diags: Vec<Diagnostic>,
     mode: Mode,
     stops: Vec<&'static [&'static str]>,
+    /// Statements being read inside one another (blocks, IF, loops).
+    nest: usize,
+    /// A nest past [`MAX_STATEMENT_NESTING`] was met in the outermost
+    /// statement being read: the diagnostics of the statements around it
+    /// are left out.
+    too_deep: bool,
 }
+
+/// The deepest nesting of statements the parser reads (BEGIN inside IF
+/// inside WHILE ...). The passes after it recurse once per level, with large
+/// frames: on the engine's stack a nest of `IF` overflows near 3 000 levels in
+/// a debug build. Real code nests a few dozen at most. Past this the rest of
+/// the batch is one error node and the parse reports it, so the unit is
+/// refused instead of the process crashing.
+pub const MAX_STATEMENT_NESTING: usize = 1000;
 
 impl<'a> Parser<'a> {
     // ---- token access ----------------------------------------------------
@@ -141,8 +157,8 @@ impl<'a> Parser<'a> {
 
     fn sig_index(&self, n: usize) -> Option<usize> {
         let mut seen = 0;
-        for i in self.pos..self.tokens.len() {
-            if !self.tokens[i].kind.is_trivia() {
+        for (i, t) in self.tokens.iter().enumerate().skip(self.pos) {
+            if !t.kind.is_trivia() {
                 if seen == n {
                     return Some(i);
                 }
@@ -245,14 +261,18 @@ impl<'a> Parser<'a> {
     }
 
     fn diag_here(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        // While the enclosing statements unwind from a nest that was too
+        // deep, each of them would report its own missing END: the one
+        // too-deep report says it.
+        if self.too_deep && !message.contains("nesting too deep") {
+            return;
+        }
         let offset = self
             .sig_index(0)
             .map(|i| self.tokens[i].start)
             .unwrap_or(self.src.len());
-        self.diags.push(Diagnostic {
-            offset,
-            message: message.into(),
-        });
+        self.diags.push(Diagnostic { offset, message });
     }
 
     fn with_stops<R>(
@@ -328,6 +348,56 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_statement(&mut self) {
+        if self.nest >= MAX_STATEMENT_NESTING {
+            self.bump_trivia();
+            let offset = self
+                .sig_index(0)
+                .map(|i| self.tokens[i].start)
+                .unwrap_or(self.src.len());
+            self.too_deep = true;
+            self.start(ERROR);
+            // Stop at the next batch separator: the objects after a deep
+            // routine are separate batches and still parse.
+            while self.nth_kind(0).is_some_and(|k| k != BATCH_SEP) {
+                self.bump();
+            }
+            // Say exactly what was left unread: the lines from here to the
+            // separator or the end of the file (a count of statements is not
+            // exact, since `;` is optional in T-SQL and the `END`s of the
+            // blocks already read are swallowed too).
+            let (stop, end) = match self.sig_index(0) {
+                Some(i) => (self.tokens[i].start, "the next batch separator"),
+                None => (self.src.len(), "the end of the file"),
+            };
+            let line = |o: usize| self.src[..o].bytes().filter(|&b| b == b'\n').count() + 1;
+            let (first, last) = (
+                line(offset),
+                line(self.src[..stop].trim_end().len().max(offset)),
+            );
+            let lines = if first == last {
+                format!("line {first} was")
+            } else {
+                format!("lines {first} to {last} were")
+            };
+            self.diags.push(Diagnostic {
+                offset,
+                message: format!(
+                    "statements nested deeper than {MAX_STATEMENT_NESTING}: nesting too deep; \
+                     {lines} not read (up to {end})"
+                ),
+            });
+            self.finish();
+            return;
+        }
+        self.nest += 1;
+        self.parse_statement_at();
+        self.nest -= 1;
+        if self.nest == 0 {
+            self.too_deep = false;
+        }
+    }
+
+    fn parse_statement_at(&mut self) {
         self.bump_trivia();
         let cp = self.builder.checkpoint();
         if self.try_label() && self.dialect == Dialect::Tsql {
@@ -669,7 +739,10 @@ impl<'a> Parser<'a> {
             }
             if !first && depth == 0 && case == 0 && k == IDENT {
                 let w = self.upper_word();
-                let starter = TSQL_STARTERS.contains(&w.as_str()) || w == "ELSE" || w == "END";
+                let starter = TSQL_STARTERS.contains(&w.as_str())
+                    || w == "ELSE"
+                    || w == "END"
+                    || w == "BULK" && self.nth_kw(1, "INSERT");
                 let continues = matches!(prev_word.as_str(), "AND" | "OR" | "NOT")
                     || matches!(prev_kind, Some(COMMA | L_PAREN));
                 if starter && !continues {
@@ -1053,7 +1126,14 @@ impl<'a> Parser<'a> {
                 if w == "END" || w == "ELSE" {
                     break;
                 }
-                if tsql_starts_statement(&w, &head, &prev_word, prev_kind, &seen) {
+                if tsql_starts_statement(
+                    &w,
+                    &head,
+                    &prev_word,
+                    prev_kind,
+                    &seen,
+                    self.nth_kw(1, "INSERT"),
+                ) {
                     self.builder.token(INFERRED_TERMINATOR.into(), "");
                     break;
                 }
@@ -1139,8 +1219,10 @@ fn tsql_starts_statement(
     prev_word: &str,
     prev_kind: Option<SyntaxKind>,
     seen: &HashSet<String>,
+    next_is_insert: bool,
 ) -> bool {
-    if !TSQL_STARTERS.contains(&w) {
+    // `BULK INSERT` starts a statement; a lone `BULK` is an ordinary word.
+    if !(TSQL_STARTERS.contains(&w) || w == "BULK" && next_is_insert) {
         return false;
     }
     if matches!(prev_kind, Some(COMMA | L_PAREN | DOT)) || TSQL_CONTINUE_AFTER.contains(&prev_word)
@@ -1158,6 +1240,8 @@ fn tsql_starts_statement(
             !(head == "INSERT" && !seen_any(&["SELECT", "VALUES", "EXEC", "EXECUTE"])
                 || head == "WITH" && !seen_any(DML))
         }
+        // `BULK INSERT t FROM 'file' WITH (…)` is one statement.
+        "INSERT" if head == "BULK" && prev_word == "BULK" => false,
         "INSERT" | "UPDATE" | "DELETE" | "MERGE" => !(head == "WITH" && !seen_any(DML)),
         "SET" => {
             !(head == "UPDATE" && !seen.contains("SET") || prev_word == "UPDATE" || head == "ALTER")
@@ -1189,6 +1273,48 @@ mod tests {
                 (n.kind(), words.join(" "))
             })
             .collect()
+    }
+
+    #[test]
+    fn bulk_insert_is_one_statement() {
+        let text = "PRINT 'x'\nBULK INSERT [a].[b] FROM 'f.csv'\nWITH (FIELDTERMINATOR = ',', TABLOCK)\nSELECT 1\nGO\nBULK INSERT t FROM 'g.csv';\nINSERT INTO t SELECT 1;";
+        let words: Vec<String> = units(text, Dialect::Tsql)
+            .into_iter()
+            .map(|(_, w)| w)
+            .collect();
+        assert_eq!(
+            words,
+            [
+                "PRINT 'X'",
+                "BULK INSERT",
+                "SELECT 1",
+                "BULK INSERT",
+                "INSERT INTO"
+            ]
+        );
+    }
+
+    #[test]
+    fn bulk_insert_as_the_body_of_if_and_while() {
+        for text in [
+            "IF 1 = 1 BULK INSERT t FROM 'f'\nSELECT 1",
+            "IF 1 = 1 BULK INSERT t FROM 'f' ELSE BULK INSERT t FROM 'g'\nSELECT 1",
+            "WHILE 1 = 1 BULK INSERT t FROM 'f'\nSELECT 1",
+            "IF 1 = 1\n    BULK INSERT t FROM 'f' WITH (TABLOCK);\nSELECT 1",
+        ] {
+            let words: Vec<String> = units(text, Dialect::Tsql)
+                .into_iter()
+                .map(|(_, w)| w)
+                .collect();
+            assert!(
+                !words.iter().any(|w| w.starts_with("INSERT")),
+                "{text}: {words:?}"
+            );
+            assert!(
+                words.iter().any(|w| w == "BULK INSERT"),
+                "{text}: {words:?}"
+            );
+        }
     }
 
     #[test]
@@ -1365,6 +1491,108 @@ mod tests {
         assert!(root
             .descendants()
             .any(|n| n.kind() == STATEMENT && ast::first_words(&n, 1) == ["UPDATE"]));
+    }
+
+    #[test]
+    fn statements_nested_too_deep_are_one_error_and_the_text_stays_whole() {
+        let nest = |k: usize| format!("{}SELECT 1;\n{}", "BEGIN\n".repeat(k), "END\n".repeat(k));
+        let deep = nest(MAX_STATEMENT_NESTING + 50);
+        let ok = nest(MAX_STATEMENT_NESTING - 10);
+        {
+            let d = Dialect::Tsql;
+            let (bad, good) = (parse(&deep, d), parse(&ok, d));
+            assert!(
+                bad.diagnostics
+                    .iter()
+                    .any(|x| x.message.contains("nesting too deep")),
+                "{d:?}"
+            );
+            assert_eq!(bad.syntax().text().to_string(), deep, "{d:?}: lossless");
+            assert!(
+                !good
+                    .diagnostics
+                    .iter()
+                    .any(|x| x.message.contains("nesting too deep")),
+                "{d:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn too_deep_message_names_the_unread_lines_exactly() {
+        let k = MAX_STATEMENT_NESTING;
+        let msg = |text: &str, d: Dialect| {
+            let p = parse(text, d);
+            assert_eq!(p.syntax().text().to_string(), text, "{d:?}: lossless");
+            let m: Vec<_> = p
+                .diagnostics
+                .iter()
+                .filter(|x| x.message.contains("nesting too deep"))
+                .map(|x| x.message.clone())
+                .collect();
+            assert_eq!(m.len(), 1, "{d:?}: {m:?}");
+            m[0].clone()
+        };
+        let want = |what: &str, end: &str| {
+            format!("statements nested deeper than {k}: nesting too deep; {what} not read (up to {end})")
+        };
+        let n = k + 10;
+        // T-SQL without semicolons: statements are not counted, lines are.
+        // The error starts at the BEGIN nested k deep (line k + 1) and runs to
+        // the last END (line n + 3 + n).
+        let text = format!(
+            "{}SELECT 1\nSELECT 2\nPRINT 'x'\n{}",
+            "BEGIN\n".repeat(n),
+            "END\n".repeat(n)
+        );
+        assert_eq!(
+            msg(&text, Dialect::Tsql),
+            want(
+                &format!("lines {} to {} were", k + 1, n + 3 + n),
+                "the end of the file"
+            )
+        );
+        // The same nest with `;` and `END;` reports lines the same way.
+        let text = format!("{}SELECT 1;\n{}", "BEGIN\n".repeat(n), "END;\n".repeat(n));
+        assert_eq!(
+            msg(&text, Dialect::Tsql),
+            want(
+                &format!("lines {} to {} were", k + 1, n + 1 + n),
+                "the end of the file"
+            )
+        );
+        // A batch separator ends the unread span.
+        let text = format!(
+            "{}SELECT 1\n{}GO\nSELECT 2\n",
+            "BEGIN\n".repeat(n),
+            "END\n".repeat(n)
+        );
+        assert_eq!(
+            msg(&text, Dialect::Tsql),
+            want(
+                &format!("lines {} to {} were", k + 1, n + 1 + n),
+                "the next batch separator"
+            )
+        );
+        // One unread line.
+        let text = format!(
+            "{}SELECT 1 {}",
+            "BEGIN ".repeat(k + 1),
+            "END ".repeat(k + 1)
+        );
+        assert_eq!(
+            msg(&text, Dialect::Tsql),
+            want("line 1 was", "the end of the file")
+        );
+        // Db2 for i (no batch separator: the rest of the file).
+        let text = format!("{}SET v = 1;\n{}", "BEGIN\n".repeat(n), "END;\n".repeat(n));
+        assert_eq!(
+            msg(&text, Dialect::Db2i),
+            want(
+                &format!("lines {} to {} were", k + 1, n + 1 + n),
+                "the end of the file"
+            )
+        );
     }
 
     #[test]

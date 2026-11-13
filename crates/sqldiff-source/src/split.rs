@@ -259,7 +259,7 @@ pub fn parts(text: &str, d: Dialect) -> Vec<Part> {
         last.ranges.append(&mut pending);
     }
     // Repeated names (overloads): number them in file order.
-    let mut seen: std::collections::HashMap<String, usize> = Default::default();
+    let mut seen: std::collections::BTreeMap<String, usize> = Default::default();
     for p in &mut out {
         let k = seen.entry(p.fragment.clone()).or_insert(0);
         *k += 1;

@@ -151,3 +151,172 @@ fn a_link_in_a_folder_is_not_written_through() {
         SRC
     );
 }
+
+fn with_stdin(dir: &PathBuf, args: &[&str], input: &[u8]) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut c = Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+        .current_dir(dir)
+        .env("SQLDIFF_CONFIG", dir.join("no-user-config.toml"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    c.stdin.take().unwrap().write_all(input).unwrap();
+    c.wait_with_output().unwrap()
+}
+
+#[test]
+fn stdin_to_stdout_with_filepath_dialect_and_config() {
+    let d = scratch("stdin");
+    std::fs::create_dir_all(d.join("db")).unwrap();
+    // Config is found from the --stdin-filepath directory, not the cwd.
+    std::fs::write(
+        d.join("db").join("sqldiff.toml"),
+        "[format]\nkeyword_case = \"lower\"\n",
+    )
+    .unwrap();
+    let o = with_stdin(
+        &d,
+        &["fmt", "-", "--stdin-filepath", "db/q.pg.sql"],
+        SRC.as_bytes(),
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(stdout(&o), "select a, b\nfrom t\nwhere x = 1\n");
+    // Without the filepath there is no dialect.
+    let o = with_stdin(&d, &["fmt", "-"], SRC.as_bytes());
+    assert_eq!(o.status.code(), Some(2));
+    // -d works without a path.
+    let o = with_stdin(
+        &d,
+        &["fmt", "-", "-d", "postgres", "--keyword-case", "upper"],
+        SRC.as_bytes(),
+    );
+    assert_eq!(stdout(&o), "SELECT a, b\nFROM t\nWHERE x = 1\n");
+}
+
+#[test]
+fn stdin_keeps_crlf_and_rejects_bad_utf8() {
+    let d = scratch("stdin-crlf");
+    let o = with_stdin(
+        &d,
+        &["fmt", "-", "-d", "postgres"],
+        b"select a,b\r\nfrom t\r\n",
+    );
+    assert_eq!(o.stdout, b"SELECT a, b\r\nFROM t\r\n");
+    let o = with_stdin(&d, &["fmt", "-", "-d", "postgres"], b"select '\xff'");
+    assert_eq!(o.status.code(), Some(2));
+    assert!(o.stdout.is_empty());
+}
+
+#[test]
+fn stdin_check_and_write() {
+    let d = scratch("stdin-check");
+    let o = with_stdin(
+        &d,
+        &["fmt", "-", "--check", "-d", "postgres"],
+        SRC.as_bytes(),
+    );
+    assert_eq!(o.status.code(), Some(1));
+    assert!(o.stdout.is_empty());
+    let o = with_stdin(
+        &d,
+        &["fmt", "-", "--write", "-d", "postgres"],
+        SRC.as_bytes(),
+    );
+    assert_eq!(o.status.code(), Some(2));
+    let o = with_stdin(&d, &["fmt", "x.sql", "--stdin-filepath", "y.sql"], b"");
+    assert_eq!(o.status.code(), Some(2));
+}
+
+#[test]
+fn check_reads_stdin_with_the_filepath_shown() {
+    let d = scratch("stdin-lint");
+    let o = with_stdin(
+        &d,
+        &[
+            "check",
+            "-",
+            "--stdin-filepath",
+            "sub/x.tsql.sql",
+            "-f",
+            "json",
+        ],
+        b"select 1\nfrom t limit 3\n",
+    );
+    let out = stdout(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(out.contains("\"path\": \"sub/x.tsql.sql\""), "{out}");
+    assert!(out.contains("residue.pg.limit"), "{out}");
+    assert!(out.contains("\"start_line\": 2"), "{out}");
+}
+
+#[test]
+fn stdin_filepath_matches_dialect_map_when_absolute_or_dotdot() {
+    let d = scratch("stdin-map");
+    let proj = d.join("proj");
+    std::fs::create_dir_all(proj.join("db").join("sub")).unwrap();
+    std::fs::create_dir_all(d.join("other")).unwrap();
+    std::fs::write(
+        proj.join("sqldiff.toml"),
+        "[[dialect_map]]\nglob = \"db/**/*.sql\"\ndialect = \"postgres\"\n",
+    )
+    .unwrap();
+    let abs = proj.join("db").join("sub").join("x.sql");
+    let rel_from_proj = "db/sub/x.sql".to_string();
+    let abs = abs.to_string_lossy().to_string();
+    let dotdot = "../proj/db/sub/x.sql".to_string();
+    let cases: [(&PathBuf, &str); 3] = [
+        (&proj, abs.as_str()),
+        (&proj, rel_from_proj.as_str()),
+        (&d.join("other"), dotdot.as_str()),
+    ];
+    for (cwd, path) in cases {
+        let o = with_stdin(cwd, &["fmt", "-", "--stdin-filepath", path], SRC.as_bytes());
+        assert!(
+            o.status.success(),
+            "{path}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        assert_eq!(stdout(&o), "SELECT a, b\nFROM t\nWHERE x = 1\n", "{path}");
+        let o = with_stdin(
+            cwd,
+            &["check", "-", "--stdin-filepath", path, "-f", "json"],
+            b"select 1\n",
+        );
+        assert!(
+            o.status.code() != Some(2),
+            "{path}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    // A path outside the project does not match the glob.
+    let o = with_stdin(
+        &proj,
+        &["fmt", "-", "--stdin-filepath", "../x.sql"],
+        SRC.as_bytes(),
+    );
+    assert_eq!(o.status.code(), Some(2));
+}
+
+#[test]
+fn check_json_ranges_are_one_based_byte_columns() {
+    let d = scratch("stdin-range");
+    let o = with_stdin(
+        &d,
+        &["check", "-", "--stdin-filepath", "x.tsql.sql", "-f", "json"],
+        "select 'é', 1\nfrom t limit 3\n".as_bytes(),
+    );
+    let out = stdout(&o);
+    // `limit 3` starts at byte column 8 of line 2 and ends (exclusive) at 15.
+    for key in [
+        "\"start_line\": 2",
+        "\"start_col\": 8",
+        "\"end_line\": 2",
+        "\"end_col\": 15",
+    ] {
+        assert!(out.contains(key), "{key} in {out}");
+    }
+}

@@ -23,7 +23,7 @@ use sqldiff_syntax::LineIndex;
 
 use crate::{check, recount, rewrite_in, span, Conversion, Draft, Note, Status, U16Index};
 use sqldiff_core::catalog::Catalog;
-use sqldiff_core::Options;
+use sqldiff_core::{Facts, Options};
 
 /// Excerpt lines in remapped findings.
 const EXCERPT: usize = 3;
@@ -270,6 +270,56 @@ impl TemplateDraft {
     pub fn output(&self) -> &str {
         self.draft.output()
     }
+
+    /// Everything of this draft that [`check_template`] reads, as text: the
+    /// fragment and its offset map, the rules' draft (canonical, with its
+    /// options), the placeholders' spellings, the special forms and the
+    /// harness. Part of a stored result's key (`store::TemplateInput`); a
+    /// field of the draft that is not here would let a stale result through.
+    pub fn canonical(&self) -> String {
+        let TemplateDraft {
+            frag,
+            draft,
+            written,
+            specials,
+            harness,
+        } = self;
+        format!(
+            "{:?}",
+            (
+                &frag.text,
+                &frag.map.spans,
+                draft.canonical(),
+                draft.options(),
+                written,
+                specials,
+                harness,
+            )
+        )
+    }
+}
+
+/// Everything of a template job besides its draft that [`check_template`]
+/// reads, as text: the template's text and segments, how the placeholders
+/// were decided, the delimiters and the stand-ins. Part of a stored result's
+/// key together with [`TemplateDraft::canonical`].
+pub fn job_material(
+    t: &Template,
+    stand: &StandIns,
+    basis: PlaceholderBasis,
+    delimiters: (&str, &str),
+) -> String {
+    format!(
+        "{:?}",
+        (
+            &t.text,
+            &t.segments,
+            t.ignore_case,
+            stand,
+            basis,
+            delimiters
+        )
+    )
 }
 
 /// The fragment of `t` under `stand`: placeholders as stand-in names,
@@ -389,7 +439,10 @@ pub fn rewrite_template_with(
     let harness = match kind.harness(&stand.stem, parameters) {
         Some((pre, neutral, post)) if from == Dialect::Tsql => {
             let marker = format!("/*{}hb*/", stand.stem);
-            let base = rewrite_in(&format!("{pre}{neutral}{post}"), from, to, source);
+            // A fragment's statements are the template's, not a whole routine's: no error continuation.
+            let base = sqldiff_draft::tsql::without_continuation(|| {
+                rewrite_in(&format!("{pre}{neutral}{post}"), from, to, source)
+            });
             let base = base.output();
             let around = base.find(&marker).and_then(|m| {
                 let m = m + marker.len();
@@ -425,7 +478,8 @@ pub fn rewrite_template_with(
         }
         _ => None,
     };
-    let draft = rewrite_in(&frag.text, from, to, source);
+    let draft =
+        sqldiff_draft::tsql::without_continuation(|| rewrite_in(&frag.text, from, to, source));
     TemplateDraft {
         frag,
         draft,
@@ -446,6 +500,34 @@ pub fn check_template(
     opts: &Options,
     basis: PlaceholderBasis,
     delimiters: (&str, &str),
+) -> Conversion {
+    check_template_as(t, d, stand, opts, basis, delimiters, true)
+}
+
+/// What a template that was not checked in this run comes out as (an
+/// increment that left it out, with no stored result that matches): the
+/// output is the rules' draft with the placeholders and special forms put
+/// back, every unit is not converted (`plan.not-checked`) and the reports are
+/// empty, as for a plain file ([`crate::not_checked`]). The engine never
+/// ran on it.
+pub fn not_checked_template(
+    t: &Template,
+    d: TemplateDraft,
+    stand: &StandIns,
+    basis: PlaceholderBasis,
+    delimiters: (&str, &str),
+) -> Conversion {
+    check_template_as(t, d, stand, &Options::default(), basis, delimiters, false)
+}
+
+fn check_template_as(
+    t: &Template,
+    d: TemplateDraft,
+    stand: &StandIns,
+    opts: &Options,
+    basis: PlaceholderBasis,
+    delimiters: (&str, &str),
+    checked: bool,
 ) -> Conversion {
     let TemplateDraft {
         frag,
@@ -475,16 +557,20 @@ pub fn check_template(
             std::sync::Arc::new(c)
         };
         if !opts.facts_a.is_empty() || !opts.catalog_a.is_empty() {
-            with_harness.facts_a.push(table(from));
+            with_harness.facts_a.push(Facts::new(table(from)));
         }
         if !opts.facts_b.is_empty() || !opts.catalog_b.is_empty() {
-            with_harness.facts_b.push(table(to));
+            with_harness.facts_b.push(Facts::new(table(to)));
         }
         &with_harness
     } else {
         opts
     };
-    let mut c = check(&frag.text, draft, opts);
+    let mut c = if checked {
+        check(&frag.text, draft, opts)
+    } else {
+        crate::not_checked(&frag.text, draft)
+    };
     if let Some(h) = &harness {
         let mid = h.around.as_ref().and_then(|(pre, post)| {
             let o = &c.output;

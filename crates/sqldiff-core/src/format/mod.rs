@@ -22,7 +22,7 @@ use sqldiff_syntax::{parse, Dialect, LineIndex, SyntaxElement, SyntaxKind, Synta
 
 use crate::{Artifact, Options, Verdict};
 
-pub use keywords::recasable;
+pub use keywords::{recasable, recasable_name};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -421,6 +421,24 @@ fn fail(tops: Vec<usize>, reason: impl Into<String>) -> Option<Failure> {
 }
 
 /// Non-whitespace tokens with text, as the layout sees them.
+/// For each token [`tokens`] lists: no whitespace between it and the one before.
+fn glued(root: &SyntaxNode) -> Vec<bool> {
+    let mut gap = false;
+    let mut out = Vec::new();
+    for t in root
+        .descendants_with_tokens()
+        .filter_map(SyntaxElement::into_token)
+    {
+        if t.kind() == SyntaxKind::WHITESPACE {
+            gap = true;
+        } else if t.kind() != SyntaxKind::INFERRED_TERMINATOR && !t.text().is_empty() {
+            out.push(!gap);
+            gap = false;
+        }
+    }
+    out
+}
+
 fn tokens(root: &SyntaxNode) -> Vec<(SyntaxKind, String)> {
     root.descendants_with_tokens()
         .filter_map(SyntaxElement::into_token)
@@ -484,16 +502,44 @@ fn verify(
     // 1. The same tokens, in the same order, with the same text; only
     //    recasable keywords may differ in case.
     let (a, b) = (tokens(root), tokens(&new_root));
-    let same = |x: &(SyntaxKind, String), y: &(SyntaxKind, String)| {
+    let glued_a = glued(root);
+    let same = |k: usize, x: &(SyntaxKind, String), y: &(SyntaxKind, String)| {
         x.0 == y.0
             && (x.1 == y.1
                 || (x.0 == SyntaxKind::IDENT
                     && x.1.is_ascii()
                     && x.1.eq_ignore_ascii_case(&y.1)
-                    && recasable(&x.1.to_ascii_uppercase(), dialect)))
+                    && {
+                        let upper = x.1.to_ascii_uppercase();
+                        let is_comment = |t: &&(SyntaxKind, String)| {
+                            matches!(t.0, SyntaxKind::LINE_COMMENT | SyntaxKind::BLOCK_COMMENT)
+                        };
+                        let call = a[k + 1..]
+                            .iter()
+                            .find(|t| !is_comment(t))
+                            .is_some_and(|t| t.0 == SyntaxKind::L_PAREN);
+                        // A single `:` before the word: a psql or host variable.
+                        // Only `name: word`, with a gap after the colon and none
+                        // before it, is a label.
+                        let mut before = (0..k).rev().filter(|&j| !is_comment(&&a[j]));
+                        let colon = before.next().filter(|&j| a[j].0 == SyntaxKind::COLON);
+                        let variable = colon.is_some_and(|c| {
+                            let label = !glued_a[k]
+                                && c > 0
+                                && glued_a[c]
+                                && matches!(
+                                    a[c - 1].0,
+                                    SyntaxKind::IDENT | SyntaxKind::QUOTED_IDENT
+                                );
+                            !label
+                        });
+                        !variable
+                            && (recasable(&upper, dialect)
+                                || recasable_name(&upper, dialect, call, true))
+                    }))
     };
     if let Some(k) = (0..a.len().max(b.len())).find(|&k| match (a.get(k), b.get(k)) {
-        (Some(x), Some(y)) => !same(x, y),
+        (Some(x), Some(y)) => !same(k, x, y),
         _ => true,
     }) {
         let tops: BTreeSet<usize> = [k.checked_sub(1).and_then(top_of), top_of(k)]
@@ -576,7 +622,7 @@ fn verify(
 fn engine_check(before: &str, after: &str, dialect: Dialect, opts: &Options) -> Option<String> {
     let a = Artifact::new("input", dialect, before);
     let report = crate::diff(&a, &Artifact::new("formatted", dialect, after), opts);
-    if report.verdict == Verdict::Equal && report.findings.is_empty() {
+    if report.verdict() == Verdict::Equal && report.findings.is_empty() {
         return None;
     }
     let rules = |r: &crate::Report| -> Vec<String> {
@@ -585,13 +631,13 @@ fn engine_check(before: &str, after: &str, dialect: Dialect, opts: &Options) -> 
         v
     };
     let base = crate::diff(&a, &Artifact::new("formatted", dialect, before), opts);
-    if base.verdict == report.verdict && rules(&base) == rules(&report) {
+    if base.verdict() == report.verdict() && rules(&base) == rules(&report) {
         return None;
     }
     let what = report
         .findings
         .first()
-        .map_or(report.verdict.label().to_string(), |f| f.rule.clone());
+        .map_or(report.verdict().label().to_string(), |f| f.rule.clone());
     Some(format!(
         "the engine does not find the output equal ({what})"
     ))

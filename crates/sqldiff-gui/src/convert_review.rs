@@ -461,7 +461,7 @@ impl Review {
         written: sqldiff_convert::job::Written,
     ) -> Result<Review, String> {
         let prev = Loaded {
-            convert_ms: written.tree.report.totals.seconds * 1000.0,
+            convert_ms: written.tree.report.run.seconds * 1000.0,
             unreadable: written.tree.report.unreadable.clone(),
             inputs: written.inputs,
             tree: written.tree,
@@ -485,7 +485,7 @@ impl Review {
             ));
         }
         let prev = Loaded {
-            convert_ms: tree.report.totals.seconds * 1000.0,
+            convert_ms: tree.report.run.seconds * 1000.0,
             inputs: now.inputs,
             unreadable: now.unreadable,
             written: now.written,
@@ -549,13 +549,8 @@ impl Review {
     /// The report as `sqldiff convert` would write it now (for tests).
     pub fn report_json(&self) -> serde_json::Value {
         let mut v = serde_json::to_value(&self.loaded.tree.report).unwrap();
-        if let Some(t) = v.get_mut("totals") {
-            t["seconds"] = serde_json::Value::Null;
-        }
-        if let Some(fs) = v.get_mut("files").and_then(|f| f.as_array_mut()) {
-            for f in fs {
-                f["seconds"] = serde_json::Value::Null;
-            }
+        if let Some(o) = v.as_object_mut() {
+            o.remove("run");
         }
         v
     }
@@ -1239,6 +1234,7 @@ fn empty() -> Loaded {
                 base_objects: Vec::new(),
                 base_statements: Vec::new(),
                 files: Vec::new(),
+                run: Default::default(),
                 unreadable: Vec::new(),
                 totals: Default::default(),
                 ledger: None,
@@ -1299,11 +1295,11 @@ fn load(s: &Setup, prev: Option<Loaded>, hooks: &tree::Hooks) -> Result<Loaded, 
         }
         _ => {
             let started = Instant::now();
-            let t = tree::convert_for_review(
+            let t = tree::convert_for_review_stored(
                 &s.tree,
                 &inputs,
                 unreadable.clone(),
-                Some(&s.out),
+                &s.out,
                 hooks,
             )?;
             (t, started.elapsed().as_secs_f64() * 1000.0, true)

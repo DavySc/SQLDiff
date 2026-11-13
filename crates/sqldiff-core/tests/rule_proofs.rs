@@ -6,12 +6,12 @@
 //! `SQLDIFF_BLESS=1 cargo test -p sqldiff-core --test rule_proofs`.
 //!
 //! What counts as a use:
-//! - in `crates/sqldiff-convert/src` (test modules left out), a string
+//! - in `crates/sqldiff-convert/src`, `sqldiff-draft/src` and `sqldiff-units/src` (test modules left out), a string
 //!   literal `"tsql.x"`, `"pg.x"`, `"idiom.x"` or `"db2.x"`; a literal the
 //!   code completes (`"tsql.func.{}"`) is a use of the family `tsql.func.*`,
 //!   and a member registered on its own (`tsql.func.len`) is used when its
 //!   family is and its name (`"LEN"`) is a literal in the family's sites;
-//! - in `crates/sqldiff-core/profiles/rules/*.rules`, the head of a
+//! - in `crates/sqldiff-equiv/profiles/rules/*.rules`, the head of a
 //!   `(translate ...)`, `(idiom ...)` or `(lint ...)` form, whose kind must
 //!   match.
 //!
@@ -176,6 +176,8 @@ fn scan() -> Scan {
     let literal = Regex::new(r#""((?:tsql|pg|idiom|db2)\.[a-z0-9._-]*)(["{])"#).unwrap();
     let mut rs = Vec::new();
     files(&root.join("sqldiff-convert/src"), "rs", &mut rs);
+    files(&root.join("sqldiff-draft/src"), "rs", &mut rs);
+    files(&root.join("sqldiff-units/src"), "rs", &mut rs);
     assert!(
         rs.len() > 3,
         "no converter sources under {}",
@@ -197,7 +199,7 @@ fn scan() -> Scan {
     let head = Regex::new(r"(?m)^\((translate|idiom|lint)\s+(\S+)").unwrap();
     let mut rules = Vec::new();
     files(
-        &root.join("sqldiff-core/profiles/rules"),
+        &root.join("sqldiff-equiv/profiles/rules"),
         "rules",
         &mut rules,
     );

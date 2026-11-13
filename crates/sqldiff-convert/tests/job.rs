@@ -35,11 +35,13 @@ impl Fixture {
     fn job(&self, out: &str) -> Job {
         Job {
             tree: tree::Args {
+                rules: Default::default(),
                 src: self.dir.join("src"),
                 from: Dialect::Tsql,
                 to: Dialect::Postgres,
                 jobs: Some(2),
                 no_catalog: false,
+                recheck: Default::default(),
                 template: None,
                 extensions: tree::extensions(Vec::new()),
                 helpers: Vec::new(),
@@ -50,6 +52,8 @@ impl Fixture {
             out: self.dir.join(out),
             overwrite: false,
             discard_edits: false,
+            fresh: false,
+            select: Default::default(),
             instances: None,
             queue_all: false,
             proof: Default::default(),
@@ -71,6 +75,11 @@ fn files(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
     while let Some(d) = stack.pop() {
         for e in std::fs::read_dir(&d).unwrap().flatten() {
             let p = e.path();
+            // The result store (`.sqldiff`) holds the checks a stopped job
+            // finished, so that a later run resumes from them.
+            if p.file_name().is_some_and(|n| n == ".sqldiff") {
+                continue;
+            }
             if p.is_dir() {
                 stack.push(p);
             } else {
@@ -110,6 +119,7 @@ fn progress_counts_every_check_and_the_output_is_what_the_plain_call_writes() {
     let hooks = Hooks {
         progress: Some(Box::new(move |n, total| s.lock().unwrap().push((n, total)))),
         cancel: Some(Arc::new(AtomicBool::new(false))),
+        ..Default::default()
     };
     let watched = convert_into(&f.job("watched"), &hooks).unwrap();
     let plain = convert_into(&f.job("plain"), &Hooks::default()).unwrap();
@@ -144,6 +154,7 @@ fn a_cancelled_job_fails_and_writes_nothing() {
     let hooks = Hooks {
         progress: None,
         cancel: Some(Arc::new(AtomicBool::new(true))),
+        ..Default::default()
     };
     let e = convert_into(&f.job("out"), &hooks).err().unwrap();
     assert_eq!(e, CANCELLED);
@@ -162,6 +173,7 @@ fn a_cancelled_job_fails_and_writes_nothing() {
             c.store(true, Ordering::Relaxed);
         })),
         cancel: Some(cancel),
+        ..Default::default()
     };
     let e = convert_into(&job, &hooks).err().unwrap();
     assert_eq!(e, CANCELLED);

@@ -5,11 +5,14 @@
 
 pub mod behaviour;
 pub mod cfg;
+pub mod delta;
 pub mod interp;
 pub mod overlay;
-pub mod profile;
-pub mod witness;
+pub use sqldiff_model::profile;
+pub use sqldiff_model::witness;
 
 pub use cfg::{lower, Cfg};
-pub use interp::{explore, Exit, Explorer, Fate, Fault, Outcome, Routed, Scenario};
+pub use interp::{
+    decision_free, explore, Exit, Explorer, Fate, Fault, KeyUniverse, Outcome, Routed, Scenario,
+};
 pub use profile::{ErrorKind, Profile};

@@ -34,11 +34,13 @@ impl Fixture {
 
     fn convert(&self) -> Tree {
         let a = tree::Args {
+            rules: Default::default(),
             src: self.dir.join("src"),
             from: Dialect::Tsql,
             to: Dialect::Postgres,
             jobs: Some(2),
             no_catalog: false,
+            recheck: Default::default(),
             template: None,
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),

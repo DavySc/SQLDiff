@@ -49,11 +49,13 @@ impl Fixture {
 
     fn plain_args(&self) -> tree::Args {
         tree::Args {
+            rules: Default::default(),
             src: self.src(),
             from: Dialect::Tsql,
             to: Dialect::Postgres,
             jobs: Some(1),
             no_catalog: false,
+            recheck: Default::default(),
             template: None,
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),

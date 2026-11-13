@@ -135,41 +135,8 @@ fn output_without_into_becomes_return_query_returning() {
 fn other_result_sets_stay_refused_with_the_reason() {
     for (body, why) in [
         (
-            "SELECT ItemID FROM dbo.Item;\n    SELECT ItemName FROM dbo.Item;",
-            "it returns 2 result sets",
-        ),
-        (
             "IF @ItemID > 0\n        SELECT ItemID FROM dbo.Item;",
             "inside an IF, a loop or TRY … CATCH",
-        ),
-        (
-            "SELECT ItemID FROM dbo.Item;\n    RETURN 2;",
-            "a status other than 0",
-        ),
-        (
-            "SELECT ISNULL(ItemName, N'') AS Label FROM dbo.Item;",
-            "result column 1 (Label) is not a column",
-        ),
-        ("SELECT ItemID + 1 FROM dbo.Item;", "result column 1 has no name"),
-        (
-            "UPDATE dbo.Item SET Qty = 0 WHERE ItemID = @ItemID;\n    DELETE FROM dbo.Item WHERE Qty IS NULL;\n    SELECT ItemID FROM dbo.Item;",
-            "writes before the statement that returns the rows",
-        ),
-        (
-            "SET XACT_ABORT ON;\n    UPDATE dbo.Item SET Qty = 0 WHERE ItemID = @ItemID;\n    SELECT ItemID FROM dbo.Item WHERE ItemID = 1 / @ItemID;",
-            "writes before the statement that returns the rows",
-        ),
-        (
-            "SET XACT_ABORT ON;\n    BEGIN TRAN;\n    UPDATE dbo.Item SET Qty = 0 WHERE ItemID = @ItemID;\n    COMMIT;\n    SELECT ItemID FROM dbo.Item;",
-            "writes before the statement that returns the rows",
-        ),
-        (
-            "SELECT ItemID FROM dbo.Item;\n    UPDATE dbo.Item SET Qty = 0 WHERE ItemID = @ItemID;",
-            "runs statements after the one that returns the rows",
-        ),
-        (
-            "SELECT ItemID FROM dbo.Item UNION ALL SELECT ItemID FROM dbo.Item;",
-            "built with UNION",
         ),
         (
             "SELECT ItemID FROM dbo.Item FOR JSON AUTO, ROOT(N'Items');",
@@ -183,8 +150,29 @@ fn other_result_sets_stay_refused_with_the_reason() {
         let c = convert(&proc(body));
         assert!(
             c.output.contains("CREATE OR REPLACE PROCEDURE")
-                && c.output.contains("not made a function RETURNS TABLE because")
+                && c.output
+                    .contains("not made a function RETURNS TABLE because")
                 && c.output.contains(why),
+            "{body}\n{}",
+            c.output
+        );
+    }
+    // What a function cannot take becomes a procedure with refcursor
+    // parameters (tests/result_set_cursors.rs).
+    for body in [
+        "SELECT ItemID FROM dbo.Item;\n    SELECT ItemName FROM dbo.Item;",
+        "SELECT ItemID FROM dbo.Item;\n    RETURN 2;",
+        "SELECT ISNULL(ItemName, N'') AS Label FROM dbo.Item;",
+        "SELECT ItemID + 1 FROM dbo.Item;",
+        "SELECT ItemID FROM dbo.Item;\n    UPDATE dbo.Item SET Qty = 0 WHERE ItemID = @ItemID;\n    DELETE FROM dbo.Item WHERE Qty IS NULL;",
+        "SELECT ItemID FROM dbo.Item;\n    UPDATE dbo.Item SET Qty = 0 WHERE ItemID = @ItemID;",
+        "SELECT ItemID FROM dbo.Item UNION ALL SELECT ItemID FROM dbo.Item;",
+    ] {
+        let c = convert(&proc(body));
+        assert!(
+            c.output.contains("CREATE OR REPLACE PROCEDURE")
+                && c.output.contains("INOUT result_set_1 refcursor DEFAULT NULL")
+                && c.output.contains("OPEN result_set_1 FOR"),
             "{body}\n{}",
             c.output
         );
@@ -194,7 +182,8 @@ fn other_result_sets_stay_refused_with_the_reason() {
         "CREATE PROCEDURE dbo.p @ItemID int, @n int OUTPUT\nAS\nBEGIN\n    SELECT ItemID FROM dbo.Item;\nEND;\n",
     );
     assert!(
-        c.output.contains("it has OUTPUT parameters"),
+        c.output
+            .contains("INOUT p_n integer, INOUT result_set_1 refcursor DEFAULT NULL"),
         "{}",
         c.output
     );

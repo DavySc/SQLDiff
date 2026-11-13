@@ -18,6 +18,7 @@
 //! base catalogs: a false alarm, never a miss; names inside dynamic SQL
 //! strings are not seen.
 
+use serde::{Deserialize, Serialize};
 use sqldiff_core::catalog::{ddl, key, Catalog, Column, DataType, Ident};
 use sqldiff_core::tokens::{close_paren, of_node, qualified, split_commas, texts, Tok};
 use sqldiff_core::Dialect;
@@ -32,6 +33,7 @@ pub const STAND_IN: &str = "ASM-TABLE-STAND-IN";
 pub const REFUSED_COLUMN: &str = "tree.refused-column";
 
 /// One refused table and what was left out of its stand-in.
+#[derive(Serialize, Deserialize)]
 struct StandIn {
     key: Key,
     /// `schema.name` as written.
@@ -58,7 +60,7 @@ struct StandIn {
     exposes: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct StandIns {
     tables: Vec<StandIn>,
 }
@@ -256,6 +258,7 @@ impl StandIns {
                         identity: false,
                         has_default: false,
                         generated: true,
+                        hidden: false,
                         collation: None,
                     };
                     let at = (*pos).min(table.columns.len());
@@ -356,119 +359,165 @@ impl StandIns {
         out
     }
 
-    /// Flags every unit of `convs` (converted from `files`) that names a
-    /// stand-in table, on the innermost unit around each name.
-    pub fn flag<'c>(
+    pub fn is_empty(&self) -> bool {
+        self.tables.is_empty()
+    }
+
+    /// SHA-256 of the stand-ins as they serialise: part of the key of the
+    /// flags stored for a file ([`crate::store::Store::get_flags`]).
+    pub fn digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let bytes = serde_json::to_vec(self).unwrap_or_default();
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Flags the units of file `fi` (converted from `text`) that name a
+    /// stand-in table, on the innermost unit around each name. It reads the file's output
+    /// and units and changes units and counts only.
+    pub fn flag_file(&self, fi: usize, text: &str, c: &mut Conversion, from: Dialect, to: Dialect) {
+        let flags = self.flags_of(fi, text, c, from, to);
+        apply_flags(c, &flags);
+    }
+
+    /// What [`Self::flag_file`] adds to the units of `c`, as data: a function
+    /// of the stand-ins, the file index, the text, the output and the
+    /// units' places and notes, so it can be stored with the result.
+    pub fn flags_of(
         &self,
-        files: &[(&str, &str)],
-        convs: impl Iterator<Item = &'c mut Conversion>,
+        fi: usize,
+        text: &str,
+        c: &Conversion,
         from: Dialect,
         to: Dialect,
-    ) {
+    ) -> Vec<UnitFlag> {
+        let mut flags = Vec::new();
         if self.tables.is_empty() {
-            return;
+            return flags;
         }
-        for (fi, ((_, text), c)) in files.iter().zip(convs).enumerate() {
-            // Names in the source and in the output: a name the source
-            // holds in a string (sp_addextendedproperty) is a name in the
-            // output (COMMENT ON). Names in SQL held in a string (dynamic
-            // SQL whose text is known, which the engine compares) count too.
-            let (src_toks, out_toks) = (tokens(text, from, 0), tokens(&c.output, to, 0));
-            let mut hits: Vec<Vec<usize>> = vec![Vec::new(); c.units.len()];
-            let found = refs_in(&src_toks, from)
-                .into_iter()
-                .map(|(at, r)| (innermost(c, at, false), r))
-                .chain(
-                    refs_in(&out_toks, to)
-                        .into_iter()
-                        .map(|(at, r)| (innermost(c, at, true), r)),
-                );
-            for (ui, r) in found {
-                let Some(ui) = ui else { continue };
-                for (si, s) in self.tables.iter().enumerate() {
-                    let named = s.key.same_name(&r) || s.indexes.iter().any(|i| i.same_name(&r));
-                    if !named || hits[ui].contains(&si) {
-                        continue;
-                    }
-                    // The refused statement itself stays as it is.
-                    if s.file == fi && c.units[ui].src.start <= s.at && s.at < c.units[ui].src.end {
-                        continue;
-                    }
-                    hits[ui].push(si);
-                }
-            }
-            let mut changed = false;
-            for (ui, his) in hits.into_iter().enumerate() {
-                if his.is_empty() {
+        // Names in the source and in the output: a name the source
+        // holds in a string (sp_addextendedproperty) is a name in the
+        // output (COMMENT ON). Names in SQL held in a string (dynamic
+        // SQL whose text is known, which the engine compares) count too.
+        let (src_toks, out_toks) = (tokens(text, from, 0), tokens(&c.output, to, 0));
+        let mut hits: Vec<Vec<usize>> = vec![Vec::new(); c.units.len()];
+        let found = refs_in(&src_toks, from)
+            .into_iter()
+            .map(|(at, r)| (innermost(c, at, false), r))
+            .chain(
+                refs_in(&out_toks, to)
+                    .into_iter()
+                    .map(|(at, r)| (innermost(c, at, true), r)),
+            );
+        for (ui, r) in found {
+            let Some(ui) = ui else { continue };
+            for (si, s) in self.tables.iter().enumerate() {
+                let named = s.key.same_name(&r) || s.indexes.iter().any(|i| i.same_name(&r));
+                if !named || hits[ui].contains(&si) {
                     continue;
                 }
-                let u = &mut c.units[ui];
-                let within = |t: &[Tok], (a, b): (usize, usize)| -> std::ops::Range<usize> {
-                    t.partition_point(|x| x.start < a)..t.partition_point(|x| x.start < b)
-                };
-                let src_span = &src_toks[within(&src_toks, (u.src.start, u.src.end))];
-                let out_span = &out_toks[within(&out_toks, (u.out.start, u.out.end))];
-                let mut parts = Vec::new();
-                let mut touched = Vec::new();
-                for si in his {
-                    let s = &self.tables[si];
-                    if let Some(why) =
-                        touches(src_span, s, from).or_else(|| touches(out_span, s, to))
-                    {
-                        touched.push(format!("`{}` {why}", s.name));
-                    }
-                    if s.view {
-                        parts.push(format!("`{}` ({}: {})", s.name, s.place, s.reason));
-                        continue;
-                    }
-                    let mut left = Vec::new();
-                    if !s.columns.is_empty() {
-                        left.push(format!("computed column(s) {}", s.columns.join(", ")));
-                    }
-                    if !s.options.is_empty() {
-                        left.push(format!("option(s) {}", s.options.join(", ")));
-                    }
-                    left.extend(s.others.iter().cloned());
-                    parts.push(format!(
-                        "`{}` ({}: {}; checked against the rest of it, converted by the same rules, without {})",
-                        s.name,
-                        s.place,
-                        s.reason,
-                        left.join(" and ")
-                    ));
+                // The refused statement itself stays as it is.
+                if s.file == fi && c.units[ui].src.start <= s.at && s.at < c.units[ui].src.end {
+                    continue;
                 }
-                u.notes.push(Note {
+                hits[ui].push(si);
+            }
+        }
+        for (ui, his) in hits.into_iter().enumerate() {
+            if his.is_empty() {
+                continue;
+            }
+            let u = &c.units[ui];
+            let within = |t: &[Tok], (a, b): (usize, usize)| -> std::ops::Range<usize> {
+                t.partition_point(|x| x.start < a)..t.partition_point(|x| x.start < b)
+            };
+            let src_span = &src_toks[within(&src_toks, (u.src.start, u.src.end))];
+            let out_span = &out_toks[within(&out_toks, (u.out.start, u.out.end))];
+            let mut parts = Vec::new();
+            let mut touched = Vec::new();
+            for si in his {
+                let s = &self.tables[si];
+                if let Some(why) = touches(src_span, s, from).or_else(|| touches(out_span, s, to)) {
+                    touched.push(format!("`{}` {why}", s.name));
+                }
+                if s.view {
+                    parts.push(format!("`{}` ({}: {})", s.name, s.place, s.reason));
+                    continue;
+                }
+                let mut left = Vec::new();
+                if !s.columns.is_empty() {
+                    left.push(format!("computed column(s) {}", s.columns.join(", ")));
+                }
+                if !s.options.is_empty() {
+                    left.push(format!("option(s) {}", s.options.join(", ")));
+                }
+                left.extend(s.others.iter().cloned());
+                parts.push(format!(
+                    "`{}` ({}: {}; checked against the rest of it, converted by the same rules, without {})",
+                    s.name,
+                    s.place,
+                    s.reason,
+                    left.join(" and ")
+                ));
+            }
+            flags.push(UnitFlag {
+                unit: ui,
+                stand_in: Note {
                     status: Status::Assumptions,
                     rule: STAND_IN.into(),
                     text: format!(
                         "Uses tables whose CREATE TABLE was not converted, or views over them: {}. The statement holds once the target table is created with the stand-in's columns and types; accept this when it is (a column or alias named like the table also counts).",
                         parts.join("; ")
                     ).into(),
-                });
-                if !touched.is_empty() {
-                    let at = u.notes.partition_point(|n| n.status >= Status::Unproven);
-                    u.notes.insert(
-                        at,
-                        Note {
-                            status: Status::Unproven,
-                            rule: REFUSED_COLUMN.into(),
-                            text: format!(
-                                "May use a refused column, whose target form is not known, so this is not compared: {}.",
-                                touched.join("; ")
-                            ).into(),
-                        },
-                    );
-                    u.status = u.status.max(Status::Unproven);
-                } else {
-                    u.status = u.status.max(Status::Assumptions);
-                }
-                changed = true;
+                },
+                refused: (!touched.is_empty()).then(|| Note {
+                    status: Status::Unproven,
+                    rule: REFUSED_COLUMN.into(),
+                    text: format!(
+                        "May use a refused column, whose target form is not known, so this is not compared: {}.",
+                        touched.join("; ")
+                    ).into(),
+                }),
+            });
+        }
+        flags
+    }
+}
+
+/// What flagging adds to one unit: the stand-in note and, when the unit may
+/// touch a refused column, that note (inserted before the first note below
+/// `Unproven`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitFlag {
+    unit: usize,
+    stand_in: Note,
+    refused: Option<Note>,
+}
+
+/// Adds `flags` to the units of `c` and recounts. `false`, with `c` left as
+/// it was, when a flag names a unit `c` does not have.
+pub fn apply_flags(c: &mut Conversion, flags: &[UnitFlag]) -> bool {
+    if flags.iter().any(|f| f.unit >= c.units.len()) {
+        return false;
+    }
+    for f in flags {
+        let u = &mut c.units[f.unit];
+        u.notes.push(f.stand_in.clone());
+        match &f.refused {
+            Some(n) => {
+                let at = u.notes.partition_point(|n| n.status >= Status::Unproven);
+                u.notes.insert(at, n.clone());
+                u.status = u.status.max(Status::Unproven);
             }
-            if changed {
-                crate::recount(c);
-            }
+            None => u.status = u.status.max(Status::Assumptions),
         }
     }
+    if !flags.is_empty() {
+        crate::recount(c);
+    }
+    true
 }
 
 /// `c` with the columns `cols` left out of `table` and, when it is

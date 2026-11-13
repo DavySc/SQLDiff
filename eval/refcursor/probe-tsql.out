@@ -1,0 +1,26 @@
+== Q1: the first result set shows the table before the later writes, in order
+id name
+-- ----
+1 a
+2 b
+3 c
+id name
+-- ----
+1 changed
+2 b
+4 new
+== Q2: a runtime error in a SELECT after a write: the write is kept (autocommit, XACT_ABORT OFF), the rows before the error were sent
+q
+-
+-1
+Msg 8134, Level 16, State 1, Server e97756e63f4f, Procedure dbo.p_err, Line 4
+Divide by zero error encountered.
+id name
+-- ----
+1 kept
+2 b
+3 c
+== Q3: a result set that no statement reached is not sent; later numbering shifts
+ 
+-
+second

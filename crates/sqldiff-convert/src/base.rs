@@ -28,14 +28,14 @@
 //! target dialect), side B holds exactly that instead: nothing is converted
 //! or flagged, and a base object it lacks does not bind on side B.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sqldiff_core::catalog::builtins::Helper;
 use sqldiff_core::catalog::{ddl, default_schema, key, Catalog, Ident, RoutineKind, TableKind};
-use sqldiff_core::{Dialect, Options};
+use sqldiff_core::{Dialect, Facts, Options};
 use sqldiff_syntax::{SyntaxKind, SyntaxNode};
 
 use crate::{Conversion, Status};
@@ -76,7 +76,7 @@ pub fn read_b(paths: &[PathBuf], a: &[PathBuf], no_catalog: bool) -> Result<Vec<
 }
 
 fn read_files(paths: &[PathBuf], flag: &str, side: &str) -> Result<Vec<File>, String> {
-    let mut seen = HashSet::new();
+    let mut seen = BTreeSet::new();
     let mut files = Vec::new();
     for p in paths {
         let path = p.display().to_string();
@@ -199,7 +199,7 @@ pub const BASE_SUSPECT: &str = "ASM-BASE-SUSPECT";
 /// letter case as the dialect compares, and the dialect's default schema for
 /// an unqualified name. Without a default schema (Db2 for i), an unqualified
 /// name may be any schema's.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct Key {
     pub(crate) routine: bool,
     pub(crate) schema: Option<String>,
@@ -262,6 +262,7 @@ pub(crate) struct Node {
 pub(crate) fn nodes(text: &str, d: Dialect) -> Vec<Node> {
     let root = sqldiff_syntax::parse(text, d).syntax();
     let mut out = Vec::new();
+    let lines = sqldiff_syntax::LineIndex::new(text);
     for node in root.descendants() {
         let top = node
             .parent()
@@ -298,7 +299,7 @@ pub(crate) fn nodes(text: &str, d: Dialect) -> Vec<Node> {
         out.push(Node {
             start,
             end,
-            line: text[..start].matches('\n').count() + 1,
+            line: lines.line_col(start).0,
             defines,
             touches: touched(&node, d),
         });
@@ -417,6 +418,7 @@ struct Seen {
 /// verdict and the engine compares each `CREATE TABLE` by itself.
 ///
 /// With the target's own base catalogs (`b`), side B is those, as given.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare(
     files: &[File],
     b: &[File],
@@ -425,21 +427,24 @@ pub fn prepare(
     helpers: &[Helper],
     jobs: usize,
     hooks: &crate::tree::Hooks,
+    rules: crate::RuleOptions,
 ) -> Result<Base, String> {
-    let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let names = logical_names(files.len(), false);
     let source = crate::tree::catalog(
         files.iter().map(|f| f.text.as_str()),
         from,
         Path::new(&format!("base catalogs {}", names.join(", "))),
         None,
+        jobs,
     );
     if !b.is_empty() {
-        let names_b: Vec<&str> = b.iter().map(|f| f.path.as_str()).collect();
+        let names_b = logical_names(b.len(), true);
         let target = crate::tree::catalog(
             b.iter().map(|f| f.text.as_str()),
             to,
             Path::new(&format!("base catalogs {}", names_b.join(", "))),
             None,
+            jobs,
         );
         return Ok(Base {
             source,
@@ -463,7 +468,7 @@ pub fn prepare(
     let text = |&(f, n): &(usize, usize)| &files[f].text[all[f][n].start..all[f][n].end];
     // Converted with the base catalogs alone.
     let drafts = crate::tree::parallel(jobs, &pieces, |p| {
-        crate::rewrite_in(text(p), from, to, Some(&source))
+        crate::rewrite_with(text(p), from, to, Some(&source), rules)
     });
     let outputs: Vec<String> = drafts.iter().map(|d| d.output().to_string()).collect();
     let source = Arc::new(source);
@@ -472,6 +477,7 @@ pub fn prepare(
         to,
         Path::new(&target_origin),
         None,
+        jobs,
     );
 
     // An object the rules wrote no definition for (its statement not
@@ -495,8 +501,8 @@ pub fn prepare(
     hooks.stop_if_cancelled()?;
     let opts = Options {
         helpers: helpers.to_vec(),
-        facts_a: vec![Arc::clone(&source)],
-        facts_b: vec![Arc::new(target.clone())],
+        facts_a: vec![Facts::new(Arc::clone(&source))],
+        facts_b: vec![Facts::from(target.clone())],
         ..Options::default()
     };
     let work = std::sync::Mutex::new(drafts.into_iter().map(Some).collect::<Vec<_>>());
@@ -541,7 +547,7 @@ pub fn prepare(
         node.defines.iter().map(|o| &o.key).chain(&node.touches)
     };
     let mut suspect: Vec<(Key, Seen)> = Vec::new();
-    let mut failed: HashSet<usize> = HashSet::new();
+    let mut failed: BTreeSet<usize> = BTreeSet::new();
     for (i, seen) in own.iter().enumerate() {
         if seen.status > Status::Assumptions {
             failed.insert(i);
@@ -629,7 +635,7 @@ pub fn prepare(
                     "{} `{}` ({} line {}: {})",
                     o.kind,
                     o.name,
-                    files[f].path,
+                    logical_names(files.len(), false)[f],
                     all[f][n].line,
                     seen.status.label()
                 ),
@@ -696,10 +702,10 @@ impl Base {
     /// `convs`) that uses a suspect base object with `ASM-BASE-SUSPECT`. An
     /// object the tree defines replaces the base object of its name; a tree
     /// object whose statement uses a suspect object is suspect itself.
-    pub fn flag<'c>(
+    pub fn flag<'c, C: crate::Cored + 'c>(
         &self,
         files: &[(&str, &str)],
-        convs: impl Iterator<Item = &'c mut Conversion>,
+        convs: impl Iterator<Item = &'c mut C>,
         d: Dialect,
     ) {
         if self.suspects.is_empty() {
@@ -752,7 +758,7 @@ impl Base {
         for ((_, text), c) in files.iter().zip(convs) {
             let found = refs_at(text, d);
             let mut changed = false;
-            for u in &mut c.units {
+            for u in c.units_mut().iter_mut() {
                 let mut hit: Vec<&str> = Vec::new();
                 for (at, r) in &found {
                     if *at < u.src.start || *at >= u.src.end {
@@ -798,8 +804,19 @@ impl Base {
 /// What a side's catalog is called in binding reasons when base catalogs
 /// are used: `what` and the files.
 pub fn origin(what: &str, files: &[CatalogFile]) -> String {
-    let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let names = logical_names(files.len(), false);
     format!("{what} and base catalogs {}", names.join(", "))
+}
+
+/// What the base catalog files are called in reasons and keys: their
+/// position in the order given, never their path. A path is where the files
+/// happen to be on one machine; the content is in the keys already (the
+/// catalog digest), so the same catalogs moved to another folder, or checked
+/// out on another OS, give the same keys and the same reasons. The report
+/// lists the files by path, in the same order.
+fn logical_names(n: usize, target: bool) -> Vec<String> {
+    let side = if target { "target " } else { "" };
+    (1..=n).map(|i| format!("{side}#{i}")).collect()
 }
 
 /// The tree's objects (`texts`, loaded in order) over the `base` catalog: an
@@ -813,21 +830,22 @@ pub fn over<'a>(
     d: Dialect,
     origin: String,
     stem: Option<&str>,
+    jobs: usize,
 ) -> Catalog {
     let mut cat = base.clone();
     cat.origin = origin;
     let own = match stem {
         None => {
             let mut own = Catalog::default();
-            for t in texts {
-                let root = sqldiff_syntax::parse(t, d).syntax();
+            crate::tree::each_parsed(texts, d, jobs, |p| {
+                let root = p.syntax();
                 ddl::load_tree(&mut own, &root, d);
                 ddl::load_tree(&mut cat, &root, d);
-            }
+            });
             own
         }
         Some(_) => {
-            let own = crate::tree::catalog(texts, d, Path::new(""), stem);
+            let own = crate::tree::catalog(texts, d, Path::new(""), stem, jobs);
             cat.extend(d, &own);
             own
         }
@@ -843,7 +861,7 @@ type Exact = (Option<String>, String);
 /// that is not `own`'s own.
 fn shadow(cat: &mut Catalog, own: &Catalog, d: Dialect) {
     let exact = |s: &Option<String>, n: &str| (s.as_deref().map(|s| key(d, s)), key(d, n));
-    let mut tables: HashMap<String, Vec<(Key, Exact)>> = HashMap::new();
+    let mut tables: BTreeMap<String, Vec<(Key, Exact)>> = BTreeMap::new();
     for t in &own.tables {
         let k = Key::new(d, false, t.schema.as_deref(), &t.name);
         tables
@@ -859,8 +877,8 @@ fn shadow(cat: &mut Catalog, own: &Catalog, d: Dialect) {
         let e = exact(&t.schema, &t.name);
         !list.iter().any(|(o, _)| o.same(&k)) || list.iter().any(|(_, oe)| *oe == e)
     });
-    let mut routines: HashMap<String, Vec<Key>> = HashMap::new();
-    let mut mine: HashSet<String> = HashSet::new();
+    let mut routines: BTreeMap<String, Vec<Key>> = BTreeMap::new();
+    let mut mine: BTreeSet<String> = BTreeSet::new();
     for r in &own.routines {
         let k = Key::new(d, true, r.schema.as_deref(), &r.name);
         routines.entry(k.name.clone()).or_default().push(k);

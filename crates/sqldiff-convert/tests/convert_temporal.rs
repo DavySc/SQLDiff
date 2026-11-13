@@ -201,15 +201,11 @@ fn what_has_no_exact_equivalent_is_refused() {
         (
             base(
                 cols,
-                "SYSTEM_VERSIONING = ON (HISTORY_TABLE = s.h, HISTORY_RETENTION_PERIOD = 6 MONTHS)",
+                "SYSTEM_VERSIONING = ON (HISTORY_TABLE = s.h, HISTORY_RETENTION_PERIOD = 6 FORTNIGHTS)",
             ),
             "HISTORY_RETENTION_PERIOD",
         ),
         (base(cols, "SYSTEM_VERSIONING = OFF"), "without history"),
-        (
-            base(&cols.replace("ROW START", "ROW START HIDDEN"), on),
-            "HIDDEN",
-        ),
         (
             base(&cols.replace("ROW START NOT NULL", "ROW START NULL"), on),
             "13587",
@@ -242,6 +238,67 @@ fn what_has_no_exact_equivalent_is_refused() {
         Status::Assumptions,
         "{:?}",
         c.units[0].notes
+    );
+}
+
+/// A finite retention period converts with ASM-HISTORY-RETENTION: the output
+/// keeps all history, so the note says who must prune it.
+#[test]
+fn a_finite_retention_period_is_an_assumption() {
+    let cols = "f DATETIME2 GENERATED ALWAYS AS ROW START NOT NULL, e DATETIME2 GENERATED ALWAYS AS ROW END NOT NULL";
+    for (period, shown) in [("12 months", "12 months"), ("1 YEAR", "1 YEAR")] {
+        let c = pg(&format!(
+            "CREATE TABLE s.t (k INT NOT NULL PRIMARY KEY, {cols}, PERIOD FOR SYSTEM_TIME (f, e)) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = s.h, HISTORY_RETENTION_PERIOD = {period}));
+"
+        ));
+        let u = &c.units[0];
+        assert_eq!(
+            rules_only(u),
+            Status::Assumptions,
+            "{:?}
+{}",
+            u.notes,
+            c.output
+        );
+        let n = u
+            .notes
+            .iter()
+            .find(|n| n.text.contains("older than"))
+            .unwrap_or_else(|| panic!("no retention note: {:?}", u.notes));
+        assert!(n.text.contains(shown), "{}", n.text);
+        assert!(!c.output.contains("HISTORY_RETENTION"), "{}", c.output);
+    }
+}
+
+/// HIDDEN period columns convert with ASM-HIDDEN-PERIOD-COLUMN: the keyword
+/// goes, the columns stay ordinary ones, and the note says so.
+#[test]
+fn hidden_period_columns_are_an_assumption() {
+    let cols = "f DATETIME2 GENERATED ALWAYS AS ROW START HIDDEN NOT NULL, e DATETIME2 GENERATED ALWAYS AS ROW END HIDDEN NOT NULL";
+    let c = pg(&format!(
+        "CREATE TABLE s.t (k INT NOT NULL PRIMARY KEY, {cols}, PERIOD FOR SYSTEM_TIME (f, e)) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = s.h));
+"
+    ));
+    let u = &c.units[0];
+    assert_eq!(
+        rules_only(u),
+        Status::Assumptions,
+        "{:?}
+{}",
+        u.notes,
+        c.output
+    );
+    assert!(
+        u.notes.iter().any(|n| n.rule == "ASM-HIDDEN-PERIOD-COLUMN"),
+        "{:?}",
+        u.notes
+    );
+    assert!(!c.output.to_uppercase().contains("HIDDEN"), "{}", c.output);
+    assert!(
+        c.output
+            .contains("f timestamp DEFAULT '-infinity' NOT NULL"),
+        "{}",
+        c.output
     );
 }
 
@@ -433,4 +490,45 @@ fn the_history_table_matches_computed_column_types() {
         "{:?}",
         c.units[0].notes
     );
+}
+
+/// `--temporal-historyless` (RuleOptions): a table whose period columns are
+/// both HIDDEN becomes a plain table under ASM-TEMPORAL-HISTORYLESS.
+#[test]
+fn historyless_drops_the_period_history_and_triggers() {
+    let src = "CREATE TABLE s.t (k INT NOT NULL PRIMARY KEY, f DATETIME2 GENERATED ALWAYS AS ROW START HIDDEN NOT NULL, e DATETIME2 GENERATED ALWAYS AS ROW END HIDDEN NOT NULL, v INT NULL, PERIOD FOR SYSTEM_TIME (f, e)) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = s.h, HISTORY_RETENTION_PERIOD = 6 MONTHS));\n";
+    let opts = sqldiff_convert::RuleOptions {
+        temporal_historyless: true,
+    };
+    let d = sqldiff_convert::rewrite_with(src, Dialect::Tsql, Dialect::Postgres, None, opts);
+    let o = d.output();
+    assert!(o.contains("CREATE TABLE s.t ("), "{o}");
+    for gone in [
+        "f timestamp",
+        "e timestamp",
+        "TRIGGER",
+        "FUNCTION",
+        "-infinity",
+        "PERIOD",
+    ] {
+        assert!(!o.contains(gone), "{gone}: {o}");
+    }
+    assert!(
+        !o.contains("s.h") && !o.contains("SYSTEM_VERSIONING"),
+        "{o}"
+    );
+    let c = check(src, d, &Options::default());
+    let rules: Vec<&str> = c.units[0].notes.iter().map(|n| n.rule.as_str()).collect();
+    assert!(rules.contains(&"ASM-TEMPORAL-HISTORYLESS"), "{rules:?}");
+    assert!(!rules.contains(&"ASM-TEMPORAL-TRIGGER"), "{rules:?}");
+    assert!(!rules.contains(&"ASM-HIDDEN-PERIOD-COLUMN"), "{rules:?}");
+    // The retention period belongs to the history, which is not kept.
+    assert!(!rules.contains(&"ASM-HISTORY-RETENTION"), "{rules:?}");
+    // Visible period columns are not touched by the option.
+    let d = sqldiff_convert::rewrite_with(MAIN, Dialect::Tsql, Dialect::Postgres, None, opts);
+    assert!(d.output().contains("CREATE TRIGGER"), "{}", d.output());
+    // Db2 for i still refuses.
+    let d = sqldiff_convert::rewrite_with(src, Dialect::Tsql, Dialect::Db2i, None, opts);
+    let c = check(src, d, &Options::default());
+    assert_eq!(c.units[0].status, Status::NotConverted);
 }

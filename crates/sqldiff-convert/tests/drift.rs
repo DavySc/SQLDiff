@@ -79,6 +79,7 @@ fn finds_drift_and_writes_the_reports_last() {
     let hooks = Hooks {
         progress: Some(Box::new(move |n, total| s.lock().unwrap().push((n, total)))),
         cancel: None,
+        ..Default::default()
     };
     let c = drift::check(&args(&d, &out), &hooks).unwrap();
     assert!(!c.ok);
@@ -101,6 +102,7 @@ fn a_cancelled_check_writes_nothing() {
     let hooks = Hooks {
         progress: None,
         cancel: Some(Arc::new(AtomicBool::new(true))),
+        ..Default::default()
     };
     let e = drift::check(&args(&d, &out), &hooks).err().unwrap();
     assert_eq!(e, CANCELLED);
@@ -125,6 +127,7 @@ fn a_cancel_after_the_trees_are_read_still_writes_nothing() {
             }
         })),
         cancel: Some(cancel),
+        ..Default::default()
     };
     let e = drift::check(&args(&d, &out), &hooks).err().unwrap();
     assert_eq!(e, CANCELLED);

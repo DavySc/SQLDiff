@@ -50,11 +50,13 @@ impl Fixture {
 
     fn args(&self, catalogs: &[&str]) -> tree::Args {
         tree::Args {
+            rules: Default::default(),
             src: self.dir.join("src"),
             from: Dialect::Tsql,
             to: Dialect::Postgres,
             jobs: Some(2),
             no_catalog: false,
+            recheck: Default::default(),
             template: None,
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),
@@ -180,6 +182,8 @@ fn base_ddl_is_not_written_listed_or_counted() {
         out: fx.path("out"),
         overwrite: false,
         discard_edits: false,
+        fresh: false,
+        select: Default::default(),
         instances: None,
         queue_all: false,
         proof: Default::default(),
@@ -189,6 +193,7 @@ fn base_ddl_is_not_written_listed_or_counted() {
     let mut written: Vec<String> = std::fs::read_dir(fx.path("out"))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|n| n != ".sqldiff")
         .collect();
     written.sort();
     assert_eq!(
@@ -277,7 +282,7 @@ fn a_tree_object_replaces_every_base_object_of_its_name() {
     // The tree's `orders` (no schema) is dbo's; its `p` has another
     // parameter count, so the base `p` would otherwise stay as an overload.
     let tree_ddl = "CREATE TABLE orders (order_id int, region int);\nGO\nCREATE PROCEDURE p @a int, @b int AS SELECT 1;\nGO\nALTER TABLE q_t ADD x int;\n";
-    let cat: Catalog = base::over(&base, [tree_ddl].into_iter(), d, "tree".into(), None);
+    let cat: Catalog = base::over(&base, [tree_ddl].into_iter(), d, "tree".into(), None, 1);
     let orders: Vec<_> = cat
         .tables
         .iter()
@@ -300,6 +305,7 @@ fn a_tree_object_replaces_every_base_object_of_its_name() {
         d,
         "tree".into(),
         None,
+        4,
     );
     let view = sqldiff_core::catalog::CatalogView::new(d, &[&cat]);
     let sqldiff_core::catalog::Lookup::Found(t) = view.table(&[Ident::plain("orders")]) else {
@@ -488,6 +494,8 @@ fn a_catalog_only_procedure_changes_the_rules_and_the_ledger_follows_its_content
         out: out.clone(),
         overwrite: true,
         discard_edits: false,
+        fresh: false,
+        select: Default::default(),
         instances: None,
         queue_all: false,
         proof: Default::default(),
@@ -619,6 +627,8 @@ fn bad_catalogs_are_refused_before_anything_is_written() {
             out: fx.path("out"),
             overwrite: false,
             discard_edits: false,
+            fresh: false,
+            select: Default::default(),
             instances: None,
             queue_all: false,
             proof: Default::default(),

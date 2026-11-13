@@ -21,6 +21,10 @@ fn files(dir: &Path) -> Vec<(String, String)> {
     while let Some(d) = stack.pop() {
         for e in std::fs::read_dir(&d).unwrap().flatten() {
             let p = e.path();
+            // The result store (`.sqldiff`) holds a run's own checks.
+            if p.file_name().is_some_and(|n| n == ".sqldiff") {
+                continue;
+            }
             if p.is_dir() {
                 stack.push(p);
             } else {
@@ -207,6 +211,7 @@ fn the_run_sheet_command_writes_what_the_run_wrote() {
             catalogs: cats.clone(),
             catalogs_b: cats_b.clone(),
             instances: None,
+            increment: Default::default(),
         };
         let run = runs.start(spec(&gui), isolated, |_| {}).unwrap();
         assert!(
@@ -340,6 +345,7 @@ fn a_template_run_and_its_command_write_the_same() {
         catalogs: Vec::new(),
         catalogs_b: Vec::new(),
         instances: instances.map(|p| p.display().to_string()),
+        increment: Default::default(),
     };
     let runs = Runs::default();
     // Converted templates, then their instance check by the command line.

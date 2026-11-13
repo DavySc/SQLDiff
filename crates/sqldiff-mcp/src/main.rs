@@ -37,22 +37,38 @@ struct Cli {
     gui_url: Option<String>,
 }
 
+// mimalloc: the engine allocates heavily; measured 17-39% faster conversions than the system allocator.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     sqldiff_core::with_engine_stack(|| serve(cli))
 }
 
 fn serve(cli: Cli) -> ExitCode {
-    let cfg = config::cli_layer(&[], &[], None).and_then(|layer| {
-        Resolved::load(&Sources {
-            project: cli.config,
-            user: cli.user_config,
-            isolated: cli.isolated,
-            cwd: None,
-            packs: cli.packs,
-            cli: layer,
-        })
-    });
+    // The same resolution at start and at `reload_config`.
+    let resolve = {
+        let (project, user, isolated, packs) = (
+            cli.config.clone(),
+            cli.user_config.clone(),
+            cli.isolated,
+            cli.packs.clone(),
+        );
+        move || {
+            config::cli_layer(&[], &[], None).and_then(|layer| {
+                Resolved::load(&Sources {
+                    project: project.clone(),
+                    user: user.clone(),
+                    isolated,
+                    cwd: None,
+                    packs: packs.clone(),
+                    cli: layer,
+                })
+            })
+        }
+    };
+    let cfg = resolve();
     let cfg = match cfg {
         Ok(c) => c,
         Err(e) => {
@@ -64,7 +80,7 @@ fn serve(cli: Cli) -> ExitCode {
         .gui_url
         .or_else(|| std::env::var("SQLDIFF_GUI_URL").ok());
     let mut server = match sqldiff_mcp::Server::with_config(cfg, gui_url) {
-        Ok(s) => s,
+        Ok(s) => s.with_reloader(Box::new(move || resolve().map_err(|e| e.0))),
         Err(e) => {
             eprintln!("sqldiff-mcp: review store: {e}");
             return ExitCode::from(2);

@@ -31,11 +31,13 @@ impl Fixture {
         let def: sqldiff_source::pack::TemplateSyntax =
             serde_json::from_value(serde_json::json!({ "open": "<%", "close": "%>" })).unwrap();
         let a = tree::Args {
+            rules: Default::default(),
             src: self.dir.clone(),
             from: Dialect::Tsql,
             to: Dialect::Postgres,
             jobs: Some(1),
             no_catalog: true,
+            recheck: Default::default(),
             template: Some(TemplateMode::new(&def, None).unwrap()),
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),

@@ -408,7 +408,7 @@ def extra (dep cat ra rb : String) (ans : Answer) : String :=
     ("name", "name", true, false, .str 20 false, none),
     ("city", "City", false, false, .str 30 true, some (.str "Paris")),
     ("qty", "Qty", true, false, .int .i32, some (.int (-1)))]]
--- The line `crates/sqldiff-core/src/proof.rs` writes for the same table
+-- The line `crates/sqldiff-model/src/proof.rs` writes for the same table
 -- (its test `a_mirror_request_encodes_tables_as_the_checker_reads_them`).
 #guard (catalog? ("70:ib,61636374=6964.ink.6964/6e616d65.v20n.6e616d65/" ++
     "63697479.w30.43697479.s5061726973/717479.in.517479.i-1")).map

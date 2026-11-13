@@ -1,7 +1,7 @@
 -- SQLDiff probes for Db2 for i (IBM i 7.x only).
 --
 -- GENERATED from probes/db2i/probes.toml by probes/db2i/db2i_probes.py build.
--- Do not edit by hand. Probe set ddc693c88c65.
+-- Do not edit by hand. Probe set d328f97a6d03.
 --
 -- What it does: creates the schema SQLDFPROBE (CREATE SCHEMA, so its tables are
 -- journaled), two tables and about 35 small procedures in it, runs them, and
@@ -108,7 +108,7 @@ BEGIN
   DECLARE V_NO_STATE CHAR(5);
   DECLARE V_NO_N INTEGER;
   CALL SQLDFPROBE.LOG_CALL('META-FORMAT', '00000', 1, 'probe set',
-    V_NO_STATE, V_NO_N, V_NO_N, V_NO_N, 'ddc693c88c65');
+    V_NO_STATE, V_NO_N, V_NO_N, V_NO_N, 'd328f97a6d03');
 END;
 
 -- 2. Create the probe procedures. Each create is logged with its SQLSTATE,

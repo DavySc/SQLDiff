@@ -24,7 +24,13 @@ const FILES: &[(&str, &str)] = &[
 ];
 
 fn tree_dir() -> PathBuf {
-    let d = std::env::temp_dir().join(format!("sqldiff-for-review-{}", std::process::id()));
+    // One directory per test: the tests of this file run on threads of one
+    // process, and one must not delete the files of the other.
+    let d = std::env::temp_dir().join(format!(
+        "sqldiff-for-review-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     let _ = std::fs::remove_dir_all(&d);
     for (p, text) in FILES {
         std::fs::create_dir_all(d.join("src")).unwrap();
@@ -35,11 +41,13 @@ fn tree_dir() -> PathBuf {
 
 fn args(d: &std::path::Path) -> tree::Args {
     tree::Args {
+        rules: Default::default(),
         src: d.join("src"),
         from: Dialect::Tsql,
         to: Dialect::Postgres,
         jobs: Some(2),
         no_catalog: false,
+        recheck: Default::default(),
         template: None,
         extensions: tree::extensions(Vec::new()),
         helpers: Vec::new(),
@@ -51,10 +59,7 @@ fn args(d: &std::path::Path) -> tree::Args {
 
 fn report(t: &tree::Tree) -> serde_json::Value {
     let mut v = serde_json::to_value(&t.report).unwrap();
-    v["totals"]["seconds"] = serde_json::Value::Null;
-    for f in v["files"].as_array_mut().unwrap() {
-        f["seconds"] = serde_json::Value::Null;
-    }
+    v.as_object_mut().unwrap().remove("run");
     v
 }
 
@@ -122,4 +127,105 @@ fn equal_notes_share_their_text() {
     }
     // a.sql and b.sql rest on the same assumptions.
     assert!(pairs > 0);
+}
+
+#[test]
+fn a_stored_review_conversion_reuses_results_and_equals_the_whole_one() {
+    let d = tree_dir();
+    let out = d.join("out-for-review");
+    let mut a = args(&d);
+    a.recheck = tree::Recheck::None;
+    let (inputs, unreadable) = tree::read(&a).unwrap();
+    let whole = tree::convert(&a, &inputs, unreadable.clone(), None).unwrap();
+    let hooks = tree::Hooks::default();
+    let first =
+        tree::convert_for_review_stored(&a, &inputs, unreadable.clone(), &out, &hooks).unwrap();
+    let second = tree::convert_for_review_stored(&a, &inputs, unreadable, &out, &hooks).unwrap();
+    let reused = second.report.run.files.iter().filter(|f| f.reused).count();
+    let _ = std::fs::remove_dir_all(&d);
+    // Only the output folder differs: the whole one wrote nothing.
+    let mut r = report(&first);
+    r.as_object_mut().unwrap().remove("out");
+    assert_eq!(r, report(&whole));
+    assert_eq!(first.outputs, whole.outputs);
+    assert!(
+        !first.report.run.files.iter().any(|f| f.reused),
+        "the first run checks every file"
+    );
+    assert_eq!(
+        reused,
+        second.report.run.files.len(),
+        "the second run reuses every file"
+    );
+    assert_eq!(second.outputs, whole.outputs);
+}
+
+#[test]
+fn a_run_and_a_review_share_one_store_without_wiping_each_other() {
+    let d = tree_dir();
+    let out = d.join("out-shared");
+    let mut a = args(&d);
+    a.recheck = tree::Recheck::None;
+    let (inputs, unreadable) = tree::read(&a).unwrap();
+    let hooks = tree::Hooks::default();
+    let reused = |t: &tree::Tree| t.report.run.files.iter().filter(|f| f.reused).count();
+    let n = inputs.len();
+    let run1 = tree::convert_stored(&a, &inputs, unreadable.clone(), &out, &hooks, false).unwrap();
+    let review1 =
+        tree::convert_for_review_stored(&a, &inputs, unreadable.clone(), &out, &hooks).unwrap();
+    let run2 = tree::convert_stored(&a, &inputs, unreadable.clone(), &out, &hooks, false).unwrap();
+    let review2 = tree::convert_for_review_stored(&a, &inputs, unreadable, &out, &hooks).unwrap();
+    let counts = (
+        reused(&run1),
+        reused(&review1),
+        reused(&run2),
+        reused(&review2),
+    );
+    let same = report(&run1) == report(&run2) && run1.outputs == run2.outputs;
+    let review_same = report(&review1) == report(&review2) && review1.outputs == run1.outputs;
+    let _ = std::fs::remove_dir_all(&d);
+    assert_eq!(
+        counts,
+        (0, n, n, n),
+        "each step after the first reuses every file"
+    );
+    assert!(
+        same,
+        "a run after a review gives the run's report and outputs"
+    );
+    assert!(review_same);
+}
+
+#[test]
+fn every_file_is_reported_once_as_its_own_check_finishes() {
+    let d = tree_dir();
+    let out = d.join("out-rows");
+    let a = args(&d);
+    let (inputs, unreadable) = tree::read(&a).unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+    let s = seen.clone();
+    let hooks = tree::Hooks {
+        file_done: Some(Box::new(move |p, st| {
+            s.lock().unwrap().push((p.to_string(), st.to_string()))
+        })),
+        ..Default::default()
+    };
+    // A first run checks every file; the second takes them from the store.
+    for _ in 0..2 {
+        seen.lock().unwrap().clear();
+        let t = tree::convert_stored(&a, &inputs, unreadable.clone(), &out, &hooks, false).unwrap();
+        let mut rows = seen.lock().unwrap().clone();
+        rows.sort();
+        let mut want: Vec<(String, String)> = t
+            .report
+            .files
+            .iter()
+            .map(|f| (f.path.clone(), f.status.label().to_string()))
+            .collect();
+        want.sort();
+        // No cross-file pass made a file worse in this tree, so the rows
+        // equal the final statuses; in general a row is never worse than it.
+        assert_eq!(rows, want);
+    }
+    let _ = std::fs::remove_dir_all(&d);
 }

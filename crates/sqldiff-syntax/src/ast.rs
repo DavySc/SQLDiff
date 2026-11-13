@@ -72,7 +72,78 @@ pub fn ends_with_inferred_terminator(node: &SyntaxNode) -> bool {
 }
 
 /// Text range of the significant part of a node (without leading/trailing trivia).
+///
+/// Found from both ends of the subtree: the first significant token going
+/// forward from the node's first token, the last going backward from its
+/// last, instead of walking every token to find the last.
 pub fn sig_range(node: &SyntaxNode) -> (usize, usize) {
+    // `first_token`/`last_token` follow the first/last child only, so a node
+    // that ends (or starts) in an empty node has none: then every token is
+    // walked.
+    let (Some(first_tok), Some(last_tok)) = (node.first_token(), node.last_token()) else {
+        return sig_range_walking(node);
+    };
+    let first = match significant_from(first_tok.clone(), &last_tok, node, true) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            let r = node.text_range();
+            return (r.start().into(), r.end().into());
+        }
+        Err(Stopped) => return sig_range_walking(node),
+    };
+    let last = match significant_from(last_tok.clone(), &first_tok, node, false) {
+        Ok(t) => t.unwrap_or_else(|| first.clone()),
+        Err(Stopped) => return sig_range_walking(node),
+    };
+    (
+        first.text_range().start().into(),
+        last.text_range().end().into(),
+    )
+}
+
+/// rowan's `next_token`/`prev_token` ended while tokens of the node may
+/// still lie beyond: the walk cannot say it saw them all.
+struct Stopped;
+
+/// The first significant token at or after `from` (`forward`) or at or
+/// before it (backward) that is still inside `node`; `Ok(None)` when the
+/// node has none that way. rowan's `next_token`/`prev_token` also return
+/// `None` when the adjacent sibling is an empty node, which looks like
+/// the end of the walk; that is told apart from the real end (the walk is
+/// at `edge`, the node's own last token going forward, first going
+/// backward; text positions would be fooled by zero-width tokens) and
+/// reported as [`Stopped`], so the result never depends on the parser
+/// keeping trivia away from empty nodes.
+fn significant_from(
+    from: SyntaxToken,
+    edge: &SyntaxToken,
+    node: &SyntaxNode,
+    forward: bool,
+) -> Result<Option<SyntaxToken>, Stopped> {
+    let within = |t: &SyntaxToken| t.parent_ancestors().any(|a| a == *node);
+    let mut t = from;
+    loop {
+        if is_significant(t.kind()) {
+            return Ok(Some(t));
+        }
+        let next = if forward {
+            t.next_token()
+        } else {
+            t.prev_token()
+        };
+        match next {
+            Some(n) if within(&n) => t = n,
+            Some(_) => return Ok(None),
+            None => {
+                return if t == *edge { Ok(None) } else { Err(Stopped) };
+            }
+        }
+    }
+}
+
+/// The definition by walking every significant token: the fallback of
+/// [`sig_range`] (`tests/sig_range.rs` compares the two).
+fn sig_range_walking(node: &SyntaxNode) -> (usize, usize) {
     let mut toks = sig_tokens(node);
     let Some(first) = toks.next() else {
         let r = node.text_range();

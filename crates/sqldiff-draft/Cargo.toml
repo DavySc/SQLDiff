@@ -1,0 +1,15 @@
+[package]
+name = "sqldiff-draft"
+description = "The conversion rules' first pass: T-SQL to a draft in PostgreSQL or Db2 for i, before any check"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sqldiff-syntax.workspace = true
+sqldiff-catalog.workspace = true
+sqldiff-model.workspace = true
+sqldiff-equiv.workspace = true
+sqldiff-units.workspace = true
+rowan.workspace = true

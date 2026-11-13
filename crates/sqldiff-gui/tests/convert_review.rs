@@ -53,11 +53,13 @@ impl Fixture {
 
     fn args(&self) -> tree::Args {
         tree::Args {
+            rules: Default::default(),
             src: self.dir.join("src"),
             from: Dialect::Tsql,
             to: Dialect::Postgres,
             jobs: Some(1),
             no_catalog: false,
+            recheck: Default::default(),
             template: None,
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),
@@ -541,11 +543,13 @@ fn a_decision_follows_the_base_catalogs_contents() {
         std::fs::write(f, text).unwrap();
     }
     let a = || tree::Args {
+        rules: Default::default(),
         src: dir.join("src"),
         from: Dialect::Tsql,
         to: Dialect::Postgres,
         jobs: Some(1),
         no_catalog: false,
+        recheck: Default::default(),
         template: None,
         extensions: tree::extensions(Vec::new()),
         helpers: Vec::new(),

@@ -44,22 +44,7 @@ pub enum Source {
     Default,
 }
 
-/// A fact the object's own source states, so the matching default is not
-/// an assumption for that side.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Discharge {
-    pub id: String,
-    pub side: Side,
-    pub line: usize,
-    /// The statement that states it, e.g. `SET XACT_ABORT ON`.
-    pub cite: String,
-    /// The stated value, where the fact has one (a commit level).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
-    /// Byte range of the statement.
-    #[serde(skip)]
-    pub range: (usize, usize),
-}
+pub use crate::model::Discharge;
 
 /// Facts one side's source states about its own environment.
 pub fn discharges(a: &Analyzed) -> Vec<Discharge> {
@@ -129,9 +114,17 @@ pub fn canonical_commit_level(level: &str) -> String {
 
 /// Findings for declarations that contradict what a side's source states.
 pub fn contradictions(sides: &[&Analyzed], opts: &Options) -> Vec<Finding> {
+    let found: Vec<(&Analyzed, Vec<Discharge>)> =
+        sides.iter().map(|a| (*a, discharges(a))).collect();
+    contradictions_in(&found, opts)
+}
+
+/// [`contradictions`] over discharges already read from each side (reading
+/// them lowers the side's routine).
+pub fn contradictions_in(found: &[(&Analyzed, Vec<Discharge>)], opts: &Options) -> Vec<Finding> {
     let mut out = Vec::new();
-    for a in sides {
-        for d in discharges(a) {
+    for (a, discharged) in found {
+        for d in discharged {
             let Some(text) = opts.declared.get(&d.id) else {
                 continue;
             };
@@ -313,7 +306,7 @@ pub fn ledger_by(
             raw.clone()
         };
         relabel(&mut r, &other);
-        let v = r.verdict;
+        let v = r.verdict();
         out.push(Entry {
             text: asm
                 .map(|x| x.text.clone())
@@ -326,7 +319,7 @@ pub fn ledger_by(
                 .collect(),
             reruns,
             verdict_if_flipped: Some(v),
-            flips_verdict: v != report.verdict,
+            flips_verdict: v != report.verdict(),
             id,
             status,
             source,

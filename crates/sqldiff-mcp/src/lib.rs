@@ -14,7 +14,12 @@
 //! reads files and the review store; it writes only when `convert_tree` is
 //! given an output directory, exactly what `sqldiff convert -o` writes.
 
-use std::collections::{BTreeMap, HashMap};
+// Determinism guard (perf plan W0): iterating a hash map or set in a `for` loop is
+// as order-dependent as `.iter()`; each site needs a reasoned `#[allow]`.
+#![warn(clippy::iter_over_hash_type)]
+#![recursion_limit = "512"]
+
+use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 use sqldiff_convert::tree;
@@ -80,7 +85,7 @@ pub struct Server {
     flips: Flips,
     pairs: BTreeMap<String, Held>,
     /// Fingerprint → pair id.
-    findings: HashMap<String, String>,
+    findings: BTreeMap<String, String>,
     /// Read-only; re-read before each analysis so decisions made in the CLI
     /// or GUI show up.
     store: Store,
@@ -88,6 +93,58 @@ pub struct Server {
     trees: Vec<(String, tree::Tree)>,
     /// Trees converted in this session, for ids.
     tree_count: usize,
+    /// Resolves the configuration again (`reload_config`); set by the
+    /// binary, which knows where the configuration comes from.
+    reload: Option<Reloader>,
+    /// Background `convert_tree` runs, oldest first.
+    runs: Vec<Run>,
+    run_count: usize,
+}
+
+/// Resolves the configuration again from the sources the server started with.
+pub type Reloader = Box<dyn Fn() -> Result<Resolved, String>>;
+
+/// What a background run returns: the tree, and the report files written.
+type RunResult = Result<(tree::Tree, Option<(std::path::PathBuf, std::path::PathBuf)>), String>;
+
+/// A `convert_tree` running on its own thread. Collected by `run_status`,
+/// which reports it exactly as the foreground call would.
+struct Run {
+    id: String,
+    args: Value,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// (checked, total) files, from the engine's progress hook.
+    progress: std::sync::Arc<(
+        std::sync::atomic::AtomicUsize,
+        std::sync::atomic::AtomicUsize,
+    )>,
+    /// (path, status label) of each file whose own check has finished, in
+    /// the order the worker threads finished them.
+    files: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    handle: Option<std::thread::JoinHandle<RunResult>>,
+    /// The final answer once collected: reported the same on every call.
+    done: Option<(String, Value)>,
+}
+
+/// Runs kept in a session, finished ones included.
+const RUN_LIMIT: usize = 8;
+
+/// The client went away (end of input) or the server is dropped: a run
+/// still working is asked to stop and waited for. It stops before its next
+/// check, or finishes writing its output tree if it had begun; the process
+/// never exits halfway through a write, which would leave a cut-off report
+/// in `out` that the next conversion there cannot read.
+impl Drop for Server {
+    fn drop(&mut self) {
+        for r in &self.runs {
+            r.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        for r in &mut self.runs {
+            if let Some(h) = r.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
 }
 
 impl Default for Server {
@@ -110,16 +167,25 @@ impl Server {
         Ok(Self::build(config, gui_url, store))
     }
 
+    /// Lets `reload_config` resolve the configuration again.
+    pub fn with_reloader(mut self, reload: Reloader) -> Self {
+        self.reload = Some(reload);
+        self
+    }
+
     fn build(config: Resolved, gui_url: Option<String>, store: Store) -> Self {
         Server {
             config,
             gui_url: gui_url.unwrap_or_else(|| queue::DEFAULT_GUI_URL.to_string()),
             flips: Flips::new(),
             pairs: BTreeMap::new(),
-            findings: HashMap::new(),
+            findings: BTreeMap::new(),
             store,
             trees: Vec::new(),
             tree_count: 0,
+            reload: None,
+            runs: Vec::new(),
+            run_count: 0,
         }
     }
 
@@ -213,6 +279,19 @@ impl Server {
 
     /// Runs a tool; `None` when there is no tool of that name.
     fn tool(&mut self, name: &str, args: &Value) -> Option<Result<(String, Value), String>> {
+        // A run works on the store and the output tree: nothing else
+        // converts while one does.
+        if matches!(name, "convert_tree" | "conversion_queue" | "write_unit")
+            && self
+                .runs
+                .iter()
+                .any(|r| r.handle.as_ref().is_some_and(|h| !h.is_finished()))
+        {
+            return Some(Err(
+                "a background run is working: `run_status` shows it, `cancel_run` stops it"
+                    .to_string(),
+            ));
+        }
         Some(match name {
             "diff" => self.diff(args),
             "check" => self.check(args),
@@ -229,6 +308,11 @@ impl Server {
             "conversion_queue" => self.conversion_queue(args),
             "write_unit" => self.write_unit(args),
             "converted_file" => self.converted_file(args),
+            "run_status" => self.run_status(args),
+            "cancel_run" => self.cancel_run(args),
+            "compare_runs" => self.compare_runs(args),
+            "engine" => self.engine(args),
+            "reload_config" => self.reload_config(args),
             _ => return None,
         })
     }
@@ -1101,11 +1185,13 @@ impl Server {
             _ => return Err("`artifact` needs exactly one of `path` or `text`".to_string()),
         };
         let a = tree::Args {
+            rules: Default::default(),
             src,
             from,
             to,
             jobs: Some(1),
             no_catalog: false,
+            recheck: Default::default(),
             template,
             extensions: Vec::new(),
             helpers: self.config.options().helpers,
@@ -1147,6 +1233,16 @@ impl Server {
             None => Dialect::Tsql,
         };
         Ok(tree::Args {
+            rules: sqldiff_convert::RuleOptions {
+                temporal_historyless: args
+                    .get("temporal_historyless")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            },
+            recheck: match str_arg(args, "recheck") {
+                Some(r) => r.parse()?,
+                None => Default::default(),
+            },
             src: src.into(),
             from,
             to: target(args)?,
@@ -1192,7 +1288,15 @@ impl Server {
             .unwrap_or(DEFAULT_TREE_LIMIT);
         // Converted again in memory, so decisions recorded since count; nothing is written.
         let (inputs, unreadable) = tree::read(&a)?;
-        let mut t = tree::convert(&a, &inputs, unreadable, Some(&out))?;
+        let mut t = build_tree(
+            args,
+            &a,
+            &inputs,
+            unreadable,
+            Some(&out),
+            &tree::Hooks::default(),
+            false,
+        )?;
         tree::review_in(&mut t, &inputs, &out)?;
         let q = queue::build(&t.report, inst.as_ref(), all);
         let listed: Vec<&queue::Item> = q
@@ -1272,7 +1376,15 @@ impl Server {
         tree::prepare_out(&a.src, &out, true)?;
         tree::guard_hand_edits(&out, false)?;
         let (inputs, unreadable) = tree::read(&a)?;
-        let t = tree::convert(&a, &inputs, unreadable.clone(), Some(&out))?;
+        let t = build_tree(
+            args,
+            &a,
+            &inputs,
+            unreadable.clone(),
+            Some(&out),
+            &tree::Hooks::default(),
+            false,
+        )?;
         let r = tree::written_record(
             &t,
             &inputs,
@@ -1285,7 +1397,15 @@ impl Server {
             &sqldiff_review::time::now(),
         )?;
         review::append(&out, &r)?;
-        let mut t = tree::convert(&a, &inputs, unreadable, Some(&out))?;
+        let mut t = build_tree(
+            args,
+            &a,
+            &inputs,
+            unreadable,
+            Some(&out),
+            &tree::Hooks::default(),
+            false,
+        )?;
         tree::review_in(&mut t, &inputs, &out)?;
         tree::write(&t, &out)?;
         queue::write(&queue::build(&t.report, None, false), &out)?;
@@ -1349,36 +1469,397 @@ impl Server {
 
     fn convert_tree(&mut self, args: &Value) -> Result<(String, Value), String> {
         let a = self.tree_args(args)?;
-        let out = str_arg(args, "out").map(std::path::PathBuf::from);
-        let overwrite = args
-            .get("overwrite")
+        if args
+            .get("background")
             .and_then(Value::as_bool)
-            .unwrap_or(false);
-        // The same steps as `sqldiff convert`, in the same order.
-        let (inputs, unreadable) = tree::read(&a)?;
-        if let Some(o) = &out {
-            tree::prepare_out(&a.src, o, overwrite)?;
-            let discard = args
-                .get("discard_edits")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            tree::guard_hand_edits(o, discard)?;
+            .unwrap_or(false)
+        {
+            return self.start_run(args, a);
         }
-        let mut t = tree::convert(&a, &inputs, unreadable, out.as_deref())?;
-        // Review decisions committed next to the converted tree.
-        if let Some(o) = &out {
-            tree::review_in(&mut t, &inputs, o)?;
-        }
-        let written = match &out {
-            Some(o) => {
-                let w = tree::write(&t, o)?;
-                let q = sqldiff_convert::queue::build(&t.report, None, false);
-                sqldiff_convert::queue::write(&q, o)?;
-                Some(w)
-            }
-            None => None,
-        };
+        let (t, written) = run_tree(args, &a, &tree::Hooks::default())?;
+        self.report_tree(args, t, written)
+    }
 
+    /// Starts `convert_tree` on its own thread and returns at once with a
+    /// run id. One run works at a time, and never two on the same `out`.
+    /// The run stops only between checks (`cancel_run`), and writes its
+    /// output tree only after its last check, so a stopped run changes
+    /// nothing but the store.
+    fn start_run(&mut self, args: &Value, a: tree::Args) -> Result<(String, Value), String> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        if self
+            .runs
+            .iter()
+            .any(|r| r.handle.as_ref().is_some_and(|h| !h.is_finished()))
+        {
+            return Err(
+                "a run is still working: `run_status` shows it, `cancel_run` stops it".to_string(),
+            );
+        }
+        // A finished run not yet collected holds its tree; collect it first.
+        if self.runs.iter().any(|r| r.handle.is_some()) {
+            return Err("a finished run is waiting: read it with `run_status` first".to_string());
+        }
+        if self.runs.len() >= RUN_LIMIT {
+            self.runs.remove(0);
+        }
+        self.run_count += 1;
+        let id = format!("run-{}", self.run_count);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+        let files: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
+        let hooks = tree::Hooks {
+            file_done: Some({
+                let f = files.clone();
+                Box::new(move |path, status| {
+                    if let Ok(mut v) = f.lock() {
+                        v.push((path.to_string(), status.to_string()));
+                    }
+                })
+            }),
+            cancel: Some(cancel.clone()),
+            progress: Some({
+                let p = progress.clone();
+                Box::new(move |checked, total| {
+                    p.0.store(checked, Ordering::Relaxed);
+                    p.1.store(total, Ordering::Relaxed);
+                })
+            }),
+        };
+        let worker_args = args.clone();
+        let handle = std::thread::Builder::new()
+            .stack_size(sqldiff_core::ENGINE_STACK)
+            .spawn(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_tree(&worker_args, &a, &hooks)
+                }))
+                .unwrap_or_else(|_| Err("the engine panicked".to_string()))
+            })
+            .map_err(|e| format!("could not start the run: {e}"))?;
+        self.runs.push(Run {
+            id: id.clone(),
+            args: args.clone(),
+            cancel,
+            progress,
+            files,
+            handle: Some(handle),
+            done: None,
+        });
+        let text = format!(
+            "[{id}] started; poll `run_status` with run `{id}`, stop it with `cancel_run`.\n"
+        );
+        Ok((text, json!({ "run": id, "state": "running" })))
+    }
+
+    fn run_index(&self, args: &Value) -> Result<usize, String> {
+        let id = str_arg(args, "run")
+            .ok_or("`run` is required (an id from `convert_tree` with `background`)")?;
+        self.runs
+            .iter()
+            .position(|r| r.id == id)
+            .ok_or_else(|| format!("no run `{id}` in this session (the last {RUN_LIMIT} are kept)"))
+    }
+
+    /// The configuration layers and packs in effect, each with the hash of
+    /// its content.
+    fn config_state(&self) -> Value {
+        json!({
+            "layers": self.config.layers.iter().map(|l| json!({
+                "kind": l.kind, "name": l.name, "version": l.version, "hash": l.hash,
+            })).collect::<Vec<_>>(),
+            "packs": self.config.packs.iter().map(|p| json!({
+                "path": p.path, "hash": p.hash,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// What this server runs: the engine's fingerprints (a hash of the
+    /// sources and settings that decide a conversion result, from the build)
+    /// and the configuration in effect. After a rebuild and a restart the
+    /// fingerprints show whether the new engine is the one running, and
+    /// stored results made by an engine with the same check fingerprint are
+    /// still reused.
+    fn engine(&self, _args: &Value) -> Result<(String, Value), String> {
+        let fp = json!({
+            "version": TOOL_VERSION,
+            "engine_fingerprint": sqldiff_convert::ENGINE_FINGERPRINT,
+            "check_fingerprint": sqldiff_convert::CHECK_FINGERPRINT,
+            "engine_crates": sqldiff_convert::FINGERPRINTED_CRATES,
+            "check_crates": sqldiff_convert::CHECK_FINGERPRINTED_CRATES,
+            "config": self.config_state(),
+            "can_reload_config": self.reload.is_some(),
+        });
+        let text = format!(
+            "sqldiff {TOOL_VERSION}\nengine fingerprint {}\ncheck fingerprint  {}\n{} configuration layer(s), {} pack(s)\n",
+            sqldiff_convert::ENGINE_FINGERPRINT,
+            sqldiff_convert::CHECK_FINGERPRINT,
+            self.config.layers.len(),
+            self.config.packs.len()
+        );
+        Ok((text, fp))
+    }
+
+    /// Resolves the configuration (config files, packs) again without a
+    /// restart, so a pack or config edit takes effect in the next call. A
+    /// configuration that does not load changes nothing. Stored conversion
+    /// results are unaffected: their keys hold what the packs contribute to
+    /// a check (helpers, rules), so a changed pack misses exactly the
+    /// results it can change. Trees already converted in this session keep
+    /// the configuration they were converted under.
+    fn reload_config(&mut self, _args: &Value) -> Result<(String, Value), String> {
+        if self
+            .runs
+            .iter()
+            .any(|r| r.handle.as_ref().is_some_and(|h| !h.is_finished()))
+        {
+            return Err(
+                "a background run is working: reload when it has finished or been cancelled"
+                    .to_string(),
+            );
+        }
+        let Some(reload) = &self.reload else {
+            return Err("this server cannot reload its configuration".to_string());
+        };
+        let fresh = reload()?;
+        let before = self.config_state();
+        // Rebuild the review store from the fresh configuration before assigning anything, so
+        // an unresolvable data key is refused exactly as at startup and leaves the old state.
+        let store = Store::from_config(&fresh).map_err(|e| e.0)?;
+        self.config = fresh;
+        self.store = store;
+        let after = self.config_state();
+        let changed = before != after;
+        let text = format!(
+            "Configuration reloaded: {} layer(s), {} pack(s); {}.\n",
+            self.config.layers.len(),
+            self.config.packs.len(),
+            if changed {
+                "something changed"
+            } else {
+                "nothing changed"
+            }
+        );
+        Ok((
+            text,
+            json!({ "changed": changed, "before": before, "after": after }),
+        ))
+    }
+
+    /// What changed between two conversions (`sqldiff_convert::compare`):
+    /// units that improved, regressed, changed, appeared or went. Each side
+    /// is a tree id of this session or a `conversion-report.json` (or the
+    /// folder holding it), so a baseline survives a server restart.
+    fn compare_runs(&self, args: &Value) -> Result<(String, Value), String> {
+        use sqldiff_convert::compare;
+        let side = |key: &str| -> Result<(String, Option<tree::Report>), String> {
+            let v = str_arg(args, key).ok_or_else(|| {
+                format!("`{key}` is required (a tree id from `convert_tree`, or a conversion-report.json)")
+            })?;
+            if self.trees.iter().any(|(k, _)| *k == v) {
+                return Ok((v, None));
+            }
+            let p = std::path::Path::new(&v);
+            let file = if p.is_dir() {
+                p.join("conversion-report.json")
+            } else {
+                p.to_path_buf()
+            };
+            let text = std::fs::read_to_string(&file).map_err(|e| {
+                format!("`{v}` is no tree of this session and not a readable report: {e}")
+            })?;
+            let r: tree::Report = serde_json::from_str(&text)
+                .map_err(|e| format!("{}: not a conversion report: {e}", file.display()))?;
+            Ok((v, Some(r)))
+        };
+        let (na, ra) = side("a")?;
+        let (nb, rb) = side("b")?;
+        let held = |n: &str| {
+            self.trees
+                .iter()
+                .find(|(k, _)| k == n)
+                .map(|(_, t)| &t.report)
+        };
+        let a = ra.as_ref().or_else(|| held(&na)).expect("resolved above");
+        let b = rb.as_ref().or_else(|| held(&nb)).expect("resolved above");
+        let c = compare::compare(a, b)?;
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map_or(DEFAULT_TREE_LIMIT * 4, |n| n as usize);
+        let mut text = format!(
+            "{na} -> {nb}: {} regressed, {} improved, {} changed, {} new, {} gone, {} unchanged\n",
+            c.regressed, c.improved, c.changed, c.new, c.gone, c.unchanged
+        );
+        if c.src_differs {
+            text.push_str("Note: the two conversions read different source folders.\n");
+        }
+        if c.unchecked_a + c.unchecked_b > 0 {
+            text.push_str(&format!(
+                "Note: {} file(s) of `a` and {} of `b` were not checked (an increment); their units count as not converted, so they show as regressed.\n",
+                c.unchecked_a, c.unchecked_b
+            ));
+        }
+        let show = |s: &Option<compare::Side>| match s {
+            Some(s) => format!(
+                "{}{}",
+                s.status.label(),
+                if s.rules.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", s.rules.join(", "))
+                }
+            ),
+            None => "-".to_string(),
+        };
+        for r in c.rows.iter().take(limit) {
+            let line = r.b.as_ref().or(r.a.as_ref()).map_or(0, |s| s.src_line);
+            let why =
+                r.b.as_ref()
+                    .or(r.a.as_ref())
+                    .and_then(|s| s.reason.lines().next())
+                    .unwrap_or("");
+            text.push_str(&format!(
+                "{:?} {}:{line}: {} -> {}{}: {why}\n",
+                r.change,
+                r.path,
+                show(&r.a),
+                show(&r.b),
+                if r.differs.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", r.differs.join(", "))
+                }
+            ));
+        }
+        if c.rows.len() > limit {
+            text.push_str(&format!(
+                "{} more row(s); raise `limit`.\n",
+                c.rows.len() - limit
+            ));
+        }
+        let mut structured = serde_json::to_value(&c).expect("a comparison serializes");
+        structured["omitted_rows"] = json!(c.rows.len().saturating_sub(limit));
+        structured["rows"] =
+            serde_json::to_value(&c.rows[..c.rows.len().min(limit)]).expect("rows serialize");
+        Ok((text, structured))
+    }
+
+    /// Where a run is; once it has finished, its report as `convert_tree`
+    /// returns it, and the same on every later call.
+    fn run_status(&mut self, args: &Value) -> Result<(String, Value), String> {
+        use std::sync::atomic::Ordering;
+        let k = self.run_index(args)?;
+        if let Some((t, s)) = &self.runs[k].done {
+            return Ok((t.clone(), s.clone()));
+        }
+        let r = &self.runs[k];
+        let id = r.id.clone();
+        if r.handle.as_ref().is_some_and(|h| !h.is_finished()) {
+            let (c, n) = (
+                r.progress.0.load(Ordering::Relaxed),
+                r.progress.1.load(Ordering::Relaxed),
+            );
+            let cancelling = r.cancel.load(Ordering::Relaxed);
+            let mut rows: Vec<(String, String)> =
+                r.files.lock().map(|v| v.clone()).unwrap_or_default();
+            // The finishing order depends on the threads; the report does not.
+            rows.sort();
+            let mut by_status: BTreeMap<&str, usize> = BTreeMap::new();
+            for (_, st) in &rows {
+                *by_status.entry(st.as_str()).or_default() += 1;
+            }
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map_or(DEFAULT_TREE_LIMIT, |n| n as usize);
+            let state = if cancelling { "stopping" } else { "running" };
+            let mut text = format!("[{id}] {state} {c}/{n} checks\n");
+            let shown: Vec<&(String, String)> = rows
+                .iter()
+                .filter(|(_, st)| st != "converted")
+                .take(limit)
+                .collect();
+            if !rows.is_empty() {
+                text.push_str(&format!(
+                    "{} file(s) checked so far (provisional: the passes across files that follow can only make a status worse):\n",
+                    rows.len()
+                ));
+                for (st, count) in &by_status {
+                    text.push_str(&format!("  {count:>5}  {st}\n"));
+                }
+                for (path, st) in &shown {
+                    text.push_str(&format!("{path}: {st}\n"));
+                }
+            }
+            let listed: Vec<Value> = shown
+                .iter()
+                .map(|(p, st)| json!({ "path": p, "status": st }))
+                .collect();
+            return Ok((
+                text,
+                json!({
+                    "run": id, "state": state, "checked": c, "total": n,
+                    "provisional": true,
+                    "files_checked": rows.len(),
+                    "by_status": by_status,
+                    "files": listed,
+                }),
+            ));
+        }
+        let handle = self.runs[k]
+            .handle
+            .take()
+            .expect("an uncollected run has its thread");
+        let run_args = self.runs[k].args.clone();
+        let answer = match handle.join().unwrap_or_else(|_| Err("the engine panicked".to_string())) {
+            Ok((t, written)) => {
+                let (text, mut structured) = self.report_tree(&run_args, t, written)?;
+                structured["run"] = json!(id);
+                structured["state"] = json!("finished");
+                (format!("[{id}] finished\n{text}"), structured)
+            }
+            Err(e) if e == tree::CANCELLED => (
+                format!("[{id}] cancelled: nothing was written to the output tree; the checks that finished are kept in the store.\n"),
+                json!({ "run": id, "state": "cancelled" }),
+            ),
+            Err(e) => (
+                format!("[{id}] failed: {e}\n"),
+                json!({ "run": id, "state": "failed", "error": e }),
+            ),
+        };
+        self.runs[k].done = Some(answer.clone());
+        Ok(answer)
+    }
+
+    /// Asks a running run to stop before its next check. A run that has
+    /// finished is not changed.
+    fn cancel_run(&mut self, args: &Value) -> Result<(String, Value), String> {
+        let k = self.run_index(args)?;
+        let r = &self.runs[k];
+        let running = r.handle.as_ref().is_some_and(|h| !h.is_finished());
+        if running {
+            r.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let id = r.id.clone();
+        let text = if running {
+            format!("[{id}] asked to stop; `run_status` shows when it has.\n")
+        } else {
+            format!("[{id}] is not running; `run_status` shows how it ended.\n")
+        };
+        Ok((
+            text,
+            json!({ "run": id, "state": if running { "stopping" } else { "not running" } }),
+        ))
+    }
+
+    /// The report of a converted tree, as `convert_tree` returns it.
+    fn report_tree(
+        &mut self,
+        args: &Value,
+        t: tree::Tree,
+        written: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    ) -> Result<(String, Value), String> {
         let statuses: Vec<sqldiff_convert::Status> = list_arg(args, "statuses")?;
         let folder = str_arg(args, "folder");
         let limit = args
@@ -1577,6 +2058,99 @@ fn status_label(s: queue::Status) -> &'static str {
         queue::Status::Confirmed => "confirmed in this session",
         queue::Status::Denied => "denied in this session",
     }
+}
+
+/// The increment `select` names (see `sqldiff convert --next` and
+/// friends); empty checks the whole tree. `next` must be a whole number.
+fn select_arg(args: &Value) -> Result<sqldiff_convert::plan::Select, String> {
+    let Some(v) = args.get("select").filter(|v| !v.is_null()) else {
+        return Ok(Default::default());
+    };
+    let next = match v.get("next").filter(|n| !n.is_null()) {
+        None => None,
+        Some(n) => Some(
+            n.as_u64()
+                .ok_or("`select.next` must be a whole number of groups (0 reports coverage)")?
+                as usize,
+        ),
+    };
+    Ok(sqldiff_convert::plan::Select {
+        next,
+        schemas: list_arg(v, "schemas")?,
+        objects: list_arg(v, "objects")?,
+        paths: list_arg(v, "paths")?,
+        changed: v.get("changed").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+/// Converts the tree as `sqldiff convert` does: with an `out`, each file's
+/// checked result is kept in the store of `out` and reused when its key
+/// matches, so a second call over an unchanged tree (a queue read, a
+/// drafted unit) costs a lookup. Without `out` nothing is kept. `fresh`
+/// and `select` belong to `convert_tree` alone (`incremental`): the queue
+/// and `write_unit` write nothing but the store.
+fn build_tree(
+    args: &Value,
+    a: &tree::Args,
+    inputs: &[tree::Input],
+    unreadable: Vec<String>,
+    out: Option<&std::path::Path>,
+    hooks: &tree::Hooks,
+    incremental: bool,
+) -> Result<tree::Tree, String> {
+    let fresh = args.get("fresh").and_then(Value::as_bool).unwrap_or(false);
+    let select = select_arg(args)?;
+    if !incremental && (fresh || !select.is_empty()) {
+        return Err("`fresh` and `select` belong to `convert_tree`".to_string());
+    }
+    let Some(o) = out else {
+        if !select.is_empty() || fresh {
+            return Err("`select` and `fresh` need `out`: the store lives there".to_string());
+        }
+        return tree::convert_with(a, inputs, unreadable, None, hooks);
+    };
+    let t = tree::convert_increment(a, inputs, unreadable, o, hooks, fresh, &select)?;
+    if !select.is_empty() {
+        sqldiff_convert::job::write_plan(
+            &sqldiff_convert::plan::Plan::build(&tree::plan_inputs(a, inputs), a.from),
+            o,
+        )?;
+    }
+    Ok(t)
+}
+
+/// What `convert_tree` does before it reports: the steps of
+/// `sqldiff convert`, in the same order. Runs on the calling thread or, for
+/// a background run, on its worker.
+fn run_tree(
+    args: &Value,
+    a: &tree::Args,
+    hooks: &tree::Hooks,
+) -> Result<(tree::Tree, Option<(std::path::PathBuf, std::path::PathBuf)>), String> {
+    let out = str_arg(args, "out").map(std::path::PathBuf::from);
+    let flag = |k: &str| args.get(k).and_then(Value::as_bool).unwrap_or(false);
+    let (inputs, unreadable) = tree::read(a)?;
+    if let Some(o) = &out {
+        tree::prepare_out(&a.src, o, flag("overwrite"))?;
+        tree::guard_hand_edits(o, flag("discard_edits"))?;
+    }
+    let mut t = build_tree(args, a, &inputs, unreadable, out.as_deref(), hooks, true)?;
+    // Review decisions committed next to the converted tree.
+    if let Some(o) = &out {
+        tree::review_in(&mut t, &inputs, o)?;
+    }
+    // The last point a run stops at: from here on the output is written.
+    hooks.stop_if_cancelled()?;
+    let written = match &out {
+        Some(o) => {
+            let w = tree::write(&t, o)?;
+            let q = sqldiff_convert::queue::build(&t.report, None, false);
+            sqldiff_convert::queue::write(&q, o)?;
+            Some(w)
+        }
+        None => None,
+    };
+    Ok((t, written))
 }
 
 fn str_arg(args: &Value, k: &str) -> Option<String> {
@@ -1889,6 +2463,16 @@ fn tools() -> Value {
                     "parameters": { "type": "array", "items": { "type": "string" }, "description": "With `template`: the only placeholder names, besides the pack's known_parameters" },
                     "extensions": { "type": "array", "items": { "type": "string" }, "description": "File extensions to convert (default [\"sql\"])" },
                     "jobs": { "type": "integer", "minimum": 1, "description": "Parallel jobs (default: available cores)" },
+                    "background": { "type": "boolean", "description": "Return at once with a run id and convert on a worker thread; poll `run_status`, stop with `cancel_run`. One run works at a time, and no other conversion tool runs meanwhile. The finished run reports exactly as this call would" },
+                    "temporal_historyless": { "type": "boolean", "description": "Rule option `--temporal-historyless` (ASM-TEMPORAL-HISTORYLESS), off by default. Give the same value to `conversion_queue` and `write_unit`" },
+                    "recheck": { "type": "string", "enum": ["none", "sample", "all"], "description": "With `out`: how much of what is taken from the store is built again and compared (default sample). `none` trusts the store and the report says so; `all` verifies every stored result" },
+                    "fresh": { "type": "boolean", "description": "With `out`: reuse no stored result; every file is checked again and stored" },
+                    "select": { "type": "object", "description": "With `out`: check only this increment, as `sqldiff convert --next/--schema/--object/--path/--changed`; a file outside it is taken from the store or counted not converted", "properties": {
+                        "next": { "type": "integer", "minimum": 0, "description": "0 reports coverage" },
+                        "schemas": { "type": "array", "items": { "type": "string" } },
+                        "objects": { "type": "array", "items": { "type": "string" } },
+                        "paths": { "type": "array", "items": { "type": "string" } },
+                        "changed": { "type": "boolean" } } },
                     "statuses": { "type": "array", "items": { "type": "string", "enum": ["converted", "assumptions", "decision", "unproven", "differs", "not_converted"] }, "description": "List only files with one of these statuses (totals always cover the whole tree)" },
                     "folder": { "type": "string", "description": "List only files whose path starts with this" },
                     "limit": { "type": "integer", "minimum": 0, "description": "Cap on files listed (default 25); the rest are counted" },
@@ -1901,7 +2485,7 @@ fn tools() -> Value {
         {
             "name": "conversion_queue",
             "title": "Review queue of a converted tree",
-            "description": "What a person should review in a converted tree, worst first, by tier (never a score): 1 differs, not converted, rejected, a missing object many units fail to bind on (one item), templates whose instances differ; 2 not proven, instances unknown or not woven, templates no instance uses; 3 output an agent wrote that no person approved; 4 open decisions; 5 open assumptions (unverified vendor facts and template premises first); 6 (with `all`) plainly converted units nobody approved. Converts `src` again in memory with the same arguments as `convert_tree` and applies the review-decisions.jsonl in `out`, so decisions recorded since count; writes nothing. Reviewed units are not listed. Verdicts are recorded by people in the GUI or CLI, never by this server; `write_unit` only records an agent's draft.",
+            "description": "What a person should review in a converted tree, worst first, by tier (never a score): 1 differs, not converted, rejected, a missing object many units fail to bind on (one item), templates whose instances differ; 2 not proven, instances unknown or not woven, templates no instance uses; 3 output an agent wrote that no person approved; 4 open decisions; 5 open assumptions (unverified vendor facts and template premises first); 6 (with `all`) plainly converted units nobody approved. Converts `src` again with the same arguments as `convert_tree` (each file's checked result is reused from the store in `out`, so an unchanged tree costs lookups) and applies the review-decisions.jsonl in `out`, so decisions recorded since count; writes nothing but that store. Options that differ from the run that produced `out` (rules, catalogs) store other results and drop that run's from the store at the end of the call, so pass the same values. Reviewed units are not listed. Verdicts are recorded by people in the GUI or CLI, never by this server; `write_unit` only records an agent's draft.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1912,6 +2496,8 @@ fn tools() -> Value {
                     "no_catalog": { "type": "boolean" },
                     "catalogs": { "type": "array", "items": { "type": "string" }, "description": "As given to `convert_tree`" },
                     "catalogs_b": { "type": "array", "items": { "type": "string" }, "description": "As given to `convert_tree`" },
+                    "temporal_historyless": { "type": "boolean", "description": "As given to `convert_tree`" },
+                    "recheck": { "type": "string", "enum": ["none", "sample", "all"], "description": "As given to `convert_tree`" },
                     "template": { "type": "boolean" },
                     "parameters": { "type": "array", "items": { "type": "string" } },
                     "extensions": { "type": "array", "items": { "type": "string" } },
@@ -1938,6 +2524,8 @@ fn tools() -> Value {
                     "no_catalog": { "type": "boolean" },
                     "catalogs": { "type": "array", "items": { "type": "string" }, "description": "As given to `convert_tree`" },
                     "catalogs_b": { "type": "array", "items": { "type": "string" }, "description": "As given to `convert_tree`" },
+                    "temporal_historyless": { "type": "boolean", "description": "As given to `convert_tree`" },
+                    "recheck": { "type": "string", "enum": ["none", "sample", "all"], "description": "As given to `convert_tree`" },
                     "template": { "type": "boolean" },
                     "parameters": { "type": "array", "items": { "type": "string" } },
                     "extensions": { "type": "array", "items": { "type": "string" } },
@@ -1950,6 +2538,60 @@ fn tools() -> Value {
                 "required": ["src", "to", "out", "path", "unit", "text", "reason"],
             },
             "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false },
+        },
+        {
+            "name": "run_status",
+            "title": "Status of a background run",
+            "description": "Where a `convert_tree` started with `background` is: running (checks done of total, with the files checked so far and their statuses, provisional because the passes across files that follow can only make a status worse), stopping, or finished. A finished run is reported here exactly as `convert_tree` reports (same arguments, same tree id for `converted_file`), cancelled, or failed; later calls return the same answer.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "run": { "type": "string", "description": "Run id from `convert_tree`" },
+                    "limit": { "type": "integer", "minimum": 0, "description": "While running: cap on files listed (default 25; only files not plainly converted are listed, the counts cover all)" },
+                },
+                "required": ["run"],
+            },
+            "annotations": ro,
+        },
+        {
+            "name": "cancel_run",
+            "title": "Stop a background run",
+            "description": "Asks a running background `convert_tree` to stop before its next check. A stopped run writes no output tree (the checks it finished stay in the store, so a rerun resumes); a run that already finished is not changed. Poll `run_status` to see it stop.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "run": { "type": "string", "description": "Run id from `convert_tree`" } },
+                "required": ["run"],
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
+        },
+        {
+            "name": "engine",
+            "title": "Engine and configuration in effect",
+            "description": "What this server runs: the tool version, the engine fingerprint and the check fingerprint (hashes of the sources and settings that decide a conversion, fixed at build time; stored results are keyed by them), the crates each covers, and the configuration layers and packs in effect with their content hashes. After `cargo build` and a restart, compare with an earlier answer to see which engine is running; results stored by an engine with the same check fingerprint are reused.",
+            "inputSchema": { "type": "object", "properties": {} },
+            "annotations": ro,
+        },
+        {
+            "name": "reload_config",
+            "title": "Reload packs and configuration",
+            "description": "Resolve the configuration (project and user config, packs) again from the sources this server started with, without a restart; the next call uses it. A configuration that fails to load changes nothing. Returns whether the layers or packs changed, before and after, with content hashes. Conversions already made in this session keep the configuration they were made under; stored results need no handling, since their keys hold what packs contribute to a check. Refused while a background run works.",
+            "inputSchema": { "type": "object", "properties": {} },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
+        },
+        {
+            "name": "compare_runs",
+            "title": "Compare two conversions",
+            "description": "What changed between two conversions of a tree, from their reports without converting again: units that regressed (a worse status), improved, changed (same status, but other rules, findings, reason or rewrites: a rule edit that changes a converted unit's output shows here), are new or are gone, in a fixed order (regressed worst first, improved, changed, new, gone; then path and source line). Units are joined by id, then by path and source line. Refused for conversions of different dialects; a different source folder is noted. Each side `a` (before) and `b` (after) is a tree id of this session or a conversion-report.json (or the folder holding it); copy the report before converting into the same `out` again to keep a baseline across a server restart. Returns the counts, the units per status in each run and the rows.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "a": { "type": "string", "description": "The earlier conversion: a tree id or a conversion-report.json path" },
+                    "b": { "type": "string", "description": "The later conversion: a tree id or a conversion-report.json path" },
+                    "limit": { "type": "integer", "minimum": 0, "description": "Cap on rows listed (default 100); the counts cover all" },
+                },
+                "required": ["a", "b"],
+            },
+            "annotations": ro,
         },
         {
             "name": "converted_file",

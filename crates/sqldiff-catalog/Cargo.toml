@@ -1,0 +1,21 @@
+[package]
+name = "sqldiff-catalog"
+description = "Schema catalog, DDL replay and built-in type/function tables for SQLDiff"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sqldiff-syntax.workspace = true
+rowan.workspace = true
+serde.workspace = true
+sha2.workspace = true
+toml.workspace = true
+
+[features]
+# Test builds only (the `site_switch` test of `sqldiff-convert`): lets a test
+# name a call site of a catalog read and skip recording there, to show that
+# the replay tests notice a read that is missing. Off in every other build,
+# where `site_skipped` is the constant `false`.
+site-switch = []

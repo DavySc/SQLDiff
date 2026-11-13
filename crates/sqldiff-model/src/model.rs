@@ -1,0 +1,436 @@
+//! Verdicts, change classes, findings and reports (design sections 2 and 6.1).
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// Proven equivalent with no assumptions beyond the dialect specs.
+    Equal,
+    /// Proven equivalent if every listed assumption holds.
+    EqualUnderAssumptions,
+    /// Neither equivalence nor a witness could be established.
+    Unknown,
+    /// A concrete divergence was found.
+    Different,
+}
+
+impl Verdict {
+    pub fn label(self) -> &'static str {
+        match self {
+            Verdict::Equal => "equal",
+            Verdict::EqualUnderAssumptions => "equal under assumptions",
+            Verdict::Unknown => "unknown",
+            Verdict::Different => "different",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeClass {
+    Cosmetic,
+    Structural,
+    Semantic,
+    Cardinality,
+    Transactional,
+    Concurrency,
+    Binding,
+    Residue,
+    Limit,
+}
+
+impl ChangeClass {
+    pub fn label(self) -> &'static str {
+        match self {
+            ChangeClass::Cosmetic => "cosmetic",
+            ChangeClass::Structural => "structural",
+            ChangeClass::Semantic => "semantic",
+            ChangeClass::Cardinality => "cardinality",
+            ChangeClass::Transactional => "transactional",
+            ChangeClass::Concurrency => "concurrency",
+            ChangeClass::Binding => "binding",
+            ChangeClass::Residue => "residue",
+            ChangeClass::Limit => "limit",
+        }
+    }
+
+    pub fn default_severity(self) -> Severity {
+        match self {
+            ChangeClass::Transactional => Severity::Critical,
+            ChangeClass::Concurrency | ChangeClass::Cardinality | ChangeClass::Binding => {
+                Severity::High
+            }
+            ChangeClass::Semantic | ChangeClass::Residue => Severity::Medium,
+            ChangeClass::Limit | ChangeClass::Structural => Severity::Low,
+            ChangeClass::Cosmetic => Severity::Info,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Info,
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl Severity {
+    pub fn label(self) -> &'static str {
+        match self {
+            Severity::Info => "info",
+            Severity::Low => "low",
+            Severity::Medium => "medium",
+            Severity::High => "high",
+            Severity::Critical => "critical",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Side {
+    A,
+    B,
+}
+
+/// A span in one artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Location {
+    pub side: Side,
+    pub path: String,
+    pub start_line: usize,
+    pub start_col: usize,
+    pub end_line: usize,
+    pub end_col: usize,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    /// The first lines of the located text, capped by the excerpt policy.
+    pub excerpt: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssumptionSource {
+    /// A default the tool assumes when no source states the fact.
+    Default,
+    /// Declared in source, a pack or project config.
+    Declared,
+    /// Stated by the author in a source comment (a pack author marker);
+    /// open until someone resolves it.
+    Author,
+    /// Proven from the composed output of a generator (a wrapper part
+    /// states the fact); discharged, not an open assumption.
+    ComposedOutput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Assumption {
+    /// Stable identifier, e.g. `ASM-TSQL-CALLER-XACT-ABORT-OFF`.
+    pub id: String,
+    pub text: String,
+    pub source: AssumptionSource,
+    /// Where the assumption was stated, e.g. `A:12` for side A line 12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cite: Option<String>,
+    /// The deployment profiles (`[deployment] accept`) that accept the
+    /// assumption. A reviewable fact only: the verdict does not change, and
+    /// an accepted assumption still makes a result "equal under assumptions".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_by: Vec<DeploymentSource>,
+}
+
+/// Where a deployment profile entry comes from: the config layer, and the
+/// pack and file that hold it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DeploymentSource {
+    /// `shared_pack`, `private_pack`, `project`, `user` or `command_line`.
+    pub layer: String,
+    /// The pack's name, when a shared pack holds it. A private pack is
+    /// named by its file only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack: Option<String>,
+    /// The `pack.toml` or config file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+}
+
+impl DeploymentSource {
+    /// `pack team (path/pack.toml)`, `project sqldiff.toml`, ...
+    pub fn label(&self) -> String {
+        let layer = self.layer.replace('_', " ");
+        match (&self.pack, &self.file) {
+            (Some(p), Some(f)) => format!("{layer} {p} ({f})"),
+            (Some(p), None) => format!("{layer} {p}"),
+            (None, Some(f)) => format!("{layer} {f}"),
+            (None, None) => layer,
+        }
+    }
+}
+
+impl Assumption {
+    /// An assumption the tool makes by default. The id must be in the
+    /// assumption registry (`crate::assumptions`); debug builds refuse one
+    /// that is not.
+    pub fn default(id: &str, text: &str) -> Self {
+        debug_assert!(
+            crate::assumptions::lookup(id).is_some(),
+            "assumption id `{id}` is not registered in crates/sqldiff-model/profiles/assumptions.toml"
+        );
+        Assumption {
+            id: id.to_string(),
+            text: text.to_string(),
+            source: AssumptionSource::Default,
+            cite: None,
+            accepted_by: Vec::new(),
+        }
+    }
+}
+
+/// One finding card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finding {
+    /// Stable across reformatting: object + class + rule + normalized anchors.
+    pub fingerprint: String,
+    /// Rule or engine that produced the finding, e.g. `txn.atomicity`.
+    pub rule: String,
+    pub class: ChangeClass,
+    pub severity: Severity,
+    pub verdict: Verdict,
+    /// Plain-language witness or description, anchored to both sides.
+    pub witness: String,
+    pub a: Option<Location>,
+    pub b: Option<Location>,
+    pub assumptions: Vec<String>,
+}
+
+/// Inputs needed to build a fingerprint.
+pub struct FingerprintInput<'a> {
+    pub object: &'a str,
+    pub class: ChangeClass,
+    pub rule: &'a str,
+    pub anchor_a: &'a str,
+    pub anchor_b: &'a str,
+}
+
+pub fn fingerprint(input: &FingerprintInput<'_>) -> String {
+    let mut h = Sha256::new();
+    for part in [
+        input.object,
+        input.class.label(),
+        input.rule,
+        input.anchor_a,
+        input.anchor_b,
+    ] {
+        h.update(part.as_bytes());
+        h.update([0u8]);
+    }
+    hex(&h.finalize()[..8])
+}
+
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactInfo {
+    pub path: String,
+    pub dialect: String,
+    /// Target engine version the analysis assumes.
+    pub dialect_version: String,
+    /// Object identity: routine name if one is defined, else the file stem.
+    pub object: String,
+    /// SHA-256 of the text with line endings, BOM and trailing whitespace normalized.
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticInfo {
+    pub side: Side,
+    pub line: usize,
+    pub col: usize,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoiseCounts {
+    /// Statements that differ only cosmetically (layout, case, comments, quoting).
+    pub cosmetic: usize,
+    /// Structural changes that were not listed as findings.
+    pub structural: usize,
+}
+
+/// Result of a diff or a check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Report {
+    pub tool_version: String,
+    /// Derived from the rest of the report by [`Report::settle`], never set
+    /// directly: a weaker verdict needs a finding, an unknown reason or an
+    /// assumption that says why. Read it with [`Report::verdict`].
+    pub(crate) verdict: Verdict,
+    pub a: ArtifactInfo,
+    pub b: Option<ArtifactInfo>,
+    pub findings: Vec<Finding>,
+    pub noise: NoiseCounts,
+    /// Normalizations applied to reach the verdict.
+    pub normalizations: Vec<String>,
+    pub assumptions: Vec<Assumption>,
+    /// Why the verdict could not be stronger.
+    pub unknown_reasons: Vec<String>,
+    pub diagnostics: Vec<DiagnosticInfo>,
+    /// Structured witnesses of behavioural findings, by fingerprint: the
+    /// scenario and both sides' outcomes (design §2 "must carry").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub witnesses: Vec<crate::witness::Witness>,
+    /// Defaults the objects' own source states (ledger status "discharged").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discharged: Vec<Discharge>,
+    /// Findings hidden by review decisions or in-source markers; they do
+    /// not count towards [`Report::open_verdict`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suppressed: Vec<Suppressed>,
+    /// The engine's verdict before anything was suppressed; `verdict` is
+    /// then the verdict over the open findings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_before_suppression: Option<Verdict>,
+    /// Why B only refines A, the reference: steps that hold one way
+    /// (decision 1). Empty when the two are equivalent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refinements: Vec<String>,
+    /// For an "equal" or "equal under assumptions" verdict: whether A also
+    /// refines B. Derived by [`Report::settle`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equivalent: Option<bool>,
+    /// What the proof gate found (decision 3); absent when it is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<crate::proof::Proof>,
+    /// The verdict before `require` mode made an unconfirmed "equal"
+    /// "unknown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_before_proof: Option<Verdict>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SuppressionKind {
+    /// Accepted in the review store.
+    Review,
+    /// A deliberate-difference marker in the source.
+    InSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Suppressed {
+    pub finding: Finding,
+    pub kind: SuppressionKind,
+    /// Why: the review comment or the marker text.
+    pub justification: String,
+}
+
+impl Report {
+    /// A report with nothing in it yet. Its verdict is "equal" only because
+    /// a verdict has to start somewhere: the caller fills in the rest and
+    /// hands the report to [`Report::settle`], which derives the real one.
+    /// This is the only way to build a report outside this crate, so a
+    /// verdict can never be set directly.
+    pub fn draft(tool_version: String, a: ArtifactInfo, b: Option<ArtifactInfo>) -> Report {
+        Report {
+            tool_version,
+            verdict: Verdict::Equal,
+            a,
+            b,
+            findings: Vec::new(),
+            noise: NoiseCounts::default(),
+            normalizations: Vec::new(),
+            assumptions: Vec::new(),
+            unknown_reasons: Vec::new(),
+            diagnostics: Vec::new(),
+            witnesses: Vec::new(),
+            discharged: Vec::new(),
+            suppressed: Vec::new(),
+            verdict_before_suppression: None,
+            refinements: Vec::new(),
+            equivalent: None,
+            proof: None,
+            verdict_before_proof: None,
+        }
+    }
+
+    /// The verdict over the findings that are still open. It equals
+    /// `verdict` when nothing is suppressed. When something is, it is never
+    /// better than "equal under assumptions": an accepted difference is
+    /// still a difference, so suppression never produces "equal".
+    pub fn open_verdict(&self) -> Verdict {
+        if self.suppressed.is_empty() {
+            return self.verdict;
+        }
+
+        if self
+            .findings
+            .iter()
+            .any(|f| f.verdict == Verdict::Different)
+        {
+            Verdict::Different
+        } else if self.findings.iter().any(|f| f.verdict == Verdict::Unknown)
+            || !self.unknown_reasons.is_empty()
+        {
+            Verdict::Unknown
+        } else {
+            Verdict::EqualUnderAssumptions
+        }
+    }
+
+    pub fn verdict(&self) -> Verdict {
+        self.verdict
+    }
+
+    /// Derives the verdict again from the findings, unknown reasons and
+    /// assumptions (`session::derive_verdict`). With suppressed findings it
+    /// records the engine's verdict once in `verdict_before_suppression` and
+    /// takes the [`open_verdict`](Report::open_verdict), so text, JSON,
+    /// SARIF and exit codes agree. Every change to a report's verdict goes
+    /// through here.
+    pub fn settle(&mut self) {
+        if self.suppressed.is_empty() {
+            self.verdict = crate::session::derive_verdict(self);
+        } else {
+            if self.verdict_before_suppression.is_none() {
+                self.verdict_before_suppression = Some(self.verdict);
+            }
+            self.verdict = self.open_verdict();
+        }
+        self.equivalent = matches!(
+            self.verdict,
+            Verdict::Equal | Verdict::EqualUnderAssumptions
+        )
+        .then(|| self.refinements.is_empty());
+    }
+
+    pub fn highest_class(&self) -> Option<ChangeClass> {
+        self.findings
+            .iter()
+            .max_by_key(|f| (f.severity, f.class))
+            .map(|f| f.class)
+    }
+}
+
+/// A fact the object's own source states, so the matching default is not
+/// an assumption for that side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Discharge {
+    pub id: String,
+    pub side: Side,
+    pub line: usize,
+    /// The statement that states it, e.g. `SET XACT_ABORT ON`.
+    pub cite: String,
+    /// The stated value, where the fact has one (a commit level).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// Byte range of the statement.
+    #[serde(skip)]
+    pub range: (usize, usize),
+}

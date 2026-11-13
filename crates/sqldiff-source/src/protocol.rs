@@ -284,6 +284,7 @@ impl Catalog {
                         identity: false,
                         has_default: false,
                         generated: false,
+                        hidden: false,
                         collation: c.collation.clone(),
                     })
                     .collect();
@@ -339,6 +340,7 @@ impl Catalog {
                     })
                     .collect(),
                 returns: r.returns.as_deref().map(DataType::parse_str),
+                returns_status: false,
             })
             .collect();
         core::Catalog {

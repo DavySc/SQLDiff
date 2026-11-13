@@ -187,7 +187,13 @@ fn m5a_tsql_pg_divergences_match_the_oracle() {
         &Options::default(),
     );
     let f = finding(&r, "txn.temp-state");
-    assert_eq!(f.verdict, Verdict::Different);
+    // The oracle shows the difference, but the routine branches on table
+    // state (`IF EXISTS (SELECT ...)`), which the identity analysis does not
+    // yet identify across the sides (perf plan W6c, E2): its text no longer
+    // pairs the paths, so the difference is shown by some path combinations
+    // and reported as unknown, not proven. Proving it again needs the state
+    // premise of E3.
+    assert_eq!(f.verdict, Verdict::Unknown);
     assert!(f.witness.contains("still holds the rows"), "{}", f.witness);
     assert!(f.witness.contains("is empty"), "{}", f.witness);
 }

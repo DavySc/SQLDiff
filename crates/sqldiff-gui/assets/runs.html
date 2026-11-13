@@ -134,6 +134,10 @@ details.group .run { padding-left: 32px; }
 .matrix .cell b.done { font-weight: 600; }
 .matrix .bad { color: var(--bad); }
 .matrix td.none { color: var(--faint); font-size: 12px; padding: 8px; }
+.plan { font-size: 12.5px; display: grid; gap: 6px; }
+.plan table { border-collapse: collapse; width: 100%; }
+.plan th { text-align: left; font-weight: 500; color: var(--muted); padding: 3px 8px; }
+.plan td { padding: 3px 8px; border-top: 1px solid var(--line); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .targets { display: flex; gap: 14px; flex-wrap: wrap; }
 </style>
 </head>
@@ -146,7 +150,7 @@ details.group .run { padding-left: 32px; }
 </header>
 <main><div class="col">
   <div class="tabs" role="tablist" aria-label="Kind of run"><button type="button" role="tab" data-tab="conv" class="on" aria-selected="true">Convert a tree</button><button type="button" role="tab" data-tab="instf" aria-selected="false">Check template instances</button><button type="button" role="tab" data-tab="driftf" aria-selected="false">Check template drift</button><button type="button" role="tab" data-tab="chgf" aria-selected="false">Review a branch</button><button type="button" role="tab" data-tab="batchf" aria-selected="false">Mass conversion</button></div>
-  <form class="form" id="conv" autocomplete="off">
+  <form class="form" id="conv" autocomplete="off" novalidate>
     <div class="field"><span>Source</span><input type="text" id="src" placeholder="Folder of SQL files, or one file" aria-label="Source folder or file" spellcheck="false"><button type="button" class="outline" data-browse="src" data-near="out" data-next="out">Browse…</button></div>
     <div class="field"><span>Output</span><input type="text" id="out" placeholder="Empty or new folder for the converted tree" aria-label="Output folder" spellcheck="false"><button type="button" class="outline" data-browse="out" data-near="src" data-next="go">Browse…</button></div>
     <div class="field"><span>Dialects</span><span class="pick"><select id="from" aria-label="Source dialect"></select>→<select id="to" aria-label="Target dialect"></select></span><span></span></div>
@@ -163,6 +167,16 @@ details.group .run { padding-left: 32px; }
       <div class="field"><span>Pack</span><input type="text" id="pack" placeholder="A pack to load besides the config's (pack.toml or its folder)" aria-label="Pack" spellcheck="false"><button type="button" class="outline" data-browse="pack" data-near="src">Browse…</button></div>
       <div class="field"><span>Instances</span><input type="text" id="inst" placeholder="An instance check of these templates (instance-report.json or its folder)" aria-label="Instance report" spellcheck="false"><button type="button" class="outline" data-browse="inst" data-near="out">Browse…</button></div>
       <div class="hint">With an instance check, the review judges each template by the instances woven from it.</div>
+    </details>
+    <details class="more" id="incr"><summary>Check part of the tree</summary>
+      <div class="field"><span>Next groups</span><input type="number" min="0" id="i-next" placeholder="Empty: the whole tree. 0: check nothing, show how much is covered" aria-label="Next N groups of files in plan order" spellcheck="false"><span></span></div>
+      <div class="field"><span>Schemas</span><input type="text" id="i-schemas" placeholder="Files defining an object in these schemas, comma-separated" aria-label="Schemas" spellcheck="false"><span></span></div>
+      <div class="field"><span>Objects</span><input type="text" id="i-objects" placeholder="Objects (schema.name) and what they use that is not checked yet, comma-separated" aria-label="Objects" spellcheck="false"><span></span></div>
+      <div class="field"><span>Paths</span><input type="text" id="i-paths" placeholder="Path globs: * within a folder, ** across folders, ?" aria-label="Path globs" spellcheck="false"><span></span></div>
+      <div class="acts"><label class="tog"><input type="checkbox" id="i-changed"> Every file with no stored result that matches</label></div>
+      <div class="hint">Files outside the increment are taken from the results stored in the output folder; a file with none is <b>not checked</b> and counts as not converted, never as equal. Run an increment into the same output folder as the last one and tick <i>Replace files</i>.</div>
+      <div class="acts"><button type="button" class="outline" id="plan-go">Show the plan</button></div>
+      <div id="plan" class="plan" hidden></div>
     </details>
     <div class="acts"><span class="err" id="err" role="alert"></span><button type="submit" class="primary" id="go">Convert</button></div>
   </form>
@@ -358,6 +372,16 @@ function formatRow(r) {
   return `<div class="run"><span class="dot ${r.state}"></span><div><div class="t">${r.write ? "Format" : "Check formatting of"} a folder</div><div class="s">${sub}</div></div><div>${right}</div><div>${act}</div>${extra}${sheet(r)}</div>`;
 }
 
+// An increment's coverage, as the report says it (`totals.progress`): files
+// not checked count as not converted in the review.
+function progress(t) {
+  const p = t.progress;
+  if (!p) return "";
+  const pct = (a, b) => (b ? Math.floor((a * 100) / b) : 100);
+  const left = t.files_not_checked || 0;
+  return `<div class="meta" title="Files with no stored result are not checked and count as not converted in the review">checked ${p.files_checked} of ${p.files} files (${pct(p.files_checked, p.files)}%) · ${p.lines_checked} of ${p.lines} lines · ${p.groups_checked} of ${p.groups} groups${left ? ` · ${left} file${left === 1 ? "" : "s"} not checked` : ""}${p.next_group != null ? ` · next group ${p.next_group + 1}` : ""}</div>`;
+}
+
 // A finished conversion: its own totals and its done gate (`sqldiff
 // review-status`, as the server reads it), never a count made up here.
 function convDone(r) {
@@ -365,7 +389,7 @@ function convDone(r) {
   const g = r.gate;
   const gate = !g ? (r.past ? " · done gate judged when the review opens" : "") : g.error ? ` · done gate not judged` : g.complete ? ` · <b class="done">done</b>` : ` · not done: ${g.blockers} blocker${g.blockers === 1 ? "" : "s"}`;
   return {
-    right: ladder(u) + `<div class="meta" title="${g ? esc(g.error || Object.entries(g.counts).map(([k, n]) => `${n} ${k}`).join(", ")) : ""}">${r.totals.files} file${r.totals.files === 1 ? "" : "s"} · ${r.queue} to review${gate}${r.complete ? "" : " · not every file converted"}</div>`,
+    right: ladder(u) + `<div class="meta" title="${g ? esc(g.error || Object.entries(g.counts).map(([k, n]) => `${n} ${k}`).join(", ")) : ""}">${r.totals.files} file${r.totals.files === 1 ? "" : "s"} · ${r.queue} to review${gate}${r.complete ? "" : " · not every file converted"}</div>` + progress(r.totals),
     act: `<a class="btn" href="/runs/${r.id}/review">Review${r.queue ? ` ${r.queue}` : ""}</a>`,
   };
 }
@@ -591,6 +615,38 @@ async function post(url, body) {
   if (!res.ok) throw new Error(text || res.statusText);
   return JSON.parse(text);
 }
+// The part of the tree to check: empty fields mean the whole tree.
+function increment() {
+  const list = (id) => $(id).value.split(",").map((x) => x.trim()).filter(Boolean);
+  const n = $("i-next").value.trim();
+  if ($("i-next").validity.badInput || (n !== "" && !/^\d+$/.test(n))) {
+    // The section may be collapsed: open it so the message has something to point at.
+    $("incr").open = true;
+    $("i-next").focus();
+    throw new Error("Next groups must be a whole number (0 or more), or empty for the whole tree.");
+  }
+  return { next: n === "" ? null : parseInt(n, 10), schemas: list("i-schemas"), objects: list("i-objects"), paths: list("i-paths"), changed: $("i-changed").checked };
+}
+// The plan of the tree: the groups of files in the order an increment takes them.
+$("plan-go").addEventListener("click", async () => {
+  const src = $("src").value.trim(), out = $("out").value.trim(), box = $("plan");
+  if (!src || !out) { $("err").textContent = "Give a source and an output folder."; return; }
+  $("err").textContent = ""; $("plan-go").disabled = true; box.hidden = false; box.textContent = "Reading the tree…";
+  try {
+    const list = (id) => $(id).value.split(",").map((x) => x.trim()).filter(Boolean);
+    const p = await post("/api/runs/plan", {
+      src, out, from: $("from").value, to: $("to").value, extensions: list("exts"),
+      catalogs: $("catalogs").value.split(/\r?\n/).map((x) => x.trim()).filter(Boolean),
+      catalogs_b: $("catalogs-b").value.split(/\r?\n/).map((x) => x.trim()).filter(Boolean),
+      packs: $("pack").value.trim() ? [$("pack").value.trim()] : [],
+    });
+    const rows = p.first.map((g) => `<tr><td>${g.n}</td><td>${g.files}${g.cyclic ? " (cycle)" : ""}</td><td>${g.lines}</td><td>${g.paths.map(esc).join(", ")}${g.files > g.paths.length ? ", …" : ""}</td></tr>`).join("");
+    box.innerHTML = `<div class="meta">${p.files} files · ${p.lines} lines · ${p.groups} groups${p.cyclic ? ` (${p.cyclic} cyclic)` : ""}. A group comes after every group it uses.</div>` +
+      `<table><thead><tr><th>#</th><th>Files</th><th>Lines</th><th>First files</th></tr></thead><tbody>${rows}</tbody></table>` +
+      (p.groups > p.first.length ? `<div class="meta">… and ${p.groups - p.first.length} more groups</div>` : "");
+  } catch (e) { box.textContent = ""; box.hidden = true; $("err").textContent = e.message; }
+  $("plan-go").disabled = false;
+});
 $("conv").addEventListener("submit", async (e) => {
   e.preventDefault();
   const src = $("src").value.trim(), out = $("out").value.trim();
@@ -604,8 +660,11 @@ $("conv").addEventListener("submit", async (e) => {
       catalogs: $("catalogs").value.split(/\r?\n/).map((x) => x.trim()).filter(Boolean),
       catalogs_b: $("catalogs-b").value.split(/\r?\n/).map((x) => x.trim()).filter(Boolean),
       packs: $("pack").value.trim() ? [$("pack").value.trim()] : [], instances: $("inst").value.trim() || null,
+      increment: increment(),
     });
-    $("overwrite").checked = false;
+    // The next increment goes into the same folder, so the tick stays while one is chosen.
+    const inc = increment();
+    $("overwrite").checked = $("overwrite").checked && (inc.next !== null || inc.schemas.length > 0 || inc.objects.length > 0 || inc.paths.length > 0 || inc.changed);
   } catch (e) { $("err").textContent = e.message; }
   $("go").disabled = false;
   refresh();

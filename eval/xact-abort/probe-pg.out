@@ -1,0 +1,15 @@
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+INSERT 0 2
+INSERT 0 1
+WARNING:  INSERT INTO t (id, n) VALUES (1, 1), (1, -> caught 23505: duplicate key value violates unique constraint "t_pkey"
+WARNING:  INSERT INTO t (id, n) VALUES (2, NULL) -> caught 23502: null value in column "n" of relation "t" violates not-null constraint
+WARNING:  INSERT INTO t (id, n, c) VALUES (3, 1, - -> caught 23514: new row for relation "t" violates check constraint "t_c_check"
+WARNING:  INSERT INTO t (id, n, fk) VALUES (4, 1,  -> caught 23503: insert or update on table "t" violates foreign key constraint "t_fk_fkey"
+WARNING:  INSERT INTO t (id, n) VALUES (6, 3000000 -> caught 22003: integer out of range
+WARNING:  INSERT INTO t (id, n, s) VALUES (7, 1, ' -> caught 22001: value too long for type character varying(3)
+WARNING:  INSERT INTO t (id, n) VALUES (8, 1/0) -> caught 22012: division by zero
+INSERT 0 1
+WARNING:  caught 21000 more than one row returned by a subquery used as an expression
+DO

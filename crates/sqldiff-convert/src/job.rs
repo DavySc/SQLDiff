@@ -14,6 +14,12 @@ pub struct Job {
     pub overwrite: bool,
     /// Overwrite files edited by hand since the last run.
     pub discard_edits: bool,
+    /// Reuse no stored result (`OUT/.sqldiff/results`); every file is
+    /// checked again and its result stored.
+    pub fresh: bool,
+    /// The increment to check (`plan::Select`); empty checks the whole tree.
+    /// A file outside it is taken from the result store or not checked.
+    pub select: crate::plan::Select,
     /// `instance-report.json`, or the directory holding it.
     pub instances: Option<PathBuf>,
     /// Tier 6 (nothing found, not proven) in the queue too.
@@ -23,6 +29,28 @@ pub struct Job {
     pub proof: sqldiff_core::proof::Settings,
     /// The observer reads rows-affected counts (decision 1).
     pub row_counts: bool,
+}
+
+/// Writes `plan` to `OUT/.sqldiff/plan.json`.
+pub fn write_plan(plan: &crate::plan::Plan, out: &std::path::Path) -> Result<PathBuf, String> {
+    let path = out.join(crate::plan::FILE);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    std::fs::write(&path, plan.to_json() + "\n").map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// `sqldiff convert --plan`: reads the tree, plans it and writes the plan
+/// into `out`. Nothing is converted or checked.
+pub fn plan_into(
+    tree: &tree::Args,
+    out: &std::path::Path,
+) -> Result<(crate::plan::Plan, PathBuf), String> {
+    let (inputs, _) = tree::read(tree)?;
+    let plan = crate::plan::Plan::build(&tree::plan_inputs(tree, &inputs), tree.from);
+    let path = write_plan(&plan, out)?;
+    Ok((plan, path))
 }
 
 /// `certificates.json`: what the checker said about each converted routine.
@@ -220,8 +248,9 @@ pub struct Written {
 /// Reads the source tree, converts and checks it, applies the review ledger
 /// in the output folder and writes the output tree, its report and its
 /// review queue. A job stopped through `hooks` fails with
-/// [`tree::CANCELLED`] before anything is written into the output folder
-/// (which is created if it did not exist).
+/// [`tree::CANCELLED`] before any output file is written into the output
+/// folder (which is created if it did not exist); the checks it finished are
+/// kept in the result store (`.sqldiff/results`) for the next run.
 pub fn convert_into(job: &Job, hooks: &Hooks) -> Result<Written, String> {
     // Read before anything is written, so a bad path fails early.
     let inst = match &job.instances {
@@ -231,7 +260,21 @@ pub fn convert_into(job: &Job, hooks: &Hooks) -> Result<Written, String> {
     let (inputs, unreadable) = tree::read(&job.tree)?;
     tree::prepare_out(&job.tree.src, &job.out, job.overwrite)?;
     tree::guard_hand_edits(&job.out, job.discard_edits)?;
-    let mut t = tree::convert_with(&job.tree, &inputs, unreadable, Some(&job.out), hooks)?;
+    let mut t = tree::convert_increment(
+        &job.tree,
+        &inputs,
+        unreadable,
+        &job.out,
+        hooks,
+        job.fresh,
+        &job.select,
+    )?;
+    if !job.select.is_empty() {
+        write_plan(
+            &crate::plan::Plan::build(&tree::plan_inputs(&job.tree, &inputs), job.tree.from),
+            &job.out,
+        )?;
+    }
     // Review decisions committed next to the converted tree.
     let not_applied = tree::review_in(&mut t, &inputs, &job.out)?;
     // The last point a job stops at: from here on the output is written.

@@ -3,6 +3,9 @@
 //! Exit codes: 0 equal (or equal under assumptions), 1 different or
 //! unknown, 2 usage or I/O error.
 
+// Determinism guard (perf plan W0): see the other crates.
+#![warn(clippy::iter_over_hash_type)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -27,6 +30,7 @@ mod queue_cmd;
 mod review_cmd;
 mod review_status_cmd;
 mod source_cmd;
+mod stdin_input;
 
 use review_cmd::{Pipeline, ReviewArgs};
 
@@ -104,10 +108,16 @@ enum Command {
     /// Lint one artifact: residue from other dialects, terminator hazards,
     /// parse problems and pack limits.
     Check {
+        /// The file to check; `-` reads standard input.
         file: PathBuf,
         /// Dialect (default: from `dialect_map` or the path convention).
         #[arg(short, long)]
         dialect: Option<Dialect>,
+        /// With `-`: the path standard input stands for. It decides the
+        /// dialect, where the project config is searched from and the path
+        /// findings show; the file need not exist.
+        #[arg(long, value_name = "PATH")]
+        stdin_filepath: Option<PathBuf>,
         #[arg(short, long, value_enum, default_value_t = Format::Text)]
         format: Format,
         /// Check mode for composed output: templates by name (file stem).
@@ -204,6 +214,45 @@ enum Command {
         /// run (refused otherwise; record such edits in the review ledger).
         #[arg(long, requires = "overwrite")]
         discard_edits: bool,
+        /// Check every file again instead of reusing the results stored in
+        /// OUT/.sqldiff/results by an earlier run (a result is reused only
+        /// when everything its check reads is the same).
+        #[arg(long)]
+        fresh: bool,
+        /// How much of what is taken from that store is built again and
+        /// compared (`none`, `sample` or `all`). `sample` (the default)
+        /// checks one stored file in 50 each run, chosen from the tree and
+        /// the store's run count; `all` checks every stored result and
+        /// draft and the whole tree state; `none` trusts the store, and the
+        /// summary and both reports say the reuse was not verified.
+        #[arg(long, value_name = "MODE", default_value = "sample")]
+        recheck: sqldiff_convert::tree::Recheck,
+        /// Only plan: read SRC, find which file defines and uses which
+        /// object, order the files so that what a file uses comes first and
+        /// write OUT/.sqldiff/plan.json. Nothing is converted.
+        #[arg(long, conflicts_with_all = ["next", "schema", "object", "path", "changed"])]
+        plan: bool,
+        /// Check only the next N groups of files in plan order that have a
+        /// file not checked yet; the other files are taken from the result
+        /// store, or are not checked and count as not converted. `--next 0`
+        /// checks nothing and reports how much the store covers. Not with
+        /// --template or --no-catalog.
+        #[arg(long, value_name = "N")]
+        next: Option<usize>,
+        /// Check the files that define an object in this schema (repeatable).
+        #[arg(long, value_name = "SCHEMA")]
+        schema: Vec<String>,
+        /// Check this object (`schema.name` or a name) and what it uses that
+        /// is not checked yet (repeatable).
+        #[arg(long, value_name = "NAME")]
+        object: Vec<String>,
+        /// Check the files whose path matches this glob (`*`, `**`, `?`;
+        /// repeatable).
+        #[arg(long, value_name = "GLOB")]
+        path: Vec<String>,
+        /// Check every file with no stored result that matches.
+        #[arg(long)]
+        changed: bool,
         /// Check each file alone, without catalogs built from the whole tree.
         #[arg(long)]
         no_catalog: bool,
@@ -247,6 +296,13 @@ enum Command {
         /// too (tier 6: nothing found, not proven).
         #[arg(long)]
         queue_all: bool,
+        /// T-SQL to PostgreSQL: convert a system-versioned table whose two
+        /// period columns are HIDDEN to a plain table without them, without
+        /// the history table and the versioning triggers (ASM-TEMPORAL-
+        /// HISTORYLESS; history support is future work). Off by default;
+        /// tables with visible period columns keep their history.
+        #[arg(long)]
+        temporal_historyless: bool,
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
     },
@@ -290,6 +346,9 @@ enum Command {
         /// `instance-report.json` from `sqldiff instances`, or its directory.
         #[arg(long, value_name = "PATH")]
         instances: Option<PathBuf>,
+        /// As given to `sqldiff convert`.
+        #[arg(long)]
+        temporal_historyless: bool,
         /// Exit with 1 unless the review is complete.
         #[arg(long)]
         require_complete: bool,
@@ -468,6 +527,10 @@ fn emit(report: Report, format: Format, pipe: &mut Pipeline) -> Result<(), Strin
     Ok(())
 }
 
+// mimalloc: the engine allocates heavily; measured 17-39% faster conversions than the system allocator.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let code = match sqldiff_core::with_engine_stack(|| run(cli)) {
@@ -562,6 +625,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         Command::Check {
             file,
             dialect,
+            stdin_filepath,
             format,
             catalogs,
             templates,
@@ -569,8 +633,29 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             cfg,
             review,
         } => {
-            let cfg = cfg.resolve()?;
-            let art = read(&file, dialect, &cfg)?;
+            let stdin = stdin_input::is_stdin(&file);
+            if !stdin && stdin_filepath.is_some() {
+                return Err("--stdin-filepath needs `-` as the file".into());
+            }
+            let dir = stdin_input::config_dir(stdin_filepath.as_deref());
+            let project = stdin.then(|| cfg.project_dir(dir.as_deref())).flatten();
+            let cfg = if stdin {
+                cfg.resolve_from(dir)?
+            } else {
+                cfg.resolve()?
+            };
+            let art = if stdin {
+                let text = stdin_input::read_text()?;
+                stdin_input::artifact(
+                    text,
+                    stdin_filepath.as_deref(),
+                    project.as_deref(),
+                    dialect,
+                    &cfg,
+                )?
+            } else {
+                read(&file, dialect, &cfg)?
+            };
             let mut pipe = review_cmd::pipeline(cfg, &review)?;
             pipe.templates = template_dir(templates.as_deref(), params)?;
             let mut opts = pipe.options();
@@ -663,6 +748,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             parameters,
             extensions,
             instances,
+            temporal_historyless,
             require_complete,
             json,
             cfg,
@@ -679,6 +765,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             };
             review_status_cmd::run(review_status_cmd::Args {
                 tree: sqldiff_convert::tree::Args {
+                    recheck: Default::default(),
                     src,
                     from,
                     to,
@@ -690,6 +777,9 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     deployment: resolved.deployment.clone(),
                     catalogs,
                     catalogs_b,
+                    rules: sqldiff_convert::RuleOptions {
+                        temporal_historyless,
+                    },
                 },
                 out,
                 instances,
@@ -705,6 +795,14 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             jobs,
             overwrite,
             discard_edits,
+            fresh,
+            recheck,
+            plan,
+            next,
+            schema,
+            object,
+            path,
+            changed,
             no_catalog,
             catalogs,
             catalogs_b,
@@ -713,8 +811,16 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             extensions,
             instances,
             queue_all,
+            temporal_historyless,
             cfg,
         } => {
+            let select = sqldiff_convert::plan::Select {
+                next,
+                schemas: schema,
+                objects: object,
+                paths: path,
+                changed,
+            };
             let resolved = cfg.resolve()?;
             let helpers = resolved.options().helpers;
             let template = if template {
@@ -725,23 +831,33 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             } else {
                 None
             };
-            convert_cmd::run(convert_cmd::Args {
-                tree: sqldiff_convert::tree::Args {
-                    src,
-                    from,
-                    to,
-                    jobs,
-                    no_catalog,
-                    template,
-                    extensions: sqldiff_convert::tree::extensions(extensions),
-                    helpers,
-                    deployment: resolved.deployment.clone(),
-                    catalogs,
-                    catalogs_b,
+            let tree = sqldiff_convert::tree::Args {
+                recheck,
+                src,
+                from,
+                to,
+                jobs,
+                no_catalog,
+                template,
+                extensions: sqldiff_convert::tree::extensions(extensions),
+                helpers,
+                deployment: resolved.deployment.clone(),
+                catalogs,
+                catalogs_b,
+                rules: sqldiff_convert::RuleOptions {
+                    temporal_historyless,
                 },
+            };
+            if plan {
+                return convert_cmd::plan(&tree, &out);
+            }
+            convert_cmd::run(convert_cmd::Args {
+                tree,
                 out,
                 overwrite,
                 discard_edits,
+                fresh,
+                select,
                 instances,
                 queue_all,
                 proof: resolved.proof.clone(),

@@ -23,7 +23,7 @@ re-cuts these phases around a converter whose output needs no re-review, and
 
 ## Trust boundary today
 
-`derive_verdict` (`crates/sqldiff-core/src/session.rs`) returns "equal" when no
+`derive_verdict` (`crates/sqldiff-model/src/session.rs`) returns "equal" when no
 finding is `different` or `unknown` and no unknown reason is recorded. "Equal"
 is therefore the absence of an objection, and every component whose silence
 counts is trusted:
@@ -654,7 +654,7 @@ implementations and the drift controls.
   `crates/sqldiff-syntax/src/dialect.rs`). It is set by `--dialect-version`,
   `[dialect_versions]` in `sqldiff.toml` or a pack, or a `dialect_map` entry.
   On the `verification` branch it is validated against
-  `crates/sqldiff-core/profiles/lifecycle.toml` (`sqldiff_core::target`): a
+  `crates/sqldiff-model/profiles/lifecycle.toml` (`sqldiff_core::target`): a
   T-SQL target is `2019`, `2019/130`, `mi-2022`, `mi-evergreen`, `azure` or
   `fabric` with an optional compatibility level, an unknown version is an
   error, and the CLI prints a note for a `preview`, `legacy` or `retired`
@@ -768,7 +768,7 @@ level, and a probe run plus a delta review for each IBM i Technology Refresh.
 | Packaging and performance spike | Done: all four targets within budget (decision 2) |
 | Gate on the trivial fragment: `formal/lean` (`check_sound`, no axioms), `sqldiff_core::proof`, `--proof off|report|require` | Done; the CLI tests use a stand-in for the checker; CI runs the protocol tests on the real one on all four targets and, on Linux, the CLI's proof tests against it |
 | Decision 1 semantics in Rust | Enforced where a verdict could be wrong: result column names, reference side with `equivalent` and `refinements`, ORDER BY added, observer profile for row counts. Checked 2026-10-28 and already conservative (never equal): raises across dialects (not covered by statement equivalence), temporary tables and `SET` in a body. Coverage still to add, turning unknown into proven: error kinds and pack-declared user error codes across dialects, PostgreSQL raise message changes (unknown, T-SQL already different), session state, ORDER BY removed (different when the result can hold two rows) |
-| Coverage invariant | Enforced by construction within one dialect (`crates/sqldiff-core/src/coverage.rs`). Text outside statements is compared token by token (`GO` against `GO 5` is unknown). Inside statements every comparison step leaves a receipt for the text it decided: the structural diff (same tokens, same shell, or a named structural judgment), statement equivalence and the observer profile. A final check re-verifies the "same tokens" and "same shell" receipts and requires every significant token on both sides to be under a receipt or a finding; a token under none makes the verdict unknown ("not compared"). A step that forgets a unit therefore yields unknown, not a false equal. Across dialects the lowering lists what statement equivalence does not cover (`equiv::lower`); moving that onto receipts is still to do |
+| Coverage invariant | Enforced by construction within one dialect (`crates/sqldiff-equiv/src/coverage.rs`). Text outside statements is compared token by token (`GO` against `GO 5` is unknown). Inside statements every comparison step leaves a receipt for the text it decided: the structural diff (same tokens, same shell, or a named structural judgment), statement equivalence and the observer profile. A final check re-verifies the "same tokens" and "same shell" receipts and requires every significant token on both sides to be under a receipt or a finding; a token under none makes the verdict unknown ("not compared"). A step that forgets a unit therefore yields unknown, not a false equal. Across dialects the lowering lists what statement equivalence does not cover (`equiv::lower`); moving that onto receipts is still to do |
 | AST export with generated Lean types | Done for the syntax tree: `formal/lean/Sqldiff/Syntax.lean` is generated from the Rust kinds with a schema hash (a test fails while it is stale), requests carry the hash (`sqldiff-check/2`), and the checker decodes trees into Lean types and refuses unknown kinds, a hash mismatch or malformed text. Decoding costs 25 µs per one-statement request and 5.3 ms for 400 statements (Linux x64, this container). The canonical `Term` export follows with phase 1 |
 | Signed locks, `allowed_signers`, `spec-critic` | Not started |
 | Shipping `sqldiff-check` in releases | Not started |
@@ -822,7 +822,7 @@ Each needs a test before it counts as a bug; outcomes are recorded here.
   review also confirms the other. To be split, with care for the review
   store, which keys on assumption ids.
 - `GENERATE_UUID` needs IBM i 7.6 or a Technology Refresh on 7.4 and 7.5
-  (converter note in `sqldiff-convert/src/tsql.rs`), but has no
+  (converter note in `sqldiff-draft/src/tsql.rs`), but has no
   `[db2i.since]` entry, so the binder never gates it.
 - PostgreSQL `MERGE` (15+) and its 17+ clauses are not version-gated in code.
 - `version_lt` treats an unparsable version part as 0.

@@ -33,11 +33,13 @@ impl Fixture {
 
     fn convert(&self, helpers: Vec<Helper>) -> Tree {
         let a = tree::Args {
+            rules: Default::default(),
             src: self.dir.clone(),
             from: Dialect::Tsql,
             to: Dialect::Postgres,
             jobs: Some(1),
             no_catalog: false,
+            recheck: Default::default(),
             template: None,
             extensions: tree::extensions(Vec::new()),
             helpers,

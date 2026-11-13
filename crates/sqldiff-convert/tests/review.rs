@@ -298,11 +298,13 @@ mod tree_report {
 
     fn args(src: &std::path::Path) -> tree::Args {
         tree::Args {
+            rules: Default::default(),
             src: src.to_path_buf(),
             from: Dialect::Tsql,
             to: Dialect::Postgres,
             jobs: Some(1),
             no_catalog: false,
+            recheck: Default::default(),
             template: None,
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),
@@ -410,11 +412,13 @@ mod empty_files {
         // An empty ledger is still a ledger.
         std::fs::write(out.join(LEDGER_FILE), "").unwrap();
         let a = tree::Args {
+            rules: Default::default(),
             src: src.clone(),
             from: Dialect::Tsql,
             to: Dialect::Postgres,
             jobs: Some(1),
             no_catalog: false,
+            recheck: Default::default(),
             template: None,
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),

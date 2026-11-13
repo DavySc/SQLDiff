@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 
 use sqldiff_syntax::{Diagnostic, Dialect, SyntaxElement, SyntaxKind, SyntaxKind::*, SyntaxNode};
 
-use super::keywords::recasable;
+use super::keywords::{recasable, recasable_name};
 use super::{FormatOptions, IndentStyle, KeywordCase};
 
 /// Why a line break goes before a token.
@@ -505,11 +505,79 @@ pub(super) fn keyword_set(text: &str, toks: &[Tok], dialect: Dialect) -> BTreeSe
             continue;
         }
         let w = &text[t.start..t.end];
-        if w.is_ascii() && recasable(&w.to_ascii_uppercase(), dialect) {
+        if !w.is_ascii() {
+            continue;
+        }
+        let prev = k.checked_sub(1).map(|p| &toks[sig[p]]);
+        // `:name` is a psql or host variable, which is case sensitive.
+        if let Some(c) = prev.filter(|p| p.kind == COLON) {
+            // A word touching the colon is always a variable (`:Name`,
+            // `into :a :Date`, `x:Date`). Only `name: word`, with a gap,
+            // is a label, and the word after a label is a keyword.
+            let before = k.checked_sub(2).map(|p| &toks[sig[p]]);
+            let label = c.end < t.start
+                && before
+                    .is_some_and(|b| matches!(b.kind, IDENT | QUOTED_IDENT) && b.end == c.start);
+            if !label {
+                continue;
+            }
+        }
+        let upper = w.to_ascii_uppercase();
+        let word = |t: &Tok| text[t.start..t.end].to_ascii_uppercase();
+        // A type name stands after `::`, after `RETURNS`/`OF`, after `AS`
+        // inside `CAST(`, before `(`, after `DECLARE name`, and after the
+        // name it types in a column or parameter list. Elsewhere (a column,
+        // an alias) it is a name that happens to be called like a type.
+        let name_before =
+            |p: &Tok| p.kind == QUOTED_IDENT || (p.kind == IDENT && !recasable(&word(p), dialect));
+        let type_pos = next_is(L_PAREN)
+            || prev.is_some_and(|p| {
+                (p.kind == OP && &text[p.start..p.end] == "::")
+                    || (p.kind == IDENT && matches!(word(p).as_str(), "RETURNS" | "OF"))
+                    || (p.kind == IDENT
+                        && word(p) == "AS"
+                        && matches!(
+                            open_owner(text, toks, &sig, k).as_deref(),
+                            Some("CAST" | "TRY_CAST")
+                        ))
+                    || (name_before(p) && {
+                        let pp = k.checked_sub(2).map(|q| &toks[sig[q]]);
+                        pp.is_some_and(|q| q.kind == IDENT && word(q) == "DECLARE")
+                            || open_owner(text, toks, &sig, k).is_some_and(|o| {
+                                !matches!(o.as_str(), "" | "CAST" | "TRY_CAST")
+                                    && !recasable(&o, dialect)
+                            })
+                    })
+            });
+        if recasable(&upper, dialect) || recasable_name(&upper, dialect, next_is(L_PAREN), type_pos)
+        {
             out.insert(i);
         }
     }
     out
+}
+
+/// The word (upper case) just before the innermost parenthesis still open
+/// before significant token `k`; empty if that is not a plain word, `None`
+/// if no parenthesis is open.
+fn open_owner(text: &str, toks: &[Tok], sig: &[usize], k: usize) -> Option<String> {
+    let mut depth = 0usize;
+    for j in (0..k).rev() {
+        match toks[sig[j]].kind {
+            R_PAREN => depth += 1,
+            L_PAREN if depth > 0 => depth -= 1,
+            L_PAREN => {
+                let p = j.checked_sub(1).map(|q| &toks[sig[q]]);
+                return Some(match p {
+                    Some(p) if p.kind == IDENT => text[p.start..p.end].to_ascii_uppercase(),
+                    Some(p) if p.kind == QUOTED_IDENT => "\"".to_string(),
+                    _ => String::new(),
+                });
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Renders the layout. `reverted` holds top-level statements kept as written.

@@ -82,6 +82,46 @@ pub struct ConvertSpec {
     /// then judges each template by its woven instances.
     #[serde(default)]
     pub instances: Option<String>,
+    /// Check only part of the tree (`--next`, `--schema`, `--object`,
+    /// `--path`, `--changed`); none means the whole tree.
+    #[serde(default)]
+    pub increment: IncrementSpec,
+}
+
+/// Which files of a tree a conversion checks, as `sqldiff convert --next`
+/// and its companions say it. The rest of the tree is taken from the result
+/// store of the output folder or counts as not converted (never as equal).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IncrementSpec {
+    /// The next N groups of files in plan order not checked yet; 0 checks
+    /// nothing and reports how much the store covers.
+    #[serde(default)]
+    pub next: Option<usize>,
+    /// Files defining an object in one of these schemas.
+    #[serde(default)]
+    pub schemas: Vec<String>,
+    /// Objects and what they use that is not checked yet.
+    #[serde(default)]
+    pub objects: Vec<String>,
+    /// Path globs (`*`, `**`, `?`).
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Every file with no stored result that matches.
+    #[serde(default)]
+    pub changed: bool,
+}
+
+impl IncrementSpec {
+    fn select(&self) -> sqldiff_convert::plan::Select {
+        sqldiff_convert::plan::Select {
+            next: self.next,
+            schemas: names(&self.schemas),
+            objects: names(&self.objects),
+            paths: names(&self.paths),
+            changed: self.changed,
+        }
+    }
 }
 
 /// An instance check as the page asks for it: the arguments of
@@ -402,6 +442,22 @@ impl Command {
         }
         for c in &t.catalogs_b {
             args.extend(["--catalog-b".into(), path(c)]);
+        }
+        let sel = &job.select;
+        if let Some(n) = sel.next {
+            args.extend(["--next".into(), n.to_string()]);
+        }
+        for (flag, values) in [
+            ("--schema", &sel.schemas),
+            ("--object", &sel.objects),
+            ("--path", &sel.paths),
+        ] {
+            for v in values {
+                args.extend([flag.into(), v.clone()]);
+            }
+        }
+        if sel.changed {
+            args.push("--changed".into());
         }
         if let Some(p) = &job.instances {
             args.extend(["--instances".into(), path(p)]);
@@ -1159,6 +1215,7 @@ impl Runs {
                 p.0.store(checked, Ordering::Relaxed);
             })),
             cancel: None,
+            ..Default::default()
         };
         let r = Arc::clone(run);
         std::thread::Builder::new()
@@ -1699,6 +1756,7 @@ pub fn batch_cells(spec: &BatchSpec) -> Result<Vec<(usize, String, ConvertSpec)>
                     catalogs: Vec::new(),
                     catalogs_b: Vec::new(),
                     instances: None,
+                    increment: Default::default(),
                 },
             ));
         }
@@ -1721,6 +1779,68 @@ fn source_name(src: &str) -> Option<String> {
 /// The command a run of `spec` would carry, without starting one.
 pub fn command(spec: &ConvertSpec, isolated: bool) -> Result<Command, String> {
     prepare(spec, isolated).map(|(_, _, c, _)| c)
+}
+
+/// The plan of a tree as the page shows it before a run: how big it is and
+/// the groups of files in the order an increment takes them.
+#[derive(Debug, Serialize)]
+pub struct PlanView {
+    pub files: usize,
+    pub lines: usize,
+    pub groups: usize,
+    /// Groups of files that use each other in a cycle.
+    pub cyclic: usize,
+    /// The first groups in plan order, at most [`PlanView::SHOWN`].
+    pub first: Vec<PlanGroupView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlanGroupView {
+    /// Position in plan order, from 1.
+    pub n: usize,
+    pub files: usize,
+    pub lines: usize,
+    pub cyclic: bool,
+    /// The paths of the group's files, at most three.
+    pub paths: Vec<String>,
+}
+
+impl PlanView {
+    pub const SHOWN: usize = 50;
+}
+
+/// Reads the tree of `spec` and plans it (`sqldiff convert --plan`, but
+/// nothing is written). Refuses what a run would refuse.
+pub fn plan_view(spec: &ConvertSpec, isolated: bool) -> Result<PlanView, String> {
+    let (job, _, _, _) = prepare(spec, isolated)?;
+    let (inputs, _) = tree::read(&job.tree)?;
+    let plan =
+        sqldiff_convert::plan::Plan::build(&tree::plan_inputs(&job.tree, &inputs), job.tree.from);
+    let first = plan
+        .groups
+        .iter()
+        .enumerate()
+        .take(PlanView::SHOWN)
+        .map(|(i, g)| PlanGroupView {
+            n: i + 1,
+            files: g.files.len(),
+            lines: g.files.iter().map(|&f| plan.files[f].lines).sum(),
+            cyclic: g.cyclic,
+            paths: g
+                .files
+                .iter()
+                .take(3)
+                .map(|&f| plan.files[f].path.clone())
+                .collect(),
+        })
+        .collect();
+    Ok(PlanView {
+        files: plan.files.len(),
+        lines: plan.files.iter().map(|f| f.lines).sum(),
+        groups: plan.groups.len(),
+        cyclic: plan.groups.iter().filter(|g| g.cyclic).count(),
+        first,
+    })
 }
 
 /// The command an instance check of `spec` would carry, without starting one.
@@ -2109,6 +2229,7 @@ fn prepare(
         Some(p) => Some(existing(p)?),
         None => None,
     };
+    let select = spec.increment.select();
     let parameters = names(&spec.parameters);
     if !spec.template && !parameters.is_empty() {
         return Err("parameters are for template runs".into());
@@ -2128,11 +2249,13 @@ fn prepare(
     };
     let job = Job {
         tree: tree::Args {
+            rules: Default::default(),
             src,
             from,
             to,
             jobs: None,
             no_catalog: false,
+            recheck: Default::default(),
             template,
             extensions: tree::extensions(names(&spec.extensions)),
             helpers: cfg.options().helpers,
@@ -2143,6 +2266,8 @@ fn prepare(
         out: out.clone(),
         overwrite: spec.overwrite,
         discard_edits: false,
+        fresh: false,
+        select,
         instances,
         queue_all: false,
         // The GUI does not start the proof checker yet.
@@ -2175,9 +2300,12 @@ fn reopen(
     };
     // Stored after the review is shown: compressing takes a moment.
     let keep = match (&opened, &stored) {
-        (Ok(review), Some((st, extra))) if fresh => {
-            Some((Arc::clone(st), review.stored_key(extra), review.tree_json()))
-        }
+        (Ok(review), Some((st, extra))) if fresh => Some((
+            st.pending(),
+            Arc::clone(st),
+            review.stored_key(extra),
+            review.tree_json(),
+        )),
         _ => None,
     };
     {
@@ -2192,7 +2320,7 @@ fn reopen(
             Err(e) => *opening = Some(Opening::Failed(e)),
         }
     }
-    if let Some((st, key, json)) = keep {
+    if let Some((_pending, st, key, json)) = keep {
         st.put(&key, &json);
     }
 }
@@ -2229,6 +2357,7 @@ fn execute(run: &Arc<Run>, work: Work, stored: Option<&Arc<Stored>>) -> State {
             r.checked.store(checked, Ordering::Relaxed);
         })),
         cancel: Some(Arc::clone(&run.cancel)),
+        ..Default::default()
     };
     let finished = sqldiff_review::time::now;
     let stopped = |e: String| match e == tree::CANCELLED {
@@ -2327,6 +2456,7 @@ fn execute(run: &Arc<Run>, work: Work, stored: Option<&Arc<Stored>>) -> State {
         Ok(review) => {
             let keep = extra.map(|(st, extra)| {
                 (
+                    st.pending(),
                     Arc::clone(st),
                     review.stored_key(&extra),
                     review.tree_json(),
@@ -2335,10 +2465,13 @@ fn execute(run: &Arc<Run>, work: Work, stored: Option<&Arc<Stored>>) -> State {
             *run.review.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(Arc::new(Mutex::new(review)));
             // Compressing a large tree takes a moment: not on the run's time.
-            if let Some((st, key, json)) = keep {
+            if let Some((pending, st, key, json)) = keep {
                 let _ = std::thread::Builder::new()
                     .name(format!("sqldiff-store-{}", run.id))
-                    .spawn(move || st.put(&key, &json));
+                    .spawn(move || {
+                        st.put(&key, &json);
+                        drop(pending);
+                    });
             }
         }
         // Written all the same: the review can be opened from the command line.

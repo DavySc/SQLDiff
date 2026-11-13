@@ -525,3 +525,151 @@ fn keys_from_options_invert_apply() {
     assert!(keys.names().contains(&"indent".to_string()));
     assert!(FormatKeys::default().names().is_empty());
 }
+
+#[test]
+fn builtin_functions_types_and_literals_follow_keyword_case() {
+    let lower = with(|o| o.keyword_case = KeywordCase::Lower);
+    let src = "SELECT COUNT(*), NOW(), TRUE, CAST(a AS VARCHAR(5)), \"Count\", 'COUNT(*)', Count FROM t;\n";
+    let upper_src = "select count(*), now(), true, cast(a as varchar(5)) from t;\n";
+    for d in [Dialect::Postgres, Dialect::Db2i] {
+        let f = format(src, d, &lower);
+        assert!(f.kept.is_empty(), "{d:?}: {:?}", f.kept);
+        // Quoted names and string literals keep their case; a bare name that
+        // is not followed by `(` is not a function call.
+        assert_eq!(
+            f.text,
+            "select count(*), now(), true, cast(a as varchar(5)), \"Count\", 'COUNT(*)', Count\nfrom t;\n",
+            "{d:?}"
+        );
+        let up = format(upper_src, d, &with(|o| o.keyword_case = KeywordCase::Upper));
+        assert!(up.kept.is_empty(), "{d:?}: {:?}", up.kept);
+        assert_eq!(
+            up.text, "SELECT COUNT(*), NOW(), TRUE, CAST(a AS VARCHAR(5))\nFROM t;\n",
+            "{d:?}"
+        );
+    }
+}
+
+#[test]
+fn tsql_function_and_type_names_keep_their_case() {
+    let f = format(
+        "SELECT Count(*), GetDate(), COALESCE(a, 0) FROM t",
+        Dialect::Tsql,
+        &with(|o| o.keyword_case = KeywordCase::Lower),
+    );
+    assert!(f.kept.is_empty(), "{:?}", f.kept);
+    assert_eq!(
+        f.text,
+        "select Count(*), GetDate(), coalesce(a, 0)\nfrom t\n"
+    );
+}
+
+#[test]
+fn a_word_after_a_colon_is_a_variable_and_keeps_its_case() {
+    let up = with(|o| o.keyword_case = KeywordCase::Upper);
+    for d in [Dialect::Postgres, Dialect::Db2i] {
+        let f = format(
+            "select a from t where b = :Name and c = :Date and d = :count;\n",
+            d,
+            &up,
+        );
+        assert!(f.kept.is_empty(), "{d:?}: {:?}", f.kept);
+        assert!(
+            f.text.contains(":Name") && f.text.contains(":Date") && f.text.contains(":count"),
+            "{d:?}: {}",
+            f.text
+        );
+    }
+}
+
+#[test]
+fn type_names_are_recased_only_in_type_position() {
+    let up = with(|o| o.keyword_case = KeywordCase::Upper);
+    for d in [Dialect::Postgres, Dialect::Db2i] {
+        let f = format("select name, uuid, count(*) as json from t;\n", d, &up);
+        assert!(f.kept.is_empty(), "{d:?}: {:?}", f.kept);
+        assert_eq!(
+            f.text, "SELECT name, uuid, COUNT(*) AS json\nFROM t;\n",
+            "{d:?}"
+        );
+        let f = format(
+            "create table t (name varchar(5), id int);\nselect cast(a as int) from t;\n",
+            d,
+            &up,
+        );
+        assert!(f.kept.is_empty(), "{d:?}: {:?}", f.kept);
+        assert!(
+            f.text.contains("(name VARCHAR(5), id INT)"),
+            "{d:?}: {}",
+            f.text
+        );
+        assert!(f.text.contains("CAST(a AS INT)"), "{d:?}: {}", f.text);
+    }
+    let f = format(
+        "select x::int, count /* c */ (y) from t;\n",
+        Dialect::Postgres,
+        &up,
+    );
+    assert!(f.kept.is_empty(), "{:?}", f.kept);
+    assert!(
+        f.text.contains("x::INT") && f.text.contains("COUNT /* c */ (y)"),
+        "{}",
+        f.text
+    );
+}
+
+#[test]
+fn a_keyword_after_a_label_is_recased_and_aliases_are_not_types() {
+    let up = with(|o| o.keyword_case = KeywordCase::Upper);
+    let f = format(
+        "fetch_loop: loop select 1; end loop fetch_loop;\n",
+        Dialect::Db2i,
+        &up,
+    );
+    assert!(f.kept.is_empty(), "{:?}", f.kept);
+    assert!(f.text.contains("fetch_loop: LOOP"), "{}", f.text);
+    let f = format(
+        "retry: begin try select 1; end try begin catch select 2; end catch\n",
+        Dialect::Tsql,
+        &up,
+    );
+    assert!(f.text.starts_with("retry:\nBEGIN"), "{}", f.text);
+    let f = format(
+        "select a name, x json from t uuid;\n",
+        Dialect::Postgres,
+        &up,
+    );
+    assert!(f.kept.is_empty(), "{:?}", f.kept);
+    assert!(
+        f.text.contains("a name, x json") && f.text.contains("t uuid"),
+        "{}",
+        f.text
+    );
+    let f = format("declare v int; create function f(a int, b varchar(3)) returns int language sql as 'select 1';\n", Dialect::Postgres, &up);
+    assert!(
+        f.text.contains("DECLARE v INT") && f.text.contains("(a INT, b VARCHAR(3))"),
+        "{}",
+        f.text
+    );
+}
+
+#[test]
+fn variables_after_a_name_keep_their_case() {
+    let up = with(|o| o.keyword_case = KeywordCase::Upper);
+    for d in [Dialect::Postgres, Dialect::Db2i] {
+        for src in [
+            "select a into :Name :Date from t;\n",
+            "select a into :hv:Time from t;\n",
+            "select col :Date from t;\n",
+            "select a[i:Date] from t;\n",
+            "select a[1:Time] from t;\n",
+        ] {
+            let f = format(src, d, &up);
+            for var in [":Date", ":Time", ":Name"] {
+                if src.contains(var) {
+                    assert!(f.text.contains(var), "{d:?}: {src} -> {}", f.text);
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,70 @@
+The module 'cases' depends on the missing object 'dbo.nosuchproc'. The module will still be created; however, it cannot run successfully until the object exists.
+Msg 2627, Level 14, State 1, Server 546a2e6bfd03, Procedure dbo.cases, Line 5
+Violation of PRIMARY KEY constraint 'PK__t__3213E83FC2DBDBA4'. Cannot insert duplicate key in object 'dbo.t'. The duplicate key value is (1).
+The statement has been terminated.
+Msg 515, Level 16, State 2, Server 546a2e6bfd03, Procedure dbo.cases, Line 6
+Cannot insert the value NULL into column 'n', table 'tempdb.dbo.t'; column does not allow nulls. INSERT fails.
+The statement has been terminated.
+Msg 547, Level 16, State 1, Server 546a2e6bfd03, Procedure dbo.cases, Line 7
+The INSERT statement conflicted with the CHECK constraint "CK__t__c__4CA06362". The conflict occurred in database "tempdb", table "dbo.t", column 'c'.
+The statement has been terminated.
+Msg 547, Level 16, State 1, Server 546a2e6bfd03, Procedure dbo.cases, Line 8
+The INSERT statement conflicted with the FOREIGN KEY constraint "FK__t__fk__4D94879B". The conflict occurred in database "tempdb", table "dbo.pk", column 'id'.
+The statement has been terminated.
+Msg 245, Level 16, State 1, Server 546a2e6bfd03, Procedure dbo.cases, Line 9
+Conversion failed when converting the varchar value 'abc' to data type int.
+Msg 8115, Level 16, State 2, Server 546a2e6bfd03, Procedure dbo.cases, Line 10
+Arithmetic overflow error converting expression to data type int.
+The statement has been terminated.
+Msg 2628, Level 16, State 1, Server 546a2e6bfd03, Procedure dbo.cases, Line 11
+String or binary data would be truncated in table 'tempdb.dbo.t', column 's'. Truncated value: 'too'.
+The statement has been terminated.
+Msg 8134, Level 16, State 1, Server 546a2e6bfd03, Procedure dbo.cases, Line 12
+Divide by zero error encountered.
+The statement has been terminated.
+Msg 208, Level 16, State 1, Server 546a2e6bfd03, Procedure dbo.cases, Line 13
+Invalid object name 'dbo.nosuchtable'.
+Msg 50001, Level 16, State 1, Server 546a2e6bfd03, Procedure dbo.cases, Line 14
+x
+Msg 50000, Level 16, State 1, Server 546a2e6bfd03, Procedure dbo.cases, Line 15
+x
+Msg 2812, Level 16, State 62, Server 546a2e6bfd03, Procedure dbo.cases, Line 16
+Could not find stored procedure 'dbo.nosuchproc'.
+Msg 245, Level 16, State 1, Server 546a2e6bfd03, Procedure dbo.cases, Line 17
+Conversion failed when converting the varchar value 'abc' to data type int.
+Msg 547, Level 16, State 1, Server 546a2e6bfd03, Procedure dbo.cases, Line 18
+The DELETE statement conflicted with the REFERENCE constraint "FK__t__fk__4D94879B". The conflict occurred in database "tempdb", table "dbo.t", column 'fk'.
+The statement has been terminated.
+case_name steps
+--------- -----
+badobject 1
+check 1,2
+convert 1
+delfk 1,2
+divzero 1,2
+execbad 1,2
+fk 1,2
+notnull 1,2
+outer-badobject 1,3
+outer-check 1,3
+outer-convert 1
+outer-delfk 1,3
+outer-divzero 1,3
+outer-execbad 1,3
+outer-fk 1,3
+outer-notnull 1,3
+outer-overflow 1,3
+outer-raiserror 1,3
+outer-throw 1
+outer-truncate 1,3
+outer-unique 1,3
+outer-updconv 1
+overflow 1,2
+raiserror 1,2
+throw 1
+truncate 1,2
+unique 1,2
+updconv 1
+   
+- -
+rows in t 1

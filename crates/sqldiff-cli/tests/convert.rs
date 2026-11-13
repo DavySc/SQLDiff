@@ -777,3 +777,59 @@ fn base_catalogs_bind_and_are_neither_written_nor_counted() {
     assert!(err.contains("--catalog"), "{err}");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn temporal_historyless_is_an_opt_in_flag() {
+    let d = scratch("historyless");
+    let src = d.join("src");
+    write(
+        &src.join("a.sql"),
+        b"CREATE TABLE dbo.t (k INT NOT NULL PRIMARY KEY, f DATETIME2 GENERATED ALWAYS AS ROW START HIDDEN NOT NULL, e DATETIME2 GENERATED ALWAYS AS ROW END HIDDEN NOT NULL, v INT NULL, PERIOD FOR SYSTEM_TIME (f, e)) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.t_h));\n",
+    );
+    write(
+        &src.join("b.sql"),
+        b"CREATE PROCEDURE dbo.p AS\nBEGIN\n  SELECT * FROM dbo.t;\nEND\n",
+    );
+    let convert = |name: &str, extra: &[&str]| {
+        let out = d.join(name);
+        let mut args = vec![
+            "convert",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--to",
+            "postgres",
+            "--isolated",
+        ];
+        args.extend_from_slice(extra);
+        let o = run(&args);
+        assert!(o.status.code().is_some_and(|c| c <= 1), "{o:?}");
+        let a = std::fs::read_to_string(out.join("a.sql")).unwrap();
+        let report = std::fs::read_to_string(out.join("conversion-report.json")).unwrap();
+        (a, report)
+    };
+    let (a, report) = convert("off", &[]);
+    assert!(a.contains("CREATE TRIGGER"), "{a}");
+    assert!(!report.contains("ASM-TEMPORAL-HISTORYLESS"));
+    // The star over hidden columns is not converted by default.
+    assert_ne!(status(&report, "b.sql"), "assumptions", "{report}");
+    assert_ne!(status(&report, "b.sql"), "converted", "{report}");
+    let (a, report) = convert("on", &["--temporal-historyless"]);
+    assert!(!a.contains("TRIGGER") && !a.contains("t_h"), "{a}");
+    // With the option the star is the same on both sides.
+    assert_eq!(status(&report, "b.sql"), "assumptions", "{report}");
+}
+
+/// The status of `path` in a conversion report.
+fn status(report: &str, path: &str) -> String {
+    let j: serde_json::Value = serde_json::from_str(report).unwrap();
+    j["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == path)
+        .unwrap()["status"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
