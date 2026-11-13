@@ -75,6 +75,10 @@ fn statements_with_no_counterpart_are_marked() {
         impossible::HIERARCHYID,
     );
     marked(
+        "BULK INSERT dbo.t FROM 'C:\\load\\t.csv' WITH (FIELDTERMINATOR = '+|', ROWTERMINATOR = '&|\\n');\n",
+        impossible::BULK_INSERT,
+    );
+    marked(
         "CREATE TABLE dbo.t (a int) WITH (MEMORY_OPTIMIZED = ON, DURABILITY = SCHEMA_ONLY);\n",
         impossible::IN_MEMORY_OLTP,
     );

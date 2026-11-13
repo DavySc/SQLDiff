@@ -562,7 +562,7 @@ fn bulk_insert_is_refused_without_a_leftover_statement() {
             c.units[1]
                 .notes
                 .iter()
-                .any(|n| n.text.starts_with("BULK INSERT")),
+                .any(|n| n.text.starts_with("impossible to convert automatically [bulk-insert]")),
             "{:?}",
             c.units[1].notes
         );
