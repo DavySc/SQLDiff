@@ -237,3 +237,34 @@ fn nested_regions_in_bounds_compare_equal() {
         "the mirror compares equal in bounds"
     );
 }
+
+// ---- a renamed label is not noise when a jump may name a label
+
+fn pg_pair(a: &str, b: &str) -> Verdict {
+    let wrap = |name: &str, body: &str| {
+        Artifact::new(
+            name,
+            Dialect::Postgres,
+            format!("CREATE TABLE t (c integer, d integer);\nCREATE OR REPLACE PROCEDURE p(p_x integer)\nLANGUAGE plpgsql\nAS $$\nBEGIN\n{body}\nEND;\n$$;\n"),
+        )
+    };
+    diff(&wrap("a.sql", a), &wrap("b.sql", b), &Options::default()).verdict()
+}
+
+#[test]
+fn a_renamed_label_that_changes_which_block_a_jump_leaves_is_not_equal() {
+    // `EXIT a` leaves the inner block in A (the inner `a` shadows the outer)
+    // and the outer block in B: with p_x = 1, PostgreSQL inserts one row for
+    // A and none for B.
+    let a = "<<a>> BEGIN <<a>> BEGIN IF p_x = 1 THEN EXIT a; END IF; INSERT INTO t VALUES (1, 0); END; INSERT INTO t VALUES (2, 0); END;";
+    let b = "<<a>> BEGIN <<b>> BEGIN IF p_x = 1 THEN EXIT a; END IF; INSERT INTO t VALUES (1, 0); END; INSERT INTO t VALUES (2, 0); END;";
+    assert!(!is_equal(pg_pair(a, b)));
+    assert!(!is_equal(pg_pair(b, a)));
+}
+
+#[test]
+fn a_renamed_label_nothing_jumps_to_stays_noise() {
+    let a = "<<a>> BEGIN INSERT INTO t VALUES (1, 0); END;";
+    let b = "<<b>> BEGIN INSERT INTO t VALUES (1, 0); END;";
+    assert!(is_equal(pg_pair(a, b)));
+}
