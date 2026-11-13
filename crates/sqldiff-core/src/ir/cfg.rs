@@ -470,6 +470,21 @@ struct Ctx {
     labels: Vec<(String, NodeId, NodeId)>,
     /// Db2 `DECLARE c CONDITION FOR SQLSTATE '...'`.
     conditions: HashMap<String, Vec<ErrorKind>>,
+    /// Handler bodies (Db2 `DECLARE ... HANDLER`) enclosing this point. A
+    /// jump out of one would skip its `HandlerDone`, so `GOTO` is not
+    /// followed across them.
+    handler_depth: usize,
+}
+
+/// A label a later `GOTO` can reach: the statement list it is in is one of
+/// the lists enclosing the `GOTO`, and the label comes after it.
+struct GotoLabel {
+    name: String,
+    /// First node after the label.
+    node: NodeId,
+    /// `Ctx::frames.len()` where the label is.
+    frames: usize,
+    handler_depth: usize,
 }
 
 struct Lowerer {
@@ -489,6 +504,13 @@ struct Lowerer {
     /// Otherwise `@t` and `#t` share the key `T`, so a table variable
     /// replaced by a temporary table of the same name pairs.
     other_temps: HashSet<String>,
+    /// Labels of the statement lists being lowered, later labels of
+    /// enclosing lists included (lists are lowered back to front, so the
+    /// label a forward `GOTO` names is registered before the `GOTO`).
+    goto_labels: Vec<GotoLabel>,
+    /// How many times each label name occurs in the routine. A name that
+    /// occurs twice is never a jump target.
+    label_counts: HashMap<String, usize>,
 }
 
 /// Lowers an analyzed artifact.
@@ -548,7 +570,17 @@ pub fn lower_routine(
         savepoint_names: Vec::new(),
         routine_name: routine_node.as_ref().and_then(ast::routine_name),
         other_temps,
+        goto_labels: Vec::new(),
+        label_counts: HashMap::new(),
     };
+    for n in scan_root
+        .descendants()
+        .filter(|n| n.kind() == SyntaxKind::LABEL)
+    {
+        if let Some(t) = ast::sig_tokens(&n).next() {
+            *l.label_counts.entry(upper(&t)).or_insert(0) += 1;
+        }
+    }
     l.add(Op::ExitOk, None);
     l.add(Op::ExitErr, None);
     let entry = l.add(Op::Entry, None);
@@ -560,6 +592,7 @@ pub fn lower_routine(
         loop_: None,
         labels: Vec::new(),
         conditions: HashMap::new(),
+        handler_depth: 0,
     };
     let first = l.seq(&units, EXIT_OK, &ctx);
     l.edge(entry, Edge::Next, first);
@@ -872,11 +905,54 @@ impl Lowerer {
     }
 
     fn seq(&mut self, units: &[SyntaxNode], next: NodeId, ctx: &Ctx) -> NodeId {
+        let mark = self.goto_labels.len();
         let mut cur = next;
         for u in units.iter().rev() {
+            if u.kind() == SyntaxKind::LABEL {
+                if let Some(t) = ast::sig_tokens(u).next() {
+                    self.goto_labels.push(GotoLabel {
+                        name: upper(&t),
+                        node: cur,
+                        frames: ctx.frames.len(),
+                        handler_depth: ctx.handler_depth,
+                    });
+                }
+            }
             cur = self.unit(u, cur, ctx);
         }
+        self.goto_labels.truncate(mark);
         cur
+    }
+
+    /// The node a `GOTO name;` continues at: the label's, after leaving the
+    /// plain scopes (BEGIN..END blocks) between the jump and the label, as
+    /// `EXIT label` of an enclosing block does. `None` (the jump stays
+    /// opaque) unless the label is later in the same or an enclosing
+    /// statement list, occurs once in the routine, and the jump leaves no
+    /// handler body and no TRY block.
+    fn goto_target(&mut self, name: &str, ctx: &Ctx) -> Option<NodeId> {
+        if self.label_counts.get(name) != Some(&1) {
+            return None;
+        }
+        let label = self.goto_labels.iter().rev().find(|l| l.name == name)?;
+        let (node, depth) = (label.node, label.frames);
+        if label.handler_depth != ctx.handler_depth || depth > ctx.frames.len() {
+            return None;
+        }
+        let mut scopes = Vec::new();
+        for f in &ctx.frames[depth..] {
+            match f {
+                Frame::Scope(s) => scopes.push(*s),
+                _ => return None,
+            }
+        }
+        let mut to = node;
+        for s in scopes {
+            let leave = self.add(Op::Leave(s), None);
+            self.edge(leave, Edge::Next, to);
+            to = leave;
+        }
+        Some(to)
     }
 
     fn unit(&mut self, n: &SyntaxNode, next: NodeId, ctx: &Ctx) -> NodeId {
@@ -972,6 +1048,7 @@ impl Lowerer {
         // Handlers: lowered with the context outside this block's handlers.
         let mut handlers = Vec::new();
         let mut handler_ctx = inner.clone();
+        handler_ctx.handler_depth += 1;
         self.push_frame(&mut handler_ctx, Frame::Scope(scope));
         for h in n.children().filter(|c| c.kind() == SyntaxKind::HANDLER) {
             let words: Vec<String> = ast::header_tokens(&h).iter().take(3).map(upper).collect();
@@ -1344,6 +1421,16 @@ impl Lowerer {
                         self.edge(t, Edge::False, next);
                         return t;
                     }
+                    let id = self.add(Op::Nop, Some(n.clone()));
+                    self.edge(id, Edge::Next, to);
+                    return id;
+                }
+            }
+            "GOTO"
+                if toks.len() <= 3
+                    && toks.get(1).is_some_and(|t| t.kind() == SyntaxKind::IDENT) =>
+            {
+                if let Some(to) = self.goto_target(&w(1), ctx) {
                     let id = self.add(Op::Nop, Some(n.clone()));
                     self.edge(id, Edge::Next, to);
                     return id;
@@ -1809,3 +1896,6 @@ fn resolve_oracle(prof: &Profile, frames: &[Frame], kind: ErrorKind, resume: Nod
 
 #[cfg(test)]
 mod route_tests;
+
+#[cfg(test)]
+mod goto_tests;
