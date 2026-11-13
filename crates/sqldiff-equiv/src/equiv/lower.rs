@@ -1430,7 +1430,10 @@ fn walk(node: &SyntaxNode, u: &mut Unit) {
             regions.iter().filter(|r| r.start == i).collect();
         starting.sort_by_key(|r| std::cmp::Reverse(r.label));
         for r in starting {
-            mark(u, CtlKind::Block, c);
+            // The conversion's block opener stands for the label (its
+            // source), so the marker is anchored there; the first unit of the
+            // region is where the block begins.
+            mark_at(u, CtlKind::Block, c, &kids[r.label]);
             u.blocks.push((r.name.clone(), u.tries));
             u.flow.push("a block a GOTO leaves");
             u.depth += 1;
@@ -1505,7 +1508,12 @@ fn unit(c: &SyntaxNode, u: &mut Unit) {
             u.blocks.push((name, u.tries));
             u.flow.push("a block a GOTO leaves");
             u.depth += 1;
-            walk(c, u);
+            // The block's own label is not a statement.
+            for k in cst::structural_children(c) {
+                if k.kind() != SyntaxKind::LABEL {
+                    unit(&k, u);
+                }
+            }
             u.depth -= 1;
             u.flow.pop();
             u.blocks.pop();
@@ -2324,7 +2332,9 @@ fn goto_block(c: &SyntaxNode, u: &Unit) -> Option<String> {
         .map(|t| t.text.clone())
         .collect::<String>();
     let plain = !name.is_empty()
-        && name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
     let plain_block = !c.children().any(|k| {
         matches!(
             k.kind(),
@@ -2345,7 +2355,9 @@ fn goto_exit(c: &SyntaxNode, u: &mut Unit) -> bool {
         .cloned()
         .collect();
     let (word, target) = match (u.dialect, toks.as_slice()) {
-        (Dialect::Tsql, [g, l]) if g.up == "GOTO" && l.kind == K::Word => ("GOTO", l.text.to_lowercase()),
+        (Dialect::Tsql, [g, l]) if g.up == "GOTO" && l.kind == K::Word => {
+            ("GOTO", l.text.to_lowercase())
+        }
         (Dialect::Tsql, [g, ..]) if g.up == "GOTO" => {
             u.uncovered.push((c.clone(), "`GOTO`".into()));
             return true;
@@ -2362,8 +2374,10 @@ fn goto_exit(c: &SyntaxNode, u: &mut Unit) -> bool {
         _ => return false,
     };
     let Some(at) = u.blocks.iter().rposition(|(b, _)| *b == target) else {
-        u.uncovered
-            .push((c.clone(), format!("`{word} {target}` that leaves no block it reads")));
+        u.uncovered.push((
+            c.clone(),
+            format!("`{word} {target}` that leaves no block it reads"),
+        ));
         return true;
     };
     if u.blocks[at].1 != u.tries {

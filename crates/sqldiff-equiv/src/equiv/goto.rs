@@ -94,7 +94,6 @@ impl Index {
 
     /// The regions of the statement list `units`.
     pub fn regions(&self, units: &[SyntaxNode]) -> Vec<Region> {
-        eprintln!("DBG labels {:?} gotos {:?} units {:?}", self.labels, self.gotos.iter().map(|g| g.1.clone()).collect::<Vec<_>>(), units.iter().map(|u| u.kind()).collect::<Vec<_>>());
         let mut out = Vec::new();
         for (li, ln) in units.iter().enumerate() {
             if ln.kind() != SyntaxKind::LABEL {
@@ -143,7 +142,6 @@ impl Index {
             .collect();
         let mut keep = crossing.into_iter();
         out.retain(|_| !keep.next().unwrap_or(false));
-        eprintln!("DBG regions {:?}", out);
         out
     }
 }

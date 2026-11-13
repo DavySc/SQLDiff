@@ -78,3 +78,102 @@ fn a_jump_into_a_block_is_not_followed() {
     let r = run(src, &other);
     assert_ne!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
 }
+
+// ---- T-SQL against its PostgreSQL conversion: a forward GOTO is a labelled
+// block left with EXIT (statement-level equivalence).
+
+fn tsql_file(body: &str) -> Artifact {
+    Artifact::new(
+        "p.sql",
+        Dialect::Tsql,
+        format!("CREATE TABLE dbo.t (c int, d int);\nGO\nCREATE PROCEDURE dbo.p @x int\nAS\nBEGIN\nSET XACT_ABORT ON;\nDECLARE @y int = 0;\n{body}\nEND\n"),
+    )
+}
+
+fn pg_file(body: &str) -> Artifact {
+    Artifact::new(
+        "p.pg.sql",
+        Dialect::Postgres,
+        format!("CREATE TABLE t (c integer, d integer);\nCREATE OR REPLACE PROCEDURE p(p_x integer)\nLANGUAGE plpgsql\nAS $$\nDECLARE\n  v_y integer;\nBEGIN\n  v_y := 0;\n{body}\nEND;\n$$;\n"),
+    )
+}
+
+fn cross(t: &str, p: &str) -> Verdict {
+    diff(&tsql_file(t), &pg_file(p), &Options::default()).verdict()
+}
+
+const T_ONE: &str = "IF @x = 1\nBEGIN\nSET @y = 5;\nGOTO Done\nEND\nSET @y = @x + 1;\nDone:\nUPDATE dbo.t SET c = @y;";
+
+fn p_one(block_end_after_update: bool, exit: &str, label: &str) -> String {
+    let (a, b) = if block_end_after_update {
+        ("", "END;")
+    } else {
+        ("END;", "")
+    };
+    format!(
+        "<<{label}>>\nBEGIN\nIF p_x = 1 THEN\nv_y := 5;\n{exit}\nEND IF;\nv_y := p_x + 1;\n{a}\nUPDATE t SET c = v_y;\n{b}"
+    )
+}
+
+#[test]
+fn a_forward_goto_and_its_labelled_block_are_equal() {
+    let v = cross(T_ONE, &p_one(false, "EXIT goto_done;", "goto_done"));
+    assert!(
+        matches!(v, Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{v:?}"
+    );
+    // The name of the label is not part of the meaning.
+    let v = cross(T_ONE, &p_one(false, "EXIT other;", "other"));
+    assert!(
+        matches!(v, Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{v:?}"
+    );
+}
+
+#[test]
+fn a_block_that_does_not_match_the_jump_is_not_equal() {
+    // No jump out of the block: the statement after the IF runs.
+    let v = cross(T_ONE, &p_one(false, "NULL;", "goto_done"));
+    assert!(
+        !matches!(v, Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{v:?}"
+    );
+    // The block also holds the UPDATE the label is before: EXIT skips it.
+    let v = cross(T_ONE, &p_one(true, "EXIT goto_done;", "goto_done"));
+    assert!(
+        !matches!(v, Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{v:?}"
+    );
+    // The block ends before the assignment the jump must skip.
+    let early = "<<goto_done>>\nBEGIN\nIF p_x = 1 THEN\nv_y := 5;\nEXIT goto_done;\nEND IF;\nEND;\nv_y := p_x + 1;\nUPDATE t SET c = v_y;";
+    let v = cross(T_ONE, early);
+    assert!(
+        !matches!(v, Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{v:?}"
+    );
+    // No block at all.
+    let none = "IF p_x = 1 THEN\nv_y := 5;\nELSE\nv_y := p_x + 1;\nEND IF;\nUPDATE t SET c = v_y;";
+    let v = cross(T_ONE, none);
+    // Equal here is right (same behaviour without a jump): it must not fail
+    // or claim a difference, but it may stay unproven.
+    assert_ne!(v, Verdict::Different, "{v:?}");
+}
+
+#[test]
+fn nested_blocks_leave_the_right_one() {
+    let t = "IF @x = 2 GOTO B;\nIF @x = 1 GOTO A;\nSET @y = 3;\nA:\nSET @y = @y + 1;\nB:\nUPDATE dbo.t SET c = @y;";
+    let p = |a: &str, b: &str| {
+        format!("<<goto_b>>\nBEGIN\nIF p_x = 2 THEN EXIT {b}; END IF;\n<<goto_a>>\nBEGIN\nIF p_x = 1 THEN EXIT {a}; END IF;\nv_y := 3;\nEND;\nv_y := v_y + 1;\nEND;\nUPDATE t SET c = v_y;")
+    };
+    let v = cross(t, &p("goto_a", "goto_b"));
+    assert!(
+        matches!(v, Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{v:?}"
+    );
+    // The jumps swapped: each leaves the other block.
+    let v = cross(t, &p("goto_b", "goto_a"));
+    assert!(
+        !matches!(v, Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{v:?}"
+    );
+}
