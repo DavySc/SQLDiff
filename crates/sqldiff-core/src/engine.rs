@@ -804,6 +804,11 @@ pub fn pair_states(
 /// the routines of `a` and `b` are the same fact about the input
 /// (`equiv::identity`). Nothing calls this on the diff path.
 pub fn identity(a: &Artifact, b: &Artifact, opts: &Options) -> Vec<equiv::identity::UnitReport> {
+    report_outcome(a, b, opts, false).identity
+}
+
+/// The statement-level comparison a report reads (`identity`, `coupling`).
+fn report_outcome(a: &Artifact, b: &Artifact, opts: &Options, coupling: bool) -> equiv::Outcome {
     let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
     let ab = Analyzed::new(b, Side::B, opts.excerpt_lines);
     let side_a = side(a.dialect, &opts.catalog_a, &opts.facts_a);
@@ -811,7 +816,25 @@ pub fn identity(a: &Artifact, b: &Artifact, opts: &Options) -> Vec<equiv::identi
     let mut schema_a = side_a.schema.for_check(ReadSide::Source, unrecorded());
     let mut schema_b = side_b.schema.for_check(ReadSide::Target, unrecorded());
     schema_a.list_stars_with(&mut schema_b);
-    equiv::compare(&aa, &ab, &schema_a, &schema_b, &[]).identity
+    if coupling {
+        equiv::compare_report(&aa, &ab, &schema_a, &schema_b, &[])
+    } else {
+        equiv::compare(&aa, &ab, &schema_a, &schema_b, &[])
+    }
+}
+
+/// Report only (region-comparison design, stage 0a): the relational variable
+/// coupling of the routine pairs of `a` and `b` (`equiv::coupling`), with its
+/// metered work. Nothing calls this on the diff path.
+pub fn coupling(
+    a: &Artifact,
+    b: &Artifact,
+    opts: &Options,
+) -> (
+    Vec<equiv::coupling::UnitCoupling>,
+    sqldiff_model::work::Work,
+) {
+    sqldiff_model::work::scope("coupling", || report_outcome(a, b, opts, true).coupling)
 }
 
 /// Report only (E2): the conditions the explorer treats as one decision

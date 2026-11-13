@@ -11,6 +11,7 @@ pub mod ast;
 mod call;
 pub mod canon;
 pub mod compare;
+pub mod coupling;
 pub mod cursor;
 pub mod ddl;
 pub mod dynamic;
@@ -72,6 +73,12 @@ pub struct Outcome {
     /// Which conditions of the routine pairs are the same fact about the
     /// input (`identity.rs`). A report: nothing reads it on the diff path.
     pub identity: Vec<identity::UnitReport>,
+    /// Relational variable coupling (`coupling.rs`), computed only for the
+    /// `coupling` report. A report: nothing reads it on the diff path.
+    pub coupling: Vec<coupling::UnitCoupling>,
+    /// Input, not result: whether to compute `coupling` ([`compare_report`]).
+    /// Off, the analysis does not run and counts no work.
+    coupling_on: bool,
     /// The byte ranges of the statements each side's lowering passed over
     /// with a note instead of comparing (`Unit::noted`), A then B.
     pub noted: [Vec<(usize, usize)>; 2],
@@ -368,7 +375,33 @@ pub fn compare_within(
     anchors: &[Anchor],
     allowance: &Allowance,
 ) -> Outcome {
-    let mut out = Outcome::default();
+    compare_flagged(a, b, sa, sb, anchors, allowance, false)
+}
+
+/// [`compare`] that also computes `Outcome::coupling` (report only).
+pub fn compare_report(
+    a: &Analyzed,
+    b: &Analyzed,
+    sa: &Schema,
+    sb: &Schema,
+    anchors: &[Anchor],
+) -> Outcome {
+    compare_flagged(a, b, sa, sb, anchors, &Allowance::new(None), true)
+}
+
+fn compare_flagged(
+    a: &Analyzed,
+    b: &Analyzed,
+    sa: &Schema,
+    sb: &Schema,
+    anchors: &[Anchor],
+    allowance: &Allowance,
+    coupling_on: bool,
+) -> Outcome {
+    let mut out = Outcome {
+        coupling_on,
+        ..Outcome::default()
+    };
     if let Some(pairs) = trigger::pairs(a, b, sa, sb, &mut out) {
         for (mut ua, mut ub, sa, sb) in pairs {
             tv_names(a, b, &mut ua, &mut ub);
@@ -850,6 +883,10 @@ fn compare_units_within(
     let pairs = pair_items(a, b, &ia, &ib, &gaps, anchors, wit.as_ref(), allowance, out);
     out.identity
         .push(identity::analyze(a, b, ua, ub, &ia, &ib, &pairs));
+    if out.coupling_on {
+        out.coupling
+            .push(coupling::analyze(a, b, ua, ub, &ia, &ib, &pairs));
+    }
     calls(a, b, ua, ub, sa, sb, anchors, ((&ia, &ib), &pairs), out);
     for p in places {
         if !same_place_paired((&ia, &ib), &pairs, &p.x, &p.y, anchors) {
