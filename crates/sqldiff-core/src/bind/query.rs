@@ -40,6 +40,18 @@ struct Source {
     failed: Option<usize>,
     /// Query group of a derived table's own query, which does not see the derived table.
     body: Option<usize>,
+    /// A named table (not a view, CTE or derived table): PostgreSQL gives it
+    /// system columns (`ctid`, `xmin`, …) that no catalog lists.
+    base_table: bool,
+}
+
+/// The system columns every PostgreSQL table has.
+fn is_pg_system_column(d: Dialect, key: &str) -> bool {
+    d == Dialect::Postgres
+        && matches!(
+            key.to_ascii_lowercase().as_str(),
+            "ctid" | "xmin" | "xmax" | "cmin" | "cmax" | "tableoid"
+        )
 }
 
 impl Source {
@@ -824,6 +836,7 @@ impl<'a> Binder<'a> {
                                 .cloned()
                         })
                         .flatten();
+                    let mut base_table = false;
                     let (columns, authoritative, failed) = if let Some((_, cols)) = cte {
                         self.add_ref(
                             RefKind::Table,
@@ -840,6 +853,7 @@ impl<'a> Binder<'a> {
                         match self.table_ref(&p.parts, p.span, stmt) {
                             Some(tb) => {
                                 let auth = tb.columns_known;
+                                base_table = tb.kind != TableKind::View;
                                 (auth.then(|| cols_of(d, &tb)), auth, None)
                             }
                             None => {
@@ -864,6 +878,7 @@ impl<'a> Binder<'a> {
                         from: 0,
                         failed,
                         body: None,
+                        base_table,
                     });
                     if p.head_target && !an.targets.iter().any(|(g, _)| *g == p.group) {
                         an.targets.push((p.group, idx));
@@ -889,6 +904,7 @@ impl<'a> Binder<'a> {
                         from: 0,
                         failed: None,
                         body: p.body,
+                        base_table: false,
                     });
                 }
                 PendingKind::DataChange(inner) => {
@@ -905,6 +921,7 @@ impl<'a> Binder<'a> {
                         from: 0,
                         failed: None,
                         body: None,
+                        base_table: false,
                     });
                 }
                 PendingKind::Function => {
@@ -920,6 +937,7 @@ impl<'a> Binder<'a> {
                         from: 0,
                         failed: None,
                         body: None,
+                        base_table: false,
                     });
                 }
             }
@@ -1172,6 +1190,7 @@ impl<'a> Binder<'a> {
                 from: 0,
                 failed: None,
                 body: None,
+                base_table: false,
             });
         };
         if d == Dialect::Tsql {
@@ -1383,6 +1402,13 @@ impl<'a> Binder<'a> {
                         Resolution::Resolved(target),
                     );
                 }
+                None if src.base_table && is_pg_system_column(self.d, &key) => self.add_ref(
+                    RefKind::Column,
+                    n.text.clone(),
+                    (n.start, n.end),
+                    stmt,
+                    Resolution::Resolved(Target::Implicit),
+                ),
                 None if src.authoritative => {
                     let disp = src.display.clone();
                     self.unknown_column_in(&n.text, &disp, (n.start, n.end), stmt);
@@ -2297,6 +2323,7 @@ impl<'a> Binder<'a> {
                                     from: 0,
                                     failed: None,
                                     body: None,
+                                    base_table: false,
                                 };
                                 self.column_of(&src, n, &name, span, stmt);
                             }
@@ -2437,6 +2464,13 @@ impl<'a> Binder<'a> {
                         Resolution::Resolved(target),
                     );
                 }
+                None if src.base_table && is_pg_system_column(self.d, &key) => self.add_ref(
+                    RefKind::Column,
+                    name.to_string(),
+                    span,
+                    stmt,
+                    Resolution::Resolved(Target::Implicit),
+                ),
                 None if src.authoritative => {
                     let disp = src.display.clone();
                     self.unknown_column_in(&n.text, &disp, span, stmt);

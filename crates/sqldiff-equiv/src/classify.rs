@@ -238,6 +238,13 @@ pub fn stmt_kind(node: &SyntaxNode, dialect: Dialect) -> StmtKind {
 
 /// Target object of a write statement, as unquoted name parts.
 pub fn write_target(node: &SyntaxNode) -> Option<Vec<String>> {
+    write_target_via(node).map(|x| x.0)
+}
+
+/// [`write_target`], and whether the statement names a CTE of its own WITH
+/// list as the target, so that the returned table is read only in the CTE's
+/// query and not written anywhere in the statement's text.
+pub fn write_target_via(node: &SyntaxNode) -> Option<(Vec<String>, bool)> {
     let toks: Vec<SyntaxToken> = ast::sig_tokens(node).collect();
     let mut i = dml_index(&toks)?;
     i += 1;
@@ -269,10 +276,87 @@ pub fn write_target(node: &SyntaxNode) -> Option<Vec<String>> {
     let parts = ast::qualified_name_at(&toks, i);
     if parts.len() == 1 {
         if let Some(real) = resolve_alias(&toks, i + 1, &parts[0]) {
-            return Some(real);
+            return Some((real, false));
+        }
+        if let Some(real) = cte_base(&toks, &parts[0]) {
+            return Some((real, true));
         }
     }
-    (!parts.is_empty()).then_some(parts)
+    (!parts.is_empty()).then_some((parts, false))
+}
+
+/// The base table T-SQL changes when an UPDATE or DELETE names a CTE of the
+/// statement's own WITH list (`WITH c AS (SELECT … FROM t …) UPDATE c …`):
+/// the first FROM table of that CTE's query. `None` unless the statement
+/// starts with WITH and `name` is one of its CTEs.
+fn cte_base(toks: &[SyntaxToken], name: &str) -> Option<Vec<String>> {
+    let w = |i: usize| toks.get(i).and_then(word);
+    if w(0).as_deref() != Some("WITH") {
+        return None;
+    }
+    let close = |open: usize| {
+        let mut depth = 0;
+        for (j, t) in toks.iter().enumerate().skip(open) {
+            match t.kind() {
+                SyntaxKind::L_PAREN => depth += 1,
+                SyntaxKind::R_PAREN => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    let mut i = 1;
+    if w(i).as_deref() == Some("RECURSIVE") {
+        i += 1;
+    }
+    loop {
+        let cte = toks
+            .get(i)?
+            .text()
+            .trim_matches(|c| c == '[' || c == ']' || c == '"');
+        i += 1;
+        if toks.get(i).is_some_and(|t| t.kind() == SyntaxKind::L_PAREN) {
+            i = close(i)? + 1;
+        }
+        if w(i).as_deref() != Some("AS") {
+            return None;
+        }
+        i += 1;
+        while matches!(w(i).as_deref(), Some("NOT" | "MATERIALIZED")) {
+            i += 1;
+        }
+        if !toks.get(i).is_some_and(|t| t.kind() == SyntaxKind::L_PAREN) {
+            return None;
+        }
+        let j = close(i)?;
+        if cte.eq_ignore_ascii_case(name) {
+            let mut depth = 0;
+            for k in i..j {
+                match toks[k].kind() {
+                    SyntaxKind::L_PAREN => depth += 1,
+                    SyntaxKind::R_PAREN => depth -= 1,
+                    _ if depth == 1 && word(&toks[k]).as_deref() == Some("FROM") => {
+                        let parts = ast::qualified_name_at(toks, k + 1);
+                        return (!parts.is_empty()).then_some(parts);
+                    }
+                    _ => {}
+                }
+            }
+            return None;
+        }
+        if !toks
+            .get(j + 1)
+            .is_some_and(|t| t.kind() == SyntaxKind::COMMA)
+        {
+            return None;
+        }
+        i = j + 2;
+    }
 }
 
 /// A statement's data-modifying CTEs (kind and target) and its OUTPUT … INTO

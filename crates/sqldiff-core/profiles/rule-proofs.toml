@@ -1519,3 +1519,10 @@ kind = "converter"
 proof = "engine"
 note = "GOTO l inside such a block as `EXIT goto_l`"
 sites = ["sqldiff-draft/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.dml.update-cte"
+kind = "converter"
+proof = "engine"
+note = "WITH c AS (SELECT … FROM t) UPDATE c SET col = computed: updated by row identity (ctid) from the CTE's query as a derived table"
+sites = ["sqldiff-draft/src/tsql.rs"]
