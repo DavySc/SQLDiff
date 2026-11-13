@@ -17,12 +17,18 @@ GO
 CREATE PROCEDURE Sales.One @n int AS BEGIN SET NOCOUNT ON; END;
 GO
 CREATE PROCEDURE Sales.Two @n int AS BEGIN SET NOCOUNT ON; END;
+GO
+CREATE TABLE Sales.Things (Id int NOT NULL PRIMARY KEY, Name nvarchar(50) NOT NULL);
+GO
+CREATE VIEW Sales.ThingNames AS SELECT Name FROM Sales.Things;
 ";
 
 const CAT_D: &str = "CREATE SCHEMA SALES;
 CREATE PROCEDURE SALES.NOOP () LANGUAGE SQL BEGIN END;
 CREATE PROCEDURE SALES.OTHER () LANGUAGE SQL BEGIN END;
 CREATE PROCEDURE SALES.ONE (IN P_N INTEGER) LANGUAGE SQL BEGIN END;
+CREATE TABLE SALES.THINGS (ID INTEGER NOT NULL PRIMARY KEY, NAME VARCHAR(50) NOT NULL);
+CREATE VIEW SALES.THINGNAMES AS SELECT NAME FROM SALES.THINGS;
 ";
 
 fn run(a: &str, b: &str, cat_d: &str) -> Report {
@@ -229,4 +235,154 @@ fn a_callee_whose_result_sets_the_catalog_did_not_read_is_not_compared() {
         r.unknown_reasons
     );
     assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
+fn ep(level1: &str, name: &str, col: Option<&str>, text: &str) -> String {
+    let c = col.map_or(String::new(), |c| {
+        format!(", @level2type = N'COLUMN', @level2name = N'{c}'")
+    });
+    format!(
+        "EXEC sp_addextendedproperty @name = N'MS_Description', @value = N'{text}', @level0type = N'SCHEMA', @level0name = N'Sales', @level1type = N'{level1}', @level1name = N'{name}'{c};"
+    )
+}
+
+fn comment_equal(a: &str, b: &str) {
+    let r = run(a, b, CAT_D);
+    assert!(r.unknown_reasons.is_empty(), "{:?}", r.unknown_reasons);
+    assert!(
+        !r.findings.iter().any(|f| f.verdict == Verdict::Different),
+        "{:#?}",
+        r.findings
+    );
+    assert_eq!(r.verdict(), Verdict::EqualUnderAssumptions);
+    let ids: Vec<&str> = r.assumptions.iter().map(|a| a.id.as_str()).collect();
+    for id in ["ASM-EXTPROP-COMMENT", "ASM-FACT-V35"] {
+        assert!(ids.contains(&id), "{id}: {ids:?}");
+    }
+}
+
+#[test]
+fn a_table_comment_is_equal_under_the_comment_assumptions() {
+    comment_equal(
+        &ep("TABLE", "Things", None, "Things sold"),
+        "COMMENT ON TABLE Sales.Things IS 'Things sold';",
+    );
+}
+
+#[test]
+fn a_column_comment_is_equal() {
+    comment_equal(
+        &ep("TABLE", "Things", Some("Name"), "it''s the name"),
+        "COMMENT ON COLUMN Sales.Things.Name IS 'it''s the name';",
+    );
+}
+
+#[test]
+fn a_schema_comment_is_equal() {
+    comment_equal(
+        "EXEC sp_addextendedproperty @name = N'MS_Description', @value = N'Sales data', @level0type = N'SCHEMA', @level0name = N'Sales';",
+        "COMMENT ON SCHEMA Sales IS 'Sales data';",
+    );
+}
+
+#[test]
+fn a_different_comment_text_differs() {
+    let r = run(
+        &ep("TABLE", "Things", None, "Things sold"),
+        "COMMENT ON TABLE Sales.Things IS 'Things bought';",
+        CAT_D,
+    );
+    assert_eq!(r.verdict(), Verdict::Different, "{:?}", r.unknown_reasons);
+    assert!(r.findings.iter().any(|f| f.rule == "equiv.comment-text"));
+}
+
+#[test]
+fn a_comment_longer_than_the_checked_limit_is_not_compared() {
+    let long = "x".repeat(255);
+    not_compared(
+        &ep("TABLE", "Things", None, &long),
+        &format!("COMMENT ON TABLE Sales.Things IS '{long}';"),
+        CAT_D,
+        "fact V35",
+    );
+}
+
+#[test]
+fn the_limit_itself_is_compared() {
+    let at = "x".repeat(254);
+    comment_equal(
+        &ep("TABLE", "Things", None, &at),
+        &format!("COMMENT ON TABLE Sales.Things IS '{at}';"),
+    );
+}
+
+#[test]
+fn a_comment_that_is_not_printable_ascii_is_not_compared() {
+    not_compared(
+        &ep("TABLE", "Things", None, "caf\u{e9}"),
+        "COMMENT ON TABLE Sales.Things IS 'caf\u{e9}';",
+        CAT_D,
+        "printable ASCII",
+    );
+}
+
+#[test]
+fn a_view_comment_is_not_compared() {
+    not_compared(
+        &ep("VIEW", "ThingNames", None, "Names"),
+        "COMMENT ON TABLE Sales.ThingNames IS 'Names';",
+        CAT_D,
+        "no counterpart",
+    );
+}
+
+#[test]
+fn a_view_column_comment_is_not_compared() {
+    not_compared(
+        &ep("VIEW", "ThingNames", Some("Name"), "Name"),
+        "COMMENT ON COLUMN Sales.ThingNames.Name IS 'Name';",
+        CAT_D,
+        "view's column",
+    );
+}
+
+#[test]
+fn a_column_missing_from_the_db2_catalog_is_not_compared() {
+    let cat =
+        "CREATE SCHEMA SALES;\nCREATE TABLE SALES.THINGS (ID INTEGER NOT NULL PRIMARY KEY);\n";
+    not_compared(
+        &ep("TABLE", "Things", Some("Name"), "n"),
+        "COMMENT ON COLUMN Sales.Things.Name IS 'n';",
+        cat,
+        "catalog has no column",
+    );
+}
+
+#[test]
+fn a_table_missing_from_the_db2_catalog_is_not_compared() {
+    let cat = "CREATE SCHEMA SALES;\n";
+    not_compared(
+        &ep("TABLE", "Things", None, "n"),
+        "COMMENT ON TABLE Sales.Things IS 'n';",
+        cat,
+        "catalog has no",
+    );
+}
+
+#[test]
+fn a_comment_on_other_objects_is_not_compared() {
+    not_compared(
+        &ep("TABLE", "Things", None, "n"),
+        "COMMENT ON VIEW Sales.Things IS 'n';",
+        CAT_D,
+        "COMMENT ON VIEW",
+    );
+}
+
+#[test]
+fn an_unqualified_table_comment_is_not_compared() {
+    not_compared(
+        &ep("TABLE", "Things", None, "n"),
+        "COMMENT ON TABLE Things IS 'n';",
+        CAT_D,
+        "full qualified name",
+    );
 }

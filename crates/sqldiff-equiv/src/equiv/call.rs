@@ -1,7 +1,8 @@
 //! Procedure calls and object comments compared across dialects: T-SQL
 //! `EXEC` against PostgreSQL `CALL`, and T-SQL `sp_addextendedproperty`
 //! against PostgreSQL `COMMENT ON`. Against Db2 for i only an `EXEC` without
-//! arguments, as `CALL schema.name()`, is compared.
+//! arguments, as `CALL schema.name()`, and the comments on a schema, a table
+//! and a table's column (`ASM-FACT-V35`) are compared.
 //!
 //! Each statement is read completely or not at all: dynamic SQL, return
 //! codes, `WITH` options, expressions T-SQL does not accept as arguments and
@@ -71,6 +72,21 @@ pub mod asms {
         "Whoever reads the T-SQL extended property reads the PostgreSQL comment instead: the property name is not kept, and an object has one comment",
     );
 }
+
+/// `ASM-EXTPROP-COMMENT` as read for Db2 for i.
+pub const EXTPROP_COMMENT_DB2: (&str, &str) = (
+    "ASM-EXTPROP-COMMENT",
+    "Whoever reads the T-SQL extended property reads the Db2 for i comment instead: the property name is not kept, and an object has one comment",
+);
+
+/// What a Db2 for i comment is proven to store (probes `V35-*`).
+pub const FACT_V35: (&str, &str) = (
+    "ASM-FACT-V35",
+    "A Db2 for i COMMENT ON a table, a column or a schema stores a text of at most 254 printable ASCII characters whole, as written (fact V35, not checked on a real system)",
+);
+
+/// The longest Db2 for i comment text compared (`FACT_V35`).
+const DB2_COMMENT_MAX: usize = 254;
 
 /// One argument as written.
 #[derive(Debug, Clone)]
@@ -258,9 +274,69 @@ pub fn parse(ts: &[Tok], d: Dialect) -> R<Stmt> {
         },
         Dialect::Db2i => match ts.first().map(|t| t.up.as_str()) {
             Some("CALL") => db2_call(ts).map(Stmt::Call),
-            _ => Err("Db2 for i comments are not compared yet".into()),
+            Some("COMMENT") => db2_comment(ts).map(Stmt::Comment),
+            _ => Err("not a CALL or COMMENT ON".into()),
         },
     }
+}
+
+/// Db2 for i `COMMENT ON SCHEMA s | TABLE s.t | COLUMN s.t.c IS 'text'`, with
+/// every name qualified. Views, routines, indexes and constraints are not
+/// read: a view's comment form is an open question (`V30-COMMENT-ON-TABLE-VIEW`).
+fn db2_comment(ts: &[Tok]) -> R<Comment> {
+    if !word(ts.get(1), "ON") {
+        return Err("COMMENT without ON".into());
+    }
+    let kind = ts.get(2).map(|t| t.up.as_str()).unwrap_or("");
+    let (parts, i) = match kind {
+        "SCHEMA" | "TABLE" | "COLUMN" => dotted(ts, 3)?,
+        other => return Err(format!("Db2 for i COMMENT ON {other} is not compared")),
+    };
+    let target = match (kind, parts.as_slice()) {
+        ("SCHEMA", [s]) => {
+            if s.text.chars().count() > 10 {
+                return Err(format!(
+                    "the Db2 for i schema name {} is longer than 10 characters, so its library gets another, generated system name (fact V29)",
+                    s.text
+                ));
+            }
+            Target::Schema(s.clone())
+        }
+        ("TABLE", [s, t]) => Target::Object("TABLE", s.clone(), t.clone()),
+        ("COLUMN", [s, t, c]) => Target::Column("", s.clone(), t.clone(), c.clone()),
+        _ => {
+            return Err(format!(
+                "Db2 for i COMMENT ON {kind} without a full qualified name"
+            ))
+        }
+    };
+    if !word(ts.get(i), "IS") || ts.len() != i + 2 {
+        return Err("COMMENT ON without one value after IS".into());
+    }
+    let v = &ts[i + 1];
+    if v.kind != K::Str || !v.text.starts_with('\'') {
+        return Err("a comment that is not a plain string literal".into());
+    }
+    let text = string_value(&v.text)?;
+    // Printable ASCII only: the stored form of other characters depends on
+    // the job and column CCSIDs. A zero-length text may remove the comment.
+    if text.is_empty() || !text.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+        return Err(
+            "a Db2 for i comment that is empty or not printable ASCII is not compared".into(),
+        );
+    }
+    if text.len() > DB2_COMMENT_MAX {
+        return Err(format!(
+            "a Db2 for i comment of {} characters (only up to {DB2_COMMENT_MAX} are compared, fact V35)",
+            text.len()
+        ));
+    }
+    Ok(Comment {
+        target,
+        text: Some(text),
+        narrow: false,
+        backslash: false,
+    })
 }
 
 /// Db2 for i `CALL schema.name()`: only a qualified name and an empty
@@ -638,9 +714,22 @@ fn extended_property(rest: &[Tok]) -> R<Comment> {
 pub fn pair_key(s: &Stmt, d: Dialect) -> R<String> {
     // Names pair up to letter case (`ASM-IDENT-FOLD`); `compare` checks that
     // the PostgreSQL catalog has no other name differing only in case.
-    let k = |n: &Name| -> R<String> { Ok(key(n, d)?.to_lowercase()) };
+    let k = |n: &Name| -> R<String> {
+        Ok(if d == Dialect::Db2i {
+            super::ddl::fold(n, d)?
+        } else {
+            key(n, d)?
+        }
+        .to_lowercase())
+    };
     let schema = |n: &Name| -> R<String> {
-        let default = if d == Dialect::Tsql { "dbo" } else { "public" };
+        // Db2 for i has no default schema name to drop (its Db2 comments
+        // are read only with a schema).
+        let default = match d {
+            Dialect::Tsql => "dbo",
+            Dialect::Postgres => "public",
+            Dialect::Db2i => "",
+        };
         Ok(if key(n, d)? == default {
             String::new()
         } else {
@@ -1130,7 +1219,26 @@ fn exists(target: &Target, view: RecordingView<'_>, side: &str) -> R<()> {
 }
 
 fn comments(x: &Comment, t: &Side, y: &Comment, p: &Side) -> Verdict {
-    let mut asms = vec![asm::make(asms::EXTPROP_COMMENT), asm::make(asm::IDENT_FOLD)];
+    let db2 = p.d == Dialect::Db2i;
+    let mut asms = if db2 {
+        vec![
+            asm::make(EXTPROP_COMMENT_DB2),
+            asm::make(FACT_V35),
+            asm::make(asm::IDENT_FOLD),
+        ]
+    } else {
+        vec![asm::make(asms::EXTPROP_COMMENT), asm::make(asm::IDENT_FOLD)]
+    };
+    // Db2 for i comments are read for tables only: whether COMMENT ON TABLE
+    // names a view, and what a view column's comment form is, are open
+    // (probes `V30-COMMENT-ON-TABLE-VIEW`).
+    if db2 {
+        if let Target::Column("VIEW", ..) = &x.target {
+            return Verdict::Unknown(
+                "a comment on a view's column is not compared for Db2 for i".into(),
+            );
+        }
+    }
     let schema_name = |tg: &Target| match tg {
         Target::Schema(s)
         | Target::Object(_, s, _)

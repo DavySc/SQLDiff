@@ -2368,6 +2368,49 @@ outcome = [
   { label = "other", when = { create = "00000" }, verdict = "open", meaning = "Stored differently; N1 is the stored length." },
 ]
 
+[[procedure]]
+name = "V35_COMMENT"
+commit = "*NONE"
+params = "IN Q1 VARCHAR(4000), IN Q2 VARCHAR(4000)"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  SET O_N1 = -1;
+  SET O_N2 = -1;
+  BEGIN
+    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION BEGIN END;
+    EXECUTE IMMEDIATE 'DROP TABLE SQLDFPROBE.V35T';
+  END;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    EXECUTE IMMEDIATE 'CREATE TABLE SQLDFPROBE.V35T (C1 INTEGER)';
+    EXECUTE IMMEDIATE Q1;
+    EXECUTE IMMEDIATE Q2;
+    SELECT LENGTH(LONG_COMMENT) INTO O_N1 FROM QSYS2.SYSTABLES
+      WHERE TABLE_SCHEMA = 'SQLDFPROBE' AND TABLE_NAME = 'V35T';
+    SELECT LENGTH(LONG_COMMENT) INTO O_N2 FROM QSYS2.SYSCOLUMNS
+      WHERE TABLE_SCHEMA = 'SQLDFPROBE' AND TABLE_NAME = 'V35T'
+        AND COLUMN_NAME = 'C1';
+  END;
+END
+"""
+
+[[probe]]
+id = "V35-COMMENT-254"
+fact = "V35"
+role = "decisive"
+procedure = "V35_COMMENT"
+args = ["'COMMENT ON TABLE SQLDFPROBE.V35T IS ''' || REPEAT('t', 254) || ''''", "'COMMENT ON COLUMN SQLDFPROBE.V35T.C1 IS ''' || REPEAT('c', 254) || ''''"]
+question = "A table comment and a column comment of 254 printable ASCII characters: both stored whole (N1 and N2 = 254, the table in QSYS2.SYSTABLES.LONG_COMMENT, the column in QSYS2.SYSCOLUMNS.LONG_COMMENT)?"
+source = "The engine compares a T-SQL extended property with a Db2 for i COMMENT ON up to this length (crates/sqldiff-equiv/src/equiv/call.rs, ASM-FACT-V35); the IBM i COMMENT page was not read. The catalog column names are a guess: an error in SQLSTATE or N2 = -1 means the readback failed, not the comment."
+outcome = [
+  { label = "whole", when = { state = "00000", n1 = "=254", n2 = "=254" }, verdict = "consistent", meaning = "Both comments are stored whole." },
+  { label = "other", when = { state = "*" }, verdict = "contradicts", meaning = "A comment was rejected, cut or could not be read back (see SQLSTATE, N1, N2): the comparison needs a lower limit or another form." },
+]
+
 # ---------------------------------------------------------------- V31 casts and literal types
 # The engine compares Db2 for i conversions only between integers, to wider
 # decimals and for strings that fit (crates/sqldiff-equiv/src/equiv/canon.rs,
