@@ -19,5 +19,5 @@
   "db2i": 85,
   "postgres": 135
  },
- "note": "Measured on main c1a051f (2026-11-13). Against 80b4a85 (plan section 1) PG is +2 clean units (Ola) and Db2 for i is -85, all in ola-db2i (168 -> 83), which came in with the GOTO PRs #484-#487; the baseline accepts it so the gate starts green, and it is recorded here, not endorsed."
+ "note": "Measured on main c1a051f (2026-11-13). Against 80b4a85 (plan section 1) PG is +2 clean units (Ola); Db2 for i is -85, all in ola-db2i (168 -> 83): soundness fix from #487. The Db2 converter leaves GOTO as a '[not converted]' comment, so statements between a GOTO and its label were wrongly paired and counted clean; #487 refuses to pair them (all 85 now 'not proven: statement is not paired')."
 }
