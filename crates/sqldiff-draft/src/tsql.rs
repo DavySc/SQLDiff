@@ -1590,6 +1590,12 @@ impl<'a> Cx<'a> {
             .filter(|d| d.kind() == LABEL)
             .map(|d| label_of(&d).to_lowercase())
             .collect();
+        // Regions nest like blocks and the output grows with the nesting: a
+        // routine with more labels than the equivalence layer reads
+        // (`MAX_REGIONS` there) converts none, so "not converted" with a reason.
+        if all_labels.len() > MAX_GOTO_LABELS {
+            return Vec::new();
+        }
         let gotos: Vec<(SyntaxNode, String)> = root
             .descendants()
             .filter(|d| d.kind() == STATEMENT)
@@ -12885,6 +12891,10 @@ struct ScopeEntry {
 /// Logging`) is a labelled block left with EXIT (`goto_regions`), unless the
 /// label is also reached another way (a jump from another list or from
 /// after it, a label used twice, regions that cross).
+/// The most labels a routine may have for its forward GOTOs to be converted
+/// (the engine reads no more than this many; see `sqldiff-equiv` `goto.rs`).
+const MAX_GOTO_LABELS: usize = 64;
+
 fn goto(n: &SyntaxNode, label: &str) -> String {
     let at = n.text_range().start();
     let forward = n.ancestors().skip(1).any(|a| {
@@ -12899,7 +12909,7 @@ fn goto(n: &SyntaxNode, label: &str) -> String {
         })
     });
     if forward {
-        format!("GOTO {label}: PL/pgSQL has no GOTO. A jump forward to a label of an enclosing list is a labelled block left with EXIT, but not here: {label} is also the target of a jump that is not in a statement list before it, of a name used twice, of blocks that cross, or the region would skip a table variable's DECLARE; not converted")
+        format!("GOTO {label}: PL/pgSQL has no GOTO. A jump forward to a label of an enclosing list is a labelled block left with EXIT, but not here: {label} is also the target of a jump that is not in a statement list before it, of a name used twice, of blocks that cross, the region would skip a table variable's DECLARE, or the routine has more than 64 labels; not converted")
     } else {
         format!("GOTO {label}: PL/pgSQL has no GOTO, and this jump does not go forward to a label in an enclosing statement list; rewrite it as a loop or IF; not converted")
     }
