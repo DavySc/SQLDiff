@@ -142,7 +142,7 @@ fn same_routine(a: Option<&str>, b: Option<&str>) -> bool {
 
 /// `DECLARE @t [AS] TABLE (…)`, as the rules recognise it
 /// (`tsql::Cx::table_variable`).
-fn table_variable_declare(n: &SyntaxNode) -> bool {
+pub(crate) fn table_variable_declare(n: &SyntaxNode) -> bool {
     let w = ast::first_words(n, 4);
     let w = |i: usize| w.get(i).map(String::as_str).unwrap_or("");
     w(0) == "DECLARE"
