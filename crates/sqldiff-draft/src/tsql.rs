@@ -1614,7 +1614,7 @@ impl<'a> Cx<'a> {
                 })
             };
             let starts: Vec<Option<usize>> = mine.iter().map(|g| at(g)).collect();
-            if starts.iter().any(|s| s.is_none_or(|s| s >= li)) {
+            if starts.iter().any(|s| s.map_or(true, |s| s >= li)) {
                 continue;
             }
             let start = starts.into_iter().flatten().min().unwrap_or(li);
@@ -2646,7 +2646,8 @@ impl<'a> Cx<'a> {
             "GOTO" => {
                 let label = s.get(1).map(|&i| tsql_unquote(&ts[i].s)).unwrap_or_default();
                 let key = label.to_lowercase();
-                if s.len() != 2 || !self.goto_open.contains(&key) {
+                let words = s.iter().filter(|&&i| ts[i].k != SEMICOLON).count();
+                if words != 2 || !self.goto_open.contains(&key) {
                     return no(goto(n, &label));
                 }
                 self.step_ts("tsql.ctl.goto-exit", &ts);
