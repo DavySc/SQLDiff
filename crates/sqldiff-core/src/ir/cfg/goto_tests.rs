@@ -122,4 +122,11 @@ fn a_postgres_exit_names_the_labelled_block_or_loop_it_leaves() {
     // A name that labels nothing in scope is left alone.
     let none = pg("<<g>>\nBEGIN\nIF p_x = 1 THEN EXIT h; END IF;\nEND;");
     assert_eq!(exits_followed(Dialect::Postgres, &none), vec![false]);
+    // A quoted label is neither a name that resolves nor an unlabelled exit:
+    // it stays opaque (and so never counts as the innermost loop's exit).
+    let quoted = pg("<<outer>>\nLOOP\nLOOP\nEXIT \"outer\";\nEND LOOP;\nEXIT;\nEND LOOP;");
+    assert_eq!(
+        exits_followed(Dialect::Postgres, &quoted),
+        vec![false, true]
+    );
 }

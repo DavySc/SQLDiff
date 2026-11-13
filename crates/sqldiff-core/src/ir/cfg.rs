@@ -1392,6 +1392,9 @@ impl Lowerer {
                         t.kind() == SyntaxKind::IDENT && !t.text().eq_ignore_ascii_case("WHEN")
                     })
                     .map(upper);
+                let quoted_label = toks
+                    .get(1)
+                    .is_some_and(|t| t.kind() == SyntaxKind::QUOTED_IDENT);
                 let target = match &label {
                     Some(l) => ctx
                         .labels
@@ -1399,6 +1402,10 @@ impl Lowerer {
                         .rev()
                         .find(|(x, _, _)| x == l)
                         .map(|(_, h, e)| (*h, *e)),
+                    // A quoted name (`EXIT "outer"`) is neither the loop's
+                    // label nor an unlabelled exit: it stays an opaque
+                    // statement.
+                    None if quoted_label => None,
                     None => ctx.loop_,
                 };
                 if let Some((head, exit)) = target {
