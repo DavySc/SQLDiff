@@ -229,6 +229,19 @@ enum Mode {
     Do,
 }
 
+/// Whether a unit holds a `DECLARE @t TABLE (…)` at any depth.
+fn declares_table_variable(n: &SyntaxNode) -> bool {
+    n.descendants().any(|d| {
+        d.kind() == STATEMENT && {
+            let ts: Vec<T> = tokens(&d).into_iter().filter(|t| t.sig()).collect();
+            ts.first().is_some_and(|t| t.is("DECLARE"))
+                && ts
+                    .windows(2)
+                    .any(|w| w[0].k == VARIABLE && w[1].is("TABLE"))
+        }
+    })
+}
+
 /// A forward jump of one statement list, written as a labelled block.
 struct GotoRegion {
     /// Index in the list of the first unit holding a `GOTO` to the label.
@@ -1533,6 +1546,10 @@ impl<'a> Cx<'a> {
         }
         // A region never outlives its list: every label closes its block.
         debug_assert!(open.is_empty());
+        while open.pop().is_some() {
+            self.goto_open.pop();
+            out.lines(indent + INDENT * open.len(), "END;");
+        }
     }
 
     /// The forward jumps of one statement list that PL/pgSQL can express: a
@@ -1618,6 +1635,16 @@ impl<'a> Cx<'a> {
                 continue;
             }
             let start = starts.into_iter().flatten().min().unwrap_or(li);
+            // T-SQL creates a table variable for the whole routine, jumped
+            // over or not; the conversion creates it where the DECLARE
+            // stands, which the jump skips.
+            let skipped = els[start..li]
+                .iter()
+                .filter_map(|e| e.as_node())
+                .any(declares_table_variable);
+            if skipped {
+                continue;
+            }
             out.push(GotoRegion {
                 start,
                 label: li,
@@ -2648,7 +2675,19 @@ impl<'a> Cx<'a> {
                 let key = label.to_lowercase();
                 let words = s.iter().filter(|&&i| ts[i].k != SEMICOLON).count();
                 if words != 2 || !self.goto_open.contains(&key) {
-                    return no(goto(n, &label));
+                    let elsewhere = if self.trigger.is_some() {
+                        Some("in a trigger")
+                    } else if self.mode == Mode::Top {
+                        Some("in a script without variables or control flow")
+                    } else if self.db2() {
+                        Some("for Db2 for i")
+                    } else {
+                        None
+                    };
+                    return no(match elsewhere {
+                        Some(w) => format!("GOTO {label}: not converted {w} (a forward jump in a procedure or DO block is a labelled block left with EXIT; PL/pgSQL has no GOTO)"),
+                        None => goto(n, &label),
+                    });
                 }
                 self.step_ts("tsql.ctl.goto-exit", &ts);
                 format!("EXIT goto_{key}")
@@ -12866,7 +12905,7 @@ fn goto(n: &SyntaxNode, label: &str) -> String {
         })
     });
     if forward {
-        format!("GOTO {label}: PL/pgSQL has no GOTO. A jump forward to a label of an enclosing list is a labelled block left with EXIT, but not here: {label} is also the target of a jump that is not in a statement list before it, of a name used twice, or of blocks that cross; not converted")
+        format!("GOTO {label}: PL/pgSQL has no GOTO. A jump forward to a label of an enclosing list is a labelled block left with EXIT, but not here: {label} is also the target of a jump that is not in a statement list before it, of a name used twice, of blocks that cross, or the region would skip a table variable's DECLARE; not converted")
     } else {
         format!("GOTO {label}: PL/pgSQL has no GOTO, and this jump does not go forward to a label in an enclosing statement list; rewrite it as a loop or IF; not converted")
     }

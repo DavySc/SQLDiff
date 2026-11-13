@@ -147,3 +147,64 @@ fn nested_jumps_are_nested_blocks() {
         c.output
     );
 }
+
+fn reasons(c: &Conversion) -> String {
+    c.units
+        .iter()
+        .flat_map(|u| u.notes.iter().map(|n| n.text.to_string()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn a_region_that_skips_a_table_variable_declare_is_not_converted() {
+    // T-SQL creates @t for the whole routine; the conversion creates the
+    // temporary table where the DECLARE stands, which the jump skips.
+    let src = "CREATE PROCEDURE dbo.p @x int\nAS\nBEGIN\n  IF @x = 1 GOTO l;\n  DECLARE @t TABLE (a int);\n  INSERT INTO @t VALUES (1);\n  l:\n  INSERT INTO @t VALUES (2);\n  INSERT INTO dbo.u (a) SELECT a FROM @t;\nEND\n";
+    let c = pg(src);
+    assert!(!c.output.contains("<<goto_"), "{}", c.output);
+    assert!(
+        c.units.iter().any(|u| u.status == Status::NotConverted),
+        "{}",
+        c.output
+    );
+    assert!(reasons(&c).contains("table variable"), "{}", reasons(&c));
+    // A scalar DECLARE in the region is hoisted, so the region is fine.
+    let scalar = src
+        .replace("DECLARE @t TABLE (a int);", "DECLARE @v int = 5;")
+        .replace(
+            "INSERT INTO @t VALUES (1);",
+            "INSERT INTO dbo.u (a) VALUES (@v);",
+        )
+        .replace(
+            "INSERT INTO @t VALUES (2);\n  INSERT INTO dbo.u (a) SELECT a FROM @t;",
+            "INSERT INTO dbo.u (a) VALUES (2);",
+        );
+    let c = pg(&scalar);
+    assert!(c.output.contains("<<goto_l>>"), "{}", c.output);
+}
+
+#[test]
+fn crossing_jumps_say_so_and_keep_the_output_balanced() {
+    let src = "CREATE PROCEDURE dbo.p @x int\nAS\nBEGIN\n  IF @x = 1 GOTO a;\n  IF @x = 2 GOTO b;\n  a:\n  SET @x = 3;\n  b:\n  RETURN @x\nEND\n";
+    let c = pg(src);
+    assert!(reasons(&c).contains("cross"), "{}", reasons(&c));
+}
+
+#[test]
+fn a_goto_in_a_trigger_or_with_an_odd_label_is_not_converted() {
+    let trg = "CREATE TABLE dbo.t (c int);\nGO\nCREATE TRIGGER dbo.trg ON dbo.t AFTER INSERT AS\nBEGIN\n  IF 1 = 1 GOTO l;\n  UPDATE dbo.t SET c = 1;\n  l:\n  UPDATE dbo.t SET c = 2;\nEND\n";
+    let c = pg(trg);
+    assert!(!c.output.contains("<<goto_"), "{}", c.output);
+    assert!(reasons(&c).contains("in a trigger"), "{}", reasons(&c));
+    // A label over 50 characters is no region (the block's label must fit
+    // PostgreSQL's 63 bytes with its prefix).
+    let long = "l".repeat(60);
+    let src = format!("CREATE PROCEDURE dbo.p @x int\nAS\nBEGIN\n  IF @x = 1 GOTO {long};\n  SET @x = 3;\n  {long}:\n  RETURN @x\nEND\n");
+    let c = pg(&src);
+    assert!(!c.output.contains("<<goto_"), "{}", c.output);
+    // A label that stands twice is no target.
+    let twice = "CREATE PROCEDURE dbo.p @x int\nAS\nBEGIN\n  IF @x = 1 GOTO l;\n  SET @x = 3;\n  l:\n  SET @x = 4;\n  l:\n  RETURN @x\nEND\n";
+    let c = pg(twice);
+    assert!(!c.output.contains("<<goto_"), "{}", c.output);
+}
