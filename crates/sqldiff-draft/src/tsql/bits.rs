@@ -1352,11 +1352,18 @@ impl Cx<'_> {
             }
             let scope = std::mem::replace(&mut self.scope, scope_of(&ts));
             let open = self.take_bit_unhandled();
+            let outer_types = std::mem::take(&mut *self.unresolved_types.borrow_mut());
             let e = self.bit_edits(&ts);
-            let hit = !(e.rep.is_empty()
-                && e.pre.is_empty()
-                && e.post.is_empty()
-                && self.bit_unhandled.is_empty());
+            // A column of a user type defined elsewhere: the bit-unaware
+            // idiom rules must not convert the statement; the token rules
+            // refuse it (`guard_bits`).
+            let unresolved = !self.unresolved_types.borrow().is_empty();
+            self.unresolved_types.borrow_mut().extend(outer_types);
+            let hit = unresolved
+                || !(e.rep.is_empty()
+                    && e.pre.is_empty()
+                    && e.post.is_empty()
+                    && self.bit_unhandled.is_empty());
             self.bit_unhandled = open;
             self.scope = scope;
             hit

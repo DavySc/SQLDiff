@@ -772,10 +772,49 @@ fn an_alias_type_from_another_file_is_not_guessed() {
     let cat = source_catalog(&[table, view]);
     let c = run(view, &cat);
     assert!(c.output.contains("i.active = TRUE"), "{}", c.output);
-    // A statement that does not read the column is not affected.
+    // The refusal is per table, not per column: any statement over a table
+    // that has such a column is refused, even one that never reads it.
     let other = "CREATE VIEW \"item_w\" AS\nSELECT i.id FROM \"item\" i WHERE i.id = 1\nGO\n";
     let table = "CREATE TABLE \"item\" (\"id\" int NOT NULL, \"active\" \"flag_t\" NOT NULL)\nGO\n";
     let cat = source_catalog(&[types, table, other]);
     let c = run(other, &cat);
-    assert!(c.output.contains("i.id = 1"), "{}", c.output);
+    let u = unit(&c, other, "CREATE VIEW");
+    assert_eq!(u.status, Status::NotConverted, "{:?}", u.notes);
+    // A statement over a table without such a column is not affected.
+    let plain = "CREATE TABLE \"plain\" (\"id\" int NOT NULL)\nGO\n";
+    let over_plain =
+        "CREATE VIEW \"plain_v\" AS\nSELECT p.id FROM \"plain\" p WHERE p.id = 1\nGO\n";
+    let cat = source_catalog(&[types, table, plain, over_plain]);
+    let c = run(over_plain, &cat);
+    let u = unit(&c, over_plain, "CREATE VIEW");
+    assert!(u.status < Status::NotConverted, "{:?}", u.notes);
+    assert!(c.output.contains("p.id = 1;"), "{}", c.output);
+    // Batch-level DML is refused too (the idiom rules must not take it).
+    let cat = source_catalog(&[types, table]);
+    for dml in [
+        "UPDATE \"item\" SET \"active\" = 1 WHERE \"id\" = 3;\nGO\n",
+        "INSERT INTO \"item\" (\"id\", \"active\") VALUES (1, 1);\nGO\n",
+    ] {
+        let c = run(dml, &cat);
+        let u = unit(&c, dml, "\"item\"");
+        assert_eq!(
+            u.status,
+            Status::NotConverted,
+            "{dml}: {:?}\n{}",
+            u.notes,
+            c.output
+        );
+    }
+    // Db2 for i keeps no alias types; a same-file alias is not refused for
+    // being "not defined in this file".
+    let one = format!("{types}{table}CREATE INDEX ix ON \"item\" (\"id\")\nGO\n");
+    let d = db2(&one);
+    let u = unit(&d, &one, "CREATE INDEX");
+    assert!(
+        u.notes
+            .iter()
+            .all(|n| !n.text.contains("not defined in this file")),
+        "{:?}",
+        u.notes
+    );
 }

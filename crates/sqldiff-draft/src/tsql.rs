@@ -6804,15 +6804,17 @@ impl<'a> Cx<'a> {
     /// any, is in another file, and a conversion of this file must not
     /// guess its base type (a bit alias compared with 1 needs `= TRUE`).
     fn unresolved_user_type(&self, base: &str, args: &[u32]) -> Option<String> {
-        // No type at all (a computed column) is not a user type.
-        if !args.is_empty() || base.trim().is_empty() {
+        // No type at all (a computed column) is not a user type. Db2 for i
+        // keeps no alias types (`create_alias_type` refuses them) and its
+        // rewrites do not read a column's base type this way.
+        if self.db2() || !args.is_empty() || base.trim().is_empty() {
             return None;
         }
         let parts: Vec<String> = base.split('.').map(|p| tsql_unquote(p.trim())).collect();
         let (schema, name) = match parts.as_slice() {
             [n] => ("dbo".to_string(), n.clone()),
             [s, n] => (s.to_ascii_lowercase(), n.clone()),
-            _ => return Some(base.to_string()),
+            _ => return Some(parts.join(".")),
         };
         let up = name.to_ascii_uppercase();
         let builtin = KNOWN_TYPES.contains(&up.as_str())
@@ -6828,11 +6830,15 @@ impl<'a> Cx<'a> {
         if (builtin && (schema == "dbo" || schema == "sys"))
             || self
                 .alias_types
-                .contains_key(&(schema, name.to_ascii_lowercase()))
+                .contains_key(&(schema.clone(), name.to_ascii_lowercase()))
         {
             return None;
         }
-        Some(base.to_string())
+        Some(if schema == "dbo" {
+            name
+        } else {
+            format!("{schema}.{name}")
+        })
     }
 
     fn create_schema(&mut self, ts: &[T]) -> R<String> {
