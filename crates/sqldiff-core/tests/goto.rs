@@ -177,3 +177,65 @@ fn nested_blocks_leave_the_right_one() {
         "{v:?}"
     );
 }
+
+fn is_equal(v: Verdict) -> bool {
+    matches!(v, Verdict::Equal | Verdict::EqualUnderAssumptions)
+}
+
+#[test]
+fn an_exit_names_the_block_it_leaves_not_the_innermost_one() {
+    // A jump to B skips both assignments to A's end; a jump to A only the
+    // first. With both blocks open, `EXIT goto_a` and `EXIT goto_b` differ.
+    let t = "IF @x = 2 GOTO B;\nIF @x = 1 GOTO A;\nSET @y = @y * 10 + 3;\nA:\nSET @y = @y * 10 + 4;\nB:\nSET @y = @y * 10 + 5;\nUPDATE dbo.t SET c = @y;";
+    let p = |a: &str| {
+        format!("<<goto_b>>\nBEGIN\nIF p_x = 2 THEN EXIT goto_b; END IF;\n<<goto_a>>\nBEGIN\nIF p_x = 1 THEN EXIT {a}; END IF;\nv_y := v_y * 10 + 3;\nEND;\nv_y := v_y * 10 + 4;\nEND;\nv_y := v_y * 10 + 5;\nUPDATE t SET c = v_y;")
+    };
+    assert!(is_equal(cross(t, &p("goto_a"))));
+    // The inner jump leaves the outer block: it skips the `+ 4` as well.
+    assert!(!is_equal(cross(t, &p("goto_b"))));
+}
+
+#[test]
+fn a_jump_out_of_a_try_part_is_not_equal() {
+    // A jump out of a TRY part is never read as a block exit. (The check in
+    // `goto_exit` is defence in depth: other layers refuse these pairs too,
+    // so this test pins the verdict, not that one guard.)
+    let t = "BEGIN TRY\nIF @x = 1 GOTO l;\nUPDATE dbo.t SET c = 1;\nEND TRY\nBEGIN CATCH\nUPDATE dbo.t SET d = 1;\nEND CATCH\nl:\nUPDATE dbo.t SET c = 2;";
+    let p = "<<goto_l>>\nBEGIN\nBEGIN\nIF p_x = 1 THEN EXIT goto_l; END IF;\nUPDATE t SET c = 1;\nEXCEPTION WHEN OTHERS THEN\nUPDATE t SET d = 1;\nEND;\nEND;\nUPDATE t SET c = 2;";
+    assert!(!is_equal(cross(t, p)));
+    // A jump from the EXCEPTION handler is no better.
+    let t = "BEGIN TRY\nUPDATE dbo.t SET c = 1;\nEND TRY\nBEGIN CATCH\nIF @x = 1 GOTO l;\nUPDATE dbo.t SET d = 1;\nEND CATCH\nl:\nUPDATE dbo.t SET c = 2;";
+    let p = "<<goto_l>>\nBEGIN\nBEGIN\nUPDATE t SET c = 1;\nEXCEPTION WHEN OTHERS THEN\nIF p_x = 1 THEN EXIT goto_l; END IF;\nUPDATE t SET d = 1;\nEND;\nEND;\nUPDATE t SET c = 2;";
+    assert!(!is_equal(cross(t, p)));
+}
+
+#[test]
+fn a_long_flat_list_of_jumps_is_bounded() {
+    // 600 labels each jumped to from the line before, in reverse order, nest
+    // 600 deep: past the bound no region is read, so nothing is claimed and
+    // nothing overflows the stack.
+    let n = 600;
+    let mut t = String::new();
+    for i in 0..n {
+        t.push_str(&format!("IF @x = {i} GOTO l{i};\n"));
+    }
+    t.push_str("UPDATE dbo.t SET c = 1;\n");
+    for i in (0..n).rev() {
+        t.push_str(&format!("l{i}:\n"));
+    }
+    t.push_str("UPDATE dbo.t SET d = 1;");
+    let r = diff(&tsql_file(&t), &tsql_file(&t), &Options::default());
+    assert_eq!(r.verdict(), Verdict::Unknown, "{:#?}", r.findings);
+    // Within the bound the same shape is read (and the file compares equal).
+    let mut small = String::new();
+    for i in 0..3 {
+        small.push_str(&format!("IF @x = {i} GOTO l{i};\n"));
+    }
+    small.push_str("UPDATE dbo.t SET c = 1;\n");
+    for i in (0..3).rev() {
+        small.push_str(&format!("l{i}:\n"));
+    }
+    small.push_str("UPDATE dbo.t SET d = 1;");
+    let r = diff(&tsql_file(&small), &tsql_file(&small), &Options::default());
+    assert!(is_equal(r.verdict()), "{:#?}", r.findings);
+}

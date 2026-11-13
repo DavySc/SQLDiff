@@ -2380,6 +2380,9 @@ fn goto_exit(c: &SyntaxNode, u: &mut Unit) -> bool {
         ));
         return true;
     };
+    // A jump out of a TRY part or handler is not a plain block exit (the
+    // handler and the subtransaction rules differ): refused here, and by the
+    // alignment of the TRY markers as well.
     if u.blocks[at].1 != u.tries {
         u.uncovered
             .push((c.clone(), format!("`{word} {target}` out of a TRY part")));

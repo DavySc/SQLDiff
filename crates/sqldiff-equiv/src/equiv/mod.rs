@@ -5579,7 +5579,7 @@ fn branches(items: &[Item]) -> Vec<(Option<usize>, Option<usize>)> {
     for (i, it) in items.iter().enumerate() {
         let frame = stack.last().map(|x| x.1);
         match it.term.head() {
-            "ctl-if" | "ctl-while" | "ctl-try" => {
+            "ctl-if" | "ctl-while" | "ctl-try" | "ctl-block" => {
                 out.push((frame, None));
                 stack.push((i, i));
             }

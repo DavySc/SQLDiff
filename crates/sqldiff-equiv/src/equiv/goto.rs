@@ -22,6 +22,10 @@ use sqldiff_syntax::{SyntaxKind, SyntaxNode};
 
 use super::ast::tokens_shared as tokens;
 
+/// The most regions one statement list may have (they nest, and every level
+/// is recursion); more than this are left unread, so "not proven".
+const MAX_REGIONS: usize = 500;
+
 /// One label of a statement list and the units its jumps start from.
 #[derive(Debug, Clone)]
 pub struct Region {
@@ -38,8 +42,8 @@ pub struct Region {
 pub struct Index {
     /// Occurrences of each label name (lower-cased) in the routine.
     labels: HashMap<String, usize>,
-    /// Every `GOTO`, with the label it names (lower-cased).
-    gotos: Vec<(SyntaxNode, String)>,
+    /// Every `GOTO`, by the label it names (lower-cased).
+    gotos: HashMap<String, Vec<SyntaxNode>>,
 }
 
 /// The name a label node declares (`name:`), lower-cased.
@@ -78,7 +82,9 @@ impl Index {
                     if w.first().is_some_and(|x| x == "GOTO") {
                         // A jump that is not `GOTO name` names no label.
                         ix.gotos
-                            .push((d.clone(), goto_target(&d).unwrap_or_default()));
+                            .entry(goto_target(&d).unwrap_or_default())
+                            .or_default()
+                            .push(d.clone());
                     }
                 }
                 _ => {}
@@ -106,30 +112,33 @@ impl Index {
             if !plain || self.labels.get(&name) != Some(&1) {
                 continue;
             }
-            let mine: Vec<&SyntaxNode> = self
-                .gotos
-                .iter()
-                .filter(|(_, l)| *l == name)
-                .map(|(d, _)| d)
-                .collect();
-            if mine.is_empty() {
+            let Some(mine) = self.gotos.get(&name) else {
                 continue;
-            }
+            };
             let at = |g: &SyntaxNode| {
                 units
                     .iter()
                     .position(|u| u.text_range().contains_range(g.text_range()))
             };
-            let starts: Vec<Option<usize>> = mine.iter().map(|g| at(g)).collect();
+            let starts: Vec<Option<usize>> = mine.iter().map(at).collect();
             if starts.iter().any(|s| s.map_or(true, |s| s >= li)) {
                 continue;
             }
             let start = starts.into_iter().flatten().min().unwrap_or(li);
+            // The block's node is the label (see `mark_at`), so a call inside the
+            // region sits at a different place on the T-SQL side than on the
+            // PostgreSQL side, where the block starts at its BEGIN: placement
+            // comparisons stay conservative ("not proven"), never a false equal.
             out.push(Region {
                 start,
                 label: li,
                 name,
             });
+        }
+        // Regions nest like blocks, and the lowering and the alignment
+        // recurse over them: a list with more than MAX_REGIONS reads none.
+        if out.len() > MAX_REGIONS {
+            return Vec::new();
         }
         let crossing: Vec<bool> = out
             .iter()
