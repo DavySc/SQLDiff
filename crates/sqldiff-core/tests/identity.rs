@@ -461,8 +461,9 @@ fn a_condition_on_a_parameter_inside_and_after_a_forward_goto_block_is_identifie
 #[test]
 fn a_variable_a_forward_goto_block_writes_is_unknown_after_it() {
     // After the label @y is 0 (jump taken) or 5 (not taken): not identified.
-    // (The statement level already does not prove this pair equal; the
-    // analysis's own join over a block's exits is a second guard behind it.)
+    // (The statement level already does not prove this pair equal, so this
+    // pins the verdict; the two nested pairs below are the ones where only
+    // the join over a block's exits stops the identification.)
     let c = goto_pair(
         "IF @y = 5 UPDATE dbo.t SET c = 1;",
         "IF v_y = 5 THEN UPDATE t SET c = 1; END IF;",
@@ -470,4 +471,44 @@ fn a_variable_a_forward_goto_block_writes_is_unknown_after_it() {
     assert_eq!(c.len(), 2, "{c:?}");
     assert_eq!(c[0], Class::Value, "{c:?}");
     assert!(matches!(c[1], Class::No(_)), "{c:?}");
+}
+
+#[test]
+fn a_condition_after_nested_blocks_is_not_identified_when_the_inner_jump_leaves_the_outer_block() {
+    // T-SQL `GOTO b` skips `SET @y = 2` only; PostgreSQL's `EXIT goto_a` from
+    // the inner block also skips `v_y := 3`. At x = 2 the routines differ at
+    // the last condition (T-SQL @y = 3, PostgreSQL v_y = 0), yet the
+    // statement level proves the condition terms equal: only the join over the
+    // blocks' exits keeps the analysis from identifying it.
+    let a = tsql(
+        "@x int",
+        "DECLARE @y int = 0;\nIF @x = 1 GOTO a;\nIF @x = 2 GOTO b;\nSET @y = 2;\nb:\nSET @y = 3;\na:\nIF @y = 3 UPDATE dbo.v SET c = 4;",
+    );
+    let b = pg(
+        "p_x integer",
+        "DECLARE v_y integer;",
+        "v_y := 0;\n<<goto_a>>\nBEGIN\nIF p_x = 1 THEN EXIT goto_a; END IF;\n<<goto_b>>\nBEGIN\nIF p_x = 2 THEN EXIT goto_a; END IF;\nv_y := 2;\nEND;\nv_y := 3;\nEND;\nIF v_y = 3 THEN UPDATE v SET c = 4; END IF;",
+    );
+    let c = classes(&a, &b);
+    assert_eq!(c.len(), 3, "{c:?}");
+    assert!(!c[2].identified(), "{c:?}");
+}
+
+#[test]
+fn conditions_after_the_blocks_of_nested_regions_are_not_identified() {
+    // The variable is written in both blocks: after each label it has more
+    // than one reaching definition.
+    let a = tsql(
+        "@x int",
+        "DECLARE @y int = 0;\nIF @x = 1 GOTO a;\nSET @y = 1;\nIF @x = 2 GOTO b;\nSET @y = 2;\nb:\nIF @y = 2 UPDATE dbo.v SET c = 3;\na:\nIF @y = 0 UPDATE dbo.v SET c = 4;",
+    );
+    let b = pg(
+        "p_x integer",
+        "DECLARE v_y integer;",
+        "v_y := 0;\n<<goto_a>>\nBEGIN\nIF p_x = 1 THEN EXIT goto_a; END IF;\nv_y := 1;\n<<goto_b>>\nBEGIN\nIF p_x = 2 THEN EXIT goto_b; END IF;\nv_y := 2;\nEND;\nIF v_y = 2 THEN UPDATE v SET c = 3; END IF;\nEND;\nIF v_y = 0 THEN UPDATE v SET c = 4; END IF;",
+    );
+    let c = classes(&a, &b);
+    assert_eq!(c.len(), 4, "{c:?}");
+    assert!(!c[2].identified(), "{c:?}");
+    assert!(!c[3].identified(), "{c:?}");
 }
