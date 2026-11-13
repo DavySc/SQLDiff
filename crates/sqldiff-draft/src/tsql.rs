@@ -118,6 +118,7 @@ pub(crate) fn convert(
         claims,
         loops: Vec::new(),
         goto_open: Vec::new(),
+        goto_scan: std::cell::RefCell::new(None),
         labels: 0,
         cursors: Vec::new(),
         cursor_plans: BTreeMap::new(),
@@ -437,6 +438,9 @@ struct Cx<'a> {
     /// PostgreSQL: lower-cased T-SQL labels whose `<<goto_l>> BEGIN` block is
     /// open, so a `GOTO l` inside is an `EXIT goto_l`.
     goto_open: Vec<String>,
+    /// The labels and jumps of the routine being converted, scanned once
+    /// (every statement list with a label asks for them).
+    goto_scan: std::cell::RefCell<Option<std::rc::Rc<GotoScan>>>,
     /// Db2: loop labels handed out in this routine or script.
     labels: usize,
     /// Db2: result-set cursors of the routine, declared after the variables.
@@ -1577,60 +1581,32 @@ impl<'a> Cx<'a> {
             .find(|a| a.kind() == ROUTINE)
             .or_else(|| any.ancestors().last())
             .unwrap_or_else(|| any.clone());
-        let label_of = |n: &SyntaxNode| {
-            n.text()
-                .to_string()
-                .trim()
-                .trim_end_matches(':')
-                .trim()
-                .to_string()
-        };
-        let all_labels: Vec<String> = root
-            .descendants()
-            .filter(|d| d.kind() == LABEL)
-            .map(|d| label_of(&d).to_lowercase())
-            .collect();
+        let scan = self.goto_scan_of(&root);
         // Regions nest like blocks and the output grows with the nesting: a
         // routine with more labels than the equivalence layer reads
         // (`MAX_REGIONS` there) converts none, so "not converted" with a reason.
-        if all_labels.len() > MAX_GOTO_LABELS {
+        if scan.labels.values().sum::<usize>() > MAX_GOTO_LABELS {
             return Vec::new();
         }
-        let gotos: Vec<(SyntaxNode, String)> = root
-            .descendants()
-            .filter(|d| d.kind() == STATEMENT)
-            .filter_map(|d| {
-                let ts = tokens(&d);
-                let s = sig(&ts);
-                let first = s.first().map(|&i| ts[i].up());
-                (first.as_deref() == Some("GOTO") && s.len() >= 2)
-                    .then(|| (d.clone(), tsql_unquote(&ts[s[1]].s).to_lowercase()))
-            })
-            .collect();
         let mut out = Vec::new();
         for (li, ln) in labels {
             let name = label_of(&ln).to_lowercase();
             let plain = !name.is_empty()
                 && name.len() <= 50
                 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-            if !plain || all_labels.iter().filter(|x| **x == name).count() != 1 {
+            if !plain || scan.labels.get(&name) != Some(&1) {
                 continue;
             }
-            let mine: Vec<&SyntaxNode> = gotos
-                .iter()
-                .filter(|(_, l)| *l == name)
-                .map(|(d, _)| d)
-                .collect();
-            if mine.is_empty() {
+            let Some(mine) = scan.gotos.get(&name) else {
                 continue;
-            }
+            };
             let at = |g: &SyntaxNode| {
                 els.iter().position(|e| {
                     e.as_node()
                         .is_some_and(|u| u.text_range().contains_range(g.text_range()))
                 })
             };
-            let starts: Vec<Option<usize>> = mine.iter().map(|g| at(g)).collect();
+            let starts: Vec<Option<usize>> = mine.iter().map(at).collect();
             if starts.iter().any(|s| s.map_or(true, |s| s >= li)) {
                 continue;
             }
@@ -1666,6 +1642,44 @@ impl<'a> Cx<'a> {
         let mut keep = crossing.into_iter();
         out.retain(|_| !keep.next().unwrap_or(false));
         out
+    }
+
+    /// The labels and jumps under `root`, scanned once per routine.
+    fn goto_scan_of(&self, root: &SyntaxNode) -> std::rc::Rc<GotoScan> {
+        let r = root.text_range();
+        let key = (usize::from(r.start()), usize::from(r.end()));
+        if let Some(s) = self.goto_scan.borrow().as_ref() {
+            if s.root == key {
+                return s.clone();
+            }
+        }
+        #[cfg(test)]
+        GOTO_SCANS.with(|c| c.set(c.get() + 1));
+        let mut scan = GotoScan {
+            root: key,
+            labels: BTreeMap::new(),
+            gotos: BTreeMap::new(),
+        };
+        for d in root.descendants() {
+            match d.kind() {
+                LABEL => *scan.labels.entry(label_of(&d).to_lowercase()).or_insert(0) += 1,
+                STATEMENT => {
+                    let ts = tokens(&d);
+                    let s = sig(&ts);
+                    let first = s.first().map(|&i| ts[i].up());
+                    if first.as_deref() == Some("GOTO") && s.len() >= 2 {
+                        scan.gotos
+                            .entry(tsql_unquote(&ts[s[1]].s).to_lowercase())
+                            .or_default()
+                            .push(d.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let scan = std::rc::Rc::new(scan);
+        *self.goto_scan.borrow_mut() = Some(scan.clone());
+        scan
     }
 
     /// Converts the unit `els[i]` of a list. `joined` is where the last pair
@@ -12884,17 +12898,40 @@ struct ScopeEntry {
     named: bool,
 }
 
-/// The FROM, JOIN, UPDATE, MERGE and USING items of a statement, at any
-/// depth. `None` when the statement has CTEs, whose names would hide tables.
+#[cfg(test)]
+thread_local! {
+    /// How many times a routine's labels and jumps were scanned (tests).
+    static GOTO_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The labels (lower-cased, with their counts) and the `GOTO`s (by the label
+/// they name) of one routine.
+struct GotoScan {
+    /// The byte range of the routine (or file) scanned.
+    root: (usize, usize),
+    labels: BTreeMap<String, usize>,
+    gotos: BTreeMap<String, Vec<SyntaxNode>>,
+}
+
+/// The name a label node declares, as written.
+fn label_of(n: &SyntaxNode) -> String {
+    n.text()
+        .to_string()
+        .trim()
+        .trim_end_matches(':')
+        .trim()
+        .to_string()
+}
+
+/// The most labels a routine may have for its forward GOTOs to be converted
+/// (the engine reads no more than this many; see `sqldiff-equiv` `goto.rs`).
+const MAX_GOTO_LABELS: usize = 64;
+
 /// Why a GOTO is not converted. PL/pgSQL has no GOTO; a jump forward to a
 /// label later in an enclosing statement list (Ola Hallengren's `GOTO
 /// Logging`) is a labelled block left with EXIT (`goto_regions`), unless the
 /// label is also reached another way (a jump from another list or from
 /// after it, a label used twice, regions that cross).
-/// The most labels a routine may have for its forward GOTOs to be converted
-/// (the engine reads no more than this many; see `sqldiff-equiv` `goto.rs`).
-const MAX_GOTO_LABELS: usize = 64;
-
 fn goto(n: &SyntaxNode, label: &str) -> String {
     let at = n.text_range().start();
     let forward = n.ancestors().skip(1).any(|a| {
@@ -13758,4 +13795,28 @@ fn dollar_tag(texts: &[&str]) -> String {
         })
         .find(|t| !texts.iter().any(|x| x.contains(t.as_str())))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod goto_scan_tests {
+    use super::*;
+
+    /// Every statement list with a label asks for the routine's labels and
+    /// jumps; they are scanned once per routine, not once per list (a
+    /// procedure with thousands of such blocks was quadratic).
+    #[test]
+    fn the_labels_of_a_routine_are_scanned_once() {
+        let n = 300;
+        let mut body = String::new();
+        for i in 0..n {
+            body.push_str(&format!(
+                "IF @x = {i}\nBEGIN\nSELECT 1;\nl{i}:\nSELECT 2;\nEND\n"
+            ));
+        }
+        let src = format!("CREATE PROCEDURE dbo.p @x int\nAS\nBEGIN\n{body}END\n");
+        GOTO_SCANS.with(|c| c.set(0));
+        let d = crate::rewrite(&src, Dialect::Tsql, Dialect::Postgres);
+        assert!(d.output().contains("CREATE"));
+        assert_eq!(GOTO_SCANS.with(|c| c.get()), 1);
+    }
 }
