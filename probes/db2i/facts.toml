@@ -208,3 +208,14 @@ facts = ["V33"]
 file = "crates/sqldiff-draft/src/tsql.rs"
 anchor = "\"ASM-FACT-V33\""
 hedge = "not checked on a real system"
+
+[[fact]]
+id = "V35"
+title = "COMMENT ON a table or a column stores a text of up to 254 letters, digits and code-page-invariant punctuation whole"
+review = ["crates/sqldiff-equiv/src/equiv/call.rs", "docs/vendor-facts-verification.md"]
+
+[[link]]
+facts = ["V35"]
+file = "crates/sqldiff-equiv/src/equiv/call.rs"
+anchor = "\"ASM-FACT-V35\","
+hedge = "not checked on a real system"
