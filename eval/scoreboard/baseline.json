@@ -1,0 +1,23 @@
+{
+ "clean_units": {
+  "aw-dw-db2i": 20,
+  "aw-dw-postgres": 133,
+  "aw-oltp-db2i": 80,
+  "aw-oltp-postgres": 853,
+  "ola-db2i": 83,
+  "ola-postgres": 1348,
+  "sakila-db2i": 20,
+  "sakila-postgres": 47,
+  "wwi-dw-db2i": 101,
+  "wwi-dw-postgres": 631,
+  "wwi-oltp-db2i": 704,
+  "wwi-oltp-postgres": 5163,
+  "wwi-samples-db2i": 28,
+  "wwi-samples-postgres": 75
+ },
+ "cross_dialect_different": {
+  "db2i": 85,
+  "postgres": 135
+ },
+ "note": "Measured on main c1a051f (2026-11-13). Against 80b4a85 (plan section 1) PG is +2 clean units (Ola) and Db2 for i is -85, all in ola-db2i (168 -> 83), which came in with the GOTO PRs #484-#487; the baseline accepts it so the gate starts green, and it is recorded here, not endorsed."
+}
