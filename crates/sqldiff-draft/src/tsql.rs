@@ -229,17 +229,11 @@ enum Mode {
     Do,
 }
 
-/// Whether a unit holds a `DECLARE @t TABLE (…)` at any depth.
+/// Whether a unit holds a table variable's DECLARE (`DECLARE @t [AS] TABLE
+/// (…)`, as the rules recognise it) at any depth.
 fn declares_table_variable(n: &SyntaxNode) -> bool {
-    n.descendants().any(|d| {
-        d.kind() == STATEMENT && {
-            let ts: Vec<T> = tokens(&d).into_iter().filter(|t| t.sig()).collect();
-            ts.first().is_some_and(|t| t.is("DECLARE"))
-                && ts
-                    .windows(2)
-                    .any(|w| w[0].k == VARIABLE && w[1].is("TABLE"))
-        }
-    })
+    n.descendants()
+        .any(|d| d.kind() == STATEMENT && crate::table_vars::table_variable_declare(&d))
 }
 
 /// A forward jump of one statement list, written as a labelled block.

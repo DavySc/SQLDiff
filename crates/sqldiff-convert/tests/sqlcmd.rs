@@ -169,6 +169,10 @@ fn a_region_that_skips_a_table_variable_declare_is_not_converted() {
         c.output
     );
     assert!(reasons(&c).contains("table variable"), "{}", reasons(&c));
+    let with_as = src.replace("DECLARE @t TABLE", "DECLARE @t AS TABLE");
+    let c = pg(&with_as);
+    assert!(!c.output.contains("<<goto_"), "{}", c.output);
+    assert!(reasons(&c).contains("table variable"), "{}", reasons(&c));
     // A scalar DECLARE in the region is hoisted, so the region is fine.
     let scalar = src
         .replace("DECLARE @t TABLE (a int);", "DECLARE @v int = 5;")
