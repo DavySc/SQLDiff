@@ -430,3 +430,44 @@ fn a_parameter_default_that_is_not_a_literal_is_not_identified() {
     );
     not_identified(&c);
 }
+
+// ---- forward GOTO: a labelled block left with EXIT (statement-level
+// equivalence models it, so the analysis follows it).
+
+fn goto_pair(tail_a: &str, tail_b: &str) -> Vec<Class> {
+    let a = tsql(
+        "@x int",
+        &format!("DECLARE @y int = 0;\nIF @x = 1 GOTO l;\nSET @y = 5;\nl:\n{tail_a}"),
+    );
+    let b = pg(
+        "p_x integer",
+        "v_y integer;",
+        &format!("v_y := 0;\n<<goto_l>>\nBEGIN\nIF p_x = 1 THEN EXIT goto_l; END IF;\nv_y := 5;\nEND;\n{tail_b}"),
+    );
+    classes(&a, &b)
+}
+
+#[test]
+fn a_condition_on_a_parameter_inside_and_after_a_forward_goto_block_is_identified() {
+    // Both IF conditions read only the parameter: the jump's condition
+    // (inside the block) and the one after the label.
+    let c = goto_pair(
+        "IF @x = 2 UPDATE dbo.t SET c = 1;",
+        "IF p_x = 2 THEN UPDATE t SET c = 1; END IF;",
+    );
+    assert_eq!(c, vec![Class::Value, Class::Value], "{c:?}");
+}
+
+#[test]
+fn a_variable_a_forward_goto_block_writes_is_unknown_after_it() {
+    // After the label @y is 0 (jump taken) or 5 (not taken): not identified.
+    // (The statement level already does not prove this pair equal; the
+    // analysis's own join over a block's exits is a second guard behind it.)
+    let c = goto_pair(
+        "IF @y = 5 UPDATE dbo.t SET c = 1;",
+        "IF v_y = 5 THEN UPDATE t SET c = 1; END IF;",
+    );
+    assert_eq!(c.len(), 2, "{c:?}");
+    assert_eq!(c[0], Class::Value, "{c:?}");
+    assert!(matches!(c[1], Class::No(_)), "{c:?}");
+}
