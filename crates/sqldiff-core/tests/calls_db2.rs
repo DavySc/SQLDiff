@@ -235,6 +235,8 @@ fn a_callee_whose_result_sets_the_catalog_did_not_read_is_not_compared() {
         r.unknown_reasons
     );
     assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
+}
+
 fn ep(level1: &str, name: &str, col: Option<&str>, text: &str) -> String {
     let c = col.map_or(String::new(), |c| {
         format!(", @level2type = N'COLUMN', @level2name = N'{c}'")
