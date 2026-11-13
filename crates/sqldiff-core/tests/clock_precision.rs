@@ -62,18 +62,18 @@ fn table(col_t: &str, col_p: &str, def_t: &str, def_p: &str) -> (String, String)
     )
 }
 
+/// A clock column default is not proven: inside a PostgreSQL routine
+/// `statement_timestamp()` is the time of the CALL, also where it fills a
+/// column default, while SQL Server fills the default at the INSERT.
 #[test]
-fn clock_default_of_a_datetime2_7_column() {
-    let (a, b) = table(
-        "datetime2(7)",
-        "timestamp",
-        "sysdatetime()",
-        "statement_timestamp()::timestamp",
-    );
-    let r = equal(&a, &b);
-    assert!(ids(&r).contains(&"ASM-CLOCK-FRACTION-6"), "{:?}", ids(&r));
-    // Another clock, a clock cast to another precision, another column type.
+fn clock_default_of_a_datetime2_7_column_stays_unproven() {
     for (ct, cp, dt, dp) in [
+        (
+            "datetime2(7)",
+            "timestamp",
+            "sysdatetime()",
+            "statement_timestamp()::timestamp",
+        ),
         (
             "datetime2(7)",
             "timestamp",
@@ -86,30 +86,6 @@ fn clock_default_of_a_datetime2_7_column() {
             "sysdatetime()",
             "clock_timestamp()::timestamp",
         ),
-        (
-            "datetime2(7)",
-            "timestamp",
-            "getdate()",
-            "statement_timestamp()::timestamp",
-        ),
-        (
-            "datetime2(7)",
-            "timestamp(3)",
-            "sysdatetime()",
-            "statement_timestamp()::timestamp",
-        ),
-        (
-            "datetime2(3)",
-            "timestamp(3)",
-            "sysdatetime()",
-            "statement_timestamp()::timestamp",
-        ),
-        (
-            "datetime2(7)",
-            "timestamp",
-            "sysdatetime()",
-            "statement_timestamp()::timestamp(3)",
-        ),
     ] {
         let (a, b) = table(ct, cp, dt, dp);
         not_equal(&a, &b);
@@ -118,32 +94,51 @@ fn clock_default_of_a_datetime2_7_column() {
 
 #[test]
 fn clock_cast_to_six_digits() {
+    // Top-level statements: here the rule decides. The 7th digit of
+    // SYSDATETIME() is dropped by the cast to datetime2(6).
+    let ins = |v: &str| format!("INSERT INTO dbo.t (id, w) VALUES (1, {v});\n");
+    let insp = |v: &str| format!("INSERT INTO t (id, w) VALUES (1, {v});\n");
+    let r = equal(
+        &ins("CAST(SYSDATETIME() AS datetime2(6))"),
+        &insp("CAST(statement_timestamp() AS timestamp(6))"),
+    );
+    assert!(ids(&r).contains(&"ASM-CLOCK-FRACTION-6"), "{:?}", ids(&r));
+    // Near misses: another precision, no cast on the T-SQL side or the
+    // PostgreSQL side, another clock.
+    for (a, b) in [
+        (
+            "CAST(SYSDATETIME() AS datetime2(6))",
+            "CAST(statement_timestamp() AS timestamp(3))",
+        ),
+        (
+            "CAST(SYSDATETIME() AS datetime2(7))",
+            "CAST(statement_timestamp() AS timestamp(6))",
+        ),
+        (
+            "CAST(SYSDATETIME() AS datetime2(6))",
+            "CAST(now() AS timestamp(6))",
+        ),
+        (
+            "CAST(SYSDATETIME() AS datetime2(6))",
+            "CAST(clock_timestamp() AS timestamp(6))",
+        ),
+        (
+            "CAST(GETDATE() AS datetime2(6))",
+            "CAST(statement_timestamp() AS timestamp(6))",
+        ),
+    ] {
+        not_equal(&ins(a), &insp(b));
+    }
+    // Inside a routine PostgreSQL's statement_timestamp() is the time of the
+    // CALL, so an assignment from SYSDATETIME() is not shown equal to it.
     let (a, b) = proc(
         "  SET @d = SYSDATETIME();",
         "  v_d := statement_timestamp()::timestamp;",
     );
-    // Inside a routine PostgreSQL's statement_timestamp() is the time of the
-    // CALL, not of the statement, so main no longer shows an assignment from
-    // SYSDATETIME() equal to it: the clock cast alone (ASM-CLOCK-FRACTION-6)
-    // does not make the pair equal there.
     not_equal(&a, &b);
     let (a, b) = proc(
         "  SET @d = CAST(SYSDATETIME() AS datetime2(6));",
         "  v_d := CAST(statement_timestamp() AS timestamp(6));",
-    );
-    not_equal(&a, &b);
-    // The transaction clock, the real clock and datetime's GETDATE are other values.
-    for p in [
-        "  v_d := now()::timestamp;",
-        "  v_d := clock_timestamp()::timestamp;",
-        "  v_d := statement_timestamp()::timestamp(3);",
-    ] {
-        let (a, b) = proc("  SET @d = SYSDATETIME();", p);
-        not_equal(&a, &b);
-    }
-    let (a, b) = proc(
-        "  SET @d = GETDATE();",
-        "  v_d := statement_timestamp()::timestamp;",
     );
     not_equal(&a, &b);
 }

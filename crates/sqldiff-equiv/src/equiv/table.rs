@@ -1993,25 +1993,6 @@ fn default_fits(ts: &[Tok], ty: &Ty) -> R<()> {
             | Ty::Uuid => Ok(()),
             _ => not("(a call's result converted on storing)"),
         },
-        // PostgreSQL's statement or transaction clock cast to timestamp (the
-        // converter's SYSDATETIME() default): a value that already has the
-        // 6-digit timestamp column's type, so storing it converts nothing.
-        [f, o, c, cast, t]
-            if f.kind == K::Word
-                && matches!(
-                    f.up.as_str(),
-                    "STATEMENT_TIMESTAMP" | "NOW" | "TRANSACTION_TIMESTAMP"
-                )
-                && o.kind == K::LParen
-                && c.kind == K::RParen
-                && cast.kind == K::Op
-                && cast.text == "::"
-                && t.kind == K::Word
-                && t.up == "TIMESTAMP"
-                && matches!(ty, Ty::Timestamp(6)) =>
-        {
-            Ok(())
-        }
         // PostgreSQL niladic forms: CURRENT_TIMESTAMP, LOCALTIMESTAMP, ...
         [f] if f.kind == K::Word
             && matches!(
