@@ -191,6 +191,12 @@ pub fn norm_token(tok: &SyntaxToken, dialect: Dialect) -> NormTok {
         match (folding, quoted) {
             (IdentFolding::Lower, false) => (s.to_lowercase(), s.to_lowercase()),
             (IdentFolding::Upper, false) => (s.to_uppercase(), s.to_uppercase()),
+            // A quoted name is never the keyword: `"TEXT"` or `"IN"` is an
+            // identifier, while the unquoted word is normalized to the
+            // keyword's upper case. Keep the two apart (never a wrong equal).
+            (IdentFolding::Lower | IdentFolding::Upper, true) if is_keyword(s) => {
+                (format!("\"{s}\""), format!("\"{s}\""))
+            }
             (IdentFolding::Lower | IdentFolding::Upper, true) => (s.to_string(), s.to_string()),
             (IdentFolding::Collation, _) => (s.to_uppercase(), s.to_string()),
         }

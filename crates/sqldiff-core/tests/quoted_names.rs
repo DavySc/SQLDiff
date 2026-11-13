@@ -402,3 +402,34 @@ fn a_literal_against_a_bracketed_type_column_is_a_string_comparison() {
     );
     assert!(r.assumptions.iter().any(|a| a.id == "ASM-CI-COLLATION"));
 }
+
+/// A quoted upper-case PostgreSQL name that spells a keyword (`"IN"`,
+/// `"TEXT"`) is an identifier, not the keyword the unquoted word means
+/// (issue #496).
+#[test]
+fn quoted_upper_case_keyword_is_not_the_unquoted_word() {
+    let pg = |a: &str, b: &str| {
+        diff(
+            &Artifact::new("a.sql", P, a),
+            &Artifact::new("b.sql", P, b),
+            &Options::default(),
+        )
+    };
+    for (q, u) in [
+        ("create table t (\"IN\" int);", "create table t (in int);"),
+        ("select \"TEXT\" from t;", "select text from t;"),
+        ("select a as \"TEXT\" from t;", "select a as text from t;"),
+        ("select 1 from \"SELECT\";", "select 1 from select;"),
+    ] {
+        for (a, b) in [(q, u), (u, q)] {
+            let r = pg(a, b);
+            assert_ne!(r.verdict(), Verdict::Equal, "{a} / {b}");
+            assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions, "{a} / {b}");
+        }
+    }
+    // The same quoted name on both sides is still equal.
+    assert_eq!(
+        pg("select \"TEXT\" from t;", "select \"TEXT\" from t;").verdict(),
+        Verdict::Equal
+    );
+}
