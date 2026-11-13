@@ -75,8 +75,24 @@ fn statements_with_no_counterpart_are_marked() {
         impossible::HIERARCHYID,
     );
     marked(
+        "BULK INSERT dbo.t FROM 'C:\\load\\t.csv' WITH (FIELDTERMINATOR = '+|', ROWTERMINATOR = '&|\\n');\n",
+        impossible::BULK_INSERT,
+    );
+    marked(
         "CREATE TABLE dbo.t (a int) WITH (MEMORY_OPTIMIZED = ON, DURABILITY = SCHEMA_ONLY);\n",
         impossible::IN_MEMORY_OLTP,
+    );
+}
+
+#[test]
+fn openrowset_bulk_is_not_marked_as_bulk_insert() {
+    let c = pg("INSERT INTO dbo.t SELECT * FROM OPENROWSET(BULK 'f.csv', SINGLE_CLOB) AS r;\n");
+    assert!(
+        c.units
+            .iter()
+            .all(|u| u.impossible() != Some(impossible::BULK_INSERT)),
+        "{:?}",
+        c.units.iter().map(|u| &u.notes).collect::<Vec<_>>()
     );
 }
 

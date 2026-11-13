@@ -46,13 +46,14 @@ pub const HIERARCHYID: Feature = f("hierarchyid", "hierarchyid type");
 pub const HASH_FUNCTIONS: Feature = f("sql-server-hash", "CHECKSUM and BINARY_CHECKSUM");
 pub const ALWAYS_ENCRYPTED: Feature = f("always-encrypted", "Always Encrypted keys");
 pub const INSTANCE_METADATA: Feature = f("instance-metadata", "instance and catalog metadata");
+pub const BULK_INSERT: Feature = f("bulk-insert", "BULK INSERT");
 pub const DATABASE_LEVEL: Feature = f(
     "database-level",
     "database-level statements (USE, CREATE and ALTER DATABASE)",
 );
 
 /// Every feature the converter can name, in report order.
-pub const ALL: [Feature; 13] = [
+pub const ALL: [Feature; 14] = [
     IN_MEMORY_OLTP,
     SECURITY_POLICY,
     SERVER_AUDIT,
@@ -65,6 +66,7 @@ pub const ALL: [Feature; 13] = [
     HASH_FUNCTIONS,
     ALWAYS_ENCRYPTED,
     INSTANCE_METADATA,
+    BULK_INSERT,
     DATABASE_LEVEL,
 ];
 

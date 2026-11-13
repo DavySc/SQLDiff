@@ -2771,9 +2771,9 @@ impl<'a> Cx<'a> {
                 "ALTER INDEX (REBUILD, REORGANIZE, DISABLE, SET …): maintenance with no exact PostgreSQL counterpart (REINDEX rebuilds, nothing disables an index); no rule",
                 "ALTER INDEX: maintenance with no exact Db2 for i counterpart; no rule",
             )),
-            "BULK" if w(1) == "INSERT" => return no(self.pick(
-                "BULK INSERT: reads a file on the SQL Server host with its own field and row terminators, code page and format options; PostgreSQL's COPY has different file rules (single-character delimiters, one encoding), so there is no checked rule",
-                "BULK INSERT: reads a file on the SQL Server host; Db2 for i has no statement with the same file rules; no rule",
+            "BULK" if w(1) == "INSERT" => return impossible(sqldiff_units::impossible::BULK_INSERT, self.pick(
+                "BULK INSERT: loads a file on the SQL Server host in SQL Server's file format (no escape or quote characters, multi-character and UTF-16 terminators, OEM code pages, and by default no CHECK or foreign key checks and no triggers); PostgreSQL's COPY always treats backslash (text) or its quote character (csv) as special, takes one-byte delimiters, has no UTF-16 or OEM code pages and always checks constraints and fires triggers, so no COPY loads every such file into the same rows",
+                "BULK INSERT: loads a file on the SQL Server host; Db2 for i SQL has no statement that loads a file",
             )),
             "ALTER" if sqldiff_units::impossible::of_ddl(&[w(1).as_str(), w(2).as_str()]).is_some() => {
                 let x = sqldiff_units::impossible::of_ddl(&[w(1).as_str(), w(2).as_str()]).unwrap();
