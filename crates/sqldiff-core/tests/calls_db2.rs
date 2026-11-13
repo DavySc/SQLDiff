@@ -278,10 +278,12 @@ fn a_column_comment_is_equal() {
 }
 
 #[test]
-fn a_schema_comment_is_equal() {
-    comment_equal(
+fn a_schema_comment_is_not_compared() {
+    not_compared(
         "EXEC sp_addextendedproperty @name = N'MS_Description', @value = N'Sales data', @level0type = N'SCHEMA', @level0name = N'Sales';",
         "COMMENT ON SCHEMA Sales IS 'Sales data';",
+        CAT_D,
+        "COMMENT ON SCHEMA is not compared",
     );
 }
 
@@ -322,7 +324,86 @@ fn a_comment_that_is_not_printable_ascii_is_not_compared() {
         &ep("TABLE", "Things", None, "caf\u{e9}"),
         "COMMENT ON TABLE Sales.Things IS 'caf\u{e9}';",
         CAT_D,
-        "printable ASCII",
+        "is not compared (only letters",
+    );
+}
+
+#[test]
+fn characters_that_change_with_the_code_page_are_not_compared() {
+    for c in [
+        "!", "#", "$", "@", "[", "]", "\\", "^", "`", "{", "|", "}", "~",
+    ] {
+        let text = format!("a{c}b");
+        not_compared(
+            &ep("TABLE", "Things", None, &text),
+            &format!("COMMENT ON TABLE Sales.Things IS '{text}';"),
+            CAT_D,
+            "is not compared (only letters",
+        );
+    }
+}
+
+#[test]
+fn the_invariant_punctuation_is_compared() {
+    let text = "Aa 09 \"%&''()*+,-./:;<=>?_";
+    comment_equal(
+        &ep("TABLE", "Things", None, text),
+        &format!("COMMENT ON TABLE Sales.Things IS '{text}';"),
+    );
+}
+
+#[test]
+fn an_empty_comment_is_not_compared() {
+    not_compared(
+        "EXEC sp_addextendedproperty @name = N'MS_Description', @value = N'', @level0type = N'SCHEMA', @level0name = N'Sales', @level1type = N'TABLE', @level1name = N'Things';",
+        "COMMENT ON TABLE Sales.Things IS '';",
+        CAT_D,
+        "empty Db2 for i comment",
+    );
+}
+
+#[test]
+fn a_leading_or_trailing_blank_is_not_compared() {
+    for text in [" lead", "trail "] {
+        not_compared(
+            &ep("TABLE", "Things", None, text),
+            &format!("COMMENT ON TABLE Sales.Things IS '{text}';"),
+            CAT_D,
+            "leading or trailing blank",
+        );
+    }
+}
+
+#[test]
+fn a_literal_that_is_not_plain_is_not_compared() {
+    for lit in ["N'n'", "X'6E'", "G'n'"] {
+        not_compared(
+            &ep("TABLE", "Things", None, "n"),
+            &format!("COMMENT ON TABLE Sales.Things IS {lit};"),
+            CAT_D,
+            "plain string literal",
+        );
+    }
+}
+
+#[test]
+fn text_after_the_literal_is_not_compared() {
+    not_compared(
+        &ep("TABLE", "Things", None, "n"),
+        "COMMENT ON TABLE Sales.Things IS 'n' 'm';",
+        CAT_D,
+        "one value after IS",
+    );
+}
+
+#[test]
+fn a_quoted_lower_case_db2_comment_name_is_not_the_folded_one() {
+    // "Sales" is another schema than SALES in Db2 for i.
+    not_compared(
+        &ep("TABLE", "Things", None, "n"),
+        "COMMENT ON TABLE \"Sales\".Things IS 'n';",
+        CAT_D,
+        "lower-case",
     );
 }
 

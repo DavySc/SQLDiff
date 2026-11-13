@@ -1,8 +1,8 @@
 //! Procedure calls and object comments compared across dialects: T-SQL
 //! `EXEC` against PostgreSQL `CALL`, and T-SQL `sp_addextendedproperty`
 //! against PostgreSQL `COMMENT ON`. Against Db2 for i only an `EXEC` without
-//! arguments, as `CALL schema.name()`, and the comments on a schema, a table
-//! and a table's column (`ASM-FACT-V35`) are compared.
+//! arguments, as `CALL schema.name()`, and the comments on a table and a
+//! table's column (`ASM-FACT-V35`) are compared.
 //!
 //! Each statement is read completely or not at all: dynamic SQL, return
 //! codes, `WITH` options, expressions T-SQL does not accept as arguments and
@@ -82,7 +82,7 @@ pub const EXTPROP_COMMENT_DB2: (&str, &str) = (
 /// What a Db2 for i comment is proven to store (probes `V35-*`).
 pub const FACT_V35: (&str, &str) = (
     "ASM-FACT-V35",
-    "A Db2 for i COMMENT ON a table, a column or a schema stores a text of at most 254 printable ASCII characters whole, as written (fact V35, not checked on a real system)",
+    "A Db2 for i COMMENT ON a table or a column stores a text of 1 to 254 characters whole, as written, when it holds only letters, digits, blanks between words and the punctuation \" % & ' ( ) * + , - . / : ; < = > ? _ (the printable ASCII characters EBCDIC code pages agree on), with no leading or trailing blank (fact V35, not checked on a real system)",
 );
 
 /// The longest Db2 for i comment text compared (`FACT_V35`).
@@ -280,28 +280,21 @@ pub fn parse(ts: &[Tok], d: Dialect) -> R<Stmt> {
     }
 }
 
-/// Db2 for i `COMMENT ON SCHEMA s | TABLE s.t | COLUMN s.t.c IS 'text'`, with
-/// every name qualified. Views, routines, indexes and constraints are not
-/// read: a view's comment form is an open question (`V30-COMMENT-ON-TABLE-VIEW`).
+/// Db2 for i `COMMENT ON TABLE s.t | COLUMN s.t.c IS 'text'`, with every name
+/// qualified. A schema's comment is not read (no probe reads one back), nor a
+/// view's (`V30-COMMENT-ON-TABLE-VIEW` is open), nor a routine's, index's or
+/// constraint's. The text is restricted to the characters EBCDIC keeps the
+/// same in every CCSID (`db2_comment_text`).
 fn db2_comment(ts: &[Tok]) -> R<Comment> {
     if !word(ts.get(1), "ON") {
         return Err("COMMENT without ON".into());
     }
     let kind = ts.get(2).map(|t| t.up.as_str()).unwrap_or("");
     let (parts, i) = match kind {
-        "SCHEMA" | "TABLE" | "COLUMN" => dotted(ts, 3)?,
+        "TABLE" | "COLUMN" => dotted(ts, 3)?,
         other => return Err(format!("Db2 for i COMMENT ON {other} is not compared")),
     };
     let target = match (kind, parts.as_slice()) {
-        ("SCHEMA", [s]) => {
-            if s.text.chars().count() > 10 {
-                return Err(format!(
-                    "the Db2 for i schema name {} is longer than 10 characters, so its library gets another, generated system name (fact V29)",
-                    s.text
-                ));
-            }
-            Target::Schema(s.clone())
-        }
         ("TABLE", [s, t]) => Target::Object("TABLE", s.clone(), t.clone()),
         ("COLUMN", [s, t, c]) => Target::Column("", s.clone(), t.clone(), c.clone()),
         _ => {
@@ -318,12 +311,35 @@ fn db2_comment(ts: &[Tok]) -> R<Comment> {
         return Err("a comment that is not a plain string literal".into());
     }
     let text = string_value(&v.text)?;
-    // Printable ASCII only: the stored form of other characters depends on
-    // the job and column CCSIDs. A zero-length text may remove the comment.
-    if text.is_empty() || !text.bytes().all(|b| (0x20..0x7f).contains(&b)) {
-        return Err(
-            "a Db2 for i comment that is empty or not printable ASCII is not compared".into(),
-        );
+    db2_comment_text(&text)?;
+    Ok(Comment {
+        target,
+        text: Some(text),
+        narrow: false,
+        backslash: false,
+    })
+}
+
+/// The comment texts `ASM-FACT-V35` covers: 1 to 254 characters, letters,
+/// digits, blanks inside the text and `" % & ' ( ) * + , - . / : ; < = > ? _`.
+/// Those are the printable ASCII characters EBCDIC code pages agree on; the
+/// others (`! # $ @ [ \ ] ^ ` { | } ~`) change with the job's CCSID. A
+/// zero-length text may remove the comment, and a leading or trailing blank
+/// may be trimmed.
+fn db2_comment_text(text: &str) -> R<()> {
+    if text.is_empty() {
+        return Err("an empty Db2 for i comment is not compared".into());
+    }
+    if text.starts_with(' ') || text.ends_with(' ') {
+        return Err("a Db2 for i comment with a leading or trailing blank is not compared".into());
+    }
+    if let Some(c) = text
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || " \"%&'()*+,-./:;<=>?_".contains(*c)))
+    {
+        return Err(format!(
+            "a Db2 for i comment with the character {c:?} is not compared (only letters, digits and the code-page-invariant punctuation are, fact V35)"
+        ));
     }
     if text.len() > DB2_COMMENT_MAX {
         return Err(format!(
@@ -331,12 +347,7 @@ fn db2_comment(ts: &[Tok]) -> R<Comment> {
             text.len()
         ));
     }
-    Ok(Comment {
-        target,
-        text: Some(text),
-        narrow: false,
-        backslash: false,
-    })
+    Ok(())
 }
 
 /// Db2 for i `CALL schema.name()`: only a qualified name and an empty

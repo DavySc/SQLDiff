@@ -211,7 +211,7 @@ hedge = "not checked on a real system"
 
 [[fact]]
 id = "V35"
-title = "COMMENT ON a table, a column or a schema stores a text of up to 254 printable ASCII characters whole"
+title = "COMMENT ON a table or a column stores a text of up to 254 letters, digits and code-page-invariant punctuation whole"
 review = ["crates/sqldiff-equiv/src/equiv/call.rs", "docs/vendor-facts-verification.md"]
 
 [[link]]

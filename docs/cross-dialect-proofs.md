@@ -162,13 +162,14 @@ each side, no parameters, a schema on the Db2 name; `ASM-CALLEE-CONVERTED`).
 A call with arguments needs the Db2 for i parameter types and stays not
 compared.
 
-Db2 for i comments: `COMMENT ON SCHEMA s | TABLE s.t | COLUMN s.t.c IS 'text'`
-against `sp_addextendedproperty` on a schema, a table or a table's column,
-with every Db2 name qualified, the table (not a view) in both catalogs, and a
-text of 1 to 254 printable ASCII characters. Equal under
+Db2 for i comments: `COMMENT ON TABLE s.t | COLUMN s.t.c IS 'text'` against
+`sp_addextendedproperty` on a table or a table's column, with every Db2 name
+qualified, the table (not a view) in both catalogs, and a text of 1 to 254
+letters, digits, blanks between words and code-page-invariant punctuation
+(`" % & ' ( ) * + , - . / : ; < = > ? _`). Equal under
 `ASM-EXTPROP-COMMENT` and `ASM-FACT-V35` (probe `V35-COMMENT-254`, not run).
-Views, routines, indexes, constraints, longer or non-ASCII texts are not
-compared; the open questions are probes `V30-*` in
+Schemas, views, routines, indexes, constraints, longer texts and other
+characters are not compared; the open questions are probes `V30-*` in
 [probes/db2i](../probes/db2i/README.md).
 
 **Calls.** The called procedure is looked up in both sides' catalogs (in a

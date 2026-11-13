@@ -51,7 +51,7 @@ Checked against official vendor documentation on 2026-10-23. Target versions are
 | V32 | Db2 i ORDER BY and FETCH FIRST below the outer query | Unverified | FETCH FIRST n ROWS ONLY and ORDER BY in a derived table, IN and scalar subquery, CTE (and INSERT … SELECT, view), and a NULL row count: probes `V32-*` in `probes/db2i`. |
 | V33 | Db2 i date and timestamp strings | Partial | ISO `yyyy-mm-dd` dates, ISO and IBM SQL timestamps (0 to 12 fraction digits, padded or truncated to the precision) documented; T-SQL's compact `yyyymmdd` is not a Db2 i date or timestamp string. That an assignment reads them as a CAST does is inferred: probes `V33-*` in `probes/db2i`. |
 | V34 | Db2 i BEFORE INSERT trigger as a sequence default | Unverified | A NOT NULL column left out of an INSERT, filled by a `WHEN (N.c IS NULL) SET N.c = NEXT VALUE FOR s` trigger before the NOT NULL check, per row, for INSERT … SELECT and MERGE, no value taken when the INSERT gives one; a written NULL and the DEFAULT keyword: probes `V34-*` in `probes/db2i`. |
-| V35 | Db2 i COMMENT ON text | Unverified | A table, column or schema comment of up to 254 printable ASCII characters is stored whole: probe `V35-COMMENT-254` in `probes/db2i`. Whether COMMENT ON TABLE takes a view (`V30-COMMENT-ON-TABLE-VIEW`) and longer comments (`V30-COMMENT-LENGTH`) stay open and are not compared. |
+| V35 | Db2 i COMMENT ON text | Unverified | A table or column comment of up to 254 letters, digits, blanks and code-page-invariant punctuation is stored whole: probe `V35-COMMENT-254` in `probes/db2i`. Whether COMMENT ON TABLE takes a view (`V30-COMMENT-ON-TABLE-VIEW`) and longer comments (`V30-COMMENT-LENGTH`) stay open and are not compared. |
 
 Items that change implementation decisions: **V2, V7/V16, V10, V13 (UUID case), V20 (Db2 time source)**.
 
@@ -327,9 +327,9 @@ Db2 for i takes no `NEXT VALUE FOR` in a column default, so the converter writes
 - An INSERT that gives the column takes no sequence value.
 - Open, no expectation: an INSERT that writes NULL into the column (T-SQL refuses it; the trigger would fill it, as `ASM-SEQUENCE-DEFAULT-TRIGGER` states) and one that writes `DEFAULT`.
 
-### V35. COMMENT ON text on a table, a column or a schema — Unverified
+### V35. COMMENT ON text on a table or a column — Unverified
 
-The engine compares a T-SQL `sp_addextendedproperty` with a Db2 for i `COMMENT ON SCHEMA | TABLE | COLUMN … IS 'text'` when the text is 1 to 254 printable ASCII characters (`ASM-FACT-V35`) and the table or column is a table's in both catalogs. That the text is stored as written, whole, is not checked on a real system; the IBM i COMMENT page was not read. The probe `V35-COMMENT-254` in [probes/db2i](../probes/db2i/README.md) stores a table and a column comment of 254 characters and reads their length back. Views, longer or non-ASCII texts, routines, indexes and constraints are not compared.
+The engine compares a T-SQL `sp_addextendedproperty` with a Db2 for i `COMMENT ON TABLE | COLUMN … IS 'text'` (`ASM-FACT-V35`) when the table is a table in both catalogs and the text is 1 to 254 characters made of letters, digits, blanks between words and the punctuation `" % & ' ( ) * + , - . / : ; < = > ? _`, with no leading or trailing blank. These are the printable ASCII characters EBCDIC code pages agree on; `! # $ @ [ \ ] ^ ` { | } ~` change with the job's CCSID and are not compared. That the text is stored as written is not checked on a real system; the IBM i COMMENT page was not read. The probe `V35-COMMENT-254` in [probes/db2i](../probes/db2i/README.md) stores a table and a column comment of 254 characters that use every accepted character and reads each back for equality. Schema comments, views, routines, indexes, constraints, longer or other texts are not compared.
 
 ### JSON_QUERY, JSON_VALUE and PostgreSQL json — Confirmed (SQL Server, PostgreSQL)
 
