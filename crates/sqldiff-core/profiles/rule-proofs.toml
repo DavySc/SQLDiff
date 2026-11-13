@@ -1505,3 +1505,17 @@ id = "upsert/on-conflict"
 kind = "idiom"
 proof = "engine"
 sites = ["sqldiff-equiv/profiles/rules/idioms.rules"]
+
+[[rule]]
+id = "tsql.ctl.goto-block"
+kind = "converter"
+proof = "engine"
+note = "a forward GOTO's region (first unit holding a jump to the label .. the label) as a labelled `<<goto_l>> BEGIN … END` block; the engine follows the jump on the T-SQL side and the exit on the PostgreSQL side"
+sites = ["sqldiff-draft/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.ctl.goto-exit"
+kind = "converter"
+proof = "engine"
+note = "GOTO l inside such a block as `EXIT goto_l`"
+sites = ["sqldiff-draft/src/tsql.rs"]
