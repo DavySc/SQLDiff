@@ -46,6 +46,12 @@
 //! SQL or an uncovered construct mentions anywhere. A loop-carried variable
 //! has two reaching definitions and is unknown.
 //!
+//! A forward `GOTO` is a labelled block left by a jump (`CtlKind::Block`,
+//! `CtlKind::Exit`): after the block, every variable the block writes has
+//! two definitions (the state at the end of the block, and the state at a
+//! jump), so it is unknown. A backward jump, or one the statement level does
+//! not model, still refuses the routine pair (`jumps`).
+//!
 //! **Scope: fault-free runs.** A failed assignment leaves the old value (and
 //! continues) in T-SQL, and leaves for the handler in PostgreSQL. The
 //! analysis says nothing about runs with a fault; the report states it.
@@ -144,6 +150,9 @@ enum Def {
     Loop(usize),
     /// The state at an error handler: any prefix of the TRY part ran.
     Handler(usize),
+    /// The state at a jump out of a block (`GOTO` forward): any prefix of
+    /// the block ran.
+    Exit(usize),
     /// Not declared yet.
     Undefined,
 }
@@ -195,6 +204,11 @@ enum Blk {
         body: Vec<Blk>,
         catch: Vec<Blk>,
     },
+    /// A block a forward `GOTO` leaves (`CtlKind::Block`).
+    Block {
+        at: usize,
+        body: Vec<Blk>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -202,6 +216,7 @@ enum Open {
     If,
     While,
     Try,
+    Block,
 }
 
 struct Frame {
@@ -241,9 +256,9 @@ fn structure(ev: &[Ev<'_>]) -> Option<Vec<Blk>> {
             CtlKind::If(_) | CtlKind::RowsIf(..) => Some(Open::If),
             CtlKind::While(_) | CtlKind::FetchWhile(_) => Some(Open::While),
             CtlKind::Try => Some(Open::Try),
-            // A block or a jump out of one is not followed here: an `End`
-            // would close the wrong construct.
-            CtlKind::Block | CtlKind::Exit(_) => return None,
+            CtlKind::Block => Some(Open::Block),
+            // A jump out of a block is an event like any other here; what it
+            // does to the definitions is `walk`'s `Blk::Block`.
             _ => None,
         };
         if let Some(kind) = open {
@@ -290,6 +305,10 @@ fn structure(ev: &[Ev<'_>]) -> Option<Vec<Blk>> {
                         at: f.at,
                         body: first,
                         catch: second.unwrap_or_default(),
+                    },
+                    Open::Block => Blk::Block {
+                        at: f.at,
+                        body: first,
                     },
                 });
             }
@@ -548,6 +567,7 @@ impl<'a> Side<'a> {
                     self.assigned_in(body, in_catch, out);
                     self.assigned_in(catch, true, out);
                 }
+                Blk::Block { body, .. } => self.assigned_in(body, in_catch, out),
             }
         }
     }
@@ -607,6 +627,24 @@ impl<'a> Side<'a> {
                     self.walk(body, &mut ok, in_catch);
                     self.walk(catch, &mut handler, true);
                     *st = join(&ok, &handler);
+                }
+                Blk::Block { at, body } => {
+                    // A jump leaves the block after any prefix of it, so
+                    // after the block a variable it writes may hold a value
+                    // written so far or the one before: the state at a jump
+                    // is `Exit` for each of them, joined with the state at
+                    // the end of the block. Two definitions are no known
+                    // value, so such a variable is unknown after the block
+                    // whatever the block's own end state says.
+                    let mut assigned = BTreeSet::new();
+                    self.assigned_in(body, in_catch, &mut assigned);
+                    let mut exit = st.clone();
+                    for v in &assigned {
+                        Rc::make_mut(&mut exit)[*v] = Rc::new(vec![Def::Exit(*at)]);
+                    }
+                    let mut inner = st.clone();
+                    self.walk(body, &mut inner, in_catch);
+                    *st = join(&inner, &exit);
                 }
             }
         }
@@ -1059,7 +1097,9 @@ fn variable_facts(ua: &Unit, ub: &Unit, sa: &Side<'_>) -> Vec<Result<Asms, Strin
     out
 }
 
-/// A label or `GOTO`: control flow the structured walk does not follow. The
+/// A label or `GOTO` the statement level did not lower to a block and an
+/// exit (a backward jump, a jump into a block, a crossing region, a label
+/// used twice): control flow the structured walk does not follow. The
 /// first token of each statement is read on demand ([`LStmt::toks`]).
 fn jumps(u: &Unit) -> Option<String> {
     let goto = |t: &[super::ast::Tok]| t.first().is_some_and(|f| f.up == "GOTO");
@@ -1092,7 +1132,8 @@ pub(super) fn analyze(
     if rep.conds_a == 0 && rep.conds_b == 0 {
         return rep;
     }
-    // A label with a GOTO is a loop the structured walk does not see.
+    // A label or GOTO that is not a modelled forward block (a loop, say) is
+    // control flow the structured walk does not see.
     if let Some(why) = jumps(ua).or_else(|| jumps(ub)) {
         rep.refused = Some(why);
         return rep;
