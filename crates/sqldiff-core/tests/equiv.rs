@@ -1592,3 +1592,30 @@ fn routine_clock_is_not_per_statement() {
         r.findings
     );
 }
+
+/// A column default `statement_timestamp()` is the CALL's start when a
+/// PostgreSQL routine inserts the row, SQL Server's SYSDATETIME() default is
+/// the INSERT's: the pair is not proven, alone or with the procedure.
+#[test]
+fn statement_clock_column_default_is_not_proven() {
+    let ts_table = "CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, w datetime2(6) NOT NULL CONSTRAINT df DEFAULT (sysdatetime()));\nGO\n";
+    let ts_proc = "CREATE PROCEDURE dbo.p AS BEGIN SET NOCOUNT ON; SET XACT_ABORT ON; INSERT INTO dbo.t (id) VALUES (1); END";
+    for cast in ["", "::timestamp(6)"] {
+        let pg_table = format!("CREATE TABLE t (id integer NOT NULL PRIMARY KEY, w timestamp(6) NOT NULL DEFAULT (statement_timestamp(){cast}));\n");
+        let pg_proc = "CREATE OR REPLACE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN INSERT INTO t (id) VALUES (1); END; $$;";
+        for (a, b) in [
+            (ts_table.to_string(), pg_table.clone()),
+            (
+                format!("{ts_table}{ts_proc}"),
+                format!("{pg_table}{pg_proc}"),
+            ),
+        ] {
+            let r = run(&a, T, &b, P, false);
+            assert!(
+                !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+                "{cast:?}: {:?}",
+                r.findings
+            );
+        }
+    }
+}
