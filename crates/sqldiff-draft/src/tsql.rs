@@ -3549,8 +3549,11 @@ impl<'a> Cx<'a> {
     /// identity: `UPDATE t AS x SET col = c.rn FROM (SELECT ctid AS rid, …
     /// FROM t WHERE w) AS c WHERE x.ctid = c.rid`. Every base row meets its
     /// own row of the query, never another. Only the plain shape is taken: one
-    /// CTE; its query one SELECT from one named table (a catalog table or a
-    /// converted table variable) with an optional WHERE, no DISTINCT, TOP,
+    /// CTE without a column list; its query one
+    /// SELECT from one session-private table (a converted table variable or a
+    /// `#temp` table: a catalog table may be partitioned or inherited, where
+    /// `ctid` repeats, or changed by another session while the UPDATE waits,
+    /// when READ COMMITTED skips the row whose `ctid` moved) with an optional WHERE, no DISTINCT, TOP,
     /// grouping, set operation, join or ORDER BY; every item a plain column
     /// or `expression AS alias`; the UPDATE with no FROM, WHERE, TOP or
     /// OUTPUT, and every SET item `column = alias`, a plain column set from a
@@ -3564,6 +3567,11 @@ impl<'a> Cx<'a> {
         let [cte] = names else {
             return Err(why("only a list of one CTE is converted"));
         };
+        // `WITH c (a, b) AS (…)` renames the CTE's columns by position, which
+        // this rule does not map: only `WITH c AS (…)` is converted.
+        if sig(ts).get(2).map_or(true, |&i| !ts[i].is("AS")) {
+            return Err(why("the CTE has a column list"));
+        }
         let bodies = cte_bodies(ts).ok_or_else(|| why("the WITH list is unreadable"))?;
         let body = &ts[bodies[0].1.clone()];
         let bs = sig(body);
@@ -3612,23 +3620,25 @@ impl<'a> Cx<'a> {
         if !leaf.table || hinted(leaf.toks) || find_word(leaf.toks, 0, "WITH").is_some() {
             return Err(why("the CTE's source is not a plain table without hints"));
         }
-        match leaf.name.first().and_then(|n| n.strip_prefix('@')) {
-            Some(v) => {
+        // Only a source private to the session is updated by `ctid`: a
+        // converted table variable or a `#temp` table. A catalog table may be
+        // partitioned or inherited on PostgreSQL (the same `ctid` in two
+        // partitions) and may be changed by another session while the UPDATE
+        // waits (READ COMMITTED then skips the row whose `ctid` moved).
+        match leaf.name.first() {
+            Some(n) if n.starts_with('@') => {
+                let v = &n[1..];
                 if !self.tables.contains_key(v) {
                     return Err(why(&format!(
                         "the table variable `@{v}` was not converted to a table"
                     )));
                 }
             }
-            None => {
-                if self
-                    .catalog_table(&leaf.name)
-                    .map_or(true, |t| t.kind == sqldiff_equiv::catalog::TableKind::View)
-                {
-                    return Err(why(
-                        "the source catalog does not show the CTE's source as a table (a view has no row identity to update by)",
-                    ));
-                }
+            Some(n) if n.starts_with('#') && leaf.name.len() == 1 => {}
+            _ => {
+                return Err(why(
+                    "the CTE's source is not a table variable or a temporary table: a catalog table may be partitioned or inherited, where `ctid` is not a row identity, and another session may change it while the UPDATE waits",
+                ));
             }
         }
         // The source's name without its alias.
@@ -3675,8 +3685,10 @@ impl<'a> Cx<'a> {
                 _ => return Err(why("a CTE column is not a column or `expression AS alias`")),
             }
         }
-        if plain.iter().any(|c| computed.contains(c)) {
-            return Err(why("two CTE columns share a name"));
+        let mut all: Vec<&String> = plain.iter().chain(computed.iter()).collect();
+        all.sort();
+        if all.windows(2).any(|w| w[0] == w[1]) {
+            return Err(why("two CTE columns share a name (SQL Server rejects it)"));
         }
         // The UPDATE: `UPDATE c SET col = alias, …` and nothing else.
         let upd = &ts[verb..];
