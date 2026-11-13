@@ -631,9 +631,13 @@ fn explain_conv(
     let what = render(a.v);
     let fits = |n: u32| dst.len.map_or(true, |l| l >= n);
     let diff = |rule, text: String| Some((ChangeClass::Semantic, rule, text));
-    // T-SQL truncates to an integer, PostgreSQL rounds.
+    // T-SQL truncates to an integer, PostgreSQL rounds. No witness when the
+    // operand is already a whole number (ceil, floor, round, trunc).
     if a.trunc && b.dialect == Some("postgres") && dst.fam == "Int" && a.v == b.v {
         let src = b.src?;
+        if is_whole_result(a.v) || is_whole_result(b.v) {
+            return None;
+        }
         if let Some(lit) = num_literal(a.v) {
             let (t, r) = (trunc_text(lit)?, round_text(lit)?);
             if t == r {
@@ -694,6 +698,11 @@ fn explain_conv(
     if same_src && src_t.fam == dst.fam && dst.scale.is_none() {
         let (dl, sl) = (dst.len?, src_t.len?.min(src_p.len?));
         if dl < sl && dst.fam == "Timestamp" {
+            // The witness needs dl + 1 fraction digits; an operand that is
+            // itself a conversion may hold fewer (a 3-digit value widened).
+            if !holds_digits(a.v, dl + 1) || !holds_digits(b.v, dl + 1) {
+                return None;
+            }
             let (v, t, p) = if dl == 0 {
                 (
                     "1999-12-31 23:59:59.5".to_string(),
@@ -753,6 +762,37 @@ fn explain_conv(
         );
     }
     None
+}
+
+/// True when the term is a whole-number function (`ceil`, `floor`, `round`
+/// or `trunc` of anything), so no fractional witness exists for it.
+fn is_whole_result(t: &Term) -> bool {
+    t.is("ceil")
+        || t.is("floor")
+        || (t.is("fn")
+            && matches!(
+                t.kid(0).and_then(Term::atom),
+                Some("ceil" | "ceiling" | "floor" | "trunc" | "round")
+            ))
+}
+
+/// Whether a witness with `n` fraction digits can be a value of this
+/// operand. A plain operand (parameter, column) is typed by the caller; a
+/// conversion term is only as wide as the type it converts from, so one from
+/// an unknown or narrower type may not hold such a value.
+fn holds_digits(mut t: &Term, n: u32) -> bool {
+    while let Some(c) = conv_view(t) {
+        match c.src {
+            Some(TyParts {
+                fam: "Timestamp",
+                len: Some(l),
+                ..
+            }) if l >= n => {}
+            _ => return false,
+        }
+        t = c.v;
+    }
+    true
 }
 
 /// The text of a numeric literal term with a decimal point.
