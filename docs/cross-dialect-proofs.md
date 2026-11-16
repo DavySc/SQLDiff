@@ -159,8 +159,17 @@ long as only comments follow it on each side (nothing after it can create,
 change or drop the object again). Db2 for i: only a T-SQL `EXEC p` without
 arguments against `CALL schema.p()` is compared (the procedure found once on
 each side, no parameters, a schema on the Db2 name; `ASM-CALLEE-CONVERTED`).
-A call with arguments needs the Db2 for i parameter types, and Db2 for i
-comments are not compared yet; the open questions are probes `V30-*` in
+A call with arguments needs the Db2 for i parameter types and stays not
+compared.
+
+Db2 for i comments: `COMMENT ON TABLE s.t | COLUMN s.t.c IS 'text'` against
+`sp_addextendedproperty` on a table or a table's column, with every Db2 name
+qualified, the table (not a view) in both catalogs, and a text of 1 to 254
+letters, digits, blanks between words and code-page-invariant punctuation
+(`" % & ' ( ) * + , - . / : ; < = > ? _`). Equal under
+`ASM-EXTPROP-COMMENT` and `ASM-FACT-V35` (probe `V35-COMMENT-254`, not run).
+Schemas, views, routines, indexes, constraints, longer texts and other
+characters are not compared; the open questions are probes `V30-*` in
 [probes/db2i](../probes/db2i/README.md).
 
 **Calls.** The called procedure is looked up in both sides' catalogs (in a
