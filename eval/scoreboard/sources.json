@@ -1,0 +1,17 @@
+{
+  "repos": {
+    "sql-server-samples": {
+      "url": "https://github.com/microsoft/sql-server-samples",
+      "sha": "348bbbc25079785f93ea74be3dd0d6369a59358f",
+      "sparse": ["samples/databases/wide-world-importers", "samples/databases/adventure-works"]
+    },
+    "sql-server-maintenance-solution": {
+      "url": "https://github.com/olahallengren/sql-server-maintenance-solution",
+      "sha": "41617578643e722b790ea4d57ef80f8de38ae747"
+    },
+    "sakila": {
+      "url": "https://github.com/jOOQ/sakila",
+      "sha": "e089a5b1ec9af0df7a9c6a5d47d49fa1736a4e84"
+    }
+  }
+}

@@ -538,6 +538,13 @@ fact = "The data has at most microsecond precision."
 sites = ["sqldiff-draft/src/tsql.rs", "sqldiff-equiv/src/equiv/table.rs"]
 
 [[assumption]]
+id = "ASM-CLOCK-FRACTION-6"
+statement = "Storing the statement clock in, or casting it to, a 6-digit timestamp changes nothing the code reads: SYSDATETIME() has 7 fraction digits in T-SQL and the cast rounds the 7th away, the PostgreSQL statement clock has only 6. Only the precision: whether the two clocks are the same instant is a separate question this assumption does not cover."
+discharge = "deployment"
+fact = "No code reads the 7th fraction digit of a clock value."
+sites = ["sqldiff-equiv/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-GRANT-PRINCIPAL"
 statement = "The target role a GRANT names stands for the same users as the T-SQL principal of that name, and no T-SQL DENY outranks the grant."
 discharge = "deployment"

@@ -559,10 +559,9 @@ fn bulk_insert_is_refused_without_a_leftover_statement() {
         assert_eq!(c.units.len(), 2, "{}", c.output);
         assert_eq!(c.units[1].status, Status::NotConverted);
         assert!(
-            c.units[1]
-                .notes
-                .iter()
-                .any(|n| n.text.starts_with("BULK INSERT")),
+            c.units[1].notes.iter().any(|n| n
+                .text
+                .starts_with("impossible to convert automatically [bulk-insert]")),
             "{:?}",
             c.units[1].notes
         );

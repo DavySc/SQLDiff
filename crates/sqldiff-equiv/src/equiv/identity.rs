@@ -46,6 +46,12 @@
 //! SQL or an uncovered construct mentions anywhere. A loop-carried variable
 //! has two reaching definitions and is unknown.
 //!
+//! A forward `GOTO` is a labelled block left by a jump (`CtlKind::Block`,
+//! `CtlKind::Exit`): after the block, every variable the block writes has
+//! two definitions (the state at the end of the block, and the state at a
+//! jump), so it is unknown. A backward jump, or one the statement level does
+//! not model, still refuses the routine pair (`jumps`).
+//!
 //! **Scope: fault-free runs.** A failed assignment leaves the old value (and
 //! continues) in T-SQL, and leaves for the handler in PostgreSQL. The
 //! analysis says nothing about runs with a fault; the report states it.
@@ -127,7 +133,7 @@ pub struct UnitReport {
 /// Names the report's scope, for every consumer to read.
 pub const SCOPE: &str = "fault-free runs only";
 
-type Var = usize;
+pub(super) type Var = usize;
 
 /// A definition that reaches a point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -144,6 +150,9 @@ enum Def {
     Loop(usize),
     /// The state at an error handler: any prefix of the TRY part ran.
     Handler(usize),
+    /// The state at a jump out of a block (`GOTO` forward): any prefix of
+    /// the block ran.
+    Exit(usize),
     /// Not declared yet.
     Undefined,
 }
@@ -173,13 +182,13 @@ fn join(a: &State, b: &State) -> State {
 }
 
 /// One step of the routine in document order.
-enum Ev<'a> {
+pub(super) enum Ev<'a> {
     Ctl(&'a Ctl),
     Stmt(&'a LStmt),
 }
 
 /// The structured form of the event sequence.
-enum Blk {
+pub(super) enum Blk {
     Ev(usize),
     If {
         cond: usize,
@@ -195,6 +204,11 @@ enum Blk {
         body: Vec<Blk>,
         catch: Vec<Blk>,
     },
+    /// A block a forward `GOTO` leaves (`CtlKind::Block`).
+    Block {
+        at: usize,
+        body: Vec<Blk>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -202,6 +216,7 @@ enum Open {
     If,
     While,
     Try,
+    Block,
 }
 
 struct Frame {
@@ -214,7 +229,7 @@ struct Frame {
 }
 
 /// The events of a unit in the order `items()` visits them.
-fn events(u: &Unit) -> Vec<Ev<'_>> {
+pub(super) fn events(u: &Unit) -> Vec<Ev<'_>> {
     let mut out = Vec::new();
     let mut stmts = u.stmts.iter().enumerate().peekable();
     let mut ctl = u.ctl.iter().peekable();
@@ -229,7 +244,7 @@ fn events(u: &Unit) -> Vec<Ev<'_>> {
     out
 }
 
-fn structure(ev: &[Ev<'_>]) -> Option<Vec<Blk>> {
+pub(super) fn structure(ev: &[Ev<'_>]) -> Option<Vec<Blk>> {
     let mut stack: Vec<Frame> = Vec::new();
     let mut cur: Vec<Blk> = Vec::new();
     for (i, e) in ev.iter().enumerate() {
@@ -241,9 +256,9 @@ fn structure(ev: &[Ev<'_>]) -> Option<Vec<Blk>> {
             CtlKind::If(_) | CtlKind::RowsIf(..) => Some(Open::If),
             CtlKind::While(_) | CtlKind::FetchWhile(_) => Some(Open::While),
             CtlKind::Try => Some(Open::Try),
-            // A block or a jump out of one is not followed here: an `End`
-            // would close the wrong construct.
-            CtlKind::Block | CtlKind::Exit(_) => return None,
+            CtlKind::Block => Some(Open::Block),
+            // A jump out of a block is an event like any other here; what it
+            // does to the definitions is `walk`'s `Blk::Block`.
             _ => None,
         };
         if let Some(kind) = open {
@@ -291,6 +306,10 @@ fn structure(ev: &[Ev<'_>]) -> Option<Vec<Blk>> {
                         body: first,
                         catch: second.unwrap_or_default(),
                     },
+                    Open::Block => Blk::Block {
+                        at: f.at,
+                        body: first,
+                    },
                 });
             }
             _ => cur.push(Blk::Ev(i)),
@@ -300,7 +319,7 @@ fn structure(ev: &[Ev<'_>]) -> Option<Vec<Blk>> {
 }
 
 /// What an event does to a variable.
-enum Write {
+pub(super) enum Write {
     /// A plain assignment from the allow-list.
     Plain(Var),
     /// A declaration without a value.
@@ -310,23 +329,23 @@ enum Write {
 }
 
 /// One side of the pair.
-struct Side<'a> {
-    unit: &'a Unit,
-    items: &'a [Item],
-    ev: Vec<Ev<'a>>,
+pub(super) struct Side<'a> {
+    pub(super) unit: &'a Unit,
+    pub(super) items: &'a [Item],
+    pub(super) ev: Vec<Ev<'a>>,
     /// The item an event belongs to, and whether it is the item's first
     /// event (the rest were absorbed by it).
-    item_of: Vec<Option<(usize, bool)>>,
+    pub(super) item_of: Vec<Option<(usize, bool)>>,
     /// Variable names: parameters (`p1`, ...), then locals by their id.
-    names: Vec<String>,
+    pub(super) names: Vec<String>,
     /// Definitions that reach each event (kept for conditions and plain
     /// assignments, which are what a query asks about).
     before: Vec<Option<State>>,
     /// Variables a call, dynamic SQL or an uncovered construct mentions.
-    tainted: BTreeSet<Var>,
+    pub(super) tainted: BTreeSet<Var>,
 }
 
-fn sym_names(u: &Unit) -> Vec<String> {
+pub(super) fn sym_names(u: &Unit) -> Vec<String> {
     let mut v: Vec<String> = (0..u.params.len()).map(|i| format!("p{}", i + 1)).collect();
     for i in 0..u.locals.len() {
         v.push(match &u.local_ids {
@@ -339,7 +358,7 @@ fn sym_names(u: &Unit) -> Vec<String> {
 
 impl<'a> Side<'a> {
     /// The variable a name stands for (the rule of `Canon::sym`).
-    fn var_of(&self, name: &str) -> Option<Var> {
+    pub(super) fn var_of(&self, name: &str) -> Option<Var> {
         if name.starts_with("@@") {
             return None;
         }
@@ -354,12 +373,12 @@ impl<'a> Side<'a> {
             .map(|i| self.unit.params.len() + i)
     }
 
-    fn var_of_sym(&self, sym: &str) -> Option<Var> {
+    pub(super) fn var_of_sym(&self, sym: &str) -> Option<Var> {
         self.names.iter().position(|n| n == sym)
     }
 
     /// Every variable the tokens name.
-    fn mentioned(&self, toks: &[super::ast::Tok]) -> BTreeSet<Var> {
+    pub(super) fn mentioned(&self, toks: &[super::ast::Tok]) -> BTreeSet<Var> {
         let mut out = BTreeSet::new();
         for t in toks {
             if matches!(t.kind, K::Var | K::Word | K::Quoted | K::Param) {
@@ -415,7 +434,7 @@ impl<'a> Side<'a> {
         out
     }
 
-    fn writes(&self, e: usize, in_catch: bool) -> Vec<Write> {
+    pub(super) fn writes(&self, e: usize, in_catch: bool) -> Vec<Write> {
         let mut out = Vec::new();
         match &self.ev[e] {
             Ev::Ctl(m) => {
@@ -528,7 +547,7 @@ impl<'a> Side<'a> {
         (target.is("sym") && target.kid(0)?.atom()? == self.names[v]).then_some(it)
     }
 
-    fn assigned_in(&self, blks: &[Blk], in_catch: bool, out: &mut BTreeSet<Var>) {
+    pub(super) fn assigned_in(&self, blks: &[Blk], in_catch: bool, out: &mut BTreeSet<Var>) {
         for b in blks {
             match b {
                 Blk::Ev(e) => {
@@ -548,6 +567,7 @@ impl<'a> Side<'a> {
                     self.assigned_in(body, in_catch, out);
                     self.assigned_in(catch, true, out);
                 }
+                Blk::Block { body, .. } => self.assigned_in(body, in_catch, out),
             }
         }
     }
@@ -608,6 +628,24 @@ impl<'a> Side<'a> {
                     self.walk(catch, &mut handler, true);
                     *st = join(&ok, &handler);
                 }
+                Blk::Block { at, body } => {
+                    // A jump leaves the block after any prefix of it, so
+                    // after the block a variable it writes may hold a value
+                    // written so far or the one before: the state at a jump
+                    // is `Exit` for each of them, joined with the state at
+                    // the end of the block. Two definitions are no known
+                    // value, so such a variable is unknown after the block
+                    // whatever the block's own end state says.
+                    let mut assigned = BTreeSet::new();
+                    self.assigned_in(body, in_catch, &mut assigned);
+                    let mut exit = st.clone();
+                    for v in &assigned {
+                        Rc::make_mut(&mut exit)[*v] = Rc::new(vec![Def::Exit(*at)]);
+                    }
+                    let mut inner = st.clone();
+                    self.walk(body, &mut inner, in_catch);
+                    *st = join(&inner, &exit);
+                }
             }
         }
     }
@@ -615,7 +653,7 @@ impl<'a> Side<'a> {
 
 /// The name a target expression stands for, when it is a variable or a bare
 /// name (PL/pgSQL variables are bare names).
-fn var_expr(e: &Expr) -> Result<String, ()> {
+pub(super) fn var_expr(e: &Expr) -> Result<String, ()> {
     match e {
         Expr::Var(n) => Ok(n.clone()),
         Expr::Name(p) if p.len() == 1 => Ok(p[0].clone()),
@@ -694,7 +732,7 @@ fn side<'a>(u: &'a Unit, items: &'a [Item]) -> Result<Side<'a>, String> {
 
 /// The kind of term a condition or value is.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Kind {
+pub(super) enum Kind {
     Value,
     State,
     Rows,
@@ -784,7 +822,7 @@ const VALUE_FNS: &[&str] = &[
     "rtrim", "len", "length", "left", "right", "greatest", "least", "sign", "power", "mod",
 ];
 
-fn kind_of(t: &Term) -> Kind {
+pub(super) fn kind_of(t: &Term) -> Kind {
     if t.is("rows-found") || t.is("cursor-found") {
         return Kind::Rows;
     }
@@ -826,7 +864,7 @@ fn kind_of(t: &Term) -> Kind {
     }
 }
 
-fn syms(t: &Term, out: &mut BTreeSet<String>) {
+pub(super) fn syms(t: &Term, out: &mut BTreeSet<String>) {
     if t.is("sym") {
         if let Some(s) = t.kid(0).and_then(|k| k.atom()) {
             out.insert(s.to_string());
@@ -838,19 +876,19 @@ fn syms(t: &Term, out: &mut BTreeSet<String>) {
     }
 }
 
-type Asms = BTreeSet<String>;
+pub(super) type Asms = BTreeSet<String>;
 
-struct Analysis<'a> {
-    a: Side<'a>,
-    b: Side<'a>,
+pub(super) struct Analysis<'a> {
+    pub(super) a: Side<'a>,
+    pub(super) b: Side<'a>,
     /// Item pairs (side A item, side B item).
-    pairs: BTreeMap<usize, usize>,
+    pub(super) pairs: BTreeMap<usize, usize>,
     /// Per variable (by side A index): what the declared types allow.
-    var_ok: Vec<Result<Asms, String>>,
-    da: Dialect,
-    db: Dialect,
-    pair_memo: BTreeMap<(usize, usize), Result<Asms, String>>,
-    memo: BTreeMap<(Var, usize, usize), Result<Asms, String>>,
+    pub(super) var_ok: Vec<Result<Asms, String>>,
+    pub(super) da: Dialect,
+    pub(super) db: Dialect,
+    pub(super) pair_memo: BTreeMap<(usize, usize), Result<Asms, String>>,
+    pub(super) memo: BTreeMap<(Var, usize, usize), Result<Asms, String>>,
 }
 
 const DEPTH: usize = 400;
@@ -858,7 +896,7 @@ const DEPTH: usize = 400;
 impl Analysis<'_> {
     /// Whether the statement level proved items `i` (A) and `j` (B) equal,
     /// and the assumptions it did so under.
-    fn pair_equal(&mut self, i: usize, j: usize) -> Result<Asms, String> {
+    pub(super) fn pair_equal(&mut self, i: usize, j: usize) -> Result<Asms, String> {
         if self.pairs.get(&i) != Some(&j) {
             return Err("the items are not paired".into());
         }
@@ -992,7 +1030,7 @@ fn literal_default(d: &str) -> bool {
 }
 
 /// What the declared types and defaults of paired variables allow.
-fn variable_facts(ua: &Unit, ub: &Unit, sa: &Side<'_>) -> Vec<Result<Asms, String>> {
+pub(super) fn variable_facts(ua: &Unit, ub: &Unit, sa: &Side<'_>) -> Vec<Result<Asms, String>> {
     let mut out: Vec<Result<Asms, String>> = vec![Err("not paired".to_string()); sa.names.len()];
     let db2 = ua.dialect == Dialect::Db2i || ub.dialect == Dialect::Db2i;
     for (i, (x, y)) in ua.params.iter().zip(&ub.params).enumerate() {
@@ -1059,7 +1097,9 @@ fn variable_facts(ua: &Unit, ub: &Unit, sa: &Side<'_>) -> Vec<Result<Asms, Strin
     out
 }
 
-/// A label or `GOTO`: control flow the structured walk does not follow. The
+/// A label or `GOTO` the statement level did not lower to a block and an
+/// exit (a backward jump, a jump into a block, a crossing region, a label
+/// used twice): control flow the structured walk does not follow. The
 /// first token of each statement is read on demand ([`LStmt::toks`]).
 fn jumps(u: &Unit) -> Option<String> {
     let goto = |t: &[super::ast::Tok]| t.first().is_some_and(|f| f.up == "GOTO");
@@ -1067,6 +1107,35 @@ fn jumps(u: &Unit) -> Option<String> {
         what.contains("label") || goto(&tokens(n)) || tokens(n).iter().any(|t| t.up == "GOTO")
     }) || u.stmts.iter().any(|s| goto(&s.toks()));
     hit.then(|| "a label or GOTO makes control flow the analysis does not follow".to_string())
+}
+
+/// The two sides of a routine pair with their definitions and variable facts,
+/// or why the structured walk cannot follow the pair. Shared with
+/// `coupling.rs`.
+pub(super) fn build<'a>(
+    ua: &'a Unit,
+    ub: &'a Unit,
+    ia: &'a [Item],
+    ib: &'a [Item],
+    pairs: &[(usize, usize)],
+) -> Result<Analysis<'a>, String> {
+    // A label or GOTO that is not a modelled forward block (a loop, say) is
+    // control flow the structured walk does not see.
+    if let Some(why) = jumps(ua).or_else(|| jumps(ub)) {
+        return Err(why);
+    }
+    let (sa, sb) = (side(ua, ia)?, side(ub, ib)?);
+    let var_ok = variable_facts(ua, ub, &sa);
+    Ok(Analysis {
+        a: sa,
+        b: sb,
+        pairs: pairs.iter().copied().collect(),
+        var_ok,
+        da: ua.dialect,
+        db: ub.dialect,
+        pair_memo: BTreeMap::new(),
+        memo: BTreeMap::new(),
+    })
 }
 
 /// The analysis of one routine pair. `pairs` are the item pairs
@@ -1092,29 +1161,12 @@ pub(super) fn analyze(
     if rep.conds_a == 0 && rep.conds_b == 0 {
         return rep;
     }
-    // A label with a GOTO is a loop the structured walk does not see.
-    if let Some(why) = jumps(ua).or_else(|| jumps(ub)) {
-        rep.refused = Some(why);
-        return rep;
-    }
-    let both = (side(ua, ia), side(ub, ib));
-    let (sa, sb) = match both {
-        (Ok(x), Ok(y)) => (x, y),
-        (Err(e), _) | (_, Err(e)) => {
+    let mut an = match build(ua, ub, ia, ib, pairs) {
+        Ok(x) => x,
+        Err(e) => {
             rep.refused = Some(e);
             return rep;
         }
-    };
-    let var_ok = variable_facts(ua, ub, &sa);
-    let mut an = Analysis {
-        a: sa,
-        b: sb,
-        pairs: pairs.iter().copied().collect(),
-        var_ok,
-        da: ua.dialect,
-        db: ub.dialect,
-        pair_memo: BTreeMap::new(),
-        memo: BTreeMap::new(),
     };
     // Event of each condition item, per side.
     // `item_of` is fixed when a side is built and `classify` never changes
