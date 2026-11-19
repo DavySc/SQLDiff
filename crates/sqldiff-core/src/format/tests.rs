@@ -161,6 +161,40 @@ ORDER BY n DESC
 }
 
 #[test]
+fn hangs_parentheses_and_aligns_and_or_on() {
+    // A `(` alone on its line sits at the clause's indent, its contents one
+    // step in; one that opens mid-line keeps the usual indent. AND, OR and
+    // ON that start a line end where WHERE, HAVING or the join's first word
+    // ends.
+    let q = "insert into #t\n(\na,\nb\n)\nselect x,\ncoalesce(\ny, 1)\nfrom t\nleft join u\non u.a = t.a\nand u.b = t.b\njoin v\non v.a = t.a\nwhere t.c = 1\nor t.d = 2\nand t.e in\n(\n1, 2\n)";
+    let o = with(|o| o.keyword_case = KeywordCase::Lower);
+    assert_eq!(
+        format(q, Dialect::Tsql, &o).text,
+        "insert into #t
+(
+    a,
+    b
+)
+select x,
+    coalesce(
+        y, 1)
+from t
+left join u
+  on u.a = t.a
+ and u.b = t.b
+join v
+  on v.a = t.a
+where t.c = 1
+   or t.d = 2
+  and t.e in
+(
+    1, 2
+)
+"
+    );
+}
+
+#[test]
 fn options_change_only_layout() {
     let src = "select a from t where x = 1\n";
     let tabs = format(

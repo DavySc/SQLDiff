@@ -80,6 +80,33 @@ Some gaps keep their exact shape:
 No space is ever inserted next to another operator: T-SQL reads `*=` as one
 operator and `* =` as two.
 
+## Layout rules
+
+Each line is indented by its block level; a continued line of a statement
+one step more, plus one per open parenthesis. Two exceptions:
+
+- A `(` that starts a line and ends it (what follows starts a new line)
+  sits at its clause's indent, and what it holds one step in from it; its
+  `)` lines up with it. A `(` that opens mid-line keeps the usual indent.
+- `AND`, `OR` and `ON` that start a line of a `WHERE`, `HAVING` or join
+  clause end where the clause's first word ends (`LEFT JOIN` aligns with
+  `LEFT`):
+
+```sql
+insert into #t
+(
+    a,
+    b
+)
+select x
+from t
+left join u
+  on u.a = t.a
+ and u.b = t.b
+where t.c = 1
+  and t.d = 2
+```
+
 ## How each result is checked
 
 The formatter does not trust its own layout. Before it returns a result:
