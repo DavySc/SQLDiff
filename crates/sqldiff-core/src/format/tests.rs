@@ -200,11 +200,22 @@ fn hangs_nested_parentheses_and_rivers_inside_them() {
     // the river works at every parenthesis depth; a BETWEEN's AND is no
     // conjunction; a `(` left open does not shift the next statement; a
     // `(` that ends a line hangs too (Davy's CTE, 2026-11-19).
-    let q = "with c as (\nselect a,\nb\nfrom t\nwhere a = 1\nor b = 2\n)\nselect *\nfrom t\nwhere exists\n(\nselect 1\nfrom u\njoin v\non v.a = u.a\nwhere u.a in\n(\nselect b\nfrom w\n)\nand u.c between 1\nand 2\n)\nselect 1 where x in\n(\n(\n1\n;\nselect a\nfrom t\nwhere b = 1\nand\nc = 2";
+    let q = "select *\nfrom\n(\n(\nselect 1\n)\nunion all\n(\nselect 2\n)\n) q;\nwith c as (\nselect a,\nb\nfrom t\nwhere a = 1\nor b = 2\n)\nselect *\nfrom t\nwhere exists\n(\nselect 1\nfrom u\njoin v\non v.a = u.a\nwhere u.a in\n(\nselect b\nfrom w\n)\nand u.c between 1\nand 2\n)\nselect 1 where x in\n(\n(\n1\n;\nselect a\nfrom t\nwhere b = 1\nand\nc = 2";
     let o = with(|o| o.keyword_case = KeywordCase::Lower);
     assert_eq!(
         format(q, Dialect::Tsql, &o).text,
-        "with c as (
+        "select *
+from
+(
+    (
+        select 1
+    )
+    union all
+    (
+        select 2
+    )
+) q;
+with c as (
     select a,
     b
     from t
@@ -230,9 +241,9 @@ where exists
 select 1
 where x in
 (
-(
-    1
-    ;
+    (
+        1
+        ;
 select a
 from t
 where b = 1

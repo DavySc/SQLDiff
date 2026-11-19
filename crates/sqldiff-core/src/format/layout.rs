@@ -664,6 +664,10 @@ pub(super) fn render(
             }
         }
         let d = t.depth;
+        // A statement starts afresh: nothing of the last one carries over.
+        if t.brk == Brk::Unit || (i > 0 && toks[i - 1].kind == SEMICOLON) {
+            ds.clear();
+        }
         if ds.len() <= d {
             ds.resize(d + 1, Depth::default());
         }
@@ -791,8 +795,9 @@ fn hangs(text: &str, toks: &[Tok], i: usize) -> bool {
 /// The indent of code token `c` that starts a line, as levels and extra
 /// spaces. `line`: the indent level of the last line that started with code.
 /// AND, OR and ON that start a line of a WHERE, HAVING or join clause end
-/// where the clause's first word ends (a river); a hanging `(` sits at the
-/// level of the line before it, and its `)` with it.
+/// where the clause's first word ends (a river); a hanging `(` alone on its
+/// line sits at the level of the line before it, or inside parentheses with
+/// the lines there, and its `)` with it.
 fn column(text: &str, toks: &[Tok], c: usize, ds: &[Depth], line: usize) -> (usize, usize) {
     let t = &toks[c];
     if matches!(t.brk, Brk::Unit | Brk::Footer | Brk::Clause) {
@@ -806,7 +811,7 @@ fn column(text: &str, toks: &[Tok], c: usize, ds: &[Depth], line: usize) -> (usi
         }
     }
     if t.kind == L_PAREN && hangs(text, toks, c) {
-        return (line, 0);
+        return if t.depth > 0 { inner(ds, t) } else { (line, 0) };
     }
     if t.kind == R_PAREN {
         if let Some(at) = ds.get(t.depth + 1).and_then(|d| d.hang) {
