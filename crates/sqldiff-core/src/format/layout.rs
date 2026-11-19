@@ -600,20 +600,18 @@ pub(super) fn render(
                 .is_some_and(|u| reverted.contains(&u) && i > 0 && toks[i - 1].top == Some(u))
     };
     let max_nl = opts.max_blank_lines + 1;
-    // Open parentheses: their level and how many of them, up to this one at
-    // that level, hang (see `allman`). `head`: the last token that started
-    // a line with a break, for `river`.
-    let mut par: Vec<(usize, usize)> = Vec::new();
-    let mut head = 0usize;
+    // What each parenthesis depth of the statement holds (`Depth`), and the
+    // indent level of the last line that started with code.
+    let mut ds = vec![Depth::default()];
+    let mut line = 0usize;
     for i in 0..toks.len() {
         let t = &toks[i];
         let prev_end = if i == 0 { 0 } else { toks[i - 1].end };
         let gap = &text[prev_end..t.start];
         let plain = gap.chars().all(|c| matches!(c, ' ' | '\t' | '\r' | '\n'));
         let nls = gap.matches('\n').count();
-        let mut lined = false;
+        let mut lined = None;
         let mut newline = |n: usize, out: &mut String| {
-            lined = true;
             for _ in 0..n {
                 out.push_str(nl);
             }
@@ -623,16 +621,10 @@ pub(super) fn render(
                 .map(|k| i + k);
             let (level, spaces) = match c {
                 Some(c) if c > i && toks[c].brk == Brk::Footer => (toks[c].level + 1, 0),
-                Some(c) => column(
-                    text,
-                    toks,
-                    c,
-                    head,
-                    hangs(&par, &toks[c]),
-                    allman(text, toks, c),
-                ),
+                Some(c) => column(text, toks, c, &ds, line),
                 None => (t.level, 0),
             };
+            lined = Some((level, spaces));
             push_indent(out, level, opts);
             out.extend(std::iter::repeat(' ').take(spaces));
         };
@@ -671,15 +663,36 @@ pub(super) fn render(
                 out.push(' ');
             }
         }
-        if lined && t.brk != Brk::None {
-            head = i;
+        let d = t.depth;
+        if ds.len() <= d {
+            ds.resize(d + 1, Depth::default());
+        }
+        if let Some(at) = lined.filter(|_| !t.is_comment()) {
+            line = at.0;
+            if is(text, t, HEADS) {
+                ds[d].head = Some((i, at));
+                ds[d].between = 0;
+            } else if t.brk != Brk::None {
+                ds[d].head = None;
+            }
+        }
+        if is(text, t, &["BETWEEN"]) {
+            ds[d].between += 1;
+        } else if is(text, t, &["AND"]) {
+            ds[d].between = ds[d].between.saturating_sub(1);
         }
         if t.kind == R_PAREN {
-            par.pop();
+            ds.truncate(d + 1);
         }
         if t.kind == L_PAREN {
-            let h = hangs(&par, t) + usize::from(allman(text, toks, i));
-            par.push((t.level, h));
+            let hang = hangs(text, toks, i).then_some((line, 0));
+            let (l, s) = hang.unwrap_or_else(|| inner(&ds, t));
+            ds.truncate(d + 1);
+            ds.push(Depth {
+                inner: Some((l + 1, s)),
+                hang,
+                ..Depth::default()
+            });
         }
         starts.push(out.len());
         let word = &text[t.start..t.end];
@@ -728,54 +741,79 @@ fn verbatim_pair(a: &Tok, b: &Tok) -> bool {
     (s(a.kind) && s(b.kind)) || a.kind == ERROR_TOKEN || b.kind == ERROR_TOKEN
 }
 
-/// How many open parentheses at `t`'s level hang (`par` as in `render`).
-fn hangs(par: &[(usize, usize)], t: &Tok) -> usize {
-    par.last().filter(|p| p.0 == t.level).map_or(0, |p| p.1)
+/// What `render` keeps for one parenthesis depth of a statement.
+#[derive(Clone, Copy, Default)]
+struct Depth {
+    /// Indent of a line inside the parenthesis that opened this depth;
+    /// `None` at depth 0 and past a depth `render` never saw opened.
+    inner: Option<(usize, usize)>,
+    /// Where that parenthesis and its `)` sit when it hangs (`hangs`).
+    hang: Option<(usize, usize)>,
+    /// The last clause word here that started a line (a WHERE, HAVING or
+    /// join), and its indent: AND, OR and ON line up under it.
+    head: Option<(usize, (usize, usize))>,
+    /// BETWEENs here still waiting for their AND, which is no conjunction.
+    between: usize,
 }
 
-/// Whether `(` token `i` hangs: it starts a line and ends one (a line break
-/// follows it, or what follows starts a line of its own). It then sits at
-/// its clause's indent, Allman style, and what it holds one step in from it.
-fn allman(text: &str, toks: &[Tok], i: usize) -> bool {
+/// The words that start a clause whose AND, OR and ON form a river.
+const HEADS: &[&str] = &[
+    "WHERE", "HAVING", "JOIN", "LEFT", "RIGHT", "FULL", "INNER", "CROSS",
+];
+
+fn is(text: &str, t: &Tok, words: &[&str]) -> bool {
+    words
+        .iter()
+        .any(|w| text[t.start..t.end].eq_ignore_ascii_case(w))
+}
+
+/// The indent of a line starting with `t` inside its parenthesis: one step
+/// in from a hanging one, one step more per depth otherwise.
+fn inner(ds: &[Depth], t: &Tok) -> (usize, usize) {
+    ds.get(t.depth)
+        .and_then(|d| d.inner)
+        .unwrap_or((t.level + 1 + t.depth, 0))
+}
+
+/// Whether `(` token `i` hangs: it ends its line (a line break follows it,
+/// or what follows starts a line of its own). What it holds then sits one
+/// step in from the line that opened it, and its `)` at that line's level;
+/// a `(` alone on its line sits there too (Allman style).
+fn hangs(text: &str, toks: &[Tok], i: usize) -> bool {
     let t = &toks[i];
-    if t.kind != L_PAREN || t.brk != Brk::None || i == 0 || i + 1 >= toks.len() {
+    if t.kind != L_PAREN || t.brk != Brk::None || i + 1 >= toks.len() {
         return false;
     }
     let n = &toks[i + 1];
-    text[toks[i - 1].end..t.start].contains('\n')
-        && (n.brk != Brk::None || text[t.end..n.start].contains('\n'))
+    n.brk != Brk::None || text[t.end..n.start].contains('\n')
 }
 
 /// The indent of code token `c` that starts a line, as levels and extra
-/// spaces. `hangs`: the hanging parentheses open at its level, `open`: it
-/// is one itself. AND, OR and ON that start a line of a WHERE, HAVING or
-/// join clause end where the clause's first word ends (a river).
-fn column(
-    text: &str,
-    toks: &[Tok],
-    c: usize,
-    head: usize,
-    hangs: usize,
-    open: bool,
-) -> (usize, usize) {
+/// spaces. `line`: the indent level of the last line that started with code.
+/// AND, OR and ON that start a line of a WHERE, HAVING or join clause end
+/// where the clause's first word ends (a river); a hanging `(` sits at the
+/// level of the line before it, and its `)` with it.
+fn column(text: &str, toks: &[Tok], c: usize, ds: &[Depth], line: usize) -> (usize, usize) {
     let t = &toks[c];
     if matches!(t.brk, Brk::Unit | Brk::Footer | Brk::Clause) {
         return (t.level, 0);
     }
-    let h = &toks[head];
-    let word = |t: &Tok| text[t.start..t.end].to_ascii_uppercase();
-    if t.depth == 0
-        && h.brk == Brk::Clause
-        && h.level == t.level
-        && matches!(word(t).as_str(), "AND" | "OR" | "ON")
-        && matches!(
-            word(h).as_str(),
-            "WHERE" | "HAVING" | "JOIN" | "LEFT" | "RIGHT" | "FULL" | "INNER" | "CROSS"
-        )
-    {
-        return (h.level, (h.end - h.start).saturating_sub(t.end - t.start));
+    let d = ds.get(t.depth);
+    if let Some((h, (l, s))) = d.filter(|d| d.between == 0).and_then(|d| d.head) {
+        let h = &toks[h];
+        if h.level == t.level && is(text, t, &["AND", "OR", "ON"]) {
+            return (l, s + (h.end - h.start).saturating_sub(t.end - t.start));
+        }
     }
-    (t.level + 1 + t.depth - hangs - usize::from(open), 0)
+    if t.kind == L_PAREN && hangs(text, toks, c) {
+        return (line, 0);
+    }
+    if t.kind == R_PAREN {
+        if let Some(at) = ds.get(t.depth + 1).and_then(|d| d.hang) {
+            return at;
+        }
+    }
+    inner(ds, t)
 }
 
 fn push_indent(out: &mut String, level: usize, opts: &FormatOptions) {

@@ -195,6 +195,54 @@ where t.c = 1
 }
 
 #[test]
+fn hangs_nested_parentheses_and_rivers_inside_them() {
+    // A hanging `(` inside another sits one step in, with its siblings;
+    // the river works at every parenthesis depth; a BETWEEN's AND is no
+    // conjunction; a `(` left open does not shift the next statement; a
+    // `(` that ends a line hangs too (Davy's CTE, 2026-11-19).
+    let q = "with c as (\nselect a,\nb\nfrom t\nwhere a = 1\nor b = 2\n)\nselect *\nfrom t\nwhere exists\n(\nselect 1\nfrom u\njoin v\non v.a = u.a\nwhere u.a in\n(\nselect b\nfrom w\n)\nand u.c between 1\nand 2\n)\nselect 1 where x in\n(\n(\n1\n;\nselect a\nfrom t\nwhere b = 1\nand\nc = 2";
+    let o = with(|o| o.keyword_case = KeywordCase::Lower);
+    assert_eq!(
+        format(q, Dialect::Tsql, &o).text,
+        "with c as (
+    select a,
+    b
+    from t
+    where a = 1
+       or b = 2
+)
+select *
+from t
+where exists
+(
+    select 1
+    from u
+    join v
+      on v.a = u.a
+    where u.a in
+    (
+        select b
+        from w
+    )
+      and u.c between 1
+    and 2
+)
+select 1
+where x in
+(
+(
+    1
+    ;
+select a
+from t
+where b = 1
+  and
+    c = 2
+"
+    );
+}
+
+#[test]
 fn options_change_only_layout() {
     let src = "select a from t where x = 1\n";
     let tabs = format(
