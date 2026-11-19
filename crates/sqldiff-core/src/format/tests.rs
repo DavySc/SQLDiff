@@ -161,6 +161,111 @@ ORDER BY n DESC
 }
 
 #[test]
+fn hangs_parentheses_and_aligns_and_or_on() {
+    // A `(` alone on its line sits at the clause's indent, its contents one
+    // step in; one that opens mid-line keeps the usual indent. AND, OR and
+    // ON that start a line end where WHERE, HAVING or the join's first word
+    // ends.
+    let q = "insert into #t\n(\na,\nb\n)\nselect x,\ncoalesce(\ny, 1)\nfrom t\nleft join u\non u.a = t.a\nand u.b = t.b\njoin v\non v.a = t.a\nwhere t.c = 1\nor t.d = 2\nand t.e in\n(\n1, 2\n)";
+    let o = with(|o| o.keyword_case = KeywordCase::Lower);
+    assert_eq!(
+        format(q, Dialect::Tsql, &o).text,
+        "insert into #t
+(
+    a,
+    b
+)
+select x,
+    coalesce(
+        y, 1)
+from t
+left join u
+  on u.a = t.a
+ and u.b = t.b
+join v
+  on v.a = t.a
+where t.c = 1
+   or t.d = 2
+  and t.e in
+(
+    1, 2
+)
+"
+    );
+}
+
+#[test]
+fn hangs_nested_parentheses_and_rivers_inside_them() {
+    // A hanging `(` inside another sits one step in, with its siblings;
+    // the river works at every parenthesis depth; a BETWEEN's AND is no
+    // conjunction; a `(` left open does not shift the next statement; a
+    // `(` that ends a line hangs too (Davy's CTE, 2026-11-19).
+    let q = "select *\nfrom\n(\n(\nselect 1\n)\nunion all\n(\nselect 2\n)\n) q;\nwith c as (\nselect a,\nb\nfrom t\nwhere a = 1\nor b = 2\n)\nselect *\nfrom t\nwhere exists\n(\nselect 1\nfrom u\njoin v\non v.a = u.a\nwhere u.a in\n(\nselect b\nfrom w\n)\nand u.c between 1\nand 2\n)\nselect 1 where x in\n(\n(\n1\n;\nselect a\nfrom t\nwhere b = 1\nand\nc = 2";
+    let o = with(|o| o.keyword_case = KeywordCase::Lower);
+    assert_eq!(
+        format(q, Dialect::Tsql, &o).text,
+        "select *
+from
+(
+    (
+        select 1
+    )
+    union all
+    (
+        select 2
+    )
+) q;
+with c as (
+    select a,
+    b
+    from t
+    where a = 1
+       or b = 2
+)
+select *
+from t
+where exists
+(
+    select 1
+    from u
+    join v
+      on v.a = u.a
+    where u.a in
+    (
+        select b
+        from w
+    )
+      and u.c between 1
+    and 2
+)
+select 1
+where x in
+(
+    (
+        1
+        ;
+select a
+from t
+where b = 1
+  and
+    c = 2
+"
+    );
+}
+
+#[test]
+fn a_statement_starts_without_the_last_ones_river() {
+    // The parser gives `merge` no break after a header without AS: the
+    // WHERE before the `;` must not river its ON.
+    let q =
+        "create procedure p ()\nselect a from t\nwhere t.a = 1;\nmerge u\nusing v\non u.a = v.a";
+    let o = with(|o| o.keyword_case = KeywordCase::Lower);
+    assert!(format(q, Dialect::Tsql, &o)
+        .text
+        .ends_with("\n    on u.a = v.a\n"));
+}
+
+#[test]
 fn options_change_only_layout() {
     let src = "select a from t where x = 1\n";
     let tabs = format(
