@@ -254,6 +254,18 @@ where b = 1
 }
 
 #[test]
+fn a_statement_starts_without_the_last_ones_river() {
+    // The parser gives `merge` no break after a header without AS: the
+    // WHERE before the `;` must not river its ON.
+    let q =
+        "create procedure p ()\nselect a from t\nwhere t.a = 1;\nmerge u\nusing v\non u.a = v.a";
+    let o = with(|o| o.keyword_case = KeywordCase::Lower);
+    assert!(format(q, Dialect::Tsql, &o)
+        .text
+        .ends_with("\n    on u.a = v.a\n"));
+}
+
+#[test]
 fn options_change_only_layout() {
     let src = "select a from t where x = 1\n";
     let tabs = format(
