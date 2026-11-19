@@ -1,0 +1,48 @@
+name: scoreboard
+
+# Goal numbers per commit (eval/scoreboard/README.md): units and files clean for
+# the 14 benchmark conversions, blockers by engine rule id, wall time and the
+# cross-dialect drift detection rate. Fails on a false equal, on a witness for
+# a meaning-preserving edit and on a drop in clean units against
+# eval/scoreboard/baseline.json.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths: ["crates/**", "eval/**", "Cargo.*", ".github/workflows/scoreboard.yml"]
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  scoreboard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/scoreboard/ext
+          key: scoreboard-sources-${{ hashFiles('eval/scoreboard/sources.json') }}
+      - run: cargo build --release -p sqldiff-cli
+      - name: Scoreboard
+        run: |
+          python3 eval/scoreboard/scoreboard.py run \
+            --bin "$PWD/target/release/sqldiff" \
+            --work "$RUNNER_TEMP/scoreboard" --out scoreboard-out \
+            --commit "${{ github.event.pull_request.head.sha || github.sha }}"
+      - name: Job summary
+        if: always()
+        run: '[ -f scoreboard-out/scoreboard.md ] && cat scoreboard-out/scoreboard.md >> "$GITHUB_STEP_SUMMARY" || true'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scoreboard-${{ github.event.pull_request.head.sha || github.sha }}
+          path: scoreboard-out/
+          retention-days: 90

@@ -2368,6 +2368,62 @@ outcome = [
   { label = "other", when = { create = "00000" }, verdict = "open", meaning = "Stored differently; N1 is the stored length." },
 ]
 
+# V35_COMMENT: V_S is 254 characters made of every character the engine accepts
+# (letters, digits, blanks between words, the punctuation EBCDIC keeps in every
+# CCSID, a quote that is doubled when the statement text is built).
+[[procedure]]
+name = "V35_COMMENT"
+commit = "*NONE"
+options = "SRTSEQ = *HEX"
+body = """
+BEGIN
+  DECLARE V_S VARCHAR(254);
+  DECLARE V_C VARCHAR(4000);
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  SET O_N1 = -1;
+  SET O_N2 = -1;
+  SET V_S = SUBSTR(REPEAT('aZ09 "%&''()*+,-./:;<=>?_', 12), 1, 254);
+  BEGIN
+    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION BEGIN END;
+    EXECUTE IMMEDIATE 'DROP TABLE SQLDFPROBE.V35T';
+  END;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    EXECUTE IMMEDIATE 'CREATE TABLE SQLDFPROBE.V35T (C1 INTEGER)';
+    SET V_C = 'COMMENT ON TABLE SQLDFPROBE.V35T IS '''
+      || REPLACE(V_S, '''', '''''') || '''';
+    EXECUTE IMMEDIATE V_C;
+    SET V_C = 'COMMENT ON COLUMN SQLDFPROBE.V35T.C1 IS '''
+      || REPLACE(V_S, '''', '''''') || '''';
+    EXECUTE IMMEDIATE V_C;
+    SET O_N1 = 0;
+    SET O_N2 = 0;
+    SELECT 1 INTO O_N1 FROM QSYS2.SYSTABLES
+      WHERE TABLE_SCHEMA = 'SQLDFPROBE' AND TABLE_NAME = 'V35T'
+        AND LONG_COMMENT = V_S AND LENGTH(LONG_COMMENT) = 254;
+    SELECT 1 INTO O_N2 FROM QSYS2.SYSCOLUMNS
+      WHERE TABLE_SCHEMA = 'SQLDFPROBE' AND TABLE_NAME = 'V35T'
+        AND COLUMN_NAME = 'C1' AND LONG_COMMENT = V_S
+        AND LENGTH(LONG_COMMENT) = 254;
+  END;
+END
+"""
+
+[[probe]]
+id = "V35-COMMENT-254"
+fact = "V35"
+role = "decisive"
+procedure = "V35_COMMENT"
+question = "A table comment and a column comment of 254 characters made of every character the engine accepts (letters, digits, blanks between words, the punctuation EBCDIC keeps in every CCSID, a quote): does each read back exactly as written (N1 = 1 for the table in QSYS2.SYSTABLES.LONG_COMMENT, N2 = 1 for the column in QSYS2.SYSCOLUMNS.LONG_COMMENT)?"
+source = "The engine compares a T-SQL extended property with a Db2 for i COMMENT ON up to this length and over this character set (crates/sqldiff-equiv/src/equiv/call.rs, ASM-FACT-V35); the IBM i COMMENT page was not read. The catalog column names are a guess: an SQLSTATE, or N1 or N2 left at 0 after a clean run, means no stored text equal to the one written was found."
+outcome = [
+  { label = "whole", when = { state = "00000", n1 = "=1", n2 = "=1" }, verdict = "consistent", meaning = "Both comments read back exactly as written." },
+  { label = "other", when = { state = "*" }, verdict = "contradicts", meaning = "A comment was rejected, changed, cut or could not be read back (see SQLSTATE, N1, N2): the comparison needs a smaller character set or limit." },
+]
+
 # ---------------------------------------------------------------- V31 casts and literal types
 # The engine compares Db2 for i conversions only between integers, to wider
 # decimals and for strings that fit (crates/sqldiff-equiv/src/equiv/canon.rs,

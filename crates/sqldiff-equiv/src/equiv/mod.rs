@@ -11,6 +11,7 @@ pub mod ast;
 mod call;
 pub mod canon;
 pub mod compare;
+pub mod coupling;
 pub mod cursor;
 pub mod ddl;
 pub mod dynamic;
@@ -72,6 +73,13 @@ pub struct Outcome {
     /// Which conditions of the routine pairs are the same fact about the
     /// input (`identity.rs`). A report: nothing reads it on the diff path.
     pub identity: Vec<identity::UnitReport>,
+    /// Relational variable coupling (`coupling.rs`), computed only for the
+    /// `coupling` report. A report: nothing reads it on the diff path.
+    pub coupling: Vec<coupling::UnitCoupling>,
+    /// Input, not result: the step budget of `coupling`, or `None` to not
+    /// compute it ([`compare_report`]).
+    /// Off, the analysis does not run and counts no work.
+    coupling_cap: Option<u64>,
     /// The byte ranges of the statements each side's lowering passed over
     /// with a note instead of comparing (`Unit::noted`), A then B.
     pub noted: [Vec<(usize, usize)>; 2],
@@ -368,7 +376,52 @@ pub fn compare_within(
     anchors: &[Anchor],
     allowance: &Allowance,
 ) -> Outcome {
-    let mut out = Outcome::default();
+    compare_flagged(a, b, sa, sb, anchors, allowance, None)
+}
+
+/// [`compare`] that also computes `Outcome::coupling` (report only).
+pub fn compare_report(
+    a: &Analyzed,
+    b: &Analyzed,
+    sa: &Schema,
+    sb: &Schema,
+    anchors: &[Anchor],
+) -> Outcome {
+    compare_flagged(
+        a,
+        b,
+        sa,
+        sb,
+        anchors,
+        &Allowance::new(None),
+        Some(coupling::MAX_STEPS),
+    )
+}
+
+/// [`compare_report`] with another step budget (a test of the over-cap path).
+pub fn compare_report_capped(
+    a: &Analyzed,
+    b: &Analyzed,
+    sa: &Schema,
+    sb: &Schema,
+    cap: u64,
+) -> Outcome {
+    compare_flagged(a, b, sa, sb, &[], &Allowance::new(None), Some(cap))
+}
+
+fn compare_flagged(
+    a: &Analyzed,
+    b: &Analyzed,
+    sa: &Schema,
+    sb: &Schema,
+    anchors: &[Anchor],
+    allowance: &Allowance,
+    coupling_cap: Option<u64>,
+) -> Outcome {
+    let mut out = Outcome {
+        coupling_cap,
+        ..Outcome::default()
+    };
     if let Some(pairs) = trigger::pairs(a, b, sa, sb, &mut out) {
         for (mut ua, mut ub, sa, sb) in pairs {
             tv_names(a, b, &mut ua, &mut ub);
@@ -850,6 +903,10 @@ fn compare_units_within(
     let pairs = pair_items(a, b, &ia, &ib, &gaps, anchors, wit.as_ref(), allowance, out);
     out.identity
         .push(identity::analyze(a, b, ua, ub, &ia, &ib, &pairs));
+    if let Some(cap) = out.coupling_cap {
+        out.coupling
+            .push(coupling::analyze(a, b, ua, ub, &ia, &ib, &pairs, cap));
+    }
     calls(a, b, ua, ub, sa, sb, anchors, ((&ia, &ib), &pairs), out);
     for p in places {
         if !same_place_paired((&ia, &ib), &pairs, &p.x, &p.y, anchors) {
@@ -1004,13 +1061,13 @@ fn calls(
         format!("`{s}`")
     };
     let t_is_a = match (a.dialect(), b.dialect()) {
-        (Dialect::Tsql, Dialect::Postgres) => true,
-        (Dialect::Postgres, Dialect::Tsql) => false,
+        (Dialect::Tsql, Dialect::Postgres | Dialect::Db2i) => true,
+        (Dialect::Postgres | Dialect::Db2i, Dialect::Tsql) => false,
         _ => {
             for (side, u, name) in [(a, ua, &na), (b, ub, &nb)] {
                 for (node, _) in &u.calls {
                     out.unknown_reasons.push(format!(
-                        "{name} line {}: the call {} is not compared: only T-SQL against PostgreSQL is",
+                        "{name} line {}: the call {} is not compared: only T-SQL against PostgreSQL or Db2 for i is",
                         side.line_of(node),
                         shown(node)
                     ));
@@ -1634,6 +1691,27 @@ enum Same {
     No(ChangeClass, &'static str, String),
     Unknown(String),
 }
+
+/// Whether a column default reads PostgreSQL's `statement_timestamp()`. A
+/// default is filled when a row is inserted, and inside a routine that clock
+/// is the start of the CALL, not of the INSERT (SQL Server's SYSDATETIME()
+/// default reads the INSERT's): which of the two a default means depends on
+/// the statements that fill it, so it is never shown equal.
+/// An equal verdict for defaults one of which reads `statement_timestamp()`
+/// becomes "not proven"; a difference or an unknown stays as it is.
+fn clock_default_not_proven(v: Same, clock: bool) -> Same {
+    match v {
+        Same::Yes(_) if clock => Same::Unknown(STATEMENT_CLOCK_DEFAULT.to_string()),
+        v => v,
+    }
+}
+
+fn reads_statement_clock(toks: &[ast::Tok]) -> bool {
+    toks.iter()
+        .any(|t| t.kind == ast::K::Word && t.up == "STATEMENT_TIMESTAMP")
+}
+
+const STATEMENT_CLOCK_DEFAULT: &str = "a default that reads statement_timestamp() is the start of the CALL when a routine inserts the row, not the time of the INSERT";
 
 /// Compares statement `x` (side A) with `y` (side B) term by term.
 #[allow(clippy::too_many_arguments)]
@@ -2871,7 +2949,11 @@ fn table_pair(
                     v.extend(e.iter().cloned());
                     v
                 };
-                match same(&select(&ea), &select(&eb), sa, sb, false) {
+                let verdict = clock_default_not_proven(
+                    same(&select(&ea), &select(&eb), sa, sb, false),
+                    reads_statement_clock(&ea) || reads_statement_clock(&eb),
+                );
+                match verdict {
                     Same::Yes(xs) => xs.into_iter().for_each(|x| add(&mut asms, x)),
                     Same::No(class, rule, w) => {
                         found = true;
@@ -3575,7 +3657,11 @@ fn ddl_stmts(
                         v.extend(e.iter().cloned());
                         v
                     };
-                    match same_stmt(&select(&ea), &select(&eb), ua, ub, sa, sb, &na, &nb) {
+                    let verdict = clock_default_not_proven(
+                        same_stmt(&select(&ea), &select(&eb), ua, ub, sa, sb, &na, &nb),
+                        reads_statement_clock(&ea) || reads_statement_clock(&eb),
+                    );
+                    match verdict {
                         Same::Yes(xs) => xs.into_iter().for_each(|x| add(&mut asms, x)),
                         Same::No(class, rule, w) => {
                             found = true;

@@ -1,6 +1,8 @@
 //! Procedure calls and object comments compared across dialects: T-SQL
 //! `EXEC` against PostgreSQL `CALL`, and T-SQL `sp_addextendedproperty`
-//! against PostgreSQL `COMMENT ON`.
+//! against PostgreSQL `COMMENT ON`. Against Db2 for i only an `EXEC` without
+//! arguments, as `CALL schema.name()`, and the comments on a table and a
+//! table's column (`ASM-FACT-V35`) are compared.
 //!
 //! Each statement is read completely or not at all: dynamic SQL, return
 //! codes, `WITH` options, expressions T-SQL does not accept as arguments and
@@ -70,6 +72,21 @@ pub mod asms {
         "Whoever reads the T-SQL extended property reads the PostgreSQL comment instead: the property name is not kept, and an object has one comment",
     );
 }
+
+/// `ASM-EXTPROP-COMMENT` as read for Db2 for i.
+pub const EXTPROP_COMMENT_DB2: (&str, &str) = (
+    "ASM-EXTPROP-COMMENT",
+    "Whoever reads the T-SQL extended property reads the Db2 for i comment instead: the property name is not kept, and an object has one comment",
+);
+
+/// What a Db2 for i comment is proven to store (probes `V35-*`).
+pub const FACT_V35: (&str, &str) = (
+    "ASM-FACT-V35",
+    "A Db2 for i COMMENT ON a table or a column stores a text of 1 to 254 characters whole, as written, when it holds only letters, digits, blanks between words and the punctuation \" % & ' ( ) * + , - . / : ; < = > ? _ (the printable ASCII characters EBCDIC code pages agree on), with no leading or trailing blank (fact V35, not checked on a real system)",
+);
+
+/// The longest Db2 for i comment text compared (`FACT_V35`).
+const DB2_COMMENT_MAX: usize = 254;
 
 /// One argument as written.
 #[derive(Debug, Clone)]
@@ -192,7 +209,15 @@ fn object_key(parts: &[Name], d: Dialect) -> R<(Option<String>, String)> {
     let default = match d {
         Dialect::Tsql => "dbo",
         Dialect::Postgres => "public",
-        Dialect::Db2i => return Err("Db2 for i is not compared".into()),
+        // A Db2 for i name without a schema resolves through the current
+        // schema or the library list, which no catalog here records.
+        Dialect::Db2i => {
+            return match parts {
+                [s, o] => Ok((Some(super::ddl::fold(s, d)?), super::ddl::fold(o, d)?)),
+                [_] => Err("a Db2 for i name without a schema is not compared".into()),
+                _ => Err("a name with more than two parts".into()),
+            }
+        }
     };
     match parts {
         [o] => Ok((None, key(o, d)?)),
@@ -247,8 +272,104 @@ pub fn parse(ts: &[Tok], d: Dialect) -> R<Stmt> {
             Some("COMMENT") => pg_comment(ts).map(Stmt::Comment),
             _ => Err("not a CALL or COMMENT ON".into()),
         },
-        Dialect::Db2i => Err("Db2 for i calls and comments are not compared yet".into()),
+        Dialect::Db2i => match ts.first().map(|t| t.up.as_str()) {
+            Some("CALL") => db2_call(ts).map(Stmt::Call),
+            Some("COMMENT") => db2_comment(ts).map(Stmt::Comment),
+            _ => Err("not a CALL or COMMENT ON".into()),
+        },
     }
+}
+
+/// Db2 for i `COMMENT ON TABLE s.t | COLUMN s.t.c IS 'text'`, with every name
+/// qualified. A schema's comment is not read (no probe reads one back), nor a
+/// view's (`V30-COMMENT-ON-TABLE-VIEW` is open), nor a routine's, index's or
+/// constraint's. The text is restricted to the characters EBCDIC keeps the
+/// same in every CCSID (`db2_comment_text`).
+fn db2_comment(ts: &[Tok]) -> R<Comment> {
+    if !word(ts.get(1), "ON") {
+        return Err("COMMENT without ON".into());
+    }
+    let kind = ts.get(2).map(|t| t.up.as_str()).unwrap_or("");
+    let (parts, i) = match kind {
+        "TABLE" | "COLUMN" => dotted(ts, 3)?,
+        other => return Err(format!("Db2 for i COMMENT ON {other} is not compared")),
+    };
+    let target = match (kind, parts.as_slice()) {
+        ("TABLE", [s, t]) => Target::Object("TABLE", s.clone(), t.clone()),
+        ("COLUMN", [s, t, c]) => Target::Column("", s.clone(), t.clone(), c.clone()),
+        _ => {
+            return Err(format!(
+                "Db2 for i COMMENT ON {kind} without a full qualified name"
+            ))
+        }
+    };
+    if !word(ts.get(i), "IS") || ts.len() != i + 2 {
+        return Err("COMMENT ON without one value after IS".into());
+    }
+    let v = &ts[i + 1];
+    if v.kind != K::Str || !v.text.starts_with('\'') {
+        return Err("a comment that is not a plain string literal".into());
+    }
+    let text = string_value(&v.text)?;
+    db2_comment_text(&text)?;
+    Ok(Comment {
+        target,
+        text: Some(text),
+        narrow: false,
+        backslash: false,
+    })
+}
+
+/// The comment texts `ASM-FACT-V35` covers: 1 to 254 characters, letters,
+/// digits, blanks inside the text and `" % & ' ( ) * + , - . / : ; < = > ? _`.
+/// Those are the printable ASCII characters EBCDIC code pages agree on; the
+/// others (`! # $ @ [ \ ] ^ ` { | } ~`) change with the job's CCSID. A
+/// zero-length text may remove the comment, and a leading or trailing blank
+/// may be trimmed.
+fn db2_comment_text(text: &str) -> R<()> {
+    if text.is_empty() {
+        return Err("an empty Db2 for i comment is not compared".into());
+    }
+    if text.starts_with(' ') || text.ends_with(' ') {
+        return Err("a Db2 for i comment with a leading or trailing blank is not compared".into());
+    }
+    if let Some(c) = text
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || " \"%&'()*+,-./:;<=>?_".contains(*c)))
+    {
+        return Err(format!(
+            "a Db2 for i comment with the character {c:?} is not compared (only letters, digits and the code-page-invariant punctuation are, fact V35)"
+        ));
+    }
+    if text.len() > DB2_COMMENT_MAX {
+        return Err(format!(
+            "a Db2 for i comment of {} characters (only up to {DB2_COMMENT_MAX} are compared, fact V35)",
+            text.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Db2 for i `CALL schema.name()`: only a qualified name and an empty
+/// argument list are read. An argument takes the parameter's type, and the
+/// Db2 for i parameter types are not verified facts, so a call with
+/// arguments is not compared.
+fn db2_call(ts: &[Tok]) -> R<Call> {
+    let (name, i) = dotted(ts, 1)?;
+    if ts.get(i).map(|t| t.kind) != Some(K::LParen) || ts.last().map(|t| t.kind) != Some(K::RParen)
+    {
+        return Err("CALL without an argument list".into());
+    }
+    if ts.len() != i + 2 {
+        return Err(
+            "Db2 for i call arguments are not compared (the parameter types are not verified)"
+                .into(),
+        );
+    }
+    Ok(Call {
+        name,
+        args: Vec::new(),
+    })
 }
 
 fn tsql(ts: &[Tok]) -> R<Stmt> {
@@ -604,9 +725,22 @@ fn extended_property(rest: &[Tok]) -> R<Comment> {
 pub fn pair_key(s: &Stmt, d: Dialect) -> R<String> {
     // Names pair up to letter case (`ASM-IDENT-FOLD`); `compare` checks that
     // the PostgreSQL catalog has no other name differing only in case.
-    let k = |n: &Name| -> R<String> { Ok(key(n, d)?.to_lowercase()) };
+    let k = |n: &Name| -> R<String> {
+        Ok(if d == Dialect::Db2i {
+            super::ddl::fold(n, d)?
+        } else {
+            key(n, d)?
+        }
+        .to_lowercase())
+    };
     let schema = |n: &Name| -> R<String> {
-        let default = if d == Dialect::Tsql { "dbo" } else { "public" };
+        // Db2 for i has no default schema name to drop (its Db2 comments
+        // are read only with a schema).
+        let default = match d {
+            Dialect::Tsql => "dbo",
+            Dialect::Postgres => "public",
+            Dialect::Db2i => "",
+        };
         Ok(if key(n, d)? == default {
             String::new()
         } else {
@@ -1096,7 +1230,26 @@ fn exists(target: &Target, view: RecordingView<'_>, side: &str) -> R<()> {
 }
 
 fn comments(x: &Comment, t: &Side, y: &Comment, p: &Side) -> Verdict {
-    let mut asms = vec![asm::make(asms::EXTPROP_COMMENT), asm::make(asm::IDENT_FOLD)];
+    let db2 = p.d == Dialect::Db2i;
+    let mut asms = if db2 {
+        vec![
+            asm::make(EXTPROP_COMMENT_DB2),
+            asm::make(FACT_V35),
+            asm::make(asm::IDENT_FOLD),
+        ]
+    } else {
+        vec![asm::make(asms::EXTPROP_COMMENT), asm::make(asm::IDENT_FOLD)]
+    };
+    // Db2 for i comments are read for tables only: whether COMMENT ON TABLE
+    // names a view, and what a view column's comment form is, are open
+    // (probes `V30-COMMENT-ON-TABLE-VIEW`).
+    if db2 {
+        if let Target::Column("VIEW", ..) = &x.target {
+            return Verdict::Unknown(
+                "a comment on a view's column is not compared for Db2 for i".into(),
+            );
+        }
+    }
     let schema_name = |tg: &Target| match tg {
         Target::Schema(s)
         | Target::Object(_, s, _)
@@ -1589,7 +1742,57 @@ fn comparable(x: &Term, y: &Term) -> bool {
     x.head() == y.head() && (!x.is("tval") || x.kid(0) == y.kid(0))
 }
 
+/// A T-SQL `EXEC p` without arguments against a Db2 for i `CALL p()`.
+/// Nothing is passed, so no parameter type or value is involved: both
+/// procedures must exist once, in a qualified name, and take no parameters.
+fn calls_without_arguments(x: &Call, t: &Side, y: &Call, p: &Side) -> R<Verdict> {
+    if !x.args.is_empty() || !y.args.is_empty() {
+        return Err("a call with arguments to Db2 for i is not compared".into());
+    }
+    let (rt, rp) = (callee(x, t)?, callee(y, p)?);
+    if !rt.params.is_empty() || !rp.params.is_empty() {
+        return Err(format!(
+            "{} takes {} parameter(s) on {} and {} on {}",
+            rt.display(),
+            rt.params.len(),
+            t.name,
+            rp.params.len(),
+            p.name
+        ));
+    }
+    // A Db2 for i procedure's open cursors go to its caller, a T-SQL
+    // procedure's result sets to the client: `CALL` of a callee that declares
+    // DYNAMIC RESULT SETS may route rows elsewhere (WITH RETURN TO CALLER).
+    match rp.dynamic_result_sets {
+        Some(false) => {}
+        Some(true) => {
+            return Err(format!(
+                "{} declares DYNAMIC RESULT SETS: its result sets may go to the caller of the CALL, not to the client as T-SQL's go",
+                rp.display()
+            ))
+        }
+        None => {
+            return Err(format!(
+                "{}'s catalog entry does not say whether it declares DYNAMIC RESULT SETS (its result sets may go to the caller of the CALL)",
+                rp.display()
+            ))
+        }
+    }
+    // Both sides must name the same procedure (schema and name, up to
+    // letter case).
+    if object_key(&x.name, t.d)? != object_key(&y.name, p.d)? {
+        return Err("the two calls name different procedures".into());
+    }
+    Ok(Verdict::Equal(vec![
+        asm::make(asms::CALLEE),
+        asm::make(asm::IDENT_FOLD),
+    ]))
+}
+
 fn calls(x: &Call, t: &Side, y: &Call, p: &Side) -> R<Verdict> {
+    if p.d == Dialect::Db2i {
+        return calls_without_arguments(x, t, y, p);
+    }
     let mut asms = vec![asm::make(asms::CALLEE), asm::make(asm::IDENT_FOLD)];
     let (rt, rp) = (callee(x, t)?, callee(y, p)?);
     case_check(&y.name, p)?;

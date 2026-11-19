@@ -457,6 +457,17 @@ enum Frame {
     },
 }
 
+/// Where `EXIT`/`BREAK` and `CONTINUE`/`ITERATE` go for a loop or labelled
+/// block, and the context it was entered in: a jump out of scopes opened
+/// since then (a PostgreSQL exception block, a T-SQL TRY) must leave them.
+#[derive(Clone, Copy)]
+struct Target {
+    head: NodeId,
+    exit: NodeId,
+    frames: usize,
+    handler_depth: usize,
+}
+
 #[derive(Clone)]
 struct Ctx {
     frames: Vec<Frame>,
@@ -464,10 +475,10 @@ struct Ctx {
     /// (`Lowerer::push_frame`) and shared by every statement lowered here.
     routes: Rc<FrameRoutes>,
     scope: Option<ScopeId>,
-    /// Innermost loop: (head, exit).
-    loop_: Option<(NodeId, NodeId)>,
-    /// Labels of enclosing loops and blocks: label -> (head, exit).
-    labels: Vec<(String, NodeId, NodeId)>,
+    /// Innermost loop: its head and exit, and the context it was entered in.
+    loop_: Option<Target>,
+    /// Labels of enclosing loops and blocks: label -> target (head, exit, depth).
+    labels: Vec<(String, Target)>,
     /// Db2 `DECLARE c CONDITION FOR SQLSTATE '...'`.
     conditions: HashMap<String, Vec<ErrorKind>>,
     /// Handler bodies (Db2 `DECLARE ... HANDLER`) enclosing this point. A
@@ -1031,7 +1042,16 @@ impl Lowerer {
         let mut inner = ctx.clone();
         inner.scope = Some(scope);
         if let Some(l) = Self::label_of(n) {
-            inner.labels.push((l, leave, leave));
+            inner.labels.push((
+                l,
+                Target {
+                    head: leave,
+                    exit: leave,
+                    // The block's own frame (pushed below) is left by `leave`.
+                    frames: ctx.frames.len() + 1,
+                    handler_depth: ctx.handler_depth,
+                },
+            ));
         }
         // Db2 condition declarations.
         for c in n.children().filter(|c| c.kind() == SyntaxKind::STATEMENT) {
@@ -1330,6 +1350,33 @@ impl Lowerer {
         cur
     }
 
+    /// The node a jump to `to` (a loop's head or exit, a labelled block's
+    /// exit) starts at: the exception blocks and TRY blocks entered since
+    /// the target was set up are left first, as at their normal ends, so no
+    /// scope stays on the stack (a later COMMIT would be refused as inside an
+    /// exception block). A jump out of a Db2 handler body keeps the direct
+    /// edge (PostgreSQL EXCEPTION handlers run in the outer context).
+    fn leave_scopes(&mut self, t: &Target, to: NodeId, ctx: &Ctx) -> NodeId {
+        if t.handler_depth != ctx.handler_depth || t.frames > ctx.frames.len() {
+            return to;
+        }
+        let mut scopes = Vec::new();
+        for f in &ctx.frames[t.frames..] {
+            match f {
+                Frame::Scope(s)
+                | Frame::Try { scope: s, .. }
+                | Frame::Handlers { scope: s, .. } => scopes.push(*s),
+            }
+        }
+        let mut node = to;
+        for s in scopes {
+            let leave = self.add(Op::Leave(s), None);
+            self.edge(leave, Edge::Next, node);
+            node = leave;
+        }
+        node
+    }
+
     fn loop_(&mut self, n: &SyntaxNode, next: NodeId, ctx: &Ctx) -> NodeId {
         let cond = n.children().find(|c| c.kind() == SyntaxKind::CONDITION);
         let first = ast::header_tokens(n)
@@ -1355,9 +1402,15 @@ impl Lowerer {
             cond.clone().or_else(|| Some(n.clone())),
         );
         let mut inner = ctx.clone();
-        inner.loop_ = Some((test, next));
+        let target = Target {
+            head: test,
+            exit: next,
+            frames: ctx.frames.len(),
+            handler_depth: ctx.handler_depth,
+        };
+        inner.loop_ = Some(target);
         if let Some(l) = Self::label_of(n) {
-            inner.labels.push((l, test, next));
+            inner.labels.push((l, target));
         }
         let body_units: Vec<SyntaxNode> = n
             .children()
@@ -1400,20 +1453,21 @@ impl Lowerer {
                         .labels
                         .iter()
                         .rev()
-                        .find(|(x, _, _)| x == l)
-                        .map(|(_, h, e)| (*h, *e)),
+                        .find(|(x, _)| x == l)
+                        .map(|(_, t)| *t),
                     // A quoted name (`EXIT "outer"`) is neither the loop's
                     // label nor an unlabelled exit: it stays an opaque
                     // statement.
                     None if quoted_label => None,
                     None => ctx.loop_,
                 };
-                if let Some((head, exit)) = target {
+                if let Some(t) = target {
                     let to = if matches!(w(0).as_str(), "CONTINUE" | "ITERATE") {
-                        head
+                        t.head
                     } else {
-                        exit
+                        t.exit
                     };
+                    let to = self.leave_scopes(&t, to, ctx);
                     let when = toks
                         .iter()
                         .position(|t| t.text().eq_ignore_ascii_case("WHEN"));
@@ -1560,9 +1614,16 @@ impl Lowerer {
         }
         // Temporary objects written and read.
         let mut temp_writes: Vec<String> = Vec::new();
+        // `WITH c AS (SELECT … FROM @t) UPDATE c …` writes @t, which the text
+        // names only inside the CTE's query: that mention is a read and the
+        // write is one more use of the table.
+        let mut hidden_write: Option<String> = None;
         if kind.is_write() {
-            if let Some(parts) = classify::write_target(n) {
+            if let Some((parts, via_cte)) = classify::write_target_via(n) {
                 if let Some(t) = self.temp_of(&parts) {
+                    if via_cte {
+                        hidden_write = Some(t.clone());
+                    }
                     temp_writes.push(t);
                 }
             }
@@ -1621,6 +1682,9 @@ impl Lowerer {
                     .entry(self.name_key(parts.last().unwrap_or(&t.text().to_string())))
                     .or_insert(0) += 1;
             }
+        }
+        if let Some(t) = hidden_write {
+            *mentions.entry(t).or_insert(0) += 1;
         }
         let declares = matches!(kind, StmtKind::Declare | StmtKind::Ddl);
         let temp_reads: Vec<String> = if declares {
@@ -1905,6 +1969,9 @@ fn resolve_oracle(prof: &Profile, frames: &[Frame], kind: ErrorKind, resume: Nod
 
 #[cfg(test)]
 mod route_tests;
+
+#[cfg(test)]
+mod exit_tests;
 
 #[cfg(test)]
 mod goto_tests;
