@@ -83,3 +83,50 @@ fn db2_goto_out_of_a_handler_or_a_block_with_handlers_is_not_followed() {
     let src = "CREATE PROCEDURE p (IN x INT)\nLANGUAGE SQL\nBEGIN\nBEGIN\nDECLARE CONTINUE HANDLER FOR SQLEXCEPTION\nBEGIN\nINSERT INTO e VALUES (1);\nGOTO l;\nEND;\nIF x = 1 THEN GOTO l; END IF;\nINSERT INTO t VALUES (2);\nEND;\nINSERT INTO t VALUES (4);\nl:\nINSERT INTO t VALUES (3);\nEND\n";
     assert_eq!(followed(Dialect::Db2i, src), vec![false, false]);
 }
+
+/// For each `EXIT` statement of the first routine, in source order: `true`
+/// when it is followed (an `Op::Nop` that continues elsewhere), `false` when
+/// it stays an opaque statement.
+fn exits_followed(d: Dialect, text: &str) -> Vec<bool> {
+    let art = Artifact::new("p.sql", d, text.to_string());
+    let a = Analyzed::new(&art, Side::A, 0);
+    let cfg = lower(&a);
+    let mut out: Vec<(usize, bool)> = cfg
+        .nodes
+        .iter()
+        .filter_map(|n| {
+            let s = n.syntax.as_ref()?;
+            let first = ast::sig_tokens(s).next()?;
+            if s.kind() != SyntaxKind::STATEMENT || !first.text().eq_ignore_ascii_case("EXIT") {
+                return None;
+            }
+            let pos = usize::from(s.text_range().start());
+            Some((pos, matches!(n.op, Op::Nop)))
+        })
+        .collect();
+    out.sort();
+    out.into_iter().map(|(_, f)| f).collect()
+}
+
+fn pg(body: &str) -> String {
+    format!("CREATE PROCEDURE p(p_x integer)\nLANGUAGE plpgsql\nAS $$\nBEGIN\n{body}\nEND;\n$$;\n")
+}
+
+#[test]
+fn a_postgres_exit_names_the_labelled_block_or_loop_it_leaves() {
+    // The label of `<<name>> BEGIN` and `<<name>> LOOP` is the name, not `<<`.
+    let block = pg("<<g>>\nBEGIN\nIF p_x = 1 THEN EXIT g; END IF;\nUPDATE t SET c = 1;\nEND;");
+    assert_eq!(exits_followed(Dialect::Postgres, &block), vec![true]);
+    let lp = pg("<<outer>>\nLOOP\nLOOP\nEXIT outer;\nEND LOOP;\nEND LOOP;");
+    assert_eq!(exits_followed(Dialect::Postgres, &lp), vec![true]);
+    // A name that labels nothing in scope is left alone.
+    let none = pg("<<g>>\nBEGIN\nIF p_x = 1 THEN EXIT h; END IF;\nEND;");
+    assert_eq!(exits_followed(Dialect::Postgres, &none), vec![false]);
+    // A quoted label is neither a name that resolves nor an unlabelled exit:
+    // it stays opaque (and so never counts as the innermost loop's exit).
+    let quoted = pg("<<outer>>\nLOOP\nLOOP\nEXIT \"outer\";\nEND LOOP;\nEXIT;\nEND LOOP;");
+    assert_eq!(
+        exits_followed(Dialect::Postgres, &quoted),
+        vec![false, true]
+    );
+}

@@ -1012,8 +1012,10 @@ impl Lowerer {
     fn label_of(n: &SyntaxNode) -> Option<String> {
         let prev = n.prev_sibling().filter(|p| p.kind() == SyntaxKind::LABEL);
         let inner = n.children().find(|c| c.kind() == SyntaxKind::LABEL);
+        // The name is the identifier: PostgreSQL writes `<<name>>`, whose
+        // first token is `<<`.
         prev.or(inner)
-            .and_then(|l| ast::sig_tokens(&l).next())
+            .and_then(|l| ast::sig_tokens(&l).find(|t| t.kind() == SyntaxKind::IDENT))
             .map(|t| upper(&t))
     }
 
@@ -1443,6 +1445,9 @@ impl Lowerer {
                         t.kind() == SyntaxKind::IDENT && !t.text().eq_ignore_ascii_case("WHEN")
                     })
                     .map(upper);
+                let quoted_label = toks
+                    .get(1)
+                    .is_some_and(|t| t.kind() == SyntaxKind::QUOTED_IDENT);
                 let target = match &label {
                     Some(l) => ctx
                         .labels
@@ -1450,6 +1455,10 @@ impl Lowerer {
                         .rev()
                         .find(|(x, _)| x == l)
                         .map(|(_, t)| *t),
+                    // A quoted name (`EXIT "outer"`) is neither the loop's
+                    // label nor an unlabelled exit: it stays an opaque
+                    // statement.
+                    None if quoted_label => None,
                     None => ctx.loop_,
                 };
                 if let Some(t) = target {
